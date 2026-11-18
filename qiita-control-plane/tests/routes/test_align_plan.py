@@ -659,12 +659,12 @@ async def test_align_plan_holds_both_definitions_in_its_ticket_transaction(
     async def _alignment(conn, idx):
         assert conn.is_in_transaction()
         locked.append(("alignment", idx))
-        await real_alignment(conn, idx)
+        return await real_alignment(conn, idx)
 
     async def _mask(conn, idx):
         assert conn.is_in_transaction()
         locked.append(("mask", idx))
-        await real_mask(conn, idx)
+        return await real_mask(conn, idx)
 
     monkeypatch.setattr(align_planner, "lock_active_alignment", _alignment)
     monkeypatch.setattr(align_planner, "lock_active_mask", _mask)
@@ -739,3 +739,80 @@ async def test_a_mask_deprecation_during_the_mint_waits_and_counts_the_plan(
     assert resp.status_code == 202, resp.text
     with pytest.raises(MaskHasLiveWork):
         await attempts[0]
+
+
+async def test_an_alignment_edit_committed_inside_the_plans_mint_re_mints(
+    ctx, planned, monkeypatch
+):
+    """The real plan path: the alignment the plan's params resolve to already exists,
+    and an admin edit of it commits during the plan's mint, before the hold. The plan
+    re-mints, so its tickets record an alignment with the params it hashed, and the
+    edited row keeps the edit."""
+    import json
+
+    from qiita_common.models import DefinitionKind
+
+    from qiita_control_plane.definition_settings import edit_definition_settings
+
+    await _seed_align_action(planned["db"])
+    db = planned["db"]
+    real_mint = align_planner.mint_alignment_definition
+    edited: list[int] = []
+
+    async def mint_then_edit(conn, *, params, principal_idx):
+        if not edited:
+            # The row the plan's mint resolves, committed before the plan's own mint.
+            async with db.acquire() as other:
+                existing = await real_mint(other, params=params, principal_idx=principal_idx)
+        row = await real_mint(conn, params=params, principal_idx=principal_idx)
+        if not edited:
+            assert row["alignment_idx"] == existing["alignment_idx"]
+            async with db.acquire() as other, other.transaction():
+                await edit_definition_settings(
+                    other,
+                    kind=DefinitionKind.ALIGNMENT,
+                    idx=row["alignment_idx"],
+                    params={**params, "edited": True},
+                    workflow=None,
+                    version=None,
+                    reason="corrected in a test",
+                    principal_idx=ctx["admin_session"]["principal_idx"],
+                )
+            edited.append(row["alignment_idx"])
+        return row
+
+    monkeypatch.setattr(align_planner, "mint_alignment_definition", mint_then_edit)
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 202, resp.text
+    recorded = {
+        r["alignment_idx"]
+        for r in await db.fetch(
+            "SELECT DISTINCT wt.alignment_idx FROM qiita.work_ticket wt"
+            "  JOIN qiita.block_member bm ON bm.block_idx = wt.block_idx"
+            " WHERE bm.prep_sample_idx = ANY($1::bigint[])",
+            planned["prep_samples"],
+        )
+    }
+    assert len(edited) == 1 and len(recorded) == 1
+    assert recorded != set(edited)
+    params_of = "SELECT params FROM qiita.alignment_definition WHERE alignment_idx = $1"
+    assert "edited" not in json.loads(await db.fetchval(params_of, recorded.pop()))
+    assert json.loads(await db.fetchval(params_of, edited[0]))["edited"] is True
+
+
+async def test_a_plan_whose_alignment_is_edited_before_every_hold_is_refused_409(
+    ctx, planned, monkeypatch
+):
+    """When the held row's hash differs from the plan's on every attempt, the plan is
+    refused with a 409 and leaves no alignment behind. The held hash is stubbed: a
+    real edit cannot reach a row the plan's own transaction inserted."""
+    await _seed_align_action(planned["db"])
+
+    async def moved_hash(conn, alignment_idx):
+        return {"params_hash": b"\x00" * 32}
+
+    monkeypatch.setattr(align_planner, "lock_active_alignment", moved_hash)
+    resp = await ctx["wet"].post(_url(planned), json=_body(planned))
+    assert resp.status_code == 409, resp.text
+    assert "edited between the mint and its hold" in resp.json()["detail"]
+    assert await _alignments_of(planned["db"], planned["reference_idx"]) == 0

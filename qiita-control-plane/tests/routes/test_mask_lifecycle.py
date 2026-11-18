@@ -25,7 +25,7 @@ from qiita_common.api_paths import (
     URL_MASK_DEFINITION_SAMPLE_STATUS,
     URL_MASK_DEFINITION_STATUS,
 )
-from qiita_common.models import MaskDefinitionStatus, WorkTicketState
+from qiita_common.models import DeprecationRefusal, MaskDefinitionStatus, WorkTicketState
 
 from qiita_control_plane.repositories.mask_definition import (
     MaskDefinitionDeprecated,
@@ -612,7 +612,12 @@ async def test_deprecation_waits_for_the_masks_unfinished_tickets(client, postgr
     try:
         resp = await _deprecate(client, lifecycle["mask_idx"])
         assert resp.status_code == 409, resp.text
-        assert resp.json()["detail"]["work_ticket_idx"] == [wt]
+        detail = resp.json()["detail"]
+        assert (detail["reason"], detail["work_ticket_idx"]) == (
+            DeprecationRefusal.LIVE_WORK,
+            [wt],
+        )
+        assert "unfinished work ticket" in detail["detail"]
         await postgres_pool.execute(
             "UPDATE qiita.work_ticket SET state = $2 WHERE work_ticket_idx = $1",
             wt,
@@ -627,9 +632,9 @@ async def test_deprecation_waits_for_the_masks_unfinished_tickets(client, postgr
 
 
 async def test_a_deprecated_mask_cannot_be_recorded_on_a_ticket(client, lifecycle, postgres_pool):
-    """The runner's writer of work_ticket.mask_idx re-checks the status under a share
-    lock, so a deprecation landing after the mask was minted still stops the run
-    before it records the mask."""
+    """The runner's writer of a consumed mask (one the ticket reads rather than mints)
+    re-checks the status under a share lock, so a deprecation landing before the
+    write still stops the run before it records the mask."""
     from qiita_common.actions import READ_MASK_ACTION_ID
     from qiita_common.backend_failure import BackendFailure, FailureKind
 

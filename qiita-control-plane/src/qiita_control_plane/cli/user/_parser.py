@@ -41,6 +41,8 @@ from qiita_common.models import (
     BIOSAMPLE_ATTRIBUTE_FIELDS,
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
+    INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
     LEGACY_IDX_RESERVED_CEILING,
     REDRIVABLE_WORK_TICKET_STATES,
     STORABLE_ACCESS_TIERS,
@@ -1205,10 +1207,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "Counts are reads with a mapped primary alignment to each insert of the"
             " mask's SynDNA reference, ungated — the table classic Qiita publishes as"
             " syndna.biom. The selection filters intersect; name at least one. Needs"
-            " viewer (or above) on every study each selected prep_sample is linked to,"
-            " and every selected prep_sample completed under the mask. Each"
-            " prep_sample's sample_id is its biosample accession; the export refuses"
-            " two prep_samples that would share one."
+            " viewer (or above) on every study each selected prep_sample is linked to."
+            " Each prep_sample is read under the mask of --mask-idx's similarity group"
+            " it resolves to; one that is incomplete or not processed there is left"
+            " out of the table and listed on stderr. Each prep_sample's sample_id is"
+            " its biosample accession; the export refuses two prep_samples that would"
+            " share one. Beside the table, <output>.metadata.json records each"
+            " sample_id's mask handle (QP<n>), the left-out prep_samples by biosample"
+            " accession with state and reason, and whether the mask read was deprecated"
+            " (BIOM output cannot carry sample metadata). The Parquet table also has a"
+            " mask_export_processing_id column."
         ),
     )
     p_mask_syndna.add_argument("--mask-idx", type=int, required=True)
@@ -1223,7 +1231,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="This prep_sample (repeatable)",
     )
     p_mask_syndna.add_argument(
-        "--output", type=Path, required=True, help="Table file to write; must not exist"
+        "--output",
+        type=Path,
+        required=True,
+        help="Table file to write; it and <output>.metadata.json must not exist",
     )
     p_mask_syndna.add_argument(
         "--format",
@@ -1234,6 +1245,15 @@ def _build_parser() -> argparse.ArgumentParser:
             " either way; BIOM omits zero cells."
         ),
     )
+    p_mask_syndna.add_argument(
+        INCLUDE_DEPRECATED_FLAG,
+        action="store_true",
+        help=(
+            "Read a deprecated --mask-idx's own counts, without its group (refused"
+            " without this flag); a mask that is not deprecated reads its group either way"
+        ),
+    )
+    _common.add_as_of_event_argument(p_mask_syndna)
     p_mask_syndna.add_argument(
         "--prefix-pool",
         action="store_true",
@@ -1400,7 +1420,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "cohort",
         help=(
             "List the pool's prep_samples that are both readable by you and completed"
-            " for one alignment — the set `feature-table build` uses by default"
+            " for one alignment — what `feature-table build` unions, per alignment of"
+            " the similarity group, by default"
         ),
     )
     p_alignment_cohort.add_argument("--sequencing-run-idx", type=int, required=True)
@@ -1423,13 +1444,37 @@ def _build_parser() -> argparse.ArgumentParser:
             " with the exported-identifier map needed to read it"
         ),
     )
-    p_ft_build.add_argument("--sequencing-run-idx", type=int, required=True)
-    p_ft_build.add_argument("--sequenced-pool-idx", type=int, required=True)
+    # Repeatable as a pair, so one table can span pools: the Nth --sequencing-run-idx
+    # goes with the Nth --sequenced-pool-idx. The pools are where the alignments' params
+    # are read from (and, without --prep-sample-idx, where the cohort is found).
+    p_ft_build.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        action="append",
+        required=True,
+        help=(
+            "The sequencing run of a pool the cohort is on. Repeat together with"
+            " --sequenced-pool-idx for a cohort spanning pools; the two are paired in"
+            " the order given."
+        ),
+    )
+    p_ft_build.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        action="append",
+        required=True,
+        help="A pool the cohort is on; one per --sequencing-run-idx, in the same order.",
+    )
     p_ft_build.add_argument(
         "--alignment-idx",
         type=int,
         required=True,
-        help="From `qiita alignment list`; its params say which reference it used.",
+        help=(
+            "From `qiita alignment list`; its params say which reference it used. Each"
+            " prep_sample is read from the alignment that it resolves to in this"
+            " alignment's similarity group (one part per alignment), and a prep_sample"
+            " that is not processed in the group, or is incomplete, stops the build."
+        ),
     )
     p_ft_build.add_argument(
         "--denovo-alignment-idx",
@@ -1440,10 +1485,39 @@ def _build_parser() -> argparse.ArgumentParser:
             " once: against its own contig where the de novo arm placed it, against the"
             " reference otherwise. Reference genomes therefore lose the reads the de novo"
             " arm wins, so one that clears --coverage-threshold without this flag can drop"
-            " out with it. From `qiita alignment list`; its params must name the same"
-            " mask_idx as --alignment-idx. Cannot be combined with --circular-gate."
-            " A prep_sample in the cohort that assembled nothing simply has no de novo"
-            " arm and stays reference-only; it is not an error."
+            " out with it. From `qiita alignment list`. Each prep_sample is read from the"
+            " de novo alignment that it resolves to in this one's group, which must be"
+            " aligned at a mask in the same mask group as the prep_sample's reference"
+            " arm. Cannot be"
+            " combined with --circular-gate. A prep_sample with no de novo alignment in"
+            " the group, or whose assembly produced no contigs, has no de novo arm and"
+            " stays reference-only; it is not an error."
+        ),
+    )
+    _common.add_as_of_event_argument(p_ft_build)
+    p_ft_build.add_argument(
+        INCLUDE_DEPRECATED_FLAG,
+        action="store_true",
+        help=(
+            "Read a deprecated --alignment-idx or --denovo-alignment-idx alone, its own"
+            " completed, non-withdrawn prep_samples, without its group (refused without"
+            " this flag). The manifest marks each part read this way, and records the"
+            " prep_samples such a read leaves out (every one not read, except one with no"
+            " run under the alignment, or, de novo, whose assembly produced no contigs) by"
+            " biosample accession and QB handle. Also reads a de novo"
+            " arm whose assembly run is deprecated. An alignment that is not deprecated"
+            " reads its group either way."
+        ),
+    )
+    p_ft_build.add_argument(
+        INCLUDE_DEPRECATED_UPSTREAM_FLAG,
+        action="store_true",
+        help=(
+            "Read an active alignment (reference or de novo) whose mask, or whose"
+            " assembly run, is deprecated (refused without this flag). The manifest names"
+            " each deprecated upstream read, by params_hash and reason. Over the default"
+            " cohort, a prep_sample whose mask run is withdrawn is left out and recorded in"
+            " the manifest by biosample accession and QB handle; a named one is refused."
         ),
     )
     p_ft_build.add_argument(
@@ -1451,9 +1525,11 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         action="append",
         help=(
-            "Restrict the cohort to these prep_samples; repeat for several. Omit to use the"
-            " pool's whole mintable cohort for this alignment (`qiita alignment cohort`)."
-            " The cohort changes the table — breadth of coverage is measured over it."
+            "Restrict the cohort to these prep_samples; repeat for several. They may be on"
+            " any of the named pools. Omit to use every prep_sample of the named pools you"
+            " can read that is completed for an alignment in --alignment-idx's group"
+            " (`qiita alignment cohort` per alignment). The cohort changes the table —"
+            " breadth of coverage is measured over it."
         ),
     )
     p_ft_build.add_argument(

@@ -23,7 +23,7 @@ from qiita_common.api_paths import (
     URL_ALIGNMENT_DEFINITION_STATUS,
     URL_WORK_TICKET_RUN,
 )
-from qiita_common.models import AlignmentDefinitionStatus, WorkTicketState
+from qiita_common.models import AlignmentDefinitionStatus, DeprecationRefusal, WorkTicketState
 
 from qiita_control_plane.align_planner import ALIGN_ACTION_VERSION
 from qiita_control_plane.fanout_dispatch import align_block_cohort, top_up_dispatch
@@ -40,6 +40,7 @@ from qiita_control_plane.repositories.block import (
     has_incomplete_covering_alignment_block,
     set_block_work_ticket,
 )
+from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
     seed_action_if_absent,
@@ -125,13 +126,23 @@ async def lc(postgres_pool, human_admin_session):
         f"align-lifecycle-{suffix}",
         owner,
     )
+    # A real mask: the cohort routes read the alignment's upstream mask row.
     async with postgres_pool.acquire() as conn:
+        mask_idx = (
+            await mint_mask_definition(
+                conn,
+                filter_workflow="read-mask",
+                filter_version="1.0.0",
+                params={"filter_workflow": "read-mask", "s": suffix},
+                principal_idx=owner,
+            )
+        )["mask_idx"]
         row = await mint_alignment_definition(
             conn,
             params={
                 "reference_idx": reference_idx,
                 "aligner": "minimap2",
-                "mask_idx": 1,
+                "mask_idx": mask_idx,
                 "shard_ids": [0],
                 "s": suffix,
             },
@@ -217,6 +228,7 @@ async def lc(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
+    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
     await delete_action_if_created(
         postgres_pool,
         action_id=ALIGN_ACTION_ID,
@@ -282,7 +294,9 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     )
     resp = await _deprecate(client, lc["alignment_idx"])
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["work_ticket_idx"] == [held]
+    detail = resp.json()["detail"]
+    assert (detail["reason"], detail["work_ticket_idx"]) == (DeprecationRefusal.LIVE_WORK, [held])
+    assert "unfinished work ticket" in detail["detail"]
     status = await lc["pool"].fetchval(
         "SELECT status FROM qiita.alignment_definition WHERE alignment_idx = $1",
         lc["alignment_idx"],
@@ -297,54 +311,29 @@ async def test_deprecation_waits_for_unfinished_tickets(client, lc):
     assert (await _deprecate(client, lc["alignment_idx"])).status_code == 200
 
 
-async def test_a_deprecated_alignment_cannot_be_recorded_on_a_ticket(lc):
-    """The de novo writer of work_ticket.alignment_idx re-checks the status under a
-    share lock, so a deprecation landing after the mint still stops the run before it
-    records the alignment."""
-    from qiita_common.actions import ALIGN_DENOVO_ACTION_ID
+async def test_refuse_deprecated_alignment_refuses_from_the_row(lc):
+    """`_refuse_deprecated_alignment` refuses, from the alignment's row, a deprecation
+    that landed since the ticket was submitted."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
-    from qiita_control_plane.runner._alignment import _persist_alignment_idx
+    from qiita_control_plane.repositories.alignment_definition import (
+        fetch_alignment_definition_by_idx,
+    )
+    from qiita_control_plane.runner._feature_table import _refuse_deprecated_alignment
 
     pool = lc["pool"]
-    a, _b, _c = lc["samples"]
-    version = f"lifecycle-{secrets.token_hex(4)}"
-    created = await seed_action_if_absent(
-        pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, target_kind="prep_sample"
-    )
-    # The shape the de novo runner stamps: a processing prep_sample ticket that does
-    # not carry the alignment yet.
-    wt = await pool.fetchval(
-        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, prep_sample_idx, state)"
-        " VALUES ($1, $2, $3, 'prep_sample', $4, $5) RETURNING work_ticket_idx",
-        ALIGN_DENOVO_ACTION_ID,
-        version,
+    await pool.execute(
+        "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
+        "       deprecated_by_idx = $2, deprecation_reason = 'late'"
+        " WHERE alignment_idx = $1",
+        lc["alignment_idx"],
         lc["owner"],
-        a,
-        WorkTicketState.PROCESSING.value,
+        AlignmentDefinitionStatus.DEPRECATED.value,
     )
-    try:
-        await pool.execute(
-            "UPDATE qiita.alignment_definition SET status = $3, deprecated_at = now(),"
-            "       deprecated_by_idx = $2, deprecation_reason = 'late'"
-            " WHERE alignment_idx = $1",
-            lc["alignment_idx"],
-            lc["owner"],
-            AlignmentDefinitionStatus.DEPRECATED.value,
-        )
-        with pytest.raises(BackendFailure, match="late") as ei:
-            await _persist_alignment_idx(pool, wt, lc["alignment_idx"])
-        assert ei.value.kind == FailureKind.BAD_INPUT
-        recorded = await pool.fetchval(
-            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt
-        )
-        assert recorded is None
-    finally:
-        await pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt)
-        await delete_action_if_created(
-            pool, action_id=ALIGN_DENOVO_ACTION_ID, version=version, created=created
-        )
+    row = await fetch_alignment_definition_by_idx(pool, lc["alignment_idx"])
+    with pytest.raises(BackendFailure, match="late") as ei:
+        _refuse_deprecated_alignment(row)
+    assert ei.value.kind == FailureKind.BAD_INPUT
 
 
 async def test_deprecate_without_reason_is_422(client, lc):
@@ -885,7 +874,9 @@ async def test_cohort_doget_refuses_a_deprecated_alignment(client, lc):
         json={"prep_sample_idx": [a], "columns": ["alignment_idx"]},
     )
     assert resp.status_code == 409, resp.text
-    assert _REASON in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "deprecated"
+    assert _REASON in detail["detail"] and "--include-deprecated" in detail["detail"]
 
 
 async def test_cohort_doget_refuses_an_invalidated_sample(client, lc):

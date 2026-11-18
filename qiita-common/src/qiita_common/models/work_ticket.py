@@ -91,8 +91,9 @@ class WorkTicketState(StrEnum):
     "done" signal rather than being stuck behind permanent failures.
 
     CANCELLED is the terminal outcome for an OPERATOR-stopped ticket (the
-    `qiita-admin ticket cancel` path): the CP flips it terminal so the poll
-    loop aborts and no new attempt is submitted, then reaps its SLURM job(s).
+    `qiita-admin ticket cancel` path, from a non-terminal or a FAILED state): the
+    CP flips it terminal so the poll loop aborts and no new attempt is submitted,
+    then reaps its SLURM job(s).
     It carries NULL failure_* columns — distinct from FAILED so a deliberate
     stop is legible (in `ticket list`, the pool rollups, the notify digest)
     rather than masquerading as a genuine failure. Like FAILED it is redrivable
@@ -330,6 +331,13 @@ class WorkTicket(BaseModel):
     # explainable instead of silent.
     transient_reason: str | None = None
     transient_since: AwareDatetime | None = None
+    # A cancel's reap mark: set while a cancel's reap of the ticket's SLURM jobs has not
+    # succeeded, which blocks a redrive (`qiita.work_ticket.reap_pending_since` says
+    # when it is set and cleared). `reap_note` is the in-flight marker or the reap's
+    # error; the ticket GETs and `/run`'s 409 show it to a system_admin only
+    # (`routes/work_ticket.py`, `sees_reap_note`).
+    reap_pending_since: AwareDatetime | None = None
+    reap_note: str | None = None
     # The follow-on this ticket submits once it COMPLETES, and what became of
     # it: the ticket it created, or why it was refused. Mirrors the
     # qiita.work_ticket columns of the same names.
@@ -697,15 +705,15 @@ _MAX_CANCEL_IDXS = 1000
 
 
 class WorkTicketCancelRequest(BaseModel):
-    """Body for POST /api/v1/work-ticket/cancel — operator-cancel of in-flight
-    compute (system_admin, `work_ticket:cancel`).
+    """Body for POST /api/v1/work-ticket/cancel — operator-cancel of in-flight or
+    failed work (system_admin, `work_ticket:cancel`).
 
     Selects the tickets by an explicit idx list AND/OR a filter. The filter is
     `action_id` (required to filter) plus an optional `sequencing_run_idx` /
-    `sequenced_pool_idx` narrowing, and matches only NON-terminal tickets
-    (cancelling a terminal ticket is a no-op). Explicit `work_ticket_idxs` are
-    reaped regardless of state (defensive orphan-reap). At least one selector must
-    be present; run/pool narrowing requires `action_id`."""
+    `sequenced_pool_idx` narrowing, and matches only NON-terminal tickets.
+    Explicit `work_ticket_idxs` are reaped regardless of state (defensive
+    orphan-reap), and a non-terminal or failed one is flipped to `cancelled`. At
+    least one selector must be present; run/pool narrowing requires `action_id`."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -734,10 +742,11 @@ class WorkTicketCancelRequest(BaseModel):
 
 class WorkTicketCancelResult(BaseModel):
     """The outcome for ONE ticket in a cancel request. `cancelled` is True iff this
-    call flipped it terminal (False = it was already terminal, a no-op); the scancel
-    reap runs either way. `not_found` marks an explicit idx that does not exist.
-    `reap_error` is set when the terminal flip landed but the scancel failed (the
-    flip stands — re-run cancel to retry the reap)."""
+    call flipped it to `cancelled` (False = a no-op on a ticket the control plane does
+    not cancel from its state); the scancel reap runs either way. `not_found` marks an
+    explicit idx that does not exist. `reap_error` is set when the terminal flip
+    landed but the scancel failed (the flip stands — re-run cancel to retry the
+    reap); the ticket records it until a reap succeeds (`work_ticket_cancel`)."""
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
     previous_state: str | None = None

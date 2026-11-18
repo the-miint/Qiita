@@ -11,6 +11,7 @@ from collections.abc import Mapping
 
 from fastapi.responses import JSONResponse
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import DefinitionKind
 
 VALID_SCOPES: frozenset[Scope] = frozenset(Scope)
 
@@ -211,3 +212,12 @@ def validate_scopes_against_ceiling(
             content={"detail": ceiling_violation_detail, "rejected_scopes": rejected},
         )
     return None
+
+
+# The lifecycle scope that governs each definition kind's output equivalences and settings
+# edits.
+KIND_LIFECYCLE_SCOPE: Mapping[DefinitionKind, Scope] = {
+    DefinitionKind.MASK: Scope.MASK_DEFINITION_LIFECYCLE,
+    DefinitionKind.ALIGNMENT: Scope.ALIGNMENT_DEFINITION_LIFECYCLE,
+    DefinitionKind.PROCESSING: Scope.PROCESSING_LIFECYCLE,
+}

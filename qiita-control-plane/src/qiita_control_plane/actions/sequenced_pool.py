@@ -392,10 +392,12 @@ async def delete_sequenced_pool_cascade(
     an identity that never returns — `genome_idx` is GENERATED ALWAYS AS IDENTITY, and
     a re-assembly mints a fresh one.
 
-    Still not cleared here: `qiita.exported_identifier.prep_sample_idx` (a published
-    handle naming the prep_sample itself), also ON DELETE RESTRICT and ungated, so a
-    pool carrying one raises ForeignKeyViolationError out of the prep_sample delete
-    below.
+    `qiita.exported_identifier.prep_sample_idx` (a published `QM<n>` handle naming
+    the prep_sample under a mask or an alignment) is ON DELETE SET NULL as well: a
+    BEFORE DELETE trigger on prep_sample writes the biosample's accession and public
+    handle onto the row, and the retire trigger retires it when the FK action nulls
+    the column, so the handle keeps resolving, as retired (migration
+    `20261116000002_exported_identifier_prep_sample_delete.sql`).
 
     Returns the per-table delete counts for the caller's response. The derived
     deletes are not surfaced — gate rows, the block cover map, the assembly

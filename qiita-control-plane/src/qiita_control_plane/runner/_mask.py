@@ -11,9 +11,11 @@ from typing import Any, NamedTuple
 
 import asyncpg
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.hashing import canonical_params_hash
 
 from ..actions.library import complete_empty_mask_sample
 from ..repositories.block import MaskSampleInvalidated
+from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
@@ -26,6 +28,7 @@ from ..repositories.mask_definition import (
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
 from ._base import _log, _workflow_declares_action
+from ._record import fail_exhausted_hold, record_minted
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -400,6 +403,7 @@ async def _mint_read_mask(
     host_minimap2_reference_idx: int | None,
     resolved_lima: dict[str, Any] | None,
     resolved_syndna: dict[str, Any] | None,
+    work_ticket_idx: int | None = None,
 ) -> dict[str, int]:
     """Mint (or resolve) the `mask_idx` for this filtering config and bind it.
 
@@ -418,6 +422,11 @@ async def _mint_read_mask(
         reference's sequences, not of the materialized artifact).
     `mint_mask_definition` hashes `params` (canonical JSON) and upserts on it, so
     the same effective config resolves to the same mask_idx fleet-wide.
+
+    With `work_ticket_idx`, the same transaction records the mask on the ticket
+    (`work_ticket.mask_idx`), holding the mask row `FOR SHARE` from the mint through
+    that write (the hold: `repositories.definition_hold`), and refuses a ticket that
+    already records another mask (the refusal: `runner._record`).
 
     Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
     BAD_INPUT the outer handler turns into a FAILED ticket: no sequenced_sample
@@ -471,17 +480,35 @@ async def _mint_read_mask(
         adapter_hashes,
     )
 
+    async def held_params_hash(conn: asyncpg.Connection, row: asyncpg.Record) -> bytes:
+        return (await lock_active_mask(conn, row["mask_idx"]))["params_hash"]
+
     try:
-        async with pool.acquire() as conn:
-            mask_row = await mint_mask_definition(
+        async with pool.acquire() as conn, conn.transaction():
+            mask_row = await mint_and_hold(
                 conn,
-                filter_workflow=action_id,
-                filter_version=action_version,
-                params=params,
-                principal_idx=originator_principal_idx,
-                legacy_params=legacy_params,
-                adapter_hash_scheme=adapter_hashes.scheme(),
+                mint=lambda: mint_mask_definition(
+                    conn,
+                    filter_workflow=action_id,
+                    filter_version=action_version,
+                    params=params,
+                    principal_idx=originator_principal_idx,
+                    legacy_params=legacy_params,
+                    adapter_hash_scheme=adapter_hashes.scheme(),
+                ),
+                held_params_hash=partial(held_params_hash, conn),
+                params_hash=canonical_params_hash(params),
+                what=f"mask for {action_id} {action_version}",
             )
+            if work_ticket_idx is not None:
+                await record_minted(
+                    conn,
+                    work_ticket_idx=work_ticket_idx,
+                    column="mask_idx",
+                    definition_idx=mask_row["mask_idx"],
+                )
+    except MintHoldExhausted as exc:
+        raise fail_exhausted_hold(exc) from exc
     except MaskDefinitionDeprecated as exc:
         # Same class as the FK case below: the ticket named a config that cannot be
         # minted against, which is bad input rather than a fault to retry. Left
@@ -497,10 +524,10 @@ async def _mint_read_mask(
 
 
 async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: int) -> None:
-    """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
-    traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
-    re-resolves to the same mask_idx via the config-hash upsert, so re-running
-    this writes the same value.
+    """Write a consumed `mask_idx` onto the ticket row (durable ticket→mask
+    traceability + a cheap shared-mask guard): a mask the ticket reads rather than
+    mints. A minted mask is recorded by `_mint_read_mask` in its mint's transaction.
+    Idempotent: the value comes from the ticket's action_context.
 
     Holds the mask row `FOR SHARE` across the write and refuses a deprecated mask
     (`lock_active_mask`), so a deprecation that counted this ticket's work as absent

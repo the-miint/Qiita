@@ -35,6 +35,19 @@ async def fetch_mask_syndna_reference(
     )
 
 
+async def fetch_mask_syndna_references(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, mask_idxs: Sequence[int]
+) -> dict[int, int | None]:
+    """`{mask_idx: reference_idx}` for each of `mask_idxs` that exists; the value is
+    None for a mask that ran without SynDNA."""
+    rows = await pool_or_conn.fetch(
+        f"SELECT mask_idx, {SYNDNA_REFERENCE_SQL} AS reference_idx"
+        "  FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
+        list(mask_idxs),
+    )
+    return {r["mask_idx"]: r["reference_idx"] for r in rows}
+
+
 async def fetch_syndna_inserts(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, reference_idx: int
 ) -> list[asyncpg.Record]:
@@ -83,24 +96,21 @@ async def replace_syndna_read_counts(
 
 async def fetch_syndna_export_roster(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    mask_idx: int,
+    mask_idxs: Sequence[int],
     *,
     study_idx: int | None,
     sequenced_pool_idx: int | None,
     prep_sample_idxs: Sequence[int] | None,
     limit: int,
 ) -> list[asyncpg.Record]:
-    """Up to `limit` non-retired samples with a mask_sample row under `mask_idx`,
-    matching every given filter, ascending by prep_sample_idx. Each row carries the
-    gate state, the biosample accession and the sample's sequenced_pool_idx (NULL
-    when it was never pooled).
-
-    Every state is returned, not only 'completed': the export refuses a selection
-    holding any other, and it can only say so if it sees them. No caller-visibility
-    narrowing — the route authorizes the whole roster. Callers that need to detect
-    truncation pass `limit = cap + 1`.
+    """Up to `limit` non-retired prep_samples with a mask_sample row in any state
+    under any of `mask_idxs`, matching every given filter, ascending by
+    prep_sample_idx, one row each. Each row carries the biosample accession and the
+    prep_sample's sequenced_pool_idx (NULL when it was never pooled). No
+    caller-visibility narrowing. A caller that needs to detect truncation passes
+    `limit = cap + 1`.
     """
-    args: list = [mask_idx]
+    args: list = [list(mask_idxs)]
     scope, _narrowed = sample_scope_sql(
         alias=_ROSTER_ALIAS,
         args=args,
@@ -115,14 +125,15 @@ async def fetch_syndna_export_roster(
     args.append(limit)
     return list(
         await pool_or_conn.fetch(
-            f"SELECT {_ROSTER_ALIAS}.prep_sample_idx, {_ROSTER_ALIAS}.state,"
+            f"SELECT {_ROSTER_ALIAS}.prep_sample_idx,"
             "        bs.biosample_accession, ss.sequenced_pool_idx"
-            f"  FROM qiita.mask_sample {_ROSTER_ALIAS}"
+            "  FROM (SELECT DISTINCT prep_sample_idx FROM qiita.mask_sample"
+            f"         WHERE mask_idx = ANY($1::bigint[])) {_ROSTER_ALIAS}"
             f"  JOIN qiita.prep_sample ps ON ps.idx = {_ROSTER_ALIAS}.prep_sample_idx"
             "   JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
             "   LEFT JOIN qiita.sequenced_sample ss"
             f"    ON ss.prep_sample_idx = {_ROSTER_ALIAS}.prep_sample_idx"
-            f" WHERE {_ROSTER_ALIAS}.mask_idx = $1{scope}"
+            f" WHERE true{scope}"
             f" ORDER BY {_ROSTER_ALIAS}.prep_sample_idx"
             f" LIMIT ${len(args)}",
             *args,
@@ -132,16 +143,18 @@ async def fetch_syndna_export_roster(
 
 async def fetch_syndna_read_counts(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    mask_idx: int,
-    prep_sample_idxs: Sequence[int],
+    mask_by_sample: Mapping[int, int],
 ) -> list[asyncpg.Record]:
-    """Every stored `(prep_sample_idx, feature_idx, read_count)` row for these
-    samples under `mask_idx`."""
+    """Every stored `(prep_sample_idx, feature_idx, read_count)` row of each
+    prep_sample in `mask_by_sample` under the mask it maps to."""
+    prep_sample_idxs = sorted(mask_by_sample)
     return list(
         await pool_or_conn.fetch(
-            "SELECT prep_sample_idx, feature_idx, read_count FROM qiita.syndna_read_count"
-            " WHERE mask_idx = $1 AND prep_sample_idx = ANY($2::bigint[])",
-            mask_idx,
-            list(prep_sample_idxs),
+            "SELECT c.prep_sample_idx, c.feature_idx, c.read_count"
+            "  FROM qiita.syndna_read_count c"
+            "  JOIN unnest($1::bigint[], $2::bigint[]) AS s(prep_sample_idx, mask_idx)"
+            "    ON s.prep_sample_idx = c.prep_sample_idx AND s.mask_idx = c.mask_idx",
+            prep_sample_idxs,
+            [mask_by_sample[ps] for ps in prep_sample_idxs],
         )
     )
