@@ -60,6 +60,7 @@ async def run(postgres_pool):
         "processing_idx": processing["processing_idx"],
         "pool_idx": pool_idx,
         "prep_sample_idxs": sorted(ps for _, ps in samples),
+        "owner_idx": owner,
     }
     await postgres_pool.execute(
         "DELETE FROM qiita.amplicon_sample WHERE processing_idx = $1",
@@ -216,7 +217,14 @@ async def test_a_sample_retired_mid_run_is_still_closed(postgres_pool, run):
     await _create_amplicon_gate_pending(
         postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
     )
-    await postgres_pool.execute("UPDATE qiita.prep_sample SET retired = true WHERE idx = $1", a)
+    await postgres_pool.execute(
+        "UPDATE qiita.prep_sample"
+        " SET retired = true, retired_at = now(), retired_by_idx = $2,"
+        "     retire_reason = 'retired mid-run'"
+        " WHERE idx = $1",
+        a,
+        run["owner_idx"],
+    )
     await _record_amplicon_gate_no_data(
         postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
     )
