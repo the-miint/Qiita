@@ -1564,38 +1564,52 @@ async def _list(client, **params) -> dict:
     return resp.json()
 
 
+async def _export_ids(ctx, idxs: dict[str, int]) -> dict[str, str]:
+    """Each fixture study's export_entity_id, read from the table. A row that
+    only a public default admits carries no study_idx, so a test that lists
+    one keys every row on this instead."""
+    return {
+        name: await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx)
+        for name, idx in idxs.items()
+    }
+
+
 async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     token, idxs = await _seed_list_fixture(ctx)
+    qs = await _export_ids(ctx, idxs)
     body = await _list(ctx["user"], q=token)
-    rows = {r["study_idx"]: r for r in body["studies"]}
-    assert set(rows) == {idxs["shared"], idxs["public"], idxs["own"]}
-    assert rows[idxs["shared"]]["caller_tier"] == Tier.VIEWER
-    assert rows[idxs["public"]]["caller_tier"] == Tier.PUBLIC
-    assert rows[idxs["own"]]["access_via"] == StudyAccessVia.OWNER
-    assert rows[idxs["shared"]]["access_via"] == StudyAccessVia.GRANT
-    assert rows[idxs["public"]]["access_via"] == StudyAccessVia.PUBLIC
+    # Keyed on the export_entity_id that each row carries, read from the table
+    # independently.
+    rows = {r["export_entity_id"]: r for r in body["studies"]}
+    assert set(rows) == {qs["shared"], qs["public"], qs["own"]}
+    assert rows[qs["shared"]]["caller_tier"] == Tier.VIEWER
+    assert rows[qs["public"]]["caller_tier"] == Tier.PUBLIC
+    assert rows[qs["own"]]["access_via"] == StudyAccessVia.OWNER
+    assert rows[qs["shared"]]["access_via"] == StudyAccessVia.GRANT
+    assert rows[qs["public"]]["access_via"] == StudyAccessVia.PUBLIC
     # A viewer grant on a member-default study reads only its summary.
-    assert rows[idxs["shared"]]["record_view"] == StudyRecordView.SUMMARY
-    # Only the public default admits them to the public study: its public view.
-    assert rows[idxs["public"]]["record_view"] == StudyRecordView.PUBLIC
-    assert rows[idxs["own"]]["record_view"] == StudyRecordView.FULL
-    # Each row carries its export_entity_id, read from the table independently.
-    expected_ids = {
-        idx: await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx) for idx in rows
-    }
-    assert {idx: row["export_entity_id"] for idx, row in rows.items()} == expected_ids
+    assert rows[qs["shared"]]["record_view"] == StudyRecordView.SUMMARY
+    # Only the public default admits them to the public study: its public view,
+    # whose row carries no study_idx.
+    assert rows[qs["public"]]["record_view"] == StudyRecordView.PUBLIC
+    assert "study_idx" not in rows[qs["public"]]
+    assert rows[qs["own"]]["record_view"] == StudyRecordView.FULL
+    assert rows[qs["shared"]]["study_idx"] == idxs["shared"]
+    assert rows[qs["own"]]["study_idx"] == idxs["own"]
     # Newest first.
-    assert [r["study_idx"] for r in body["studies"]] == sorted(rows, reverse=True)
+    newest_first = sorted(("shared", "public", "own"), key=idxs.__getitem__, reverse=True)
+    assert [r["export_entity_id"] for r in body["studies"]] == [qs[n] for n in newest_first]
 
 
 async def test_list_studies_agrees_with_get_by_idx(ctx):
     """For every fixture study, the list includes it exactly when
     GET /study/{idx} admits the same caller."""
     token, idxs = await _seed_list_fixture(ctx)
-    listed = {r["study_idx"] for r in (await _list(ctx["user"], q=token))["studies"]}
+    qs = await _export_ids(ctx, idxs)
+    listed = {r["export_entity_id"] for r in (await _list(ctx["user"], q=token))["studies"]}
     for name, idx in idxs.items():
         status = (await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=idx))).status_code
-        assert (status == 200) == (idx in listed), (name, status)
+        assert (status == 200) == (qs[name] in listed), (name, status)
 
 
 async def test_list_studies_wet_lab_admin_sees_every_study(ctx):
@@ -1632,15 +1646,17 @@ async def test_list_studies_cursor_pages_through_without_gaps_or_repeats(ctx):
     """limit=1 forces one candidate study per page; following the cursor
     yields exactly the readable set, newest first, each study once."""
     token, idxs = await _seed_list_fixture(ctx)
-    seen: list[int] = []
+    qs = await _export_ids(ctx, idxs)
+    seen: list[str] = []
     params: dict = {"q": token, "limit": 1}
     for _ in range(10):
         body = await _list(ctx["user"], **params)
-        seen += [r["study_idx"] for r in body["studies"]]
+        seen += [r["export_entity_id"] for r in body["studies"]]
         if body["next_after_study_idx"] is None:
             break
         params["after_study_idx"] = body["next_after_study_idx"]
-    assert seen == sorted({idxs["shared"], idxs["public"], idxs["own"]}, reverse=True)
+    newest_first = sorted(("shared", "public", "own"), key=idxs.__getitem__, reverse=True)
+    assert seen == [qs[n] for n in newest_first]
 
 
 async def test_list_studies_anonymous_401(ctx):
@@ -1847,10 +1863,12 @@ async def test_list_studies_public_reader_cannot_search_fields_the_public_view_l
     assert created.status_code == 201, created.text
     idx = created.json()["study_idx"]
 
+    qs = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx)
+
     assert (await _list(ctx["user"], q=secret))["studies"] == []
     by_abstract = (await _list(ctx["user"], q=described))["studies"]
-    assert [(r["study_idx"], r["record_view"]) for r in by_abstract] == [
-        (idx, StudyRecordView.PUBLIC)
+    assert [(r["export_entity_id"], r["record_view"]) for r in by_abstract] == [
+        (qs, StudyRecordView.PUBLIC)
     ]
     for word in (secret, described):
         full = (await _list(ctx["wet"], q=word))["studies"]
