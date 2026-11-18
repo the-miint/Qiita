@@ -95,9 +95,10 @@ GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
 
 # The feature-axis label source — `feature_idx -> feature_id`, the row-keyed flavour the
-# note above anticipates. Same minted handle as `GENOME_LABEL_TABLE`: `export_feature_id`,
-# a `QF<n>` for a de-novo feature (an ASV) or an accession for one that is also a reference
-# sequence. Only the key column differs, so both feed one `labelled_relation_sql`.
+# note above anticipates. Same minted handle as `GENOME_LABEL_TABLE`: `export_feature_id`.
+# The feature axis names features Qiita observed itself (an ASV), which carry no accession,
+# so the handle is a minted `QF<n>`. Only the key column differs, so both feed one
+# `labelled_relation_sql`.
 FEATURE_LABEL_TABLE = "feature_label"
 
 # The published shape — a VIEW, not a table, and the second exception to the

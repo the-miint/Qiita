@@ -24,6 +24,7 @@ from qiita_common.models import GenomeSource
 
 from qiita_control_plane.repositories.exported_feature import (
     _SOURCE_ID_IS_EXTERNAL_ACCESSION,
+    IncompleteMintError,
     mint_exported_features,
     mint_observed_features,
 )
@@ -152,4 +153,21 @@ async def test_an_observed_feature_mints_a_qf_and_is_idempotent(postgres_pool):
             "DELETE FROM qiita.exported_feature WHERE feature_idx = $1", feature_idx
         )
         await postgres_pool.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feature_idx)
+        await delete_principal(postgres_pool, [principal_idx])
+
+
+@pytest.mark.db
+async def test_an_unknown_feature_idx_raises_incomplete_not_a_fk_error(postgres_pool):
+    """A feature_idx absent from qiita.feature drops out of the mint's JOIN and comes back
+    as IncompleteMintError, not a raw foreign-key violation that names the schema."""
+    principal_idx = await seed_user_principal(
+        postgres_pool, prefix="obsfeat-fk", suffix=str(uuid.uuid4())[:8]
+    )
+    try:
+        with pytest.raises(IncompleteMintError) as exc:
+            await mint_observed_features(
+                postgres_pool, feature_idx=[2**62], created_by_idx=principal_idx
+            )
+        assert exc.value.feature_idx == [2**62]
+    finally:
         await delete_principal(postgres_pool, [principal_idx])

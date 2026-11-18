@@ -1204,9 +1204,9 @@ def _manifest_payload(
 
 
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
-    """The companions these flags ask for, in write order. Spelled out per member rather
-    than read off the namespace, so a renamed flag is a signature change here instead of a
-    silently absent file."""
+    """The flag-gated companions these flags ask for, in write order. `_COMPANIONS` also
+    holds the amplicon `sequences` companion, which is not flag-gated and is written by its
+    own path; `.get(..., False)` leaves it — and any member absent from `asked` — out here."""
     asked = {"taxonomy": taxonomy, "tree": tree}
     return tuple(companion for companion in _COMPANIONS if asked.get(companion.name, False))
 

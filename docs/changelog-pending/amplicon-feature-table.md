@@ -6,8 +6,8 @@
   public name), its values as sparse COO `(sample, feature, value)`, and its features
   `(feature, sequence, length, md5)`: each ASV under its exported-feature handle, mapped
   to its sequence and reproducible md5. Features are named through `exported_feature`
-  like a genome's — a de-novo ASV gets a minted `QF`, one matching a reference its
-  accession — so the amplicon and metagenomic tables share one identifier mechanism, not
+  the same way a genome is — a de-novo ASV, which names nothing outside its load, gets a
+  minted `QF` — so the amplicon and metagenomic tables share one identifier mechanism, not
   two. Values and features are Arrow IPC streams; access is all-or-nothing over the
   cohort, checked before the data plane is read. `qiita feature-table runs` writes the
   three as a bundle with the map needed to read it.
