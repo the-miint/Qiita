@@ -66,7 +66,22 @@ from ..repositories.assembly import (
 )
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
-from ._upload import _submission_bad_input, _submission_dp_fetch_failure
+from ._upload import (
+    _submission_bad_input,
+    _submission_dp_fetch_failure,
+)
+
+
+def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
+    """Refuse (bad submission input) a deprecated alignment, from its
+    `alignment_definition` row. A plain status read: the callers act on the row after
+    the check, under no lock, so a `FOR SHARE` held only for the check would buy
+    nothing."""
+    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        raise _submission_bad_input(
+            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
+        )
+
 
 # The genome-map Parquet the compute job consumes as an input (feature_idx ->
 # genome_idx for the whole reference), staged by _resolve_feature_table_bindings.
@@ -150,15 +165,6 @@ async def _validate_denovo_arm(
         prep_sample_idx=prep_sample_idx,
     )
     return processing_idx
-
-
-def _refuse_deprecated_alignment(row: asyncpg.Record) -> None:
-    """Refuse a deprecated alignment as either arm. An invalidated prep_sample needs no
-    check of its own: it is not 'completed', so the cohort gate refuses it."""
-    if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise _submission_bad_input(
-            f"alignment {row['alignment_idx']} is deprecated: {row['deprecation_reason']}"
-        )
 
 
 async def _refuse_deprecated_assembly(pool: asyncpg.Pool, *, processing_idx: int) -> None:

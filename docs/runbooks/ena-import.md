@@ -137,7 +137,8 @@ added since (a restricted ticket re-downloads only its listed runs, and skips, w
 warning, listed runs flagged or retired since; it fails only if none remain). `/run` is refused with
 a 409 on an older ticket (the error names the newer one and its state), and on a failed
 ticket that still has a live download job from before the failure, which holds the old
-roster: cancel it by idx (`work_ticket_idxs`) to reap the job, then re-import the study. The ticket stays FAILED and keeps refusing `/run`.
+roster: cancel it by idx (`work_ticket_idxs`), which reaps the job and sets the ticket
+`cancelled`, then `/run` it or re-import the study; either reads the pool's current roster.
 A re-import does not retry the permanently failed runs of a `completed_partial` pool: they
 keep reporting `download_failed`. It tickets the runs a completed download never read, and
 those that failed `retriable` (the retries ran out): a new ticket for the same pool,

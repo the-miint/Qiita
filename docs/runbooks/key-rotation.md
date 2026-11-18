@@ -89,7 +89,7 @@ sudo systemctl restart qiita-control-plane qiita-data-plane@50051   # + any extr
 ```bash
 make verify-health         # DP gRPC health SERVING
 # and one live DoGet (as a system_admin with a fresh PAT):
-qiita-admin masked-read-export --sequenced-pool-idx <P> --mask-idx <M> \
+qiita-admin masked-read-export --sequenced-pool-idx <P> --mask-idx <M> --allow-partial \
     --output-dir /tmp/rot-check --data-plane-url grpc+tls://<fqdn>:443
 ```
 

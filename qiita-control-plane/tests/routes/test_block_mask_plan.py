@@ -373,3 +373,62 @@ async def test_block_mask_plan_minimap2_requires_rype_422(ctx, planned):
     await _seed_block_action(planned["db"])
     resp = await ctx["wet"].post(_url(planned), json={"host_minimap2_reference_idx": 9})
     assert resp.status_code == 422, resp.text
+
+
+async def test_block_mask_plan_whose_mask_was_edited_before_its_hold_409(ctx, planned, monkeypatch):
+    """The real plan path: an admin edit of a mask the plan just minted commits before
+    the plan's transaction holds it, so the plan refuses (409) and writes no ticket.
+    The mask's settings are edited back afterwards, since block-mask masks are shared
+    by every plan of the same protocol and instrument in this database."""
+    import json
+
+    from qiita_common.models import DefinitionKind
+
+    from qiita_control_plane.definition_settings import edit_definition_settings
+
+    await _seed_block_action(planned["db"])
+    db = planned["db"]
+    real_mint = block_planner.mint_mask_definition
+    edited: dict[int, dict] = {}
+
+    async def edit(mask_idx, params):
+        async with db.acquire() as other, other.transaction():
+            await edit_definition_settings(
+                other,
+                kind=DefinitionKind.MASK,
+                idx=mask_idx,
+                params=params,
+                workflow=None,
+                version=None,
+                reason="corrected in a test",
+                principal_idx=ctx["admin_session"]["principal_idx"],
+            )
+
+    async def mint_then_edit(conn, **kwargs):
+        row = await real_mint(conn, **kwargs)
+        if not edited:
+            stored = json.loads(
+                await db.fetchval(
+                    "SELECT params FROM qiita.mask_definition WHERE mask_idx = $1",
+                    row["mask_idx"],
+                )
+            )
+            await edit(row["mask_idx"], {**stored, "edited": True})
+            edited[row["mask_idx"]] = stored
+        return row
+
+    monkeypatch.setattr(block_planner, "mint_mask_definition", mint_then_edit)
+    try:
+        resp = await ctx["wet"].post(_url(planned), json={})
+        assert resp.status_code == 409, resp.text
+        assert "plan the pool again" in resp.json()["detail"]
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM qiita.block_member WHERE prep_sample_idx = ANY($1::bigint[])",
+                planned["prep_samples"],
+            )
+            == 0
+        )
+    finally:
+        for mask_idx, stored in edited.items():
+            await edit(mask_idx, stored)

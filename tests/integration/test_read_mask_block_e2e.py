@@ -42,8 +42,9 @@ import pytest
 from fastapi import HTTPException
 from qiita_common.actions import BLOCK_MASK_ACTION_ID
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason
+from qiita_common.models import MaskedReadExportTicketRequest, ReadMaskReason, WorkTicketState
 from qiita_control_plane.block_planner import BLOCK_MASK_ACTION_VERSION
+from qiita_control_plane.repositories.block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_PENDING
 from qiita_control_plane.testing.db_seeds import (
     delete_action_if_created,
     seed_action_if_absent,
@@ -243,10 +244,10 @@ async def block_pool(postgres_pool, human_admin_session):
     mask_idx = mask["mask_idx"]
     for ps in (prep_a, prep_b):
         await postgres_pool.execute(
-            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
-            " VALUES ($1, $2, 'pending')",
+            "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state) VALUES ($1, $2, $3)",
             mask_idx,
             ps,
+            MASK_SAMPLE_PENDING,
         )
 
     # The REAL bulk-masking action id, not a throwaway: a block ticket's KIND is
@@ -336,6 +337,17 @@ async def _mask_sample_state(pool, mask_idx, prep_sample_idx):
     )
 
 
+async def _complete_block_ticket(pool, block_idx):
+    """Mark the block's work ticket completed, as the runner does once reconcile, its
+    last step, has run. The export ticket route counts a ticket that is still open
+    as an unfinished run of the prep_samples its block covers."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET state = $2 WHERE block_idx = $1",
+        block_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+
+
 async def _export_ticket_or_status(pool, data_plane, *, prep_sample_idx, mask_idx):
     """Call the real create_masked_read_export_ticket in-process; return the HTTP
     status (201 on a minted ticket, or the HTTPException status_code on a gate
@@ -422,9 +434,11 @@ async def test_block_split_sample_reconciles_and_gates_export(block_pool, data_p
         workspace=stage1,
     )
 
+    await _complete_block_ticket(pool, block1)
+
     # prep_a's only covering block completed -> finalized; prep_b still owes block 2.
-    assert await _mask_sample_state(pool, mask_idx, prep_a) == "completed"
-    assert await _mask_sample_state(pool, mask_idx, prep_b) == "pending"
+    assert await _mask_sample_state(pool, mask_idx, prep_a) == MASK_SAMPLE_COMPLETED
+    assert await _mask_sample_state(pool, mask_idx, prep_b) == MASK_SAMPLE_PENDING
     row_a = await _metrics_row(pool, block_pool["ss_a"])
     assert row_a["raw_read_count_r1r2"] == _EXPECTED_RAW_R1R2
     assert row_a["biological_read_count_r1r2"] == _EXPECTED_BIOLOGICAL_R1R2
@@ -473,9 +487,11 @@ async def test_block_split_sample_reconciles_and_gates_export(block_pool, data_p
         workspace=stage2,
     )
 
+    await _complete_block_ticket(pool, block2)
+
     # prep_b now complete: all 4 reads registered (count assertion held inside
     # reconcile), gate flipped, metrics rolled up from the DuckLake aggregate.
-    assert await _mask_sample_state(pool, mask_idx, prep_b) == "completed"
+    assert await _mask_sample_state(pool, mask_idx, prep_b) == MASK_SAMPLE_COMPLETED
     assert (
         _count_read_mask_rows(data_plane, mask_idx=mask_idx, prep_sample_idx=prep_b)
         == _READS_PER_SAMPLE

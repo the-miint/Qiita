@@ -126,6 +126,8 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 - `scope_target_kind` plus one of `(study_idx, prep_idx)` or `reference_idx` — tagged-union scope target, governed by the `work_ticket_scope_target_consistent` CHECK
 - `shard_id` — the sharded-index fan-out discriminant; non-NULL only on a reference-scope ticket, NULL on every other kind (CHECK enforced)
 - `mask_idx` — the read-mask ticket's minted mask (FK to `qiita.mask_definition`); NULL on a ticket that mints no mask
+- `processing_idx` — the processing the ticket minted (FK to `qiita.processing`, ON DELETE SET NULL); NULL on a ticket that mints none or ended before its mint
+- `reap_pending_since` / `reap_note` — set together from a cancel's flip until its reap of the ticket's SLURM jobs succeeds: running, interrupted, or failed (`reap_note` holds the error); every redrive refuses the ticket meanwhile. The column comments hold the full rule
 - `action_context` — JSONB validated at submission against `action.context_schema`
 - `state` — `pending` / `queued` / `processing` / `completed` / `failed`
 - `retry_count` — number of retry attempts so far (incremented on each PROCESSING → QUEUED retry)
@@ -154,7 +156,7 @@ Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 - The caller must be the ticket's originator or wet_lab_admin+ (404 otherwise) and the stored ticket must pass `_gate_submission` against the action's current definition (the follow-on gate, the in-flight dedupe and `force` do not apply); a ticket that no longer does is refused with 422 and the work is submitted again.
 - Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
 - Triggers a fresh in-process dispatch via `schedule_dispatch`, which queues behind the process-wide dispatch cap below when all slots are held. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
-- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask.
+- Entries with a `completed` step row are fast-forwarded, not re-run. A step row is read for the entry at its `step_index` only while that entry still has the row's `step_name` and kind (`step:` or `action:`), because workflow YAMLs are edited in place and re-synced (`step_progress.check_step_progress`). A ticket with a row that no longer matches — a step was inserted, removed, renamed or reordered ahead of it — is refused by `/run` with a 409 naming those rows, and fails permanently at `submission` when startup recovery resumes it; a new ticket is submitted in its place (a terminal ticket does not block one), or, for `read-mask-block`, its prep_samples are re-masked under a new mask version. `/run` also refuses a ticket whose `mask_idx` names a deprecated mask, and (409, `reason` `reap_pending`) one that carries a reap mark, saying whether the reap failed or has not finished, and naming `qiita-admin ticket cancel <idx>` as the retry. A dispatch that keeps step rows from an earlier attempt (fast-forwarded or re-attached) fails the ticket, as bad submission input before any step, when a definition it records (`mask_idx`, `alignment_idx`, `processing_idx`) had an admin settings edit after the ticket was created; a ticket dispatched with no step row (a first run, a rerun-block re-arm) runs a definition it consumes or carries from its plan under the current settings, while a ticket that minted a mask, an alignment or a processing and records an edited one fails at its mint either way (`runner/_workflow.py`, `runner/_record.py`; edits are audited in `qiita.definition_settings_edit`). How a mint holds its row through the write that records it, and the block-mask plan's exception (it refuses the plan with a 409 instead of re-minting), are stated in `repositories/definition_hold.py`.
 - A `download-ena-study` redrive also drops completed step rows so the roster is re-read, and is refused (409) when a newer download ticket exists for the pool or a FAILED ticket still has a live job; see the [ENA import runbook](../runbooks/ena-import.md).
 
 **Dispatch concurrency.** Every dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump release) goes through `schedule_dispatch`, whose task holds one slot of the process-wide `_DISPATCH_CONCURRENCY` cap (8) for its whole workflow — an hours-long download poll included. Tasks past the cap queue FIFO and start as slots free, logging `queued behind the dispatch cap` when they start waiting and `dispatched after waiting` when they get one; nothing fails while it waits. Bounding in-flight workflows, not just connections, is the deliberate consequence: it is what keeps a burst of submits from pressuring the connection pool after `_STUDY_CONCURRENCY`'s permit has already been released at submit. Two behaviours follow that an operator should expect: a restart with more than 8 tickets in flight re-attaches the first 8 and queues the rest, and `/run` queues behind the same slots as ordinary submits. The cap is sized against the pool and `FANOUT_MAX_INFLIGHT` together — see the note on the constant.
@@ -331,3 +333,74 @@ Each service exposes a health check endpoint for monitoring and deployment verif
 ## Work Ticket Queue
 
 Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qiita-control-plane. Work ticket state transitions driven by callbacks from data plane and compute orchestrator.
+
+## Output equivalence
+
+A mask, an alignment or a processing is a definition minted from its params, so a
+changed setting mints a new one and the prep_samples run under each are split across
+the two. A system_admin records an output equivalence: one verdict on whether two
+definitions of one kind give equivalent outputs (`qiita.output_equivalence`, with its
+history in `qiita.output_equivalence_event`, which refuses UPDATE and DELETE and keeps
+its output equivalence from being deleted; migration
+`20261113000000_output_equivalence.sql`). `same` and `similar` join the group,
+`different` and `not_benchmarked` keep the two apart, and `pending` is undecided
+(`qiita_common.models.JOINING_VERDICTS` and its SQL twin
+`qiita.output_equivalence_verdict_joins`). A hand DELETE of a definition detaches the
+output equivalences naming it, and is refused while a joining one names it (the trigger
+`refuse_definition_delete_under_joining_equivalence` in that migration says why). The
+procedure is
+[`runbooks/deciding-output-equivalence.md`](../runbooks/deciding-output-equivalence.md).
+
+- **Groups are computed on read.** Nothing stores a group: `definition_similarity`
+  derives them from the definitions' params and the live output equivalences on each
+  call. Its module docstring holds the rules and every refusal, among them that two
+  masks differing in SynDNA reference are never joined, so every mask of a group counts
+  SynDNA against one reference.
+- **The resolver** (`definition_resolver`) answers, for each prep_sample, which member
+  of a group its results are read from: `processed` under that member, `incomplete`,
+  or `not_processed`, with a reason. `POST /definition-group/resolve` exposes it to any
+  caller with `Tier.VIEWER` on every study of every prep_sample. Its other callers are
+  the masked-read export roster and ticket routes, the SynDNA count export, `qiita
+  feature-table build` (one part per resolved alignment; see [flight.md](flight.md))
+  and the human alignment cohort DoGet; the ticket routes refuse a prep_sample that
+  does not resolve to the definition they name. `resolve_group` runs only in a
+  REPEATABLE READ transaction, and says why. Its module docstring holds the rules,
+  among them which failed tickets it ignores as stale.
+- **A deprecated definition read on purpose.** A route that names a deprecated mask
+  refuses (409) unless the caller sets `include_deprecated`
+  (`routes/_helpers.deprecated_read`); with it, the resolver's exact mode
+  (`resolve_exact`) reads that definition's own runs, without its group, and the
+  output is marked deprecated. The masked-read export routes, the mask-handle mints
+  and the SynDNA count export take the flag for a mask; the alignment cohort DoGet,
+  the pool alignment cohort listing and the alignment-kind identifier and processing
+  mints take it for an alignment (`alignment_exact_read`, at step 2a of
+  `authorize_completed_alignment_cohort`), and `qiita feature-table build` passes it
+  to each. An active alignment whose upstream (its mask, or a de novo alignment's
+  assembly run) is deprecated is read only under `include_deprecated_upstream`
+  (`deprecated_upstream_read`, at the same step): the group is resolved without the
+  upstream deprecation checks (the resolver's "Deprecated upstreams" paragraph). The
+  cohort DoGet names the deprecated upstreams read, an exact read's included. Under
+  either flag the pool alignment cohort listing leaves out and reports the
+  prep_samples the read cannot use; the rules are stated at
+  `definition_resolver.NO_RUN_TO_READ`.
+- **The group lock** is one Postgres advisory lock over every kind's groups
+  (`repositories/output_equivalence.py`). A decide or revoke takes it exclusive, by
+  try-lock with a bounded retry and a 503 when it stays busy; the three deprecation
+  routes take it shared before reading the output equivalences that name the
+  definition, so a joining decision and the deprecation of one of its sides cannot both commit.
+  Readers of the groups take no lock: they read one REPEATABLE READ snapshot.
+- **Settings are locked after the mint.** A definition's params, params_hash and
+  workflow / version columns change only through the audited edit
+  (`definition_settings`; `qiita.definition_settings_columns` lists the columns, and
+  `qiita.lock_definition_settings` the one exception, the mask adapter-hash re-key). The edit takes the
+  group lock exclusive, as a decision does, since the groups are computed from those
+  params, and is refused under live work or a published handle (`definition_settings`
+  states the refusals).
+- **Decision provenance.** Every resolution records the decision set it was computed
+  under (`decision_set`): a content hash of every decided output equivalence's verdict,
+  replayed from `qiita.output_equivalence_event` in the resolution's snapshot, so no
+  output-equivalence or event idx leaves the system. Passed back as `as_of_event`, it
+  makes `load_groups` read the output equivalences' verdicts at that point and
+  everything else as it is now; the guards never use it. `equivalences_used` counts the
+  joining output equivalences that shaped the groups read (`decision_set.py`,
+  "Equivalences used").
