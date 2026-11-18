@@ -40,6 +40,9 @@ async def lock_prep_sample_range(conn: asyncpg.Connection, *, prep_sample_idx: i
     prep_sample then holds reads and an empty completion at once. With the lock,
     whichever side takes it second waits for the first to commit, then sees its rows.
 
+    The release of a failed run's range (`release_sequence_range_minted_by`) takes it too,
+    so it cannot race a writer that has read the prep_sample as range-less.
+
     The mint takes it before `mint_sequence_range`, whose allocation lock is global
     and held to commit: waiting for this lock after that one would stall every mint
     behind a block plan that holds it. A caller taking it for many prep_samples takes
@@ -102,21 +105,18 @@ async def mint_sequence_range(
 
 async def release_sequence_range_minted_by(
     conn: asyncpg.Connection, *, prep_sample_idx: int, work_ticket_idx: int
-) -> bool:
-    """Delete `prep_sample_idx`'s range if `work_ticket_idx` minted it; True when one went.
+) -> None:
+    """Delete `prep_sample_idx`'s range if `work_ticket_idx` minted it.
 
     For a range minted ahead of reads that were never stored. The allocation is not recycled.
     """
     require_transaction(conn)
     await lock_prep_sample_range(conn, prep_sample_idx=prep_sample_idx)
-    return (
-        await conn.fetchval(
-            "DELETE FROM qiita.sequence_range"
-            " WHERE prep_sample_idx = $1 AND minted_by_work_ticket_idx = $2 RETURNING true",
-            prep_sample_idx,
-            work_ticket_idx,
-        )
-        is True
+    await conn.execute(
+        "DELETE FROM qiita.sequence_range"
+        " WHERE prep_sample_idx = $1 AND minted_by_work_ticket_idx = $2",
+        prep_sample_idx,
+        work_ticket_idx,
     )
 
 
