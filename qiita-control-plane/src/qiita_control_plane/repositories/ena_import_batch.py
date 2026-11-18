@@ -260,8 +260,8 @@ async def fetch_runs_needing_download(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, *, sequenced_sample_idxs: list[int]
 ) -> dict[int, list[str]]:
     """`sequenced_pool_idx -> run accessions` for the active, non-ENA-flagged
-    `sequenced_sample_idxs` with no registered reads and no download failure but a retriable
-    one, sorted."""
+    `sequenced_sample_idxs` with no registered reads whose download failure, if any, is
+    `retriable`, sorted."""
     rows = await pool_or_conn.fetch(
         "SELECT ss.sequenced_pool_idx, ss.ena_run_accession"
         " FROM qiita.sequenced_sample ss"
