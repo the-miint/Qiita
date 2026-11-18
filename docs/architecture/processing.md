@@ -207,7 +207,7 @@ download did not read get a new, forced ticket on that pool). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
 + the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
 `register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records
-each run that could not be stored. One item's failure — resolver
+each run that could not be stored and releases the read numbering minted for it. One item's failure — resolver
 error, unmappable platform, a DB conflict — is isolated to that item; it never
 aborts the batch or its siblings. See
 [`docs/runbooks/ena-import.md`](../runbooks/ena-import.md) for the operator-facing

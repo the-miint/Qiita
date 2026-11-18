@@ -25,8 +25,8 @@ description: >
   independent of any mask) plus a durable per-sample copy the repeatable
   read-mask workflow consumes. A run whose fetch fails permanently, or transiently
   once the ticket's retries are spent, does not fail the pool when another run was
-  stored: `persist-ena-run-outcomes` records it on its sequenced_sample. Transport is
-  pinned to `download_method: http` (no Aspera key-staging exists in the compute env; see
+  stored: `persist-ena-run-outcomes` records it on its sequenced_sample and
+  releases the range minted for it. Transport is pinned to `download_method: http` (no Aspera key-staging exists in the compute env; see
   `docs/architecture.md`'s ENA Study Import download-ticket-granularity decision).
 
 scopes: []
