@@ -269,9 +269,11 @@ async def seeded_pool(postgres_pool, human_admin_session, tmp_path):
 
     prep_idxs = [p for _, p, _ in samples]
     bio_idxs = [b for b, _, _ in samples]
-    # Work tickets FK the pool; drop them before the pool they scope.
+    # Work tickets FK the pool and the prep_samples; drop them before what they scope.
     await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
+        "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1 OR prep_sample_idx = ANY($2)",
+        pool_idx,
+        prep_idxs,
     )
     await teardown_entity_graph(
         postgres_pool,
