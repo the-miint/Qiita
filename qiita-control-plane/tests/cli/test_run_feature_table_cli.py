@@ -1,5 +1,7 @@
 """`qiita feature-table runs`: the bundle written from the `/feature-table` routes'
-answers — an amplicon table's values, columns, and each ASV's sequence."""
+answers — an amplicon table's values, columns, and each feature's sequence and md5."""
+
+import hashlib
 
 import duckdb
 import pyarrow as pa
@@ -79,28 +81,32 @@ def _values(rows):
 
 
 def _features(rows):
+    def _md5(s):
+        return hashlib.md5(s.encode()).hexdigest() if s else None
+
     return pa.table(
         {
             "feature": [r[0] for r in rows],
             "sequence": pa.array([r[1] for r in rows], pa.string()),
             "length": pa.array([len(r[1]) if r[1] else None for r in rows], pa.int32()),
+            "md5": pa.array([_md5(r[1]) for r in rows], pa.string()),
         }
     ).cast(FEATURES_SCHEMA)
 
 
-def test_an_amplicon_bundle_carries_each_asvs_sequence(monkeypatch, tmp_path):
+def test_an_amplicon_bundle_maps_each_handle_to_sequence_and_md5(monkeypatch, tmp_path):
     out = _run(
         monkeypatch,
         tmp_path,
         "amplicon",
-        _values([("QM1", "md5a", 5.0)]),
-        _features([("md5a", "ACGT"), ("md5b", "TTTT")]),
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT"), ("QF2", "TTTT")]),
     )
     with duckdb.connect() as con:
-        sequences = con.execute(
-            "SELECT feature_id, sequence FROM read_parquet(?)",
+        mapping = con.execute(
+            "SELECT feature_id, sequence, md5 FROM read_parquet(?)",
             [str(out.with_name("table.sequences.parquet"))],
         ).fetchall()
-    # Only the features the table names.
-    assert sequences == [("md5a", "ACGT")]
+    # Only the features the table names, handle -> (sequence, md5).
+    assert mapping == [("QF1", "ACGT", hashlib.md5(b"ACGT").hexdigest())]
     assert not out.with_name("table.taxonomy.parquet").exists()

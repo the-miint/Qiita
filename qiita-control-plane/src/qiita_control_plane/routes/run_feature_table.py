@@ -47,6 +47,7 @@ from ..run_feature_table import (
     build_features,
     build_values,
     fetch_runs,
+    mint_feature_labels,
     resolve_cohort,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -123,8 +124,9 @@ async def feature_table_values(
 ) -> Response:
     """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
     cohort = await _authorized_cohort(pool, caller, request)
-    values, sequences = await _read(cohort, data_plane_url, signing_key, values=True)
-    table = build_values(cohort, values, sequences)
+    values, _ = await _read(cohort, data_plane_url, signing_key, values=True)
+    labels = await mint_feature_labels(pool, created_by_idx=caller.principal_idx, features=values)
+    table = build_values(cohort, values, labels)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
 
@@ -137,10 +139,13 @@ async def feature_table_features(
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
-    """Every feature the values name, `(feature, sequence, length)`, an Arrow IPC
-    stream. Reads only the ASV sequences: the ticket already scopes them to the ASVs
-    the cohort observed."""
+    """Every feature the values name, `(feature, sequence, length, md5)`, an Arrow IPC
+    stream — the published handle mapped to its sequence and md5. Reads the ASV
+    sequences: the ticket already scopes them to the ASVs the cohort observed."""
     cohort = await _authorized_cohort(pool, caller, request)
     _, sequences = await _read(cohort, data_plane_url, signing_key, values=False)
-    table = build_features(cohort, sequences)
+    labels = await mint_feature_labels(
+        pool, created_by_idx=caller.principal_idx, features=sequences
+    )
+    table = build_features(cohort, sequences, labels)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)

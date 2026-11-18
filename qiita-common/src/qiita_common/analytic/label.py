@@ -91,18 +91,18 @@ def genome_label_table_sql(source: str) -> str:
 
 
 def feature_label_table_sql(source: str) -> str:
-    """`feature_idx -> feature_id` from `source`, the per-feature sequence relation.
+    """`feature_idx -> feature_id` from `source`, the exported-feature mint's response
+    (`(feature_idx, export_feature_id, …)`).
 
-    The feature-axis sibling of `genome_label_table_sql`, and the one place the published
-    handle is defined: the md5 of the oriented sequence (the QIIME2 / Greengenes2
-    convention), computed rather than minted — see `relations.FEATURE_LABEL_TABLE`.
-
-    No DISTINCT: one sequence row per `feature_idx` already, so a duplicate is a staging
-    fault `check_relabel_diagnostics` refuses, not a fan-out to collapse.
+    The feature-axis twin of `genome_label_table_sql`: identical shape and reasoning. A
+    de-novo feature (an ASV) has no accession, so the mint hands it a `QF<n>`; one that
+    is also a reference sequence may carry an accession. The handle is the mint's to
+    decide, not a client's. No DISTINCT — a duplicate is a mint that answered twice,
+    which `check_relabel_diagnostics` refuses.
     """
     return (
         f"CREATE TABLE {FEATURE_LABEL_TABLE} AS "
-        f"SELECT feature_idx, md5(sequence) AS feature_id FROM {source}"
+        f"SELECT feature_idx, export_feature_id AS feature_id FROM {source}"
     )
 
 

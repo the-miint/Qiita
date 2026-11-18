@@ -81,7 +81,19 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
         )
         return (observed if values else None), sequences
 
+    async def _labels(pool, *, created_by_idx, features):
+        # Stand in for the exported-feature mint (tested separately): a deterministic
+        # QF per feature_idx, so the route tests assert handles, not minted idxs.
+        fids = sorted({int(f) for f in features.column("feature_idx").to_pylist()})
+        return pa.table(
+            {
+                "feature_idx": pa.array(fids, pa.int64()),
+                "export_feature_id": pa.array([f"QF{f}" for f in fids], pa.string()),
+            }
+        )
+
     monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.mint_feature_labels", _labels)
     yield {"processing_idx": processing_idx, "runs": runs, "fetched": fetched, **seed}
     await db.execute(
         "DELETE FROM qiita.exported_identifier WHERE processing_idx = ANY($1::bigint[])", runs
@@ -130,7 +142,7 @@ def _body(runs, *, study_idx=None, prep_sample_idx=None):
     return body
 
 
-async def test_counts_are_coo_named_by_qm_and_md5(role_keyed_clients, amplicon_run):
+async def test_counts_are_coo_named_by_qm_and_handle(role_keyed_clients, amplicon_run):
     run, db = amplicon_run, role_keyed_clients["pool"]
     cohort = sorted([run["ps_a"], run["ps_b"], run["ps_c"]])
     resp = await role_keyed_clients["wet"].post(
@@ -141,14 +153,13 @@ async def test_counts_are_coo_named_by_qm_and_md5(role_keyed_clients, amplicon_r
     table = _arrow(resp)
     assert table.column_names == ["sample", "feature", "value"]
     qms = [await _qm(db, run["processing_idx"], p) for p in cohort]
-    feature = hashlib.md5(ASV.encode()).hexdigest()
     assert sorted(zip(*table.to_pydict().values(), strict=True)) == sorted(
-        (qm, feature, float(i + 1)) for i, qm in enumerate(qms)
+        (qm, "QF77", float(i + 1)) for i, qm in enumerate(qms)
     )
     assert run["fetched"] == [([run["processing_idx"]], cohort)]
 
 
-async def test_features_carry_each_md5s_sequence(role_keyed_clients, amplicon_run):
+async def test_features_map_each_handle_to_sequence_and_md5(role_keyed_clients, amplicon_run):
     run = amplicon_run
     resp = await role_keyed_clients["wet"].post(
         URL_FEATURE_TABLE_FEATURE,
@@ -157,9 +168,10 @@ async def test_features_carry_each_md5s_sequence(role_keyed_clients, amplicon_ru
     assert resp.status_code == 200, resp.text
     assert _arrow(resp).to_pylist() == [
         {
-            "feature": hashlib.md5(ASV.encode()).hexdigest(),
+            "feature": "QF77",
             "sequence": ASV,
             "length": len(ASV),
+            "md5": hashlib.md5(ASV.encode()).hexdigest(),
         }
     ]
 

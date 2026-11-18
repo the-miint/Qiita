@@ -4,10 +4,13 @@
   answers one cohort request — one or more amplicon runs over a study's samples or a
   named prep_sample list — with the table's columns (each processed sample under its
   public name), its values as sparse COO `(sample, feature, value)`, and its features
-  `(feature, sequence, length)`: an ASV's md5, its sequence, its length. Values and
-  features are Arrow IPC streams; access is all-or-nothing over the cohort, checked
-  before the data plane is read. `qiita feature-table runs` writes the three as a
-  bundle with the map needed to read it.
+  `(feature, sequence, length, md5)`: each ASV under its exported-feature handle, mapped
+  to its sequence and reproducible md5. Features are named through `exported_feature`
+  like a genome's — a de-novo ASV gets a minted `QF`, one matching a reference its
+  accession — so the amplicon and metagenomic tables share one identifier mechanism, not
+  two. Values and features are Arrow IPC streams; access is all-or-nothing over the
+  cohort, checked before the data plane is read. `qiita feature-table runs` writes the
+  three as a bundle with the map needed to read it.
 - **Exclusion-aware amplicon read surfaces on the data plane.** The counts are served
   through a new `amplicon_membership_visible` view (`amplicon_membership` anti-joined
   with the resolved blocklist on `feature_idx`), and the ASV sequences resolve the

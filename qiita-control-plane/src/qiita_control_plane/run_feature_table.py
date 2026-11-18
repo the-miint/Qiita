@@ -4,7 +4,8 @@ A feature table is not a run's artifact. It is a selection — one or more ampli
 runs, over a study's samples or a named list — of the ASV counts the lake already
 holds as COO rows, one per processed sample and feature. ASVs are content-deduped
 into one feature space, so the same sequence found by two runs is one feature,
-named by the md5 of its sequence, which the table carries.
+named by its exported-feature handle (a `QF<n>`, minted like a genome's), with the
+feature companion mapping that handle back to the sequence and its md5.
 
 Merging runs is that selection, nothing more, provided they are runs whose
 features compare (`Source.merge_keys` — one trim length and orientation). Three
@@ -13,8 +14,10 @@ steps, each testable alone:
     prep_sample) the request names and gives each a public column name;
   * `cohort_tickets` signs the reads of their values and the ASV bytes, which
     `fetch_runs` performs;
-  * `stage_values` turns those into the features `(feature, sequence, length)` and
-    the values `(sample, feature, value)`, public handles only.
+  * `mint_feature_labels` names each feature with its exported-feature handle, and
+    `stage_values` / `stage_features` turn the reads into the values
+    `(sample, feature, value)` and the feature mapping `(feature, sequence, length, md5)`,
+    public handles only.
 
 Nothing is made dense: a rapid-16S pool is ~8% dense, and density falls as runs
 and samples are added. Internal idxs are join keys and never reach the output.
@@ -44,6 +47,7 @@ from qiita_common.models.run_feature_table import (
 )
 
 from .auth.tickets import sign_ticket
+from .repositories.exported_feature import mint_observed_features
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
 
 ARROW_STREAM_MEDIA_TYPE = "application/vnd.apache.arrow.stream"
@@ -91,15 +95,18 @@ SOURCES: dict[str, Source] = {
 }
 
 # Dictionary-encoded names: each sample and feature id is sent once, and each row
-# carries two small integer codes and its value. Plain strings would repeat a
-# 32-character md5 per observation, making the stream larger than a dense TSV.
+# carries two small integer codes and its value. Plain strings would repeat the
+# handle per observation, making the stream larger than a dense TSV.
 _NAME = pa.dictionary(pa.int32(), pa.string())
 VALUES_SCHEMA = pa.schema([("sample", _NAME), ("feature", _NAME), ("value", pa.float64())])
+# The feature companion is the handle -> (sequence, md5) mapping: the QF names the
+# column, and md5 is the reproducible-from-sequence id QIIME2/GG2 tools expect.
 FEATURES_SCHEMA = pa.schema(
     [
         ("feature", pa.string()),
         ("sequence", pa.string()),
         ("length", pa.int32()),
+        ("md5", pa.string()),
     ]
 )
 
@@ -297,8 +304,9 @@ FEATURE_RELATION = "run_feature"
 VALUE_RELATION = "run_value"
 COUNT_RELATION = "run_count"
 
-# The amplicon flavour of the shared relabel: features named by sequence md5, samples by
-# the pooled (processing_idx, prep_sample_idx). Only this value differs from the OGU default.
+# The amplicon flavour of the shared relabel: the feature axis is `feature_idx` labelled
+# by its minted `export_feature_id` (the OGU default handle), and the sample axis is the
+# pooled (processing_idx, prep_sample_idx). Only those differ from the OGU default.
 AMPLICON_AXIS = ft.RelabelAxis(
     output=COUNT_RELATION,
     feature_key="feature_idx",
@@ -306,43 +314,58 @@ AMPLICON_AXIS = ft.RelabelAxis(
     sample_key=("processing_idx", "prep_sample_idx"),
     sample_label=ft.SAMPLE_LABEL_TABLE,
     feature_noun="feature",
-    handle_noun="sequence hash",
-    unlabelled_feature_hint="the lake must hold a sequence for every feature its counts name",
+    unlabelled_feature_hint="the exported-feature mint has to cover every feature the counts name",
 )
 
 
-def stage_features(con, *, sequences: str) -> None:
-    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length) from the ASV
-    sequence relation.
+async def mint_feature_labels(
+    pool: asyncpg.Pool, *, created_by_idx: int, features: pa.Table
+) -> pa.Table:
+    """The exported-feature mint response as Arrow `(feature_idx, export_feature_id)` — a
+    `QF` per de-novo feature, minted if absent. `features` is any cohort relation carrying
+    a `feature_idx` column; the relabel reads the result as `feature_label`."""
+    feature_idx = sorted({int(f) for f in features.column("feature_idx").to_pylist()})
+    handles = await mint_observed_features(
+        pool, feature_idx=feature_idx, created_by_idx=created_by_idx
+    )
+    return pa.table(
+        {
+            "feature_idx": pa.array(list(handles), pa.int64()),
+            "export_feature_id": pa.array([handles[f] for f in handles], pa.string()),
+        }
+    )
 
-    The feature id is read from `feature_label`, not recomputed, so serving and relabelling
-    cannot drift to two ids for one feature — see `analytic.feature_label_table_sql`."""
-    con.execute(ft.feature_label_table_sql(sequences))
+
+def stage_features(con, *, labels: str, sequences: str) -> None:
+    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length, md5): each
+    feature under its minted handle (`labels`), with the sequence and its md5 — the
+    companion that maps the published handle back to a reproducible, sequence-derived id."""
+    con.execute(ft.feature_label_table_sql(labels))
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
         " SELECT s.feature_idx, l.feature_id AS feature, s.sequence,"
-        "        length(s.sequence)::INTEGER AS length"
+        "        length(s.sequence)::INTEGER AS length, md5(s.sequence) AS md5"
         f" FROM {sequences} s JOIN {ft.FEATURE_LABEL_TABLE} l USING (feature_idx)"
     )
 
 
 def _clear_relabel(con) -> ft.LabelClearance:
     """The shared relabel diagnostics, returning the clearance `labelled_relation_sql`
-    requires — the check that refuses a value whose sample has no QM or feature no sequence."""
+    requires — the check that refuses a value whose sample has no QM or feature no handle."""
     cur = con.execute(ft.relabel_diagnostics_sql(AMPLICON_AXIS))
     row = dict(zip((column[0] for column in cur.description), cur.fetchone(), strict=True))
     return ft.check_relabel_diagnostics(**row, axis=AMPLICON_AXIS)
 
 
-def stage_values(con, *, source: Source, names: str, values: str, sequences: str) -> None:
+def stage_values(con, *, source: Source, names: str, values: str, labels: str) -> None:
     """Relabel `values` to public names into `VALUE_RELATION` (sample, feature, value)
     through the shared `analytic/label.py` relabel.
 
-    The three label inputs — feature label, sample label (`names`), and counts — feed
-    `labelled_relation_sql`, held to the same `check_relabel_diagnostics` invariants as the
-    OGU table rather than a hand-written set. The trailing COO sum is a wire concern (a
-    sparse cell is one `(sample, feature)` pair), not part of the relabel."""
-    con.execute(ft.feature_label_table_sql(sequences))
+    The three label inputs — feature label (`labels`, the mint response), sample label
+    (`names`), and counts — feed `labelled_relation_sql`, held to the same
+    `check_relabel_diagnostics` invariants as the OGU table. The trailing COO sum is a wire
+    concern (a sparse cell is one `(sample, feature)` pair), not part of the relabel."""
+    con.execute(ft.feature_label_table_sql(labels))
     con.execute(
         f"CREATE TABLE {ft.SAMPLE_LABEL_TABLE} AS "
         f"SELECT processing_idx, prep_sample_idx, sample AS sample_id FROM {names}"
@@ -371,14 +394,15 @@ def names_table(cohort: Cohort) -> pa.Table:
     )
 
 
-def build_values(cohort: Cohort, values: pa.Table, sequences: pa.Table) -> pa.Table:
-    """The values `(sample, feature, value)` as Arrow, for the REST answer."""
+def build_values(cohort: Cohort, values: pa.Table, labels: pa.Table) -> pa.Table:
+    """The values `(sample, feature, value)` as Arrow, for the REST answer. `labels` is
+    the exported-feature mint response that names each feature."""
     with duckdb.connect() as duck:
         duck.register("run_values", values)
         duck.register("names", names_table(cohort))
-        duck.register("sequences", sequences)
+        duck.register("labels", labels)
         stage_values(
-            duck, source=cohort.source, names="names", values="run_values", sequences="sequences"
+            duck, source=cohort.source, names="names", values="run_values", labels="labels"
         )
         table = duck.sql(
             f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature"
@@ -386,14 +410,17 @@ def build_values(cohort: Cohort, values: pa.Table, sequences: pa.Table) -> pa.Ta
     return table.cast(VALUES_SCHEMA)
 
 
-def build_features(cohort: Cohort, sequences: pa.Table) -> pa.Table:
-    """The features `(feature, sequence, length)` as Arrow, for the REST answer. The
-    ticket already scopes the sequences to the ASVs the cohort observed."""
+def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.Table:
+    """The features `(feature, sequence, length, md5)` as Arrow, for the REST answer: the
+    handle-to-sequence mapping. The ticket scopes the sequences to the cohort's ASVs, and
+    `labels` is the mint response that names them."""
     with duckdb.connect() as duck:
         duck.register("sequences", sequences)
-        stage_features(duck, sequences="sequences")
+        duck.register("labels", labels)
+        stage_features(duck, labels="labels", sequences="sequences")
         table = duck.sql(
-            f"SELECT f.feature, f.sequence, f.length FROM {FEATURE_RELATION} f ORDER BY f.feature"
+            f"SELECT f.feature, f.sequence, f.length, f.md5"
+            f" FROM {FEATURE_RELATION} f ORDER BY f.feature"
         ).to_arrow_table()
     return table.cast(FEATURES_SCHEMA)
 
