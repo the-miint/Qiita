@@ -728,12 +728,16 @@ async def test_get_study_without_grant_403(ctx):
         ("admin", Tier.MEMBER, 200, StudyRecordView.SUMMARY),
         ("member", Tier.MEMBER, 200, StudyRecordView.FULL),
         ("member", None, 403, None),
-        ("public", None, 200, StudyRecordView.FULL),
+        ("public", None, 200, StudyRecordView.PUBLIC),
+        ("public", Tier.VIEWER, 200, StudyRecordView.FULL),
     ],
 )
 async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant, status, view):
     """The full record at or above the study's default_tier; below it, a grant
-    reads only the summary, which carries none of the record's private fields."""
+    reads only the summary, which carries none of the record's private fields.
+    A caller whom only a public default admits reads the public view: what
+    describes the study, without its internal idxs, notes, extra metadata or
+    submission state."""
     other_owner = await seed_user_principal(
         ctx["pool"], prefix=_SEED_PREFIX, suffix=f"view-{secrets.token_hex(3)}"
     )
@@ -744,6 +748,9 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
         title=_unique_title("view"),
         owner_idx=other_owner,
         default_tier=default_tier,
+        description="a description",
+        abstract="an abstract",
+        funding="a grant",
         notes="private note",
         extra_metadata={"k": "v"},
     )
@@ -776,6 +783,29 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "default_tier",
             "updated_at",
         }
+        assert body["export_entity_id"] == await fetch_export_entity_id(
+            ctx["pool"], kind="study", entity_idx=study_idx
+        )
+        assert "ETag" not in resp.headers
+    elif view == StudyRecordView.PUBLIC:
+        assert set(body) == {
+            "view",
+            "export_entity_id",
+            "title",
+            "alias",
+            "description",
+            "abstract",
+            "funding",
+            "bioproject_accession",
+            "ena_study_accession",
+            "default_tier",
+            "updated_at",
+        }
+        assert (body["description"], body["abstract"], body["funding"]) == (
+            "a description",
+            "an abstract",
+            "a grant",
+        )
         assert body["export_entity_id"] == await fetch_export_entity_id(
             ctx["pool"], kind="study", entity_idx=study_idx
         )
@@ -1546,7 +1576,8 @@ async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     assert rows[idxs["public"]]["access_via"] == StudyAccessVia.PUBLIC
     # A viewer grant on a member-default study reads only its summary.
     assert rows[idxs["shared"]]["record_view"] == StudyRecordView.SUMMARY
-    assert rows[idxs["public"]]["record_view"] == StudyRecordView.FULL
+    # Only the public default admits them to the public study: its public view.
+    assert rows[idxs["public"]]["record_view"] == StudyRecordView.PUBLIC
     assert rows[idxs["own"]]["record_view"] == StudyRecordView.FULL
     # Each row carries its export_entity_id, read from the table independently.
     expected_ids = {
@@ -1793,6 +1824,37 @@ async def test_list_studies_summary_reader_cannot_search_fields_they_cannot_read
     # A full-record reader (a wet_lab_admin) does find it by the note.
     full = (await _list(ctx["wet"], q=secret))["studies"]
     assert [r["study_idx"] for r in full] == [idx]
+
+
+async def test_list_studies_public_reader_cannot_search_fields_the_public_view_leaves_out(ctx):
+    """A public-default study with one word only in its notes and another only
+    in its abstract. A caller with no grant reads its public view, so they find
+    it by the abstract's word and not by the notes' word, which the public view
+    leaves out. A full-record reader (a wet_lab_admin) finds it by either."""
+    token = f"lst{secrets.token_hex(4)}"
+    secret, described = f"zq{secrets.token_hex(5)}", f"zd{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"pub-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} open",
+        owner_idx=other,
+        default_tier="public",
+        notes=f"internal {secret}",
+        abstract=f"about {described}",
+    )
+    assert created.status_code == 201, created.text
+    idx = created.json()["study_idx"]
+
+    assert (await _list(ctx["user"], q=secret))["studies"] == []
+    by_abstract = (await _list(ctx["user"], q=described))["studies"]
+    assert [(r["study_idx"], r["record_view"]) for r in by_abstract] == [
+        (idx, StudyRecordView.PUBLIC)
+    ]
+    for word in (secret, described):
+        full = (await _list(ctx["wet"], q=word))["studies"]
+        assert [r["study_idx"] for r in full] == [idx], word
 
 
 async def test_list_studies_owner_without_an_access_row_is_admin(ctx):
