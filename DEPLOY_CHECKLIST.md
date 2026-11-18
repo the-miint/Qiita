@@ -63,12 +63,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   restart an absent value means no host. `dbmate` applies it; run the bucket-2 backfill
   first. (#864)
 - `20261117000000_prep_sample_qc_check_metrics` adds the nullable `prep_sample_qc_check.metrics`
-  column with a JSON-object CHECK. `dbmate` applies it; there is nothing to backfill. (#N)
+  column with a JSON-object CHECK. `dbmate` applies it; there is nothing to backfill. (#912)
 
 ### 4. Deploy
 
 - The new `verify-data-type` 1.0.0 workflow reaches `qiita.action` through `qiita-admin actions
-  sync` in `activate.sh`. It is native-only, so no SIF is built. (#N)
+  sync` in `activate.sh`. It is native-only, so no SIF is built. (#912)
 
 ### 5. Verify
 
@@ -76,14 +76,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT version, enabled FROM qiita.action WHERE action_id = 'verify-data-type'"
   ```
-  (#N)
+  (#912)
 
 ### 6. After the deploy verifies green
 
 - `[operator]` **Load the four rRNA marker references `verify-data-type` classifies against**, and
   keep their `reference_idx` values for the submit context. Files, versions and commands are in
   [`docs/runbooks/verify-data-type.md`](docs/runbooks/verify-data-type.md). The deploy does not
-  depend on this; no ticket is chained to the workflow. (#N)
+  depend on this; no ticket is chained to the workflow. (#912)
 - `[admin]` **Add gene calls to the long-read-assembly runs finished before this deploy**
   (1.0.0, 1.0.1 and 1.0.2; the dry run counts them). Each run gets one
   `assembly-gene-call-recover` ticket, which reads the `assemble`, `bin_refine`, `checkm`,
