@@ -12,10 +12,12 @@ from pathlib import Path
 
 import pytest
 from helpers import KREPP_TREE_NEWICK, krepp_recorded_version
+from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
 
 from qiita_compute_orchestrator.derived_store import krepp_build_relpath
 from qiita_compute_orchestrator.jobs import krepp_index_register as job
 from qiita_compute_orchestrator.krepp_build import (
+    CHECK_KREPP_VERSION,
     JEST_LABELLED_TREE,
     JEST_NULL,
     KreppBuildInvalid,
@@ -71,7 +73,7 @@ async def test_registers_a_build_whose_tree_is_the_references(derived, tmp_path)
     assert meta["fs_path"] == "references/18/krepp/t1"
     assert (meta["state"], meta["fs_path_root"]) == ("registered", "node_local")
     assert meta["params"]["partitions"] == [0, 1]
-    assert len(meta["params"]["sha256sums_sha256"]) == 64
+    assert len(meta["params"][SHA256SUMS_SHA256_PARAM]) == 64
     assert (derived.folder / "SHA256SUMS").is_file()
 
 
@@ -103,4 +105,4 @@ async def test_refuses_a_build_from_another_krepp(derived, tmp_path):
     derived.state["linked"] = "v0.0.0"
     with pytest.raises(KreppBuildInvalid) as exc:
         await _run(tmp_path)
-    assert exc.value.check == "krepp-version"
+    assert exc.value.check == CHECK_KREPP_VERSION

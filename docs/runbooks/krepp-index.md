@@ -43,7 +43,7 @@ qiita ticket submit --action-id reference-index-register --action-version 1.0.0 
 
 The job checks the folder, the krepp version and the trees, then hashes every file and
 writes `README.md`, `manifest.json`, `verify.sh` and `SHA256SUMS`. The new row is
-`registered`; nothing uses it yet. Its row, from `GET /api/v1/reference/18/index`
+`registered`, and is not served until it is activated. Its row, from `GET /api/v1/reference/18/index`
 (`reference:read`), has the `reference_index_idx` and, in `params.sha256sums_sha256`,
 the hash to give the cluster admins.
 

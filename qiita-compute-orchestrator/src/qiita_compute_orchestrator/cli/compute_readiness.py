@@ -584,7 +584,7 @@ else
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 
-# This node's copies of the active krepp builds, checked as a placement job checks
+# This node's copies of the active krepp builds, checked as the activation job checks
 # them; the exit code is the row's status (qiita_compute_orchestrator.krepp_node_check).
 run_module_probe qiita_compute_orchestrator.krepp_node_check
 case "$MODULE_PROBE_RC" in

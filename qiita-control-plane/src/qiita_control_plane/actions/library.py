@@ -2026,8 +2026,8 @@ async def register_index(
     """
     if index_type == INDEX_TYPE_KREPP and state != ReferenceIndexState.REGISTERED:
         raise ValueError(
-            f"a krepp build is registered {ReferenceIndexState.REGISTERED.value}, not"
-            f" {state.value}; only activation moves it on"
+            f"a krepp build is registered in state {ReferenceIndexState.REGISTERED.value},"
+            f" not {state.value}; only activation moves it on"
         )
     row = await pool.fetchrow(
         "INSERT INTO qiita.reference_index"

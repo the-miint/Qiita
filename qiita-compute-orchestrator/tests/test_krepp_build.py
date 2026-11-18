@@ -21,6 +21,7 @@ import pytest
 from helpers import krepp_recorded_version
 
 from qiita_compute_orchestrator.krepp_build import (
+    CHECK_KREPP_VERSION,
     JEST_LABELLED_TREE,
     JEST_NULL,
     MANIFEST,
@@ -192,7 +193,7 @@ def test_verify_refuses_a_build_from_another_krepp(build):
     assert verify_build(build, sums, linked_krepp_version=built)
     with pytest.raises(KreppBuildInvalid) as exc:
         verify_build(build, sums, linked_krepp_version=built + "-other")
-    assert exc.value.check == "krepp-version"
+    assert exc.value.check == CHECK_KREPP_VERSION
 
 
 def test_linked_version_is_the_one_an_index_records(krepp_built_index):

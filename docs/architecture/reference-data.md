@@ -185,7 +185,7 @@ A krepp index is built outside Qiita and registered onto an existing reference w
 4. `reference-index-activate` checks a node copy and places pieces of known backbone tips with it; when enough land on their own edge it makes the build `active`, retiring the reference's previous active build in the same transaction. At most one krepp build per reference is active.
 5. `qiita-admin krepp-index remove` marks a registered or retired build `removed` once no running ticket uses it. A reference with a build not yet removed cannot be deleted.
 
-`work_ticket.reference_index_idx` is the column a placement ticket is to record its build in, and keep: a restarted ticket would use the same build, still served once retired. Nothing writes it yet; `/run` already refuses a ticket whose build is removed. Every job that reads a node copy (today `krepp_index_activate` and the readiness probe's `krepp-index` row) runs `krepp_build.verify_build` on it first and fails when it does not match; the activation report and the probe row say which node ran. [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) is the operator procedure.
+`work_ticket.reference_index_idx` is the build a ticket is fixed to; `/run` refuses a ticket whose build is removed. `repositories/reference_index.py` says who writes it and under which lock. Every job that reads a node copy runs `krepp_build.verify_build` on it first and fails when it does not match; the activation report and the probe row say which node ran. [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) is the operator procedure.
 
 ## Shard planner
 

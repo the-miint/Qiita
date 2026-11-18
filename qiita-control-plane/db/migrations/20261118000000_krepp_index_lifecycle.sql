@@ -44,11 +44,9 @@ CREATE UNIQUE INDEX reference_index_one_active_krepp
     ON qiita.reference_index (reference_idx)
     WHERE index_type = 'krepp' AND state = 'active';
 
--- 4. The krepp build a ticket is fixed to. Nothing writes it yet: the placement
---    workflow's runner step is to write it once, when the ticket first resolves its
---    build, as it writes mask_idx, alignment_idx and processing_idx. What reads it
---    now: the /run refusal for a ticket whose build was removed, and the remove
---    gate (repositories.reference_index). ON DELETE SET NULL mirrors those columns.
+-- 4. The krepp build a ticket is fixed to (repositories.reference_index says who
+--    writes and reads it). ON DELETE SET NULL mirrors mask_idx, alignment_idx and
+--    processing_idx.
 ALTER TABLE qiita.work_ticket
     ADD COLUMN reference_index_idx BIGINT
         REFERENCES qiita.reference_index(reference_index_idx) ON DELETE SET NULL;
