@@ -1218,8 +1218,11 @@ async def _run_entry_with_retry(
         # `except BackendFailure` arm below, and we never went through it. The
         # gap is reachable when a prior process recorded the attempt `failed`
         # and died before transitioning the ticket — reconcile then re-drives a
-        # still-PROCESSING ticket and would buy a free submit on every restart.
-        if skipped_terminal_attempts:
+        # still-PROCESSING ticket and would buy a free submit on every restart. A live
+        # owned row for this attempt is adopted, not submitted, so the budget is moot.
+        if skipped_terminal_attempts and _attempt_is_unowned(
+            ctx.prior_progress, step_index=index, attempt=attempt
+        ):
             current_retry = await _retry_count(ctx.pool, ctx.work_ticket_idx)
             if _retries_spent(ctx, current_retry):
                 _log.warning(

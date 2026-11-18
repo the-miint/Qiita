@@ -5368,6 +5368,36 @@ async def test_resume_with_terminal_attempt_and_spent_budget_fails_retries_exhau
     assert row["failure_reason"].startswith(f"{FailureKind.RETRIES_EXHAUSTED.value} (3/3)")
 
 
+@pytest.mark.parametrize("retry_count", [0, None], ids=["control", "budget-spent"])
+async def test_resume_adopts_the_live_attempt_even_when_the_retry_budget_is_spent(
+    postgres_pool, slurm_ticket, tmp_path, retry_count
+):
+    """The budget gates a fresh submit; a live attempt that was already submitted is adopted."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_failed_then_escalated_step(
+        postgres_pool, slurm_ticket, step_name="compute", dead_job_id=903, live_job_id=904
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET retry_count = COALESCE($2, max_retries)"
+        " WHERE work_ticket_idx = $1",
+        slurm_ticket,
+        retry_count,
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 0
+    assert [h.slurm_job_id for h in backend.status_handles] == [904]
+
+
 async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):
     """A ticket orphaned right after PENDING → PROCESSING with no progress rows
     runs from step 0 — resume degrades to a normal dispatch."""
