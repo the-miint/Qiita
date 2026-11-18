@@ -391,6 +391,9 @@ async def get_or_create_study_by_ena_accessions(
                 title=title,
                 ena_study_accession=ena_study_accession,
                 bioproject_accession=bioproject_accession,
+                # ENA already publishes the study's data, so the study an import
+                # creates is public. A study matched above keeps its own tier.
+                default_tier=Tier.PUBLIC,
             )
         return row, True
     except asyncpg.UniqueViolationError as exc:
@@ -476,6 +479,14 @@ _STUDY_SUMMARY_TSVECTOR = (
     "to_tsvector('english', concat_ws(' ', study.title, study.alias,"
     " study.bioproject_accession, study.ena_study_accession))"
 )
+# The public view's fields as a search document, for a caller whom only a
+# study's public default admits: the summary fields plus description, abstract
+# and funding, but not the notes.
+_STUDY_PUBLIC_TSVECTOR = (
+    "to_tsvector('english', concat_ws(' ', study.title, study.alias,"
+    " study.description, study.abstract, study.funding,"
+    " study.bioproject_accession, study.ena_study_accession))"
+)
 
 
 async def fetch_study_list_candidates(
@@ -503,11 +514,12 @@ async def fetch_study_list_candidates(
     only to be dropped.
 
     `query` is a websearch-syntax full-text query. A row matches on the full
-    record's `search_vector` or on the summary fields (title, alias,
-    accessions, which `search_vector` does not cover); `summary_match` says
-    whether the summary alone matched, so a caller who may read only the
-    summary is held to it. Both use the 'english' configuration, so words are
-    stemmed and matched whole.
+    record's `search_vector`, on the public view's fields, or on the summary
+    fields (title, alias, accessions; `search_vector` does not cover the
+    accessions). `summary_match` and `public_match` say whether the summary or
+    the public view alone matched, so a caller who may read only one of them
+    is held to it. All use the 'english' configuration, so words are stemmed
+    and matched whole.
 
     Keyset paging on idx (`after_study_idx`) never re-reads a skipped row, but
     a page scans down from the highest idx until it has `limit` candidates or
@@ -521,7 +533,9 @@ async def fetch_study_list_candidates(
         "       study.updated_at, sa.access_tier,"
         f"      {export_entity_id_select('study')},"
         f"      ($3::text IS NOT NULL AND {_STUDY_SUMMARY_TSVECTOR}"
-        "        @@ websearch_to_tsquery('english', $3)) AS summary_match"
+        "        @@ websearch_to_tsquery('english', $3)) AS summary_match,"
+        f"      ($3::text IS NOT NULL AND {_STUDY_PUBLIC_TSVECTOR}"
+        "        @@ websearch_to_tsquery('english', $3)) AS public_match"
         " FROM qiita.study"
         " LEFT JOIN qiita.study_access sa"
         "   ON sa.study_idx = study.idx AND sa.principal_idx = $1"
@@ -529,6 +543,7 @@ async def fetch_study_list_candidates(
         "        OR ($6 AND study.default_tier = $7::qiita.tier))"
         "   AND ($3::text IS NULL"
         "        OR study.search_vector @@ websearch_to_tsquery('english', $3)"
+        f"       OR {_STUDY_PUBLIC_TSVECTOR} @@ websearch_to_tsquery('english', $3)"
         f"       OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3))"
         "   AND ($4::bigint IS NULL OR study.idx < $4)"
         " ORDER BY study.idx DESC"

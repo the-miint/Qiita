@@ -101,12 +101,14 @@ class StudyRecordView(StrEnum):
 
     FULL = "full"
     SUMMARY = "summary"
+    PUBLIC = "public"
 
 
 class StudyResponse(BaseModel):
     """Returned by POST /api/v1/study on success, and by GET and PATCH
     /api/v1/study/{study_idx} to a caller who may read the full record
-    (`view` = full; see `StudyRecordSummary` for the other view).
+    (`view` = full; see `StudyRecordSummary` and `StudyRecordPublic` for the
+    other views).
 
     Mirrors the qiita.study row's caller-visible columns, with the
     generated search_vector and parent_study_idx (not exposed in v1)
@@ -150,7 +152,10 @@ class StudyAccessVia(StrEnum):
 
 
 class StudySummary(BaseModel):
-    """One row of GET /api/v1/study — a study the caller may read.
+    """One row of GET /api/v1/study: a study the caller may read through
+    ownership, a grant or a role. A study that only its public default admits
+    them to is a `StudyPublicSummary` row instead; `record_view` tells the two
+    apart.
 
     `caller_tier` is the caller's own tier on the study: `admin` for its
     owner, else their qiita.study_access row, or `public` when they hold none.
@@ -170,7 +175,24 @@ class StudySummary(BaseModel):
     caller_tier: Tier
     access_via: StudyAccessVia
     # What GET /study/{study_idx} would return this caller.
-    record_view: StudyRecordView
+    record_view: Literal[StudyRecordView.FULL, StudyRecordView.SUMMARY]
+    updated_at: AwareDatetime
+
+
+class StudyPublicSummary(BaseModel):
+    """One row of GET /api/v1/study for a study that only its public default
+    admits the caller to. It carries no study_idx, as the record's public view
+    (`StudyRecordPublic`) does not: `export_entity_id` is the handle."""
+
+    export_entity_id: str
+    title: str
+    alias: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
+    caller_tier: Tier
+    access_via: StudyAccessVia
+    record_view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
     updated_at: AwareDatetime
 
 
@@ -184,7 +206,7 @@ class StudySummaryListResponse(BaseModel):
     study the page considered, including ones the `min_tier` filter dropped.
     """
 
-    studies: list[StudySummary]
+    studies: list[Annotated[StudySummary | StudyPublicSummary, Field(discriminator="record_view")]]
     next_after_study_idx: int | None
 
 
@@ -198,6 +220,25 @@ class StudyRecordSummary(BaseModel):
     export_entity_id: str
     title: str
     alias: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
+    updated_at: AwareDatetime
+
+
+class StudyRecordPublic(BaseModel):
+    """GET /api/v1/study/{study_idx} for a caller whom only the study's public
+    default admits: no grant, not the owner, no bypass role. It describes the
+    study and leaves out its internal idxs, notes, extra metadata and
+    submission state; the full record is `StudyResponse`."""
+
+    view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
+    export_entity_id: str
+    title: str
+    alias: str | None
+    description: str | None
+    abstract: str | None
+    funding: str | None
     bioproject_accession: str | None
     ena_study_accession: str | None
     default_tier: Tier

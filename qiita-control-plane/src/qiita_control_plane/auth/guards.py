@@ -477,23 +477,23 @@ def study_record_view(
     bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
 ) -> StudyRecordView | None:
     """How much of this study's own record `caller` may read: FULL, SUMMARY,
-    or None (nothing). The one implementation of the rule defined in
+    PUBLIC, or None (nothing). The one implementation of the rule defined in
     docs/architecture/data-model.md ("What a tier reads of a study's own
     record"); GET /study/{idx} and the GET /study listing both decide through
     it, so a study is listed exactly when it can be opened.
 
-    FULL: `bypass_role`, the owner, or a tier at or above the study's
-    `default_tier` (a public-default study is FULL to everyone). SUMMARY: any
-    other grant, i.e. one below `default_tier`. None: no grant on a study that
-    is not public.
+    FULL: `bypass_role`, the owner, or a grant at or above the study's
+    `default_tier`. SUMMARY: any other grant, i.e. one below `default_tier`.
+    PUBLIC: no grant on a public-default study, which only that default
+    admits the caller to. None: no grant on a study that is not public.
     """
     if caller.has_role_at_least(bypass_role):
         return StudyRecordView.FULL
+    if row.access_tier is None and row.owner_idx != caller.principal_idx:
+        return StudyRecordView.PUBLIC if row.default_tier is Tier.PUBLIC else None
     if _access_row_allows(row, caller=caller, min_tier=row.default_tier):
         return StudyRecordView.FULL
-    if row.access_tier is not None:
-        return StudyRecordView.SUMMARY
-    return None
+    return StudyRecordView.SUMMARY
 
 
 def caller_effective_tier(row: CallerStudyAccessRow, *, caller: Principal) -> Tier:

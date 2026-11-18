@@ -3,8 +3,8 @@
 POST creates a study and gates on caller scope plus the lab-tech-on-behalf
 rule, and on system_admin for an explicit study_idx; GET /study lists the
 studies the caller may read, and GET /study/{idx} reads one, both deciding
-through `auth.guards.study_record_view` (the full record, its summary, or
-nothing); PATCH edits the editable post-create columns and gates on caller
+through `auth.guards.study_record_view` (the full record, its summary, its
+public view, or nothing); PATCH edits the editable post-create columns and gates on caller
 scope plus per-study Tier.ADMIN (wet_lab_admin bypass). POST, GET-by-idx and
 PATCH share the row → StudyResponse mapping via a helper in this module.
 DELETE is deferred.
@@ -32,6 +32,8 @@ from qiita_common.models import (
     StudyLookupByAccessionRequest,
     StudyLookupRequest,
     StudyPatchRequest,
+    StudyPublicSummary,
+    StudyRecordPublic,
     StudyRecordSummary,
     StudyRecordView,
     StudyResponse,
@@ -227,6 +229,31 @@ async def create_study_route(
     return _study_response_from_row(row)
 
 
+def _list_row(
+    row: asyncpg.Record,
+    *,
+    access: CallerStudyAccessRow,
+    view: StudyRecordView,
+    principal: Principal,
+) -> StudySummary | StudyPublicSummary:
+    """One GET /study row for `view`. A public-view row leaves out study_idx,
+    as `StudyRecordPublic` does."""
+    common = {
+        "export_entity_id": require_export_entity_id(row, kind="study"),
+        "title": row["title"],
+        "alias": row["alias"],
+        "bioproject_accession": row["bioproject_accession"],
+        "ena_study_accession": row["ena_study_accession"],
+        "default_tier": access.default_tier,
+        "caller_tier": caller_effective_tier(access, caller=principal),
+        "access_via": study_access_via(access, caller=principal),
+        "updated_at": row["updated_at"],
+    }
+    if view is StudyRecordView.PUBLIC:
+        return StudyPublicSummary(**common)
+    return StudySummary(study_idx=row["idx"], record_view=view, **common)
+
+
 @router.get(PATH_STUDY_ROOT)
 async def list_studies(
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -240,8 +267,9 @@ async def list_studies(
             pattern=r"^[^\x00]*$",
             description="Full-text search, web-search syntax. Words are stemmed English and"
             " match whole (`soil` finds 'soils'; `micro` does not find 'microbiome')."
-            " Searches title, alias and the accessions, plus abstract, description, notes"
-            " and funding on studies whose full record the caller may read.",
+            " Searches title, alias and the accessions; abstract, description and funding"
+            " on studies whose public view or full record the caller may read; and notes"
+            " on studies whose full record they may read.",
         ),
     ] = None,
     min_tier: Annotated[
@@ -256,12 +284,13 @@ async def list_studies(
     """The studies the caller may read, highest study_idx first: the same set
     GET /study/{idx} answers (owned, shared with them at any tier, or
     public-default; every study for wet_lab_admin+). Each row says which view
-    of the record that answer is."""
+    of the record that answer is; a row in the public view carries no
+    study_idx, as that view does not."""
     # A min_tier above public asks about the caller's own grants, so a role
     # bypass and ungranted public studies cannot contribute rows.
     relationship_only = min_tier is not None and min_tier is not Tier.PUBLIC
     bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN) and not relationship_only
-    studies: list[StudySummary] = []
+    studies: list[StudySummary | StudyPublicSummary] = []
     cursor = after_study_idx
     more = True
     for _ in range(_MAX_LIST_FILL_ROUNDS):
@@ -290,25 +319,13 @@ async def list_studies(
                 access, caller=principal, tier=min_tier
             ):
                 continue
-            # A summary reader is held to the summary fields: matching words
-            # only in a field they cannot read would disclose that field.
+            # A summary or public-view reader is held to that view's fields:
+            # matching words only in a field they cannot read would disclose it.
             if q is not None and view is StudyRecordView.SUMMARY and not row["summary_match"]:
                 continue
-            studies.append(
-                StudySummary(
-                    study_idx=row["idx"],
-                    export_entity_id=require_export_entity_id(row, kind="study"),
-                    title=row["title"],
-                    alias=row["alias"],
-                    bioproject_accession=row["bioproject_accession"],
-                    ena_study_accession=row["ena_study_accession"],
-                    default_tier=access.default_tier,
-                    caller_tier=caller_effective_tier(access, caller=principal),
-                    access_via=study_access_via(access, caller=principal),
-                    record_view=view,
-                    updated_at=row["updated_at"],
-                )
-            )
+            if q is not None and view is StudyRecordView.PUBLIC and not row["public_match"]:
+                continue
+            studies.append(_list_row(row, access=access, view=view, principal=principal))
             if len(studies) == limit:
                 # Page full: more may follow unless this was the last row of a
                 # short (final) batch.
@@ -327,7 +344,9 @@ async def list_studies(
 
 @router.get(
     PATH_STUDY_BY_IDX,
-    response_model=Annotated[StudyResponse | StudyRecordSummary, Field(discriminator="view")],
+    response_model=Annotated[
+        StudyResponse | StudyRecordSummary | StudyRecordPublic, Field(discriminator="view")
+    ],
 )
 async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
@@ -335,10 +354,11 @@ async def get_study(
     pool: asyncpg.Pool = Depends(get_db_pool),
     principal: Principal = Depends(require_scope(Scope.STUDY_READ)),
     _exists: None = Depends(require_study_exists),
-) -> StudyResponse | StudyRecordSummary:
+) -> StudyResponse | StudyRecordSummary | StudyRecordPublic:
     """Return the study's record at the view `study_record_view` gives the
     caller: the full `StudyResponse` (with an `ETag` header, fed back as
-    If-Match on PATCH), the `StudyRecordSummary`, or 403.
+    If-Match on PATCH), the `StudyRecordSummary`, the `StudyRecordPublic`,
+    or 403.
 
     require_study_exists answers 404 first, for every caller including the
     wet_lab_admin+ that `study_record_view` admits without a lookup.
@@ -365,6 +385,19 @@ async def get_study(
             export_entity_id=require_export_entity_id(row, kind="study"),
             title=row["title"],
             alias=row["alias"],
+            bioproject_accession=row["bioproject_accession"],
+            ena_study_accession=row["ena_study_accession"],
+            default_tier=row["default_tier"],
+            updated_at=row["updated_at"],
+        )
+    if view is StudyRecordView.PUBLIC:
+        return StudyRecordPublic(
+            export_entity_id=require_export_entity_id(row, kind="study"),
+            title=row["title"],
+            alias=row["alias"],
+            description=row["description"],
+            abstract=row["abstract"],
+            funding=row["funding"],
             bioproject_accession=row["bioproject_accession"],
             ena_study_accession=row["ena_study_accession"],
             default_tier=row["default_tier"],
