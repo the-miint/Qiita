@@ -108,6 +108,8 @@ class FailureKind(StrEnum):
     EXTERNAL_FETCH_TRANSIENT = "external_fetch_transient"
     # A step died on SIGSEGV; it is re-run on the same resources.
     SEGFAULT = "segfault"
+    # slurmrestd purged the job and its stderr names no cause.
+    JOB_PURGED = "job_purged"
 
     # ---- Permanent: workflow / input / contract issues -------------------
     BAD_INPUT = "bad_input"
@@ -143,6 +145,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.DATA_PLANE_TRANSIENT,
         FailureKind.EXTERNAL_FETCH_TRANSIENT,
         FailureKind.SEGFAULT,
+        FailureKind.JOB_PURGED,
     }
 )
 

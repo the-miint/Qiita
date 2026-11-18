@@ -27,6 +27,7 @@ from qiita_common.models import (
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY, BatchItemState
 from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
+from qiita_control_plane.actions.library import persist_ena_run_outcomes
 from qiita_control_plane.auth.principal import HumanUser
 from qiita_control_plane.dispatch import build_dispatch_semaphore
 from qiita_control_plane.ena_import import (
@@ -3668,14 +3669,16 @@ async def test_fetch_batch_status_reports_idx_and_requested_runs(
 _NO_DATA_REASON = "ENA run: fetch failed (IOException): no sequence data found"
 
 
-async def _record_download_failure(postgres_pool, run_accession: str) -> None:
+async def _record_download_failure(
+    postgres_pool, run_accession: str, failure_type: FailureType = FailureType.PERMANENT
+) -> None:
     await postgres_pool.execute(
         "UPDATE qiita.sequenced_sample"
         " SET download_failure_reason = $2, download_failure_type = $3"
         " WHERE ena_run_accession = $1",
         run_accession,
         _NO_DATA_REASON,
-        FailureType.PERMANENT.value,
+        failure_type.value,
     )
 
 
@@ -3705,8 +3708,15 @@ async def _store_reads(
     )
 
 
+@pytest.mark.parametrize("failure_type", list(FailureType))
 async def test_completed_download_with_a_recorded_failure_reads_completed_partial(
-    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+    batch_app,
+    postgres_pool,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    monkeypatch,
+    failure_type,
 ):
     study = unique_ena_accession("PRJEB")
     ok_run, bad_run = _runs(2)
@@ -3715,18 +3725,79 @@ async def test_completed_download_with_a_recorded_failure_reads_completed_partia
         batch_app, postgres_pool, admin_principal, batch_cleanup, [study]
     )
     await _complete_download_tickets(postgres_pool, batch_idx)
-    await _record_download_failure(postgres_pool, bad_run)
+    await _record_download_failure(postgres_pool, bad_run, failure_type)
 
     (item,) = (await fetch_batch_status(postgres_pool, batch_idx=batch_idx)).items
 
     assert item.state == BatchItemState.COMPLETED_PARTIAL
-    assert item.failure_reason == f"{bad_run} ({FailureType.PERMANENT.value})"
+    assert item.failure_reason == f"{bad_run} ({failure_type.value})"
     by_run = {r.run_accession: r for r in item.ena_runs}
     assert by_run[bad_run].status == EnaRunRegistrationStatus.DOWNLOAD_FAILED.value
     assert by_run[bad_run].failure_reason == _NO_DATA_REASON
-    assert by_run[bad_run].failure_type == FailureType.PERMANENT
+    assert by_run[bad_run].failure_type == failure_type
     assert by_run[ok_run].status == EnaRunRegistrationStatus.REGISTERED.value
     assert by_run[ok_run].failure_type is None
+
+    await _cleanup_study(postgres_pool, study)
+
+
+async def test_a_failed_run_whose_range_the_completed_ticket_minted_is_downloaded_again(
+    batch_app,
+    postgres_pool,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    monkeypatch,
+    tmp_path,
+):
+    """An earlier attempt minted both ranges; the final attempt's fetch of one failed
+    retriably, and persisting that outcome releases its range."""
+    study = unique_ena_accession("PRJEB")
+    ok_run, bad_run = _runs(2)
+    _EnaWorld(monkeypatch, {study: [ok_run, bad_run]})
+    batch_idx, items = await _drive_accessions(
+        batch_app, postgres_pool, admin_principal, batch_cleanup, [study]
+    )
+    (ticket,) = await _item_ticket_idxs(postgres_pool, items[0].idx)
+    await _store_reads(postgres_pool, admin_principal, ok_run, work_ticket_idx=ticket)
+    await _store_reads(postgres_pool, admin_principal, bad_run, work_ticket_idx=ticket)
+    await _complete_download_tickets(postgres_pool, batch_idx)
+    bad_psi, pool_idx = await postgres_pool.fetchrow(
+        "SELECT prep_sample_idx, sequenced_pool_idx FROM qiita.sequenced_sample"
+        " WHERE ena_run_accession = $1",
+        bad_run,
+    )
+    outcomes = tmp_path / "run_outcomes.json"
+    outcomes.write_text(
+        json.dumps(
+            [
+                {
+                    "prep_sample_idx": bad_psi,
+                    "ena_run_accession": bad_run,
+                    "failure_reason": _NO_DATA_REASON,
+                    "failure_type": FailureType.RETRIABLE.value,
+                }
+            ]
+        )
+    )
+
+    await persist_ena_run_outcomes(postgres_pool, pool_idx, outcomes, work_ticket_idx=ticket)
+
+    (item,) = (await fetch_batch_status(postgres_pool, batch_idx=batch_idx)).items
+    assert item.state == BatchItemState.COMPLETED_PARTIAL
+    by_run = {r.run_accession: r.status for r in item.ena_runs}
+    assert by_run == {
+        ok_run: EnaRunRegistrationStatus.REGISTERED.value,
+        bad_run: EnaRunRegistrationStatus.DOWNLOAD_FAILED.value,
+    }
+    sample_idxs = await postgres_pool.fetch(
+        "SELECT idx FROM qiita.sequenced_sample WHERE ena_run_accession = ANY($1::text[])",
+        [ok_run, bad_run],
+    )
+    needing = await fetch_runs_needing_download(
+        postgres_pool, sequenced_sample_idxs=[r["idx"] for r in sample_idxs]
+    )
+    assert needing == {pool_idx: [bad_run]}
 
     await _cleanup_study(postgres_pool, study)
 
@@ -3810,6 +3881,34 @@ async def test_reimport_of_a_partially_landed_pool_stays_partial_and_is_not_reti
     await _cleanup_study(postgres_pool, study)
 
 
+async def test_reimport_retickets_a_run_whose_download_failed_retriably(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    """The pool's completed ticket cannot be redriven, so the retriable run gets a new
+    ticket restricted to it, and the run whose failure was permanent stays out."""
+    study = unique_ena_accession("PRJEB")
+    ok_run, retry_run, permanent_run = _runs(3)
+    _EnaWorld(monkeypatch, {study: [ok_run, retry_run, permanent_run]})
+    first_idx, _ = await _drive_accessions(
+        batch_app, postgres_pool, admin_principal, batch_cleanup, [study]
+    )
+    await _complete_download_tickets(postgres_pool, first_idx)
+    await _store_reads(postgres_pool, admin_principal, ok_run)
+    await _record_download_failure(postgres_pool, retry_run, FailureType.RETRIABLE)
+    await _record_download_failure(postgres_pool, permanent_run, FailureType.PERMANENT)
+
+    second_idx, items = await _drive_accessions(
+        batch_app, postgres_pool, admin_principal, batch_cleanup, [study]
+    )
+
+    (row,) = await _batch_items(postgres_pool, second_idx)
+    assert row["state"] == BatchItemState.DOWNLOADING.value
+    (ticket,) = await _item_ticket_idxs(postgres_pool, items[0].idx)
+    assert await _ticket_restriction(postgres_pool, ticket) == [retry_run]
+
+    await _cleanup_study(postgres_pool, study)
+
+
 async def test_run_list_item_is_partial_only_for_a_failed_run_it_asked_for(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
@@ -3842,11 +3941,12 @@ async def test_fetch_runs_needing_download_excludes_every_run_a_roster_read_woul
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
     study = unique_ena_accession("PRJEB")
-    stored, failed, retired, flagged, needed = _runs(5)
-    _EnaWorld(monkeypatch, {study: [stored, failed, retired, flagged, needed]})
+    stored, failed, retired, flagged, needed, retriable = _runs(6)
+    _EnaWorld(monkeypatch, {study: [stored, failed, retired, flagged, needed, retriable]})
     await _drive_accessions(batch_app, postgres_pool, admin_principal, batch_cleanup, [study])
     await _store_reads(postgres_pool, admin_principal, stored)
     await _record_download_failure(postgres_pool, failed)
+    await _record_download_failure(postgres_pool, retriable, FailureType.RETRIABLE)
     await postgres_pool.execute(
         "UPDATE qiita.prep_sample SET retired = true, retired_at = now(),"
         " retired_by_idx = $2, retire_reason = 'test' WHERE idx = ("
@@ -3862,14 +3962,14 @@ async def test_fetch_runs_needing_download_excludes_every_run_a_roster_read_woul
     rows = await postgres_pool.fetch(
         "SELECT idx, sequenced_pool_idx FROM qiita.sequenced_sample"
         " WHERE ena_run_accession = ANY($1::text[])",
-        [stored, failed, retired, flagged, needed],
+        [stored, failed, retired, flagged, needed, retriable],
     )
 
     result = await fetch_runs_needing_download(
         postgres_pool, sequenced_sample_idxs=[r["idx"] for r in rows]
     )
 
-    assert result == {rows[0]["sequenced_pool_idx"]: [needed]}
+    assert result == {rows[0]["sequenced_pool_idx"]: sorted([needed, retriable])}
 
     await _cleanup_study(postgres_pool, study)
 

@@ -12,11 +12,12 @@ server-side field reaches the user without a CLI change.
 
 `qiita mask syndna-read-count` is the one that writes a file: the per-insert SynDNA
 read counts of a selection of prep_samples, as BIOM (default) or Parquet, named by
-public identifiers only.
+public identifiers only, with a JSON sidecar of sample metadata beside it.
 """
 
 import argparse
 import contextlib
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -137,9 +138,16 @@ def _get_syndna_read_count(
     study_idx: int | None,
     sequenced_pool_idx: int | None,
     prep_sample_idx: Sequence[int] | None,
+    include_deprecated: bool = False,
+    as_of_event: str | None = None,
 ) -> SyndnaReadCountResponse:
     """GET /api/v1/mask-definition/{mask_idx}/syndna-read-count."""
     params: dict = _common.filter_params(study_idx=study_idx, sequenced_pool_idx=sequenced_pool_idx)
+    params.update(
+        _common.optional_query_params(
+            include_deprecated=include_deprecated, as_of_event=as_of_event
+        )
+    )
     if prep_sample_idx:
         params["prep_sample_idx"] = [str(i) for i in prep_sample_idx]
     body = _common.call(
@@ -235,6 +243,63 @@ def _fetch_species(
     return {int(feature_idx): species for feature_idx, species in rows}
 
 
+# The sidecar written next to every table, in both formats: each sample_id's mask
+# handle, the left-out prep_samples, the deprecated mark and the decisions block. The
+# sidecar is where the output records these values in both formats. miint's BIOM
+# writer writes no sample metadata
+# (https://the-miint.github.io/duckdb-miint/writing/#biom), and the left-out list and
+# the decisions are not per-sample values in either format.
+SYNDNA_SIDECAR_SUFFIX = ".metadata.json"
+SYNDNA_SIDECAR_SCHEMA_VERSION = 1
+
+# The Parquet table's per-row column naming the mask the counts came from.
+MASK_HANDLE_COLUMN = "mask_export_processing_id"
+
+
+def syndna_sidecar_path(output: Path) -> Path:
+    """Where the sidecar of the table at `output` is written."""
+    return output.with_name(output.name + SYNDNA_SIDECAR_SUFFIX)
+
+
+def syndna_sidecar(response: SyndnaReadCountResponse, *, sample_names: list[str]) -> dict:
+    """The sidecar's content, public identifiers only: each sample_id's biosample
+    accession and the public handle of the mask its counts came from; each left-out
+    prep_sample by biosample accession, with its state and reason; and whether the
+    read was of a deprecated mask (`--include-deprecated`)."""
+    left_out = sorted(
+        (
+            {
+                "biosample_accession": response.left_out_biosample_accession[r.prep_sample_idx],
+                "state": r.state.value,
+                "reason": r.reason.value,
+            }
+            for r in response.left_out
+        ),
+        key=lambda e: (e["biosample_accession"] is None, e["biosample_accession"] or ""),
+    )
+    return {
+        "schema_version": SYNDNA_SIDECAR_SCHEMA_VERSION,
+        "samples": {
+            name: {
+                "biosample_accession": sample.biosample_accession,
+                MASK_HANDLE_COLUMN: sample.mask_export_processing_id,
+            }
+            for name, sample in zip(sample_names, response.samples, strict=True)
+        },
+        "left_out": left_out,
+        "deprecated": response.deprecated,
+        "deprecation_reason": response.deprecation_reason,
+        "decisions": _decisions(response),
+    }
+
+
+def _decisions(response: SyndnaReadCountResponse) -> dict:
+    """The response's decision provenance, which the route always sets."""
+    if response.decisions is None:
+        raise ValueError("the SynDNA count response carries no `decisions`")
+    return response.decisions.model_dump(mode="json")
+
+
 def write_syndna_table(
     con,
     response: SyndnaReadCountResponse,
@@ -244,34 +309,53 @@ def write_syndna_table(
     output: Path,
     fmt: str,
 ) -> int:
-    """Write the `(sample_id, feature_id, value)` table to `output`; return the rows
-    staged. Written to a `.partial` sibling and renamed, so a failure leaves no
-    table behind. Refuses an existing `output`: the Parquet COPY would replace it
-    silently."""
+    """Write the `(sample_id, feature_id, value)` table to `output`, and its sidecar
+    (`syndna_sidecar`) to `syndna_sidecar_path(output)`; return the rows staged. The
+    Parquet table also carries `MASK_HANDLE_COLUMN` per row. Both are written to
+    `.partial` siblings and renamed, the sidecar last, so a failure leaves neither
+    behind. Refuses an existing `output` or sidecar: the Parquet COPY would replace
+    the table silently."""
     if fmt not in SYNDNA_TABLE_FORMATS:
         raise ValueError(f"unsupported format {fmt!r} (expected {SYNDNA_TABLE_FORMATS})")
-    if output.exists():
-        raise ValueError(f"{output} already exists; remove it or choose another --output")
+    sidecar = syndna_sidecar_path(output)
+    for path in (output, sidecar):
+        if path.exists():
+            raise ValueError(f"{path} already exists; remove it or choose another --output")
+    parquet = fmt == "parquet"
     rows = [
         (sample_names[i], feature_names[j], float(count))
+        + ((sample.mask_export_processing_id,) if parquet else ())
         for i, sample in enumerate(response.samples)
         for j, count in enumerate(sample.read_counts)
     ]
+    handle_column = f", {MASK_HANDLE_COLUMN} VARCHAR" if parquet else ""
     con.execute(
         f"CREATE OR REPLACE TEMP TABLE {LABELLED_RELATION}"
-        " (sample_id VARCHAR, feature_id VARCHAR, value DOUBLE)"
+        f" (sample_id VARCHAR, feature_id VARCHAR, value DOUBLE{handle_column})"
     )
     if rows:
-        con.executemany(f"INSERT INTO {LABELLED_RELATION} VALUES (?, ?, ?)", rows)
+        marks = ", ".join("?" * len(rows[0]))
+        con.executemany(f"INSERT INTO {LABELLED_RELATION} VALUES ({marks})", rows)
     partial = output.with_name(output.name + ".partial")
+    sidecar_partial = sidecar.with_name(sidecar.name + ".partial")
     partial.unlink(missing_ok=True)
+    sidecar_partial.unlink(missing_ok=True)
     # Required by the Parquet COPY's options; see qiita_common.parquet.
     con.execute("SET preserve_insertion_order=false")
     try:
-        con.execute(parquet_copy_sql(partial) if fmt == "parquet" else biom_copy_sql(partial))
+        sidecar_partial.write_text(
+            json.dumps(syndna_sidecar(response, sample_names=sample_names), indent=2) + "\n"
+        )
+        con.execute(parquet_copy_sql(partial) if parquet else biom_copy_sql(partial))
         partial.replace(output)
+        try:
+            sidecar_partial.replace(sidecar)
+        except OSError:
+            output.unlink(missing_ok=True)
+            raise
     finally:
         partial.unlink(missing_ok=True)
+        sidecar_partial.unlink(missing_ok=True)
     return len(rows)
 
 
@@ -301,6 +385,8 @@ def _handle_mask_syndna_read_count(
             study_idx=args.study_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
             prep_sample_idx=args.prep_sample_idx,
+            include_deprecated=args.include_deprecated,
+            as_of_event=args.as_of_event,
         )
         samples = syndna_sample_names(response, prefix_pool=args.prefix_pool)
         with contextlib.closing(connect_with_miint()) as con:
@@ -341,6 +427,23 @@ def _handle_mask_syndna_read_count(
         return 1
     print(
         f"wrote {len(samples)} sample(s) x {len(features)} insert(s) to {args.output}"
-        f" ({args.format})"
+        f" ({args.format}), and its sample metadata to {syndna_sidecar_path(args.output)}"
     )
+    if response.deprecated:
+        _common.print_deprecated_read("mask", response.mask_idx, response.deprecation_reason)
+    print_left_out(response)
     return 0
+
+
+def print_left_out(response: SyndnaReadCountResponse) -> None:
+    """List on stderr each selected prep_sample the table leaves out, and why."""
+    if not response.left_out:
+        return
+    scope = "" if response.deprecated else "'s group"
+    print(
+        f"left out {len(response.left_out)} prep_sample(s) not processed in mask"
+        f" {response.mask_idx}{scope}:",
+        file=sys.stderr,
+    )
+    for r in response.left_out:
+        print(f"  {r.describe()}", file=sys.stderr)

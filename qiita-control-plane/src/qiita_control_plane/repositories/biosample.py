@@ -11,10 +11,9 @@ stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import BiosampleAccessionField, FieldDataType, Tier
+from qiita_common.models import BiosampleLookupKey, FieldDataType, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
@@ -292,14 +291,6 @@ async def fetch_biosample_idxs_for_study(
     )
     return [r["biosample_idx"] for r in rows]
 
-
-# The natural keys a biosample lookup may key on: the two wire-facing accession
-# columns, matrix_tube_id, and export_entity_id. Deriving from
-# BiosampleAccessionField keeps the accession set defined once, in
-# qiita_common.models.
-BiosampleLookupKey = Literal[
-    *get_args(BiosampleAccessionField), "matrix_tube_id", "export_entity_id"
-]
 
 # Each lookup key's (column expression, join) over `qiita.biosample`. Only text from
 # this closed mapping reaches the SQL, since identifiers cannot be bound.
@@ -603,3 +594,18 @@ async def import_biosample_from_owner_biosample_id(
         owner_id_biosample_study_field_created=field_created,
         deferred_metadata=deferred,
     )
+
+
+async def fetch_biosample_handles(
+    conn: asyncpg.Pool | asyncpg.Connection, prep_sample_idxs: Sequence[int]
+) -> dict[int, tuple[str | None, str | None]]:
+    """Each prep_sample's biosample accession and the biosample's `export_entity_id`
+    (`QB<n>`), each None when there is none, keyed by prep_sample_idx."""
+    rows = await conn.fetch(
+        "SELECT ps.idx AS prep_sample_idx, bs.biosample_accession, ee.export_entity_id"
+        "  FROM qiita.prep_sample ps JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx"
+        " WHERE ps.idx = ANY($1::bigint[])",
+        list(prep_sample_idxs),
+    )
+    return {r["prep_sample_idx"]: (r["biosample_accession"], r["export_entity_id"]) for r in rows}

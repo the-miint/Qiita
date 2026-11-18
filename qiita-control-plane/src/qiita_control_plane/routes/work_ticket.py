@@ -28,6 +28,9 @@ access to).
 | FAILED        | Reset → PENDING and dispatch (manual restart)     |
 | CANCELLED     | Reset → PENDING and dispatch (redrive after fix)  |
 
+The caller must be the originator or wet_lab_admin+ (else 404), and must pass the submit
+gates for the stored ticket.
+
 A download-ena-study redrive re-runs every step against the live roster. It is
 refused (409) when a newer download ticket exists for the pool, and when a FAILED
 ticket still has a live job holding the old roster.
@@ -114,11 +117,16 @@ from ..repositories.block import BLOCK_ABANDONED
 from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import (
+    ReapPending,
+    drop_dead_step_rows,
+    reset_ticket_to_pending,
+    sees_reap_note,
+)
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
 from ..work_ticket_submit import (
     _reset_failed_reference_scope_for_dispatch,
-    authorize_redrive_action,
+    authorize_redrive,
     require_compute_backend_client_dependency,
     submit_work_ticket_core,
 )
@@ -176,8 +184,9 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
     (`sequenced_pool`-scoped, e.g. bcl-convert) or its prep_sample's
     (`prep_sample`-scoped, e.g. read-mask) — COALESCE bridges both so a
     `sequenced_pool_idx` / `sequencing_run_idx` narrowing covers either shape. Only
-    non-terminal tickets: the filter targets in-flight work (cancelling a terminal
-    ticket is a no-op), whereas an explicit idx is reaped regardless."""
+    non-terminal tickets: the filter targets in-flight work, so a failed ticket is
+    cancelled only when named by idx, and an explicit idx is reaped whatever its
+    state."""
     rows = await pool.fetch(
         "SELECT DISTINCT wt.work_ticket_idx"
         " FROM qiita.work_ticket wt"
@@ -229,7 +238,7 @@ _WORK_TICKET_COLUMNS = (
     " sp.sequencing_run_idx, wt.shard_id, wt.mask_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
-    " wt.transient_reason, wt.transient_since,"
+    " wt.transient_reason, wt.transient_since, wt.reap_pending_since, wt.reap_note,"
     " wt.on_success, wt.follow_on_work_ticket_idx, wt.follow_on_error,"
     " wt.created_at, wt.updated_at"
 )
@@ -343,6 +352,13 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     sequenced_pool row — selected upstream so the assembly stays a pure
     transformation."""
     return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
+
+
+def visible_reap_note(ticket: WorkTicket, principal: Principal) -> WorkTicket:
+    """`ticket` with `reap_note` cleared unless `sees_reap_note(principal)`."""
+    if ticket.reap_note is None or sees_reap_note(principal):
+        return ticket
+    return ticket.model_copy(update={"reap_note": None})
 
 
 async def fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> WorkTicket | None:
@@ -543,6 +559,31 @@ async def pump_fanout_cohort(
     return await _pump_and_report(request, await _resolve_cohort(request, kind, key))
 
 
+async def _fetch_visible_work_ticket(
+    pool: asyncpg.Pool, principal: Principal, work_ticket_idx: int
+) -> tuple[WorkTicket, asyncpg.Record]:
+    """The ticket and its row (with `resource_override`) for its originator or a
+    wet_lab_admin+; 404 for anyone else, as for a missing idx."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    row = await pool.fetchrow(
+        f"SELECT {_WORK_TICKET_COLUMNS}, wt.resource_override{_WORK_TICKET_FROM}"
+        " WHERE wt.work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if row is None or not (
+        row["originator_principal_idx"] == principal.principal_idx
+        or principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"work_ticket {work_ticket_idx} not found",
+        )
+    return _row_to_work_ticket(row), row
+
+
 @router.get(
     PATH_WORK_TICKET_BY_IDX,
     response_model=WorkTicket,
@@ -564,22 +605,8 @@ async def get_work_ticket(
     caller cannot probe work_ticket_idx values to learn which tickets
     exist. Mirrors the enumeration-safe 404 the auth-token routes use
     (see docs/auth.md)."""
-    if isinstance(principal, Anonymous):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
-        )
-    not_found = HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=f"work_ticket {work_ticket_idx} not found",
-    )
-    ticket = await fetch_work_ticket(pool, work_ticket_idx)
-    if ticket is None:
-        raise not_found
-    is_originator = ticket.originator_principal_idx == principal.principal_idx
-    is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
-    if not (is_originator or is_bypass):
-        raise not_found
-    return ticket
+    ticket, _ = await _fetch_visible_work_ticket(pool, principal, work_ticket_idx)
+    return visible_reap_note(ticket, principal)
 
 
 @router.get(
@@ -726,7 +753,7 @@ async def list_work_tickets(
     )
     rows, truncated = cap_rows(rows, limit)
     return WorkTicketListResponse(
-        tickets=[_row_to_work_ticket_summary(row) for row in rows],
+        tickets=[visible_reap_note(_row_to_work_ticket_summary(row), principal) for row in rows],
         count=len(rows),
         truncated=truncated,
     )
@@ -866,8 +893,8 @@ async def _refuse_unsafe_download_redrive(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"work_ticket {work_ticket_idx} still has a live download job that may hold "
-                "an outdated run roster; cancel it by idx (work_ticket_idxs) to reap the job, "
-                "then re-import the study; the ticket stays FAILED"
+                "an outdated run roster; cancel it by idx (work_ticket_idxs), which reaps the "
+                "job and sets the ticket cancelled, then run it again or re-import the study"
             ),
         )
 
@@ -887,26 +914,7 @@ async def run_work_ticket(
     """Operator override — restart a FAILED ticket or resume a PENDING
     one whose original create-time dispatch was lost. State-aware (see
     table at module top)."""
-    row = await pool.fetchrow(
-        "SELECT action_id, action_version, state, scope_target_kind, reference_idx,"
-        "       sequenced_pool_idx"
-        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        work_ticket_idx,
-    )
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"work_ticket {work_ticket_idx} not found",
-        )
-
-    # Submission tells a missing action (404) from a disabled one (410); a
-    # redrive answers both with 409.
-    disabled = (
-        f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive"
-    )
-    if not await authorize_redrive_action(pool, principal, row["action_id"], row["action_version"]):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
-
+    ticket, row = await _fetch_visible_work_ticket(pool, principal, work_ticket_idx)
     current_state = row["state"]
     if current_state in _RUN_NOT_APPLICABLE_STATES:
         raise HTTPException(
@@ -916,6 +924,16 @@ async def run_work_ticket(
                 "current_state": current_state,
             },
         )
+
+    # Submission tells a missing action (404) from a disabled one (410); a
+    # redrive answers both with 409.
+    disabled = (
+        f"action {ticket.action_id!r}/{ticket.action_version!r} no longer enabled — cannot redrive"
+    )
+    if not await authorize_redrive(
+        pool, request.app.state.settings, principal, ticket, row["resource_override"]
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=disabled)
 
     if current_state in REDRIVABLE_WORK_TICKET_STATES:
         # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets
@@ -996,9 +1014,19 @@ async def run_work_ticket(
                     sequenced_pool_idx=row["sequenced_pool_idx"],
                     current_state=current_state,
                 )
-            if not await reset_ticket_to_pending(
-                conn, work_ticket_idx=work_ticket_idx, from_state=current_state
-            ):
+            try:
+                reset = await reset_ticket_to_pending(
+                    conn, work_ticket_idx=work_ticket_idx, from_state=current_state
+                )
+            except ReapPending as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "reason": exc.REASON,
+                        "detail": exc.message(with_note=sees_reap_note(principal)),
+                    },
+                ) from exc
+            if not reset:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=_RUN_STATE_CHANGED,
@@ -1069,17 +1097,21 @@ async def cancel_work_tickets(
     _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
     _: None = Depends(require_compute_backend_client_dependency),
 ) -> WorkTicketCancelResponse:
-    """Operator-cancel of in-flight compute (system_admin, `work_ticket:cancel`):
-    for each selected ticket, flip it terminal (`cancelled`) so the runner's poll
-    loop aborts and no new attempt is submitted, THEN scancel its SLURM job(s) — the
+    """Operator-cancel of in-flight or failed work (system_admin, `work_ticket:cancel`):
+    for each selected ticket, flip it to `cancelled` so the runner's poll loop aborts
+    and no new attempt is submitted, THEN scancel its SLURM job(s) — the
     terminal-first ordering that avoids re-submitting the job we just reaped.
+    `work_ticket_cancel.CANCELLABLE_WORK_TICKET_STATES` names the states that flip.
 
     Selection is the explicit `work_ticket_idxs` (reaped regardless of state — a
-    defensive orphan-reap) UNION the `action_id` (+ optional run/pool) filter
-    matches (non-terminal only). Idempotent per ticket: an already-terminal ticket
-    is not re-flipped (`cancelled=False`) but its jobs are still reaped. A missing
-    explicit idx comes back `not_found`; a reap that fails after the flip lands
-    comes back with `reap_error` (the flip stands — re-run cancel to retry)."""
+    defensive orphan-reap; a failed one is flipped too) UNION the `action_id`
+    (+ optional run/pool) filter matches (non-terminal only, so the filter never
+    cancels a failed ticket). Idempotent per ticket: a ticket whose state is not in
+    `CANCELLABLE_WORK_TICKET_STATES` is not flipped (`cancelled=False`) but its jobs
+    are still reaped. A missing explicit idx comes back `not_found`; a reap that fails after
+    the flip lands comes back with `reap_error` (the flip stands — re-run cancel to
+    retry) and is recorded on the ticket, where it blocks a redrive
+    (`ticket_redrive.ReapPending`) until a reap succeeds."""
     backend_client = request.app.state.compute_backend_client
     # Explicit idxs first (stable, deduped), then filter matches not already listed.
     selected = list(dict.fromkeys(body.work_ticket_idxs))

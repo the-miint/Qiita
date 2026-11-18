@@ -28,8 +28,10 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models._base import (
+    MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
+    NaturalKeyLookupResponse,
     NonBlankText,
     PatchRequestModel,
     PrepSampleCohort,
@@ -40,6 +42,14 @@ from qiita_common.models.biosample import (
     MetadataChecklistRef,
     MetadataEntry,
 )
+from qiita_common.models.definition_group import (
+    DecisionProvenance,
+    DecisionSetToken,
+    SampleResolution,
+    SampleResolutionReason,
+    SampleResolutionState,
+)
+from qiita_common.models.output_equivalence import DefinitionKind
 from qiita_common.models.reference import Platform
 from qiita_common.models.step import ProjectionColumns
 from qiita_common.models.work_ticket import WorkTicketState
@@ -106,27 +116,17 @@ class SequencingRunResponse(BaseModel):
 # same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionRequest
 class SequencingRunLookupByInstrumentRunIdRequest(BaseModel):
     """Resolves a list of instrument_run_id values to sequencing_run idxs in
-    one round trip. Body-shaped (not query-params) so a long id list cannot
-    exceed nginx's default URL-line cap.
+    one round trip.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     instrument_run_ids: list[Annotated[str, Field(min_length=1)]] = Field(
-        min_length=1, max_length=10_000
+        min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES
     )
 
 
-# same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionResponse
-class SequencingRunLookupByInstrumentRunIdResponse(BaseModel):
-    """`resolved` maps each found instrument_run_id to its sequencing_run_idx.
-    `missing` lists ids that did not resolve, in input order (deduped).
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
-    missing: list[str]
+SequencingRunLookupByInstrumentRunIdResponse = NaturalKeyLookupResponse
 
 
 class SequencedPoolCreateRequest(BaseModel):
@@ -1173,9 +1173,14 @@ class SyndnaInsert(BaseModel):
 
 class SyndnaReadCountSample(BaseModel):
     """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
-    order. `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
+    order. `mask_idx` is the member of the named mask's group that the prep_sample
+    resolved to, whose counts these are, and `mask_export_processing_id` is that mask's
+    public handle (`QP<n>`, `qiita.exported_processing`), which the written table cites.
+    `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
+    mask_export_processing_id: Annotated[str, Field(min_length=1)]
     biosample_accession: str | None = None
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
     read_counts: list[Annotated[int, Field(ge=0)]]
@@ -1184,15 +1189,33 @@ class SyndnaReadCountSample(BaseModel):
 class SyndnaReadCountResponse(BaseModel):
     """Returned by GET /api/v1/mask-definition/{mask_idx}/syndna-read-count.
 
-    Every selected prep_sample is 'completed' under the mask and counted; the route
-    refuses rather than returning a partial table. The counts are reads with a
-    mapped primary alignment to each insert, ungated (see qiita.syndna_read_count).
+    `mask_idx` is the mask the caller named; each selected prep_sample is resolved
+    across that mask's group (`SampleResolution`). `samples` holds the ones
+    `processed`, with their counts under the member that each resolved to; every
+    such member shares `reference_idx`. `left_out` holds the selected
+    prep_samples that are `incomplete` or `not_processed`, with the reason, ascending
+    by prep_sample_idx. The counts are reads with a mapped primary alignment to each
+    insert, ungated (see qiita.syndna_read_count).
+
+    `left_out_biosample_accession` maps each `left_out` prep_sample to its biosample
+    accession (None when it has none), so a written table can record what it left
+    out without our identifiers.
+
+    `deprecated` is true for a read of a deprecated mask under `include_deprecated`:
+    each prep_sample was then resolved to that mask alone (`definition_resolver`,
+    exact mode), and `deprecation_reason` is the mask's.
     """
 
     mask_idx: Annotated[int, Field(gt=0)]
     reference_idx: Annotated[int, Field(gt=0)]
     inserts: list[SyndnaInsert]
     samples: list[SyndnaReadCountSample]
+    left_out: list[SampleResolution] = []
+    left_out_biosample_accession: dict[int, str | None] = {}
+    deprecated: bool = False
+    deprecation_reason: str | None = None
+    # The output-equivalence verdicts the selection was resolved under (`DecisionProvenance`).
+    decisions: DecisionProvenance | None = None
 
     @model_validator(mode="after")
     def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
@@ -1203,6 +1226,11 @@ class SyndnaReadCountResponse(BaseModel):
                     f"prep_sample {sample.prep_sample_idx} carries"
                     f" {len(sample.read_counts)} counts for {width} inserts"
                 )
+        left_out = {r.prep_sample_idx for r in self.left_out}
+        if left_out != set(self.left_out_biosample_accession):
+            raise ValueError(
+                "left_out_biosample_accession must name exactly the left_out prep_samples"
+            )
         return self
 
 
@@ -1541,6 +1569,23 @@ class PoolAlignmentList(BaseModel):
     alignments: list[PoolAlignmentSummary]
 
 
+class PoolAlignmentCohortLeftOut(BaseModel):
+    """A readable prep_sample that a listing reading past deprecation leaves out. An
+    exact read of a deprecated alignment (`include_deprecated`) leaves out every
+    prep_sample it does not resolve `processed`, except one with no run under the
+    alignment or (de novo) whose assembly produced no contigs; a read of an active
+    alignment past a deprecated upstream (`include_deprecated_upstream`) leaves out a
+    prep_sample whose upstream run is withdrawn. Both rules are stated at
+    `definition_resolver.NO_RUN_TO_READ`. `biosample_export_entity_id` is the
+    biosample's `QB<n>`, which names it when it has no accession."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    biosample_export_entity_id: str | None = None
+    state: SampleResolutionState
+    reason: SampleResolutionReason
+
+
 class PoolAlignmentCohort(BaseModel):
     """Returned by GET .../sequenced-pool/{pool}/alignment/{alignment_idx}/cohort.
 
@@ -1559,6 +1604,10 @@ class PoolAlignmentCohort(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: list[Annotated[int, Field(gt=0)]]
+    # Under `include_deprecated` (a deprecated alignment) or `include_deprecated_upstream`
+    # (an active alignment past a deprecated upstream) only: the readable prep_samples
+    # the read leaves out of the cohort (`PoolAlignmentCohortLeftOut`).
+    left_out: list[PoolAlignmentCohortLeftOut] = []
 
 
 class ReadMaskedDoGetTicketRequest(BaseModel):
@@ -1583,33 +1632,39 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
 
 
 class MaskedReadExportSample(BaseModel):
-    """One sample in a sequenced_pool's masked-read export manifest.
+    """One prep_sample in a sequenced_pool's masked-read export manifest.
 
     `biosample_accession` is None until the biosample is submitted to NCBI. The
-    per-sample output filename
+    per-prep_sample output filename
     `<biosample_accession>.<sequencing_run_idx>.<sequenced_pool_idx>.<prep_sample_idx>`
-    requires it, so the export refuses a sample whose accession is still None —
-    the manifest surfaces the None rather than silently dropping the sample, and
+    requires it, so the export refuses a prep_sample whose accession is still None —
+    the manifest surfaces the None rather than silently dropping the prep_sample, and
     the export route/CLI fails loudly on it. The pool-wide
     `sequencing_run_idx`/`sequenced_pool_idx` live on the manifest, not repeated
     per row.
 
-    `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
-    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
-    exists. Only `'completed'` is exportable: `None` means "not masked-complete
-    under this mask", NOT exempt, so the ticket route 409s it the same as
-    `'pending'`. The CLI reads it to fail the whole export up front (before minting
-    any per-sample ticket) when a sample is not `'completed'`, rather than abort the
-    download loop mid-run on the ticket route's 409 and leave a partial output set.
+    `resolution` is the prep_sample's resolution across the manifest's mask group.
+    Only a `processed` prep_sample is exported, from `resolution.definition_idx`; the
+    others are listed with their reason.
 
-    This roster LEFT JOINs the gate table alone, so a sample whose per-sample mask
-    has not completed comes back `None` rather than showing why. `MaskPrepSample`
-    is the mask-side roster that also reads the ticket.
+    `mask_state` is the prep_sample's completion gate under the manifest's own `mask_idx`
+    (`qiita.mask_sample.state`, see `MaskSampleState`), or `None` when no gate row
+    exists there. It says nothing about the other members of the group.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
     mask_state: MaskSampleState | None = None
+    resolution: SampleResolution
+
+    @model_validator(mode="after")
+    def _resolution_is_this_mask_sample(self) -> MaskedReadExportSample:
+        if (
+            self.resolution.prep_sample_idx != self.prep_sample_idx
+            or self.resolution.definition_kind is not DefinitionKind.MASK
+        ):
+            raise ValueError("resolution must be this prep_sample's, across a mask group")
+        return self
 
 
 class ExportedIdentifierRequest(BaseModel):
@@ -1619,7 +1674,7 @@ class ExportedIdentifierRequest(BaseModel):
     ``alignment_idx`` names the processing; together with each ``prep_sample_idx``
     it identifies one processed sample, which is what an ``export_id`` stands for.
     The pair is the request's shape rather than the URL's because the cohort has to
-    ride a body: it is a pool's or a study's worth of samples, past nginx's 8 KB
+    ride a body: it is a pool's or a study's worth of prep_samples, past nginx's 8 KB
     request-line cap in query params, and it routinely SPANS pools.
 
     ``PrepSampleCohort`` is shared with the alignment ticket mint, cap included:
@@ -1633,6 +1688,10 @@ class ExportedIdentifierRequest(BaseModel):
 
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
+    include_deprecated: bool = False
+    # Admits an active alignment whose upstream is deprecated, as on the cohort DoGet.
+    include_deprecated_upstream: bool = False
 
 
 class ExportedIdentifier(BaseModel):
@@ -1698,6 +1757,10 @@ class ExportedProcessingRequest(BaseModel):
 
     alignment_idx: Annotated[int, Field(gt=0)]
     prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated alignment (refused without it), as on the cohort DoGet.
+    include_deprecated: bool = False
+    # Admits an active alignment whose upstream is deprecated, as on the cohort DoGet.
+    include_deprecated_upstream: bool = False
 
 
 class ExportedProcessingResponse(BaseModel):
@@ -1717,20 +1780,81 @@ class ExportedProcessingResponse(BaseModel):
     export_processing_id: str
 
 
+class ExportedMaskProcessingRequest(BaseModel):
+    """Body for POST /api/v1/exported-processing/mask — mint (or recover) the public
+    handle for a mask, so a masked-read export can cite which mask produced each file
+    without carrying ``mask_idx``. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    # Admits a deprecated mask (refused without it), as on the masked-read export.
+    include_deprecated: bool = False
+
+
+class ExportedMaskProcessingResponse(BaseModel):
+    """Returned by POST /api/v1/exported-processing/mask.
+
+    ``export_processing_id`` (``QP<idx>``) shares its namespace with the alignment
+    kind's handles. ``mask_idx`` is echoed back from the request and goes in this
+    response only, never in the exported files.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    export_processing_id: str
+
+
+class ExportedMaskIdentifierRequest(BaseModel):
+    """Body for POST /api/v1/exported-identifier/mask — mint (or recover) the public
+    handle for each prep_sample masked under ``mask_idx``. Each
+    ``(mask_idx, prep_sample_idx)`` is one processed prep_sample, which is what an
+    ``export_id`` stands for. system_admin + admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: PrepSampleCohort
+    # Admits a deprecated mask (refused without it), as on the masked-read export.
+    include_deprecated: bool = False
+
+
+class ExportedMaskIdentifierResponse(BaseModel):
+    """Returned by POST /api/v1/exported-identifier/mask: one entry per distinct
+    requested prep_sample, ascending by prep_sample_idx. Every requested prep_sample is
+    present or the request failed.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    identifiers: list[ExportedIdentifier]
+    count: Annotated[int, Field(ge=0)]
+
+
 class MaskedReadExportManifest(BaseModel):
     """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
 
-    The roster of a sequenced_pool's non-retired samples to export under a given
-    `mask_idx`, with each sample's filename parts. The caller then mints a
-    per-sample DoGet ticket (POST /admin/masked-read-export/ticket) and streams
-    each sample's read_masked rows from the data plane, writing parquet/fastq
-    locally. system_admin + admin:masked_read_export only.
+    The roster of a sequenced_pool's non-retired prep_samples, each resolved across
+    the group of masks that `mask_idx` belongs to (`group`, ascending), with each
+    prep_sample's filename parts. The caller then mints a per-prep_sample DoGet ticket
+    (POST /admin/masked-read-export/ticket) under each processed prep_sample's
+    `resolution.definition_idx` and streams its read_masked rows from the data plane,
+    writing parquet/fastq locally. system_admin + admin:masked_read_export only.
+
+    `deprecated` is true for a deprecated mask read under `include_deprecated`:
+    `group` is then the mask alone and each prep_sample is resolved to it exactly
+    (`definition_resolver`, exact mode); `deprecation_reason` is the mask's.
     """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    group: list[Annotated[int, Field(gt=0)]]
     samples: list[MaskedReadExportSample]
+    deprecated: bool = False
+    deprecation_reason: str | None = None
+    # The output-equivalence verdicts the roster was resolved under.
+    decisions: DecisionProvenance | None = None
 
 
 class MaskedReadExportTicketRequest(BaseModel):
@@ -1748,3 +1872,9 @@ class MaskedReadExportTicketRequest(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+    # A deprecated mask is refused unless set; then the prep_sample must resolve to
+    # it exactly (`definition_resolver`, exact mode).
+    include_deprecated: bool = False
+    # Resolve the mask's group under this earlier decision set
+    # (`DecisionProvenance.decision_set`); only the output-equivalence verdicts are as of it.
+    as_of_event: DecisionSetToken | None = None

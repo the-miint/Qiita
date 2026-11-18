@@ -7,6 +7,7 @@ delegating multi-table work to the biosample composer.
 import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
+from functools import partial
 from typing import Annotated
 
 import asyncpg
@@ -18,9 +19,11 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
     PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    PATH_BIOSAMPLE_FIELD_EXCEPTION,
     PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX,
     PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
+    PATH_BIOSAMPLE_LOOKUP,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
@@ -34,6 +37,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
 )
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
@@ -41,9 +45,8 @@ from qiita_common.models import (
     BiosampleImportRequest,
     BiosampleImportResponse,
     BiosampleLookupByAccessionRequest,
-    BiosampleLookupByAccessionResponse,
     BiosampleLookupByMatrixTubeIdRequest,
-    BiosampleLookupByMatrixTubeIdResponse,
+    BiosampleLookupRequest,
     BiosampleMetadataWriteByUniqueFieldResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
@@ -53,9 +56,12 @@ from qiita_common.models import (
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
+    NaturalKeyLookupResponse,
     RosterResolveFailure,
     RosterResolveRequest,
     RosterResolveResponse,
+    SampleFieldExceptionPutRequest,
+    SampleFieldExceptionResponse,
     SampleMetadataWriteByUniqueFieldRequest,
     SampleMetadataWriteRequest,
     SampleMetadataWriteResponse,
@@ -102,7 +108,6 @@ from ..repositories._sample_helpers import (
     write_resolved_metadata_entries,
 )
 from ..repositories.biosample import (
-    BiosampleLookupKey,
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
@@ -118,11 +123,14 @@ from ..repositories.biosample_metadata import (
 from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
 from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
+from ._field_exception import (
+    delete_field_exception_or_raise,
+    put_and_map_field_exception,
+    read_and_map_field_exception,
+)
 from ._helpers import (
-    ETAG_HEADER,
     GENERIC_CHECK_VIOLATION,
     GENERIC_FK_VIOLATION,
-    IF_MATCH_HEADER,
     SAMPLE_METADATA_WRITE_ERRORS,
     SAMPLE_STUDIES_HARD_CAP,
     build_idxs_list_response,
@@ -1142,6 +1150,125 @@ async def patch_biosample_metadata(
     return written
 
 
+# same-pattern-ok: cross-entity twins of the sequenced_sample field-exception routes.
+# The decorators, path, scopes, spec and entity binding are the whole per-entity
+# declaration; the contract lives in the shared helpers they call.
+@router.get(PATH_BIOSAMPLE_FIELD_EXCEPTION)
+async def get_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    response: Response,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> SampleFieldExceptionResponse:
+    """Read the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role;
+    read_and_map_field_exception carries the rest of the contract. The response
+    carries the `ETag` that a replace or clear sends as If-Match.
+    """
+    async with pool.acquire() as conn:
+        exception, etag = await read_and_map_field_exception(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
+    response.headers[ETAG_HEADER] = etag
+    return exception
+
+
+@router.put(PATH_BIOSAMPLE_FIELD_EXCEPTION)
+async def put_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    body: SampleFieldExceptionPutRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> SampleFieldExceptionResponse:
+    """Set the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role. 201 when it
+    creates the exception, 200 when it replaces one; put_and_map_field_exception
+    carries the rest of the contract, including when If-Match is needed. The
+    response carries the new `ETag`.
+    """
+    async with tx() as conn:
+        exception, etag, created = await put_and_map_field_exception(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            body=body,
+            if_match=if_match,
+            caller_idx=user.principal_idx,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
+    response.status_code = 201 if created else 200
+    response.headers[ETAG_HEADER] = etag
+    return exception
+
+
+@router.delete(PATH_BIOSAMPLE_FIELD_EXCEPTION, status_code=204)
+async def delete_biosample_field_exception(
+    study_idx: Annotated[int, Field(gt=0)],
+    biosample_idx: Annotated[int, Field(gt=0)],
+    study_field_idx: Annotated[int, Field(gt=0)],
+    if_match: Annotated[str | None, Header(alias=IF_MATCH_HEADER)] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> None:
+    """Clear the field exception on this biosample's value of one of
+    the study's fields.
+
+    Requires Tier.ADMIN on the study, or a wet_lab_admin+ role, and If-Match;
+    delete_field_exception_or_raise carries the rest of the contract.
+    """
+    async with tx() as conn:
+        await delete_field_exception_or_raise(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            fetch_row=fetch_biosample,
+            entity_idx=biosample_idx,
+            metadata_idx_column="idx",
+            study_idx=study_idx,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            study_field_idx=study_field_idx,
+            if_match=if_match,
+            tiers=await caller_metadata_tiers(conn, user),
+        )
+
+
 def _biosample_core_row_dict(
     row: asyncpg.Record, *, metadata_last_change: datetime | None
 ) -> dict[str, object]:
@@ -1342,74 +1469,66 @@ async def get_biosample(
     )
 
 
-def _biosample_natural_key_fetcher(
-    pool: asyncpg.Pool, key: BiosampleLookupKey
-) -> Callable[[list[str]], Awaitable[dict[str, int]]]:
-    """Return a single-argument awaitable that resolves a list of
-    natural-key values to a `{value: biosample_idx}` map."""
-    return lambda values: fetch_biosample_idxs_by_natural_key(pool, key=key, values=values)
+@biosample_router.post(PATH_BIOSAMPLE_LOOKUP)
+async def lookup_biosample(
+    body: BiosampleLookupRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+) -> NaturalKeyLookupResponse:
+    """Resolve a list of values of the natural key named by `body.key` to
+    biosample_idx.
+
+    Auth: HumanUser with Scope.BIOSAMPLE_READ. No per-row access predicate
+    runs — the response carries only the (value, idx) mapping with no
+    biosample columns, so a caller who sees the idx still cannot read the
+    row without satisfying GET /biosample/{idx}'s tier+access checks.
+
+    Retired biosamples are excluded from `resolved` (and therefore listed
+    in `missing`).
+    """
+    # `user` is resolved only to require a human caller; no per-caller filter
+    # runs here (see auth docstring).
+    _ = user
+    lookup_response = await resolve_idxs_by_natural_key(
+        values=body.values,
+        fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.key),
+    )
+    return lookup_response
 
 
-@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION)
+@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION, deprecated=True)
 async def lookup_biosample_by_accession(
     body: BiosampleLookupByAccessionRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
-) -> BiosampleLookupByAccessionResponse:
-    """Resolve a list of biosample accession values to biosample_idx, keyed
-    on the column named by `body.accession_field` (default
-    biosample_accession).
-
-    POST (not GET) because a typical bcl-convert pool carries up to 384
-    accessions; threaded through query-params that would exceed nginx's
-    default 8 KB request-line cap. Body has no such cap.
-
-    Auth: HumanUser with Scope.BIOSAMPLE_READ. No per-row access predicate
-    runs — the response carries only the (accession, idx) mapping with no
-    biosample columns, so a caller who sees the idx still cannot read the
-    row without satisfying GET /biosample/{idx}'s tier+access checks.
-    This keeps the bcl-convert flow from needing wet_lab_admin+ for a
-    pool whose samples span studies the caller isn't a member of.
-
-    Retired biosamples are excluded from `resolved` (and therefore listed
-    in `missing`) because the find-or-create chain the CLI uses afterwards
-    would refuse to FK a fresh prep_sample to a retired biosample.
-
-    Input deduplication: accessions appearing twice in the request are
-    deduped before the SQL fetch; `missing` echoes back the input-order
-    deduped list of accessions that did not resolve.
-    """
-    # _user is read only to keep the dependency chain explicit — no
-    # per-caller filter runs here (see auth docstring).
+) -> NaturalKeyLookupResponse:
+    """Deprecated in favor of POST /biosample/lookup: the same resolution,
+    keyed on the accession column named by `body.accession_field` (default
+    biosample_accession)."""
     _ = user
-    resolved, missing = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=_biosample_natural_key_fetcher(pool, body.accession_field),
+        fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.accession_field),
     )
-    return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
+    return lookup_response
 
 
-@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID)
+@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID, deprecated=True)
 async def lookup_biosample_by_matrix_tube_id(
     body: BiosampleLookupByMatrixTubeIdRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
-) -> BiosampleLookupByMatrixTubeIdResponse:
-    """Resolve a list of matrix_tube_id values to biosample_idx.
-
-    Mirrors the accession variant in every way except the keyed column.
-    Auth, access-predicate-skip rationale, retired-row exclusion, and
-    input-dedup behavior are identical; see lookup_biosample_by_accession
-    for the full rationale.
-    """
+) -> NaturalKeyLookupResponse:
+    """Deprecated in favor of POST /biosample/lookup with key matrix_tube_id."""
     _ = user
-    resolved, missing = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_idxs_by_natural_key(
         values=body.matrix_tube_ids,
-        fetcher=_biosample_natural_key_fetcher(pool, "matrix_tube_id"),
+        fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key="matrix_tube_id"),
     )
-    return BiosampleLookupByMatrixTubeIdResponse(resolved=resolved, missing=missing)
+    return lookup_response
 
 
 @biosample_router.post(

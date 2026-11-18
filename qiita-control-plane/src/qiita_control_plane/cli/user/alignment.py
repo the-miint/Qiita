@@ -6,9 +6,10 @@ were run over their pool and which of the pool's samples they may build a table
 from. Both are one GET printed verbatim, so a new server-side field reaches the
 user without a CLI change.
 
-Both routes scope their answer to what the CALLER may read, which is what makes
-them agree with the ticket mint: an alignment no sample of which is readable is
-absent from the list entirely, and the cohort is a valid mint body by construction.
+Both routes scope their answer to what the CALLER may read, as the ticket mint
+does: an alignment none of whose prep_samples is readable is absent from the list,
+and a cohort never 403s at the mint (the mint can still 409 a prep_sample that
+resolves to another alignment of the group).
 
 `_alignment_reference_idx` is the one piece of interpretation here, and it belongs
 beside the response whose shape it reads.
@@ -44,10 +45,16 @@ def _fetch_alignment_cohort(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
     alignment_idx: int,
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
 ) -> dict:
-    """GET the pool's samples that are BOTH readable by the caller and completed for
-    this alignment — a valid mint body by construction, sorted so the same pool always
-    produces the same request bytes.
+    """GET the pool's prep_samples that are BOTH readable by the caller and completed
+    for this alignment, sorted so the same pool always produces the same request
+    bytes. A deprecated alignment's cohort is listed only with `include_deprecated`,
+    and an active alignment's on a deprecated upstream only with
+    `include_deprecated_upstream`; `as_of_event` is the decision set its read past a
+    deprecated upstream groups under.
 
     The whole body, not just its sample list: printed on its own a bare list says
     nothing about which alignment it belongs to.
@@ -57,7 +64,17 @@ def _fetch_alignment_cohort(
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
     )
-    return _common.call("GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}")
+    params = (
+        _common.optional_query_params(
+            include_deprecated=include_deprecated,
+            include_deprecated_upstream=include_deprecated_upstream,
+            as_of_event=as_of_event,
+        )
+        or None
+    )
+    return _common.call(
+        "GET", base_url, token, f"{PATH_SEQUENCING_RUN_PREFIX}{sub_path}", params=params
+    )
 
 
 def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:
@@ -147,10 +164,10 @@ def _handle_alignment_list(args: argparse.Namespace, parser: argparse.ArgumentPa
 
 
 def _handle_alignment_cohort(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Print the cohort a table would be built over. `feature-table build` resolves the
-    same list itself when no `--prep-sample-idx` is given; this verb is for seeing it
-    first, since the cohort is what coverage is measured over and therefore part of the
-    scientific question."""
+    """Print the cohort a table would be built over. `feature-table build` reads the
+    same list itself, for each alignment of `--alignment-idx`'s similarity group, when no
+    `--prep-sample-idx` is given; this verb is for seeing it first, since the cohort is
+    what coverage is measured over and therefore part of the scientific question."""
     return _common.run_http_subcommand(
         lambda t: _fetch_alignment_cohort(
             args.base_url,

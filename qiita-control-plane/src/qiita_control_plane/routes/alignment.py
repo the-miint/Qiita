@@ -48,7 +48,9 @@ from qiita_common.models import (
     AlignmentRerunBlockResponse,
     AlignmentSampleStatusUpdate,
     AlignmentSampleStatusUpdateResponse,
+    DefinitionKind,
     DoGetTicketResponse,
+    SampleResolution,
 )
 
 from ..actions.align_abandon import AlignPlanInFlight, AlignPlanRearmed, abandon_align_plan
@@ -67,6 +69,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..auth.tickets import sign_ticket
+from ..definition_resolver import cohort_refusal, resolve_exact, resolve_group
+from ..definition_similarity import (
+    DefinitionNotFound,
+    EquivalenceRefused,
+    refuse_deprecating_with_joining_equivalences,
+)
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -94,11 +102,21 @@ from ..repositories.assembly import classify_denovo_arm_cohort
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.processing import fetch_processing_by_idx
 from ..runner import _fetch_action
+from ..ticket_redrive import sees_reap_note
 from ..work_ticket_submit import (
     authorize_redrive_action,
     require_compute_backend_client_dependency,
 )
-from ._helpers import ALIGNMENT_NOT_FOUND_DETAIL, authorize_completed_alignment_cohort, first_few
+from ._helpers import (
+    ALIGNMENT_NOT_FOUND_DETAIL,
+    authorize_completed_alignment_cohort,
+    equivalence_refused_http,
+    first_few,
+    live_work_http,
+    load_groups_as_of,
+    resolution_body,
+    sees_resolution_tickets,
+)
 
 # The DuckLake relation this route signs DoGet tickets for: the exclusion-aware
 # VIEW (`alignment` ANTI JOIN the resolved blocklist), never the raw base table —
@@ -141,13 +159,17 @@ async def update_alignment_definition_status_route(
 
     Deprecating is refused (409, listing them) while any work ticket under the
     alignment is unfinished, held ones included: they would still write rows under
-    a void config.
+    a void config. It is refused too while the alignment is a side of a joining
+    output equivalence, `same` or `similar` (`definition_similarity`).
 
     system_admin only (`alignment_definition:lifecycle`).
     """
     try:
         async with tx() as conn:
             if body.status is AlignmentDefinitionStatus.DEPRECATED:
+                await refuse_deprecating_with_joining_equivalences(
+                    conn, DefinitionKind.ALIGNMENT, alignment_idx
+                )
                 await refuse_deprecating_with_live_work(conn, alignment_idx)
             row = await transition_alignment_definition_status(
                 conn,
@@ -160,10 +182,9 @@ async def update_alignment_definition_status_route(
     except AlignmentDefinitionNotFound:
         raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL)
     except AlignmentHasLiveWork as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={"reason": str(exc), "work_ticket_idx": exc.work_ticket_idxs},
-        ) from exc
+        raise live_work_http(exc) from exc
+    except EquivalenceRefused as exc:
+        raise equivalence_refused_http(exc) from exc
     except asyncpg.ForeignKeyViolationError as exc:
         raise HTTPException(
             status_code=422,
@@ -287,7 +308,7 @@ async def rerun_alignment_block_route(
     nothing.
 
     system_admin only (`alignment_definition:lifecycle`), plus the align action's own
-    audience and scopes, as `/run` checks them.
+    audience and scopes (`authorize_redrive_action`).
     """
     deadline = pre_txn_deadline()
     ticket = await pool.fetchrow(
@@ -328,6 +349,7 @@ async def rerun_alignment_block_route(
             allow_deprecated_mask=body.allow_deprecated_mask,
             reason=body.reason,
             principal_idx=caller.principal_idx,
+            show_reap_note=sees_reap_note(caller),
             ticket_root=ticket_root,
             action_steps=definition.steps,
         )
@@ -510,20 +532,95 @@ async def create_alignment_cohort_doget_ticket(
     this route and not to that gate: the cohort is never narrowed because coverage
     filtering makes a feature table cohort-dependent, so trimming the request would
     answer a different scientific question under the name of the one asked.
+
+    After that gate, every prep_sample must resolve to this alignment in its group
+    (`definition_resolver`): a prep_sample processed under another member,
+    incomplete, or not processed (a withdrawn or deprecated upstream included) is a
+    409 naming its resolution. A deprecated alignment is read only under
+    `include_deprecated`, and then exactly (`resolve_exact`): its own completed,
+    non-withdrawn rows, still refusing a prep_sample whose mask run is withdrawn.
+    An active alignment whose upstream is deprecated is read only under
+    `include_deprecated_upstream` (`deprecated_upstream_read`); the ticket response
+    names the deprecated upstreams read.
     """
-    cohort = await authorize_completed_alignment_cohort(
+    read = await authorize_completed_alignment_cohort(
         pool,
         caller=caller,
         alignment_idx=alignment_idx,
         prep_sample_idx=body.prep_sample_idx,
         nothing_to="",
+        include_deprecated=body.include_deprecated,
+        include_deprecated_upstream=body.include_deprecated_upstream,
     )
+    cohort = read.cohort
+    try:
+        async with (
+            pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            groups = await load_groups_as_of(conn, body.as_of_event)
+            if read.exact:
+                resolution = await resolve_exact(
+                    conn,
+                    kind=DefinitionKind.ALIGNMENT,
+                    definition_idx=alignment_idx,
+                    prep_sample_idxs=cohort,
+                    groups=groups,
+                )
+            else:
+                resolution = await resolve_group(
+                    conn,
+                    kind=DefinitionKind.ALIGNMENT,
+                    definition_idx=alignment_idx,
+                    prep_sample_idxs=cohort,
+                    groups=groups,
+                    admitted_upstream_kinds=read.admitted_upstream_kinds,
+                )
+    except DefinitionNotFound as exc:
+        raise HTTPException(status_code=404, detail=ALIGNMENT_NOT_FOUND_DETAIL) from exc
+    refused = resolution.not_resolved_to(alignment_idx)
+    if refused:
+        raise _not_resolved_http(alignment_idx, refused, caller)
 
-    return _sign_alignment_ticket(
+    signed = _sign_alignment_ticket(
         alignment_idx=alignment_idx,
         prep_sample_idx=cohort,
         columns=body.columns,
         signing_key=signing_key,
+    )
+    return signed.model_copy(
+        update={
+            "decisions": resolution.decisions,
+            "deprecated_upstreams": read.deprecated_upstreams,
+        }
+    )
+
+
+def _not_resolved_http(
+    alignment_idx: int, refused: list[SampleResolution], caller: HumanUser
+) -> HTTPException:
+    """409 for cohort prep_samples that do not resolve to `alignment_idx`: a message, the
+    first refused prep_sample's `DefinitionGroupRefusal` code, the count, and the first
+    few prep_samples' resolutions. The caller passed the access check for every one of
+    them, so naming what each resolves to discloses nothing it may not read; the
+    ticket each waits on is shown per `sees_resolution_tickets`. The list is truncated
+    like every refusal built from a caller-named cohort."""
+    shown = refused[:5]
+    tickets = sees_resolution_tickets(caller)
+    examples = "; ".join(r.describe(ticket=tickets) for r in shown)
+    more = ", …" if len(refused) > len(shown) else ""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": (
+                f"{len(refused)} prep_sample(s) do not resolve to alignment {alignment_idx}"
+                f" in its group ({examples}{more})"
+            ),
+            "reason": cohort_refusal(refused[0], alignment_idx).value,
+            "alignment_idx": alignment_idx,
+            "count": len(refused),
+            "samples": [resolution_body(r, caller) for r in shown],
+        },
     )
 
 

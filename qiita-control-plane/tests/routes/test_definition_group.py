@@ -1,0 +1,876 @@
+"""DB tests for POST /definition-group/resolve: authorization (VIEWER on every study
+of every sample, refused whole), a cohort spanning pools, and the run reads the
+resolver makes against Postgres (gate rows, block and per-sample tickets, cancelled
+and abandoned ones, a failed ticket cancelled after the fact, assembly tickets by the
+processing they record).
+
+The rules are unit-tested in tests/test_definition_resolver.py.
+"""
+
+import json
+import uuid
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from qiita_common.actions import (
+    ALIGN_ACTION_ID,
+    BLOCK_MASK_ACTION_ID,
+    LONG_READ_ASSEMBLY_ACTION_ID,
+    READ_MASK_ACTION_ID,
+)
+from qiita_common.api_paths import (
+    URL_ALIGNMENT_COHORT_DOGET,
+    URL_DEFINITION_GROUP_RESOLVE,
+    URL_SEQUENCED_POOL_ALIGNMENT_COHORT,
+)
+from qiita_common.auth_constants import Scope
+from qiita_common.models import (
+    AS_OF_SCOPE,
+    DefinitionKind,
+    FailureType,
+    SampleResolutionReason,
+    SampleResolutionState,
+    ScopeTargetKind,
+    WorkTicketFailureStage,
+    WorkTicketState,
+)
+
+from qiita_control_plane.definition_resolver import resolve_group
+from qiita_control_plane.definition_similarity import revoke_equivalence
+from qiita_control_plane.repositories.alignment_definition import (
+    ALIGNMENT_SAMPLE_COMPLETED,
+    ALIGNMENT_SAMPLE_PENDING,
+)
+from qiita_control_plane.repositories.assembly import ASSEMBLY_SAMPLE_COMPLETED
+from qiita_control_plane.repositories.block import (
+    BLOCK_ABANDONED,
+    BLOCK_PENDING,
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
+    add_block_members,
+    create_block,
+)
+from qiita_control_plane.repositories.mask_definition import set_mask_sample_states
+from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.testing.db_seeds import (
+    delete_action_if_created,
+    seed_action_if_absent,
+    seed_biosample_to_study_link,
+    seed_biosample_with_sequenced_prep_sample,
+    seed_prep_sample_to_study_link,
+    seed_sequenced_sample_subtype,
+)
+from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.work_ticket_cancel import cancel_work_ticket
+
+pytestmark = pytest.mark.db
+
+PROCESSED = SampleResolutionState.PROCESSED
+INCOMPLETE = SampleResolutionState.INCOMPLETE
+NOT_PROCESSED = SampleResolutionState.NOT_PROCESSED
+R = SampleResolutionReason
+
+# A version no workflow ships, so the action rows these tests seed never collide with a
+# synced one (whose context_schema would change the assembly params).
+_TEST_VERSION = "0.0.0-resolver-test"
+
+
+@pytest.fixture
+def ctx(role_keyed_clients):
+    return dict(role_keyed_clients)
+
+
+def _body(kind: DefinitionKind, idx: int, samples: list[int]) -> dict:
+    return {"definition_kind": kind, "definition_idx": idx, "prep_sample_idx": samples}
+
+
+def _by_sample(resp) -> dict[int, dict]:
+    return {s["prep_sample_idx"]: s for s in resp.json()["samples"]}
+
+
+@pytest_asyncio.fixture
+async def other_pool_sample(ctx, alignment_group_world):
+    """ps_x: a sample in a second sequenced pool, linked to study_1 (readable by the
+    regular user), masked under mask_2 and aligned under align_3."""
+    w = alignment_group_world
+    db = ctx["pool"]
+    owner = w["owner_idx"]
+    bs_x, ps_x = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
+    run_idx, pool_idx, _ = await seed_sequenced_sample_subtype(
+        db, prep_sample_idx=ps_x, owner_idx=owner, sequenced_pool_item_id="other-pool-x"
+    )
+    assert pool_idx != w["pool_idx"]
+    await seed_biosample_to_study_link(
+        db, biosample_idx=bs_x, study_idx=w["study_1"], created_by_idx=owner
+    )
+    await seed_prep_sample_to_study_link(
+        db, prep_sample_idx=ps_x, study_idx=w["study_1"], created_by_idx=owner
+    )
+    await w["gate"]("mask_sample", w["mask_2"], ps_x, MASK_SAMPLE_COMPLETED)
+    await w["gate"]("alignment_sample", w["align_3"], ps_x, ALIGNMENT_SAMPLE_COMPLETED)
+    yield ps_x
+    await teardown_entity_graph(db, study_idxs=[], biosample_idxs=[bs_x], prep_sample_idxs=[ps_x])
+    await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
+@pytest_asyncio.fixture
+async def tickets(ctx):
+    """`block(action_id, ...)` and `sample(action_id, ...)` insert work tickets (and a
+    block covering the samples); every ticket is deleted afterwards, its block with it."""
+    db = ctx["pool"]
+    principal = ctx["wet_session"]["principal_idx"]
+    made: list[int] = []
+    actions: dict[str, bool] = {}
+
+    async def _action(action_id: str, target_kind: str) -> None:
+        if action_id not in actions:
+            actions[action_id] = await seed_action_if_absent(
+                db, action_id=action_id, version=_TEST_VERSION, target_kind=target_kind
+            )
+
+    def _failure(state: str) -> tuple:
+        if state != WorkTicketState.FAILED:
+            return (None, None, None, None)
+        return (
+            FailureType.PERMANENT.value,
+            WorkTicketFailureStage.STEP_RUN.value,
+            "align_sharded",
+            "step failed in a test",
+        )
+
+    async def block(
+        action_id: str,
+        *,
+        samples: list[int],
+        state: str,
+        mask_idx: int,
+        alignment_idx: int | None = None,
+        block_state: str = BLOCK_PENDING,
+    ) -> int:
+        await _action(action_id, ScopeTargetKind.BLOCK.value)
+        async with db.acquire() as conn, conn.transaction():
+            block_idx = await create_block(conn)
+            await add_block_members(
+                conn, block_idx=block_idx, members=[(ps, 1, 10) for ps in samples]
+            )
+        ticket = await db.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx, scope_target_kind,"
+            "  block_idx, mask_idx, alignment_idx, state,"
+            "  failure_type, failure_stage, failure_step_name, failure_reason"
+            ") VALUES ($1, $2, $3, $12::qiita.scope_target_kind, $4, $5, $6,"
+            "          $7::qiita.work_ticket_state,"
+            "          $8::qiita.failure_type, $9::qiita.work_ticket_failure_stage, $10, $11)"
+            " RETURNING work_ticket_idx",
+            action_id,
+            _TEST_VERSION,
+            principal,
+            block_idx,
+            mask_idx,
+            alignment_idx,
+            state,
+            *_failure(state),
+            ScopeTargetKind.BLOCK.value,
+        )
+        await db.execute(
+            "UPDATE qiita.block SET work_ticket_idx = $2, state = $3 WHERE block_idx = $1",
+            block_idx,
+            ticket,
+            block_state,
+        )
+        made.append(ticket)
+        return ticket
+
+    async def sample(
+        action_id: str,
+        *,
+        prep_sample_idx: int,
+        state: str,
+        mask_idx: int,
+        action_context: dict | None = None,
+        processing_idx: int | None = None,
+    ) -> int:
+        await _action(action_id, ScopeTargetKind.PREP_SAMPLE.value)
+        ticket = await db.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx, scope_target_kind,"
+            "  prep_sample_idx, mask_idx, state, action_context,"
+            "  failure_type, failure_stage, failure_step_name, failure_reason, processing_idx"
+            ") VALUES ($1, $2, $3, $12::qiita.scope_target_kind, $4, $5,"
+            "          $6::qiita.work_ticket_state,"
+            "          $7::jsonb, $8::qiita.failure_type,"
+            "          $9::qiita.work_ticket_failure_stage, $10, $11, $13)"
+            " RETURNING work_ticket_idx",
+            action_id,
+            _TEST_VERSION,
+            principal,
+            prep_sample_idx,
+            mask_idx,
+            state,
+            json.dumps(action_context or {}),
+            *_failure(state),
+            ScopeTargetKind.PREP_SAMPLE.value,
+            processing_idx,
+        )
+        made.append(ticket)
+        return ticket
+
+    yield {"block": block, "sample": sample}
+
+    await db.execute(
+        "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])", made
+    )
+    for action_id, created in actions.items():
+        await delete_action_if_created(
+            db, action_id=action_id, version=_TEST_VERSION, created=created
+        )
+
+
+# ---------------------------------------------------------------------------
+# Resolution through the route
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_across_pools_names_each_samples_member(
+    ctx, alignment_group_world, other_pool_sample
+):
+    """ps_a (seed pool) is aligned on align_1; ps_x (another pool) on align_3. Both
+    answer for the group, each naming its own member and mask; ps_c's pending gate
+    has no ticket behind it, so it is not a run."""
+    w = alignment_group_world
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(
+            DefinitionKind.ALIGNMENT, w["align_1"], [other_pool_sample, w["ps_c"], w["ps_a"]]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["group"] == sorted([w["align_1"], w["align_3"]])
+    assert [s["prep_sample_idx"] for s in body["samples"]] == sorted(
+        [w["ps_a"], w["ps_c"], other_pool_sample]
+    )
+    samples = _by_sample(resp)
+    assert (samples[w["ps_a"]]["state"], samples[w["ps_a"]]["definition_idx"]) == (
+        PROCESSED,
+        w["align_1"],
+    )
+    assert samples[w["ps_a"]]["mask_idx"] == w["mask_idx"]
+    x = samples[other_pool_sample]
+    assert (x["state"], x["definition_idx"], x["mask_idx"]) == (
+        PROCESSED,
+        w["align_3"],
+        w["mask_2"],
+    )
+    assert (samples[w["ps_c"]]["state"], samples[w["ps_c"]]["reason"]) == (
+        NOT_PROCESSED,
+        R.NO_RUN,
+    )
+
+
+async def test_resolve_a_mask_group(ctx, alignment_group_world, other_pool_sample):
+    w = alignment_group_world
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"], other_pool_sample]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["group"] == sorted([w["mask_idx"], w["mask_2"]])
+    samples = _by_sample(resp)
+    assert samples[w["ps_a"]]["definition_idx"] == w["mask_idx"]
+    assert samples[other_pool_sample]["definition_idx"] == w["mask_2"]
+    assert samples[other_pool_sample]["mask_idx"] is None
+
+
+async def test_as_of_a_decision_set_rebuilds_the_group_after_a_revoke(
+    ctx, alignment_group_world, other_pool_sample
+):
+    """The response records the decision set; after the equivalence is revoked, the current
+    resolution has no group, and the recorded decision set rebuilds the grouped one.
+    A token that names no decision set is a 422."""
+    w = alignment_group_world
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"], other_pool_sample])
+    grouped = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    assert grouped.status_code == 200, grouped.text
+    decisions = grouped.json()["decisions"]
+    assert decisions["as_of"] is False
+    assert decisions["equivalences_used"] == 1
+    assert decisions["newest_event_at"] is not None
+    assert decisions["as_of_scope"] == AS_OF_SCOPE
+    token = decisions["decision_set"]
+
+    equivalence_idx = await ctx["pool"].fetchval(
+        "SELECT output_equivalence_idx FROM qiita.output_equivalence"
+        " WHERE definition_kind = 'mask' AND low_definition_ref = $1 AND high_definition_ref = $2",
+        *sorted([w["mask_idx"], w["mask_2"]]),
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        await revoke_equivalence(
+            conn,
+            output_equivalence_idx=equivalence_idx,
+            reason="re-checked against the mock community",
+            principal_idx=ctx["admin_session"]["principal_idx"],
+        )
+
+    current = await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    assert current.status_code == 200, current.text
+    assert current.json()["group"] == [w["mask_idx"]]
+    assert current.json()["decisions"]["decision_set"] != token
+    assert current.json()["decisions"]["equivalences_used"] == 0
+    assert _by_sample(current)[other_pool_sample]["state"] == NOT_PROCESSED
+
+    as_of = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": token}
+    )
+    assert as_of.status_code == 200, as_of.text
+    assert as_of.json()["group"] == grouped.json()["group"]
+    assert as_of.json()["samples"] == grouped.json()["samples"]
+    assert as_of.json()["decisions"] == {**decisions, "as_of": True}
+
+    unknown = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": "sha256:" + "0" * 64}
+    )
+    assert unknown.status_code == 422, unknown.text
+    assert "names no decision set" in unknown.text
+
+    malformed = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json={**body, "as_of_event": "sha256:" + "A" * 64}
+    )
+    assert malformed.status_code == 422, malformed.text
+    assert "names no decision set" not in malformed.text
+
+
+# ---------------------------------------------------------------------------
+# Tickets
+# ---------------------------------------------------------------------------
+
+
+async def test_a_covering_align_block_that_is_running_makes_the_sample_incomplete(
+    ctx, alignment_group_world, tickets
+):
+    """A completed gate whose block was re-armed: the ticket is waiting again."""
+    w = alignment_group_world
+    ticket = await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.PENDING,
+        mask_idx=w["mask_idx"],
+        alignment_idx=w["align_1"],
+    )
+    resp = await ctx["admin"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    s = _by_sample(resp)[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.IN_PROGRESS,
+        ticket,
+        w["align_1"],
+    )
+
+    # Only a system_admin is told which ticket: it may be another principal's block
+    # ticket covering other studies' samples.
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    s = _by_sample(resp)[w["ps_a"]]
+    assert "work_ticket_idx" not in s
+    assert (s["state"], s["reason"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.IN_PROGRESS,
+        w["align_1"],
+    )
+
+
+async def test_the_cohort_doget_refusal_names_the_ticket_to_a_system_admin_only(
+    ctx, alignment_group_world, tickets
+):
+    w = alignment_group_world
+    ticket = await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.PENDING,
+        mask_idx=w["mask_idx"],
+        alignment_idx=w["align_1"],
+    )
+    url = URL_ALIGNMENT_COHORT_DOGET.format(alignment_idx=w["align_1"])
+    body = {"prep_sample_idx": [w["ps_a"]], "columns": ["prep_sample_idx", "feature_idx"]}
+
+    user = await ctx["user"].post(url, json=body)
+    assert user.status_code == 409, user.text
+    detail = user.json()["detail"]
+    [sample] = detail["samples"]
+    assert (sample["reason"], "work_ticket_idx" in sample) == (R.IN_PROGRESS, False)
+    assert "work_ticket" not in detail["detail"]
+
+    admin = await ctx["admin"].post(url, json=body)
+    assert admin.status_code == 409, admin.text
+    detail = admin.json()["detail"]
+    assert detail["samples"][0]["work_ticket_idx"] == ticket
+    assert f"work_ticket {ticket}" in detail["detail"]
+
+
+@pytest.mark.parametrize(
+    ("ticket_state", "block_state"),
+    [(WorkTicketState.CANCELLED, BLOCK_PENDING), (WorkTicketState.FAILED, BLOCK_ABANDONED)],
+)
+async def test_cancelled_tickets_and_abandoned_blocks_are_ignored(
+    ctx, alignment_group_world, tickets, ticket_state, block_state
+):
+    """A block ticket under align_3 that was cancelled, or whose block was abandoned,
+    leaves a pending gate nothing will finish: not a run, so ps_a resolves to
+    align_1."""
+    w = alignment_group_world
+    await w["gate"]("alignment_sample", w["align_3"], w["ps_a"], ALIGNMENT_SAMPLE_PENDING)
+    await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=ticket_state,
+        mask_idx=w["mask_2"],
+        alignment_idx=w["align_3"],
+        block_state=block_state,
+    )
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    s = _by_sample(resp)[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["align_1"])
+
+
+async def test_a_failed_per_sample_mask_ticket_under_the_newer_mask_is_incomplete(
+    ctx, alignment_group_world, tickets
+):
+    """Only the sample's newest per-sample ticket counts: a failed ticket a later
+    completed one superseded does not."""
+    w = alignment_group_world
+    newer = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    resp = await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body)
+    assert resp.status_code == 200, resp.text
+    s = _by_sample(resp)[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.FAILED,
+        newer,
+        w["mask_2"],
+    )
+
+    await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
+    )
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+
+class _ReapRecorder:
+    """Stands in for the compute backend client: records each reap, reaps nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.calls.append(work_ticket_idx)
+        return []
+
+
+async def test_cancelling_a_failed_newest_ticket_over_a_completed_gate_makes_it_processed(
+    ctx, alignment_group_world, tickets
+):
+    """A completed gate with a failed newest per-sample ticket reads as incomplete;
+    once that ticket is cancelled it is ignored, and the completed run counts."""
+    w = alignment_group_world
+    await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
+    )
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    failed = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"], s["definition_idx"]) == (
+        INCOMPLETE,
+        R.FAILED,
+        failed,
+        w["mask_2"],
+    )
+
+    backend = _ReapRecorder()
+    outcome = await cancel_work_ticket(ctx["pool"], backend, failed)
+    assert (outcome["previous_state"], outcome["cancelled"]) == (WorkTicketState.FAILED, True)
+    assert backend.calls == [failed]
+
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+
+async def _set_mask_sample(ctx, w, state: str) -> None:
+    """Withdraw or restore ps_a's run of mask_2 the way the sample-status PATCH does."""
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        result = await set_mask_sample_states(
+            conn,
+            mask_idx=w["mask_2"],
+            prep_sample_idxs=[w["ps_a"]],
+            state=state,
+            reason="redo in a test" if state == MASK_SAMPLE_INVALIDATED else None,
+            principal_idx=w["owner_idx"],
+        )
+    assert result["updated"] == [w["ps_a"]]
+
+
+async def test_the_redo_sequence_leaves_the_restored_run_processed(
+    ctx, alignment_group_world, tickets
+):
+    """Completed, withdrawn, a re-run that failed (the withdrawn gate does not reopen),
+    restored: the failed ticket is older than the restore, so it is stale. A newer
+    failed ticket after the restore counts again."""
+    w = alignment_group_world
+    await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.COMPLETED,
+        mask_idx=w["mask_2"],
+    )
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    rerun = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, rerun)
+
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+    later = await tickets["sample"](
+        READ_MASK_ACTION_ID,
+        prep_sample_idx=w["ps_a"],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.FAILED, later)
+
+
+async def test_a_failed_block_ticket_older_than_the_restore_is_stale(
+    ctx, alignment_group_world, tickets
+):
+    """The block-ticket form of the redo sequence; a running block ticket older than
+    the restore still makes the prep_sample incomplete."""
+    w = alignment_group_world
+    await w["gate"]("mask_sample", w["mask_2"], w["ps_a"], MASK_SAMPLE_COMPLETED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    await tickets["block"](
+        BLOCK_MASK_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_2"],
+    )
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    body = _body(DefinitionKind.MASK, w["mask_idx"], [w["ps_a"]])
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["definition_idx"]) == (PROCESSED, w["mask_2"])
+
+    running = await tickets["block"](
+        BLOCK_MASK_ACTION_ID,
+        samples=[w["ps_a"]],
+        state=WorkTicketState.PROCESSING,
+        mask_idx=w["mask_2"],
+    )
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_INVALIDATED)
+    await _set_mask_sample(ctx, w, MASK_SAMPLE_COMPLETED)
+    s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    assert (s["state"], s["reason"], s["work_ticket_idx"]) == (INCOMPLETE, R.IN_PROGRESS, running)
+
+
+async def test_an_assembly_ticket_counts_for_the_processing_it_records(
+    ctx, alignment_group_world, tickets
+):
+    """A long-read-assembly ticket counts for the processing written on it, here over a
+    completed gate (a same-version re-run). A failed one that records no processing
+    (it ended before its mint) is not a run, though it names the same mask."""
+    w = alignment_group_world
+    db = ctx["pool"]
+    params = {
+        "workflow": LONG_READ_ASSEMBLY_ACTION_ID,
+        "version": _TEST_VERSION,
+        "mask_idx": w["mask_idx"],
+        "probe": str(uuid.uuid4()),
+    }
+    async with db.acquire() as conn:
+        row = await mint_processing(
+            conn, workflow=LONG_READ_ASSEMBLY_ACTION_ID, version=_TEST_VERSION, params=params
+        )
+    processing_idx = row["processing_idx"]
+    try:
+        await db.execute(
+            "INSERT INTO qiita.assembly_sample (processing_idx, prep_sample_idx, state)"
+            " VALUES ($1, $2, $3)",
+            processing_idx,
+            w["ps_a"],
+            ASSEMBLY_SAMPLE_COMPLETED,
+        )
+        body = _body(DefinitionKind.PROCESSING, processing_idx, [w["ps_a"]])
+        s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+        assert (s["state"], s["definition_idx"], s["mask_idx"]) == (
+            PROCESSED,
+            processing_idx,
+            w["mask_idx"],
+        )
+
+        await tickets["sample"](
+            LONG_READ_ASSEMBLY_ACTION_ID,
+            prep_sample_idx=w["ps_a"],
+            state=WorkTicketState.FAILED,
+            mask_idx=w["mask_idx"],
+            action_context={"mask_idx": w["mask_idx"]},
+        )
+        s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+        assert s["state"] == PROCESSED
+
+        ticket = await tickets["sample"](
+            LONG_READ_ASSEMBLY_ACTION_ID,
+            prep_sample_idx=w["ps_a"],
+            state=WorkTicketState.PROCESSING,
+            mask_idx=w["mask_idx"],
+            action_context={"mask_idx": w["mask_idx"]},
+            processing_idx=processing_idx,
+        )
+        s = _by_sample(await ctx["admin"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+        assert (s["state"], s["reason"], s["work_ticket_idx"]) == (
+            INCOMPLETE,
+            R.IN_PROGRESS,
+            ticket,
+        )
+    finally:
+        # Ahead of the entity sweep: assembly_sample references this processing with
+        # no ON DELETE action, so the processing row cannot go while it exists.
+        await db.execute(
+            "DELETE FROM qiita.assembly_sample WHERE processing_idx = $1", processing_idx
+        )
+        await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx)
+
+
+# ---------------------------------------------------------------------------
+# Authorization
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_refuses_a_cohort_with_an_unreadable_study_403(ctx, alignment_group_world):
+    """ps_b is in study_2 only; ps_e is in study_1 and study_2. Either refuses the
+    whole request rather than narrowing it."""
+    w = alignment_group_world
+    for samples in ([w["ps_a"], w["ps_b"]], [w["ps_e"]]):
+        resp = await ctx["user"].post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.ALIGNMENT, w["align_1"], samples),
+        )
+        assert resp.status_code == 403, resp.text
+        assert str(w["study_2"]) in resp.json()["detail"]
+
+
+async def test_resolve_refuses_an_orphaned_sample_403(ctx, alignment_group_world):
+    w = alignment_group_world
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_d"]]),
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_resolve_unknown_definition_404_before_access(ctx, alignment_group_world):
+    w = alignment_group_world
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE, json=_body(DefinitionKind.ALIGNMENT, 999_999_999, [w["ps_b"]])
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_resolve_without_prep_sample_read_403(ctx, alignment_group_world, make_pat_client):
+    w = alignment_group_world
+    client = await make_pat_client(
+        label="no-prep-sample-read", scopes=[Scope.SELF_PROFILE, Scope.ALIGNMENT_DOGET]
+    )
+    resp = await client.post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_resolve_refuses_a_service_account(
+    ctx, alignment_group_world, compute_worker_service_account
+):
+    from qiita_control_plane.main import app
+
+    w = alignment_group_world
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
+    ) as sa:
+        resp = await sa.post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]),
+        )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_resolve_rejects_an_empty_cohort_422(ctx, alignment_group_world):
+    resp = await ctx["user"].post(
+        URL_DEFINITION_GROUP_RESOLVE,
+        json=_body(DefinitionKind.ALIGNMENT, alignment_group_world["align_1"], []),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_resolve_refuses_a_processing_whose_runs_it_cannot_read_422(
+    ctx, alignment_group_world
+):
+    """An amplicon processing records no `assembly_sample` gate, so every prep_sample
+    would read `no_run`; the route refuses it instead, before the cohort is checked
+    (ps_b is not readable by this caller). A long-read-assembly one resolves."""
+    w = alignment_group_world
+    db = ctx["pool"]
+    made = []
+    async with db.acquire() as conn:
+        for workflow in ("amplicon", LONG_READ_ASSEMBLY_ACTION_ID):
+            params = {"workflow": workflow, "version": _TEST_VERSION, "probe": str(uuid.uuid4())}
+            row = await mint_processing(
+                conn, workflow=workflow, version=_TEST_VERSION, params=params
+            )
+            made.append(row["processing_idx"])
+    amplicon, assembly = made
+    try:
+        resp = await ctx["user"].post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.PROCESSING, amplicon, [w["ps_b"]]),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "'amplicon' run" in resp.json()["detail"]
+        resp = await ctx["user"].post(
+            URL_DEFINITION_GROUP_RESOLVE,
+            json=_body(DefinitionKind.PROCESSING, assembly, [w["ps_a"]]),
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        await db.execute(
+            "DELETE FROM qiita.processing WHERE processing_idx = ANY($1::bigint[])", made
+        )
+
+
+async def test_resolve_group_refuses_a_read_committed_transaction(postgres_pool):
+    """The resolver reads gates, tickets and groups in several statements, so it
+    refuses a transaction in which each statement takes its own snapshot."""
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        with pytest.raises(RuntimeError, match="REPEATABLE READ"):
+            await resolve_group(
+                conn, kind=DefinitionKind.MASK, definition_idx=1, prep_sample_idxs=[1]
+            )
+
+
+async def test_a_deprecated_alignments_cohort_listing_leaves_out_a_failed_run(
+    ctx, alignment_group_world, tickets
+):
+    """Under include_deprecated, the listing names each readable prep_sample whose run
+    under the deprecated alignment failed or is running, with its biosample accession;
+    an active alignment's listing names none."""
+    w = alignment_group_world
+    url = URL_SEQUENCED_POOL_ALIGNMENT_COHORT.format(
+        sequencing_run_idx=w["run_idx"],
+        sequenced_pool_idx=w["pool_idx"],
+        alignment_idx=w["align_1"],
+    )
+    await tickets["block"](
+        ALIGN_ACTION_ID,
+        samples=[w["ps_c"]],
+        state=WorkTicketState.FAILED,
+        mask_idx=w["mask_idx"],
+        alignment_idx=w["align_1"],
+    )
+    active = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert active.status_code == 200, active.text
+    assert active.json()["left_out"] == []
+
+    await ctx["pool"].execute(
+        "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
+        "       deprecated_by_idx = (SELECT MIN(idx) FROM qiita.principal),"
+        "       deprecation_reason = 'aligner build was wrong'"
+        " WHERE alignment_idx = $1",
+        w["align_1"],
+    )
+    accession, entity = await ctx["pool"].fetchrow(
+        "SELECT bs.biosample_accession, ee.export_entity_id FROM qiita.prep_sample ps"
+        "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        "  JOIN qiita.exported_entity ee ON ee.biosample_idx = bs.idx WHERE ps.idx = $1",
+        w["ps_c"],
+    )
+    resp = await ctx["user"].get(url, params={"include_deprecated": True})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["left_out"] == [
+        {
+            "prep_sample_idx": w["ps_c"],
+            "biosample_accession": accession,
+            "biosample_export_entity_id": entity,
+            "state": INCOMPLETE,
+            "reason": R.FAILED,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("flags", "processed"),
+    [
+        ({}, False),
+        ({"include_deprecated": True}, False),
+        ({"include_deprecated_upstream": True}, True),
+    ],
+)
+async def test_resolve_reads_past_a_deprecated_mask_under_the_upstream_flag_only(
+    ctx, alignment_group_world, flags, processed
+):
+    """A deprecated mask under an active alignment is read past only under
+    `include_deprecated_upstream`; `include_deprecated` alone admits a deprecated
+    assembly run, not a mask (`admitted_deprecated_upstream_kinds`)."""
+    w = alignment_group_world
+    await ctx["pool"].execute(
+        "UPDATE qiita.mask_definition SET status = 'deprecated', deprecated_at = now(),"
+        " deprecated_by_idx = $2, deprecation_reason = 'host reference was wrong'"
+        " WHERE mask_idx = $1",
+        w["mask_idx"],
+        ctx["admin_session"]["principal_idx"],
+    )
+    body = {**_body(DefinitionKind.ALIGNMENT, w["align_1"], [w["ps_a"]]), **flags}
+    s = _by_sample(await ctx["user"].post(URL_DEFINITION_GROUP_RESOLVE, json=body))[w["ps_a"]]
+    if processed:
+        assert (s["state"], s["definition_idx"]) == (PROCESSED, w["align_1"])
+    else:
+        assert (s["state"], s["reason"]) == (NOT_PROCESSED, R.UPSTREAM_DEPRECATED)

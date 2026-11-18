@@ -9,10 +9,9 @@ to wrap the call in a transaction.
 """
 
 import json
-from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyAccessionField, Tier
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyLookupKey, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from .exported_entity import export_entity_id_lookup, export_entity_id_select
@@ -25,11 +24,6 @@ _STUDY_RETURNING_COLS = (
     " extra_metadata, default_tier, created_by_idx,"
     " created_at, updated_at, " + export_entity_id_select("study")
 )
-
-# The natural keys a study lookup may key on: the wire-facing accession columns
-# plus export_entity_id. Deriving from StudyAccessionField keeps the accession
-# set defined once, in qiita_common.models.
-StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
 
 # Each lookup key's (column expression, join) over `qiita.study`; see
 # `_BIOSAMPLE_LOOKUP_SQL` in repositories/biosample.py for why it is a closed mapping.

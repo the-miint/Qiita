@@ -566,6 +566,19 @@ URL_ALIGNMENT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_DOGET}"
 URL_ALIGNMENT_COHORT_DOGET = f"{URL_ALIGNMENT_PREFIX}{PATH_ALIGNMENT_COHORT_DOGET}"
 
 # =============================================================================
+# /definition-group/* — per-sample resolution across a definition group
+# =============================================================================
+# POST .../resolve: the member of a mask, alignment or processing group that each
+# named prep_sample resolves to (human, prep_sample:read, VIEWER on every study of
+# every prep_sample).
+
+PATH_DEFINITION_GROUP_PREFIX = "/definition-group"
+PATH_DEFINITION_GROUP_RESOLVE = "/resolve"
+
+URL_DEFINITION_GROUP_PREFIX = f"{API_PREFIX}{PATH_DEFINITION_GROUP_PREFIX}"
+URL_DEFINITION_GROUP_RESOLVE = f"{URL_DEFINITION_GROUP_PREFIX}{PATH_DEFINITION_GROUP_RESOLVE}"
+
+# =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface
 # =============================================================================
 # Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
@@ -735,6 +748,15 @@ PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
 )
 PATH_ADMIN_MASKED_READ_EXPORT_TICKET = "/masked-read-export/ticket"
+# Output equivalences between two definitions of one kind (system_admin, the kind's
+# lifecycle scope): list (GET) and open (POST) on the root, show one, decide, revoke.
+PATH_ADMIN_OUTPUT_EQUIVALENCE = "/output-equivalence"
+PATH_ADMIN_OUTPUT_EQUIVALENCE_BY_IDX = "/output-equivalence/{output_equivalence_idx}"
+PATH_ADMIN_OUTPUT_EQUIVALENCE_DECISION = "/output-equivalence/{output_equivalence_idx}/decision"
+PATH_ADMIN_OUTPUT_EQUIVALENCE_REVOKE = "/output-equivalence/{output_equivalence_idx}/revoke"
+# The audited edit of a definition's locked settings (system_admin, the kind's
+# lifecycle scope): PATCH.
+PATH_ADMIN_DEFINITION_SETTINGS = "/definition-settings/{definition_kind}/{definition_idx}"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -751,6 +773,13 @@ URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
     f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT}"
 )
 URL_ADMIN_MASKED_READ_EXPORT_TICKET = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
+URL_ADMIN_OUTPUT_EQUIVALENCE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_OUTPUT_EQUIVALENCE}"
+URL_ADMIN_OUTPUT_EQUIVALENCE_BY_IDX = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_OUTPUT_EQUIVALENCE_BY_IDX}"
+URL_ADMIN_OUTPUT_EQUIVALENCE_DECISION = (
+    f"{URL_ADMIN_PREFIX}{PATH_ADMIN_OUTPUT_EQUIVALENCE_DECISION}"
+)
+URL_ADMIN_OUTPUT_EQUIVALENCE_REVOKE = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_OUTPUT_EQUIVALENCE_REVOKE}"
+URL_ADMIN_DEFINITION_SETTINGS = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_DEFINITION_SETTINGS}"
 
 
 # =============================================================================
@@ -776,9 +805,10 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 PATH_STUDY_PREFIX = "/study"
 PATH_STUDY_ROOT = ""  # POST (create) and GET (list) against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
-# Bulk lookup of study_idx by a selectable study accession column
-# (ena_study_accession or bioproject_accession; default bioproject); same
-# body-vs-querystring rationale as the biosample lookup variants.
+# Bulk lookup of study_idx by the natural key that the body names. POST (not GET) so
+# the value list rides in the body, which has no URL-line cap.
+PATH_STUDY_LOOKUP = "/lookup"
+# Deprecated in favor of PATH_STUDY_LOOKUP.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Per-study access rows (qiita.study_access): list/grant against the study,
 # change-tier/revoke against one grantee's row.
@@ -787,6 +817,7 @@ PATH_STUDY_ACCESS_BY_PRINCIPAL = "/{study_idx}/access/{principal_idx}"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
+URL_STUDY_LOOKUP = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
 URL_STUDY_ACCESS = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
 URL_STUDY_ACCESS_BY_PRINCIPAL = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
@@ -821,8 +852,8 @@ PATH_SEQUENCING_RUN_PREFIX = "/sequencing-run"
 PATH_SEQUENCING_RUN_ROOT = ""  # POST against the prefix itself
 # GET one sequencing_run by idx (run metadata incl. instrument_model).
 PATH_SEQUENCING_RUN_BY_IDX = "/{sequencing_run_idx}"
-# Bulk lookup of sequencing_run_idx by instrument_run_id; same body-vs-
-# querystring rationale as the study / biosample accession lookups.
+# Bulk lookup of sequencing_run_idx by instrument_run_id; POST for the reason
+# PATH_STUDY_LOOKUP gives.
 PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = "/lookup-by-instrument-run-id"
 PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
@@ -945,6 +976,11 @@ PATH_BIOSAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/biosample/{biosample_idx}"
 PATH_BIOSAMPLE_METADATA_BY_STUDY = "/{study_idx}/biosample/{biosample_idx}/metadata"
 # Link an existing biosample into the study (POST).
 PATH_BIOSAMPLE_STUDY_LINK = "/{study_idx}/biosample/{biosample_idx}/link"
+# The field exception on one biosample's value of one of the study's
+# fields: read (GET), set (PUT), clear (DELETE).
+PATH_BIOSAMPLE_FIELD_EXCEPTION = (
+    "/{study_idx}/biosample/{biosample_idx}/field-exception/{study_field_idx}"
+)
 # The same study-scoped view, for a caller holding a study's own unique id for the
 # sample instead of its idx: a unique-in-study field's display_name and the
 # value it carries. POST (not GET) because the identifying value lives in the
@@ -967,16 +1003,12 @@ PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
 # The studies that a biosample is actively linked to, with their accessions.
 PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
-# Bulk lookup of biosample_idx by a selectable biosample accession column
-# (biosample_accession or ena_sample_accession; default biosample_accession).
-# POST (not GET) because the accession list lives in the body — a typical
-# bcl-convert pool carries ~384 accessions, which exceeds nginx's default
-# URL-line cap when threaded through query-params. The response shape carries
-# the resolved {accession: idx} map plus a missing[] list so the CLI can
-# fail-fast naming every miss without N round trips.
+# Bulk lookup of biosample_idx by the natural key that the body names; POST for the
+# reason PATH_STUDY_LOOKUP gives.
+PATH_BIOSAMPLE_LOOKUP = "/lookup"
+# Deprecated in favor of PATH_BIOSAMPLE_LOOKUP.
 PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
-# Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
-# rationale as the accession variant.
+# Deprecated in favor of PATH_BIOSAMPLE_LOOKUP.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 # Resolve a pool roster (one row per pool item, naming its biosample and projects by
 # their identifiers) to biosample_idx + study links in one round trip; 422 lists
@@ -989,6 +1021,7 @@ URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"
 URL_BIOSAMPLE_METADATA_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY}"
 URL_BIOSAMPLE_STUDY_LINK = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}"
+URL_BIOSAMPLE_FIELD_EXCEPTION = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_FIELD_EXCEPTION}"
 URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
 URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD = (
     f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD}"
@@ -998,6 +1031,7 @@ URL_BIOSAMPLE_STUDY_FIELD_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIE
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_STUDY_LIST = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_STUDY_LIST}"
+URL_BIOSAMPLE_LOOKUP = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
     f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"
@@ -1027,6 +1061,11 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
+# The field exception on one sequenced sample's (its prep_sample's) value
+# of one of the study's fields: read (GET), set (PUT), clear (DELETE).
+PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION = (
+    "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/field-exception/{study_field_idx}"
+)
 # The distinct sequenced_pools a study's samples sit in — the study-first join
 # the run-centric pool routes never expose. Composes under PATH_STUDY_PREFIX.
 PATH_SEQUENCED_POOL_BY_STUDY = "/{study_idx}/sequenced-pool"
@@ -1054,6 +1093,7 @@ URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
 URL_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY}"
 )
+URL_SEQUENCED_SAMPLE_FIELD_EXCEPTION = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_FIELD_EXCEPTION}"
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
@@ -1085,9 +1125,8 @@ PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX = "/{study_idx}/prep-sample-field/{study_fie
 # /exported-identifier — the public handle a published table carries per sample
 # =============================================================================
 # POST, and not only because it writes: the cohort has to ride the body, like
-# /biosample/lookup-by-accession, because a feature table's cohort is a pool's or
-# a study's worth of samples and routinely spans pools, neither of which a query
-# string can carry.
+# /study/lookup, because a feature table's cohort is a pool's or a study's worth
+# of prep_samples and routinely spans pools, neither of which a query string can carry.
 
 PATH_EXPORTED_IDENTIFIER_PREFIX = "/exported-identifier"
 PATH_EXPORTED_IDENTIFIER_ROOT = ""  # POST against the prefix itself
@@ -1122,6 +1161,19 @@ PATH_EXPORTED_PROCESSING_ROOT = ""  # POST against the prefix itself
 
 URL_EXPORTED_PROCESSING_PREFIX = f"{API_PREFIX}{PATH_EXPORTED_PROCESSING_PREFIX}"
 URL_EXPORTED_PROCESSING = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_ROOT}"
+
+
+# =============================================================================
+# Mask kind of /exported-processing and /exported-identifier
+# =============================================================================
+# The public handles for a mask and for a prep_sample masked under it, which a
+# masked-read export cites. system_admin + admin:masked_read_export.
+
+PATH_EXPORTED_PROCESSING_MASK = "/mask"
+PATH_EXPORTED_IDENTIFIER_MASK = "/mask"
+
+URL_EXPORTED_PROCESSING_MASK = f"{URL_EXPORTED_PROCESSING_PREFIX}{PATH_EXPORTED_PROCESSING_MASK}"
+URL_EXPORTED_IDENTIFIER_MASK = f"{URL_EXPORTED_IDENTIFIER_PREFIX}{PATH_EXPORTED_IDENTIFIER_MASK}"
 
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"

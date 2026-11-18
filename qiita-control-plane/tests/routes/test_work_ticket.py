@@ -9,6 +9,7 @@ without actually executing a workflow.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -29,10 +30,13 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
     ComputeTarget,
+    FailureType,
     MaskDefinitionStatus,
     ReferenceStatus,
     ScopeTargetKind,
     StepProgressState,
+    Tier,
+    WorkTicketFailureStage,
     WorkTicketState,
 )
 
@@ -2487,6 +2491,89 @@ async def test_run_on_cancelled_resets_to_pending(
     assert row["retry_count"] == 0
 
 
+async def test_run_is_refused_while_a_cancels_reap_is_pending_and_allowed_once_cleared(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A cancelled ticket whose reap failed may still have a job running under it:
+    /run is refused, naming the failure and the retry, until a reap clears the mark."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, reap_pending_since, reap_note)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, now(),"
+        "         'RuntimeError: orchestrator unreachable')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    url = URL_WORK_TICKET_RUN.format(work_ticket_idx=idx)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await wt_client.post(url, headers=headers)
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "reap_pending"
+    assert "orchestrator unreachable" in detail["detail"]
+    assert f"qiita-admin ticket cancel {idx}" in detail["detail"]
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+        )
+        == WorkTicketState.CANCELLED.value
+    )
+
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET reap_pending_since = NULL, reap_note = NULL"
+        " WHERE work_ticket_idx = $1",
+        idx,
+    )
+    resp = await wt_client.post(url, headers=headers)
+    assert resp.status_code == 202, resp.text
+
+
+async def test_runs_reap_pending_refusal_shows_the_note_to_a_system_admin_only(
+    wt_client, postgres_pool, admin_token, regular_token, reference_action_open, reference_idx
+):
+    """A redriving caller who is not a system_admin is told the reap failed, without the
+    orchestrator client's error text, as on the ticket reads; a system_admin sees it."""
+    user_tok, user_idx = regular_token
+    admin_tok, _ = admin_token
+    action_id, version = reference_action_open
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, reap_pending_since, reap_note)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state, now(),"
+        "         'RuntimeError: orchestrator unreachable')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        user_idx,
+        reference_idx,
+        WorkTicketState.CANCELLED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    url = URL_WORK_TICKET_RUN.format(work_ticket_idx=idx)
+
+    by_user = await wt_client.post(url, headers={"Authorization": f"Bearer {user_tok}"})
+    assert by_user.status_code == 409, by_user.text
+    detail = by_user.json()["detail"]
+    assert detail["reason"] == "reap_pending"
+    assert "failed" in detail["detail"]
+    assert "orchestrator unreachable" not in detail["detail"]
+    assert f"qiita-admin ticket cancel {idx}" in detail["detail"]
+
+    by_admin = await wt_client.post(url, headers={"Authorization": f"Bearer {admin_tok}"})
+    assert by_admin.status_code == 409, by_admin.text
+    assert "orchestrator unreachable" in by_admin.json()["detail"]["detail"]
+
+
 async def test_run_on_failed_resets_reference_scope_target_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):
@@ -3094,6 +3181,381 @@ async def test_run_on_pending_dispatches_without_state_change(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/work-ticket/{idx}/run — caller authorization
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dispatched(monkeypatch) -> list[int]:
+    """Idxs `/run` handed to dispatch."""
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket.schedule_dispatch",
+        lambda _app, idx, **_kw: calls.append(idx),
+    )
+    return calls
+
+
+async def _run(wt_client, token: str, idx: int):
+    return await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+
+async def _state(postgres_pool, idx: int) -> str:
+    return await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+
+
+async def test_run_by_non_originator_is_404_and_dispatches_nothing(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    """A user-audience action does not let a user re-run someone else's ticket."""
+    token, _ = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=admin_token[1],
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 404, resp.text
+    assert dispatched == []
+    assert await _state(postgres_pool, idx) == WorkTicketState.FAILED.value
+
+
+async def _tighten_context_schema(postgres_pool, action) -> None:
+    await postgres_pool.execute(
+        "UPDATE qiita.action SET context_schema = $3::jsonb WHERE action_id = $1 AND version = $2",
+        *action,
+        json.dumps({"type": "object", "required": ["x"]}),
+    )
+
+
+async def test_run_of_a_ticket_the_current_definition_refuses_is_422_and_says_so(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    await _tighten_context_schema(postgres_pool, reference_action_open)
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "submit the work again" in detail["reason"]
+    assert detail["refused"]["reason"] == "action_context does not match action.context_schema"
+    assert dispatched == []
+
+
+async def test_run_answers_a_state_409_before_the_gates(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.COMPLETED,
+    )
+    await _tighten_context_schema(postgres_pool, reference_action_open)
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["current_state"] == WorkTicketState.COMPLETED.value
+
+
+async def test_run_by_originator_redrives(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 202, resp.text
+    assert dispatched == [idx]
+    assert await _state(postgres_pool, idx) == WorkTicketState.PENDING.value
+
+
+async def test_run_by_wet_lab_admin_redrives_another_users_ticket(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=regular_token[1],
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 202, resp.text
+    assert dispatched == [idx]
+
+
+async def test_run_by_wet_lab_admin_is_still_gated_by_the_action_audience(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, dispatched
+):
+    """`reference_action` admits only system_admin: the role bypass on the ticket
+    does not widen the action's audience."""
+    token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action,
+        originator_idx=admin_token[1],
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 403, resp.text
+    assert dispatched == []
+
+
+async def test_run_rechecks_stored_resource_override(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    """The runner replays the stored override, so a caller who could not set it
+    cannot re-run it, even as the originator (an originator whose role has since
+    dropped is the real way this arises)."""
+    token, user_idx = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+        resource_override={"mem_gb": 48},
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 403, resp.text
+    assert "resource_override" in resp.text
+    assert dispatched == []
+    assert await _state(postgres_pool, idx) == WorkTicketState.FAILED.value
+
+
+async def test_run_of_stored_resource_override_by_admin_redrives(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx, dispatched
+):
+    token, admin_idx = admin_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=admin_idx,
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+        resource_override={"mem_gb": 48},
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 202, resp.text
+    assert dispatched == [idx]
+
+
+@pytest.fixture
+async def host_path_ticket(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+    ingest_file,
+):
+    """A FAILED ticket whose stored context names a host path, originated by a user
+    with admin access on its study."""
+    _, user_idx = regular_token
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        user_idx,
+        Tier.ADMIN.value,
+        granted_by_idx,
+    )
+    return await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=user_audience_prep_sample_action,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+        state=WorkTicketState.FAILED,
+        action_context={"fastq_path": ingest_file("sample_R1.fastq")},
+    )
+
+
+async def test_run_rechecks_stored_host_path(
+    wt_client, regular_token, host_path_ticket, dispatched
+):
+    resp = await _run(wt_client, regular_token[0], host_path_ticket)
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["context_keys"] == ["fastq_path"]
+    assert dispatched == []
+
+
+async def test_run_of_stored_host_path_by_wet_lab_admin_redrives(
+    wt_client, postgres_pool, host_path_ticket, dispatched
+):
+    token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+    resp = await _run(wt_client, token, host_path_ticket)
+    assert resp.status_code == 202, resp.text
+    assert dispatched == [host_path_ticket]
+
+
+async def test_run_applies_the_study_access_gate(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+    dispatched,
+):
+    token, user_idx = regular_token
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=user_audience_prep_sample_action,
+        originator_idx=user_idx,
+        kind=ScopeTargetKind.PREP_SAMPLE,
+        idx=prep_sample_idx,
+        state=WorkTicketState.FAILED,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 403, resp.text
+    assert dispatched == []
+
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        user_idx,
+        Tier.ADMIN.value,
+        granted_by_idx,
+    )
+    resp = await _run(wt_client, token, idx)
+    assert resp.status_code == 202, resp.text
+    assert dispatched == [idx]
+
+
+async def test_run_unauthorized_and_missing_tickets_are_indistinguishable(
+    wt_client, postgres_pool, admin_token, regular_token, reference_action_open, reference_idx
+):
+    token, _ = regular_token
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=admin_token[1],
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    missing = idx + 1_000_000
+    unauthorized = await _run(wt_client, token, idx)
+    absent = await _run(wt_client, token, missing)
+    assert unauthorized.status_code == absent.status_code == 404
+    assert unauthorized.json()["detail"].replace(str(idx), "N") == absent.json()["detail"].replace(
+        str(missing), "N"
+    )
+
+
+async def test_run_of_a_disabled_action_is_409_only_for_a_caller_who_may_see_the_ticket(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    regular_token,
+    reference_action_open,
+    reference_idx,
+    dispatched,
+):
+    from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+
+    from qiita_control_plane.actions.sync import AUTO_DEPRECATE_REASON
+
+    action_id, version = reference_action_open
+    idx = await _seed_scoped_ticket(
+        wt_client,
+        postgres_pool,
+        action=reference_action_open,
+        originator_idx=admin_token[1],
+        kind=ScopeTargetKind.REFERENCE,
+        idx=reference_idx,
+        state=WorkTicketState.FAILED,
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.action"
+        "   SET enabled = false, disabled_at = NOW(), disabled_reason = $4, disabled_by_idx = $3"
+        " WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+        SYSTEM_PRINCIPAL_IDX,
+        AUTO_DEPRECATE_REASON,
+    )
+    assert (await _run(wt_client, regular_token[0], idx)).status_code == 404
+    assert (await _run(wt_client, admin_token[0], idx)).status_code == 409
+    assert dispatched == []
+
+
+# ---------------------------------------------------------------------------
 # Startup recovery
 # ---------------------------------------------------------------------------
 
@@ -3173,10 +3635,22 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
             "schedule_dispatch",
             lambda app, idx, **kw: scheduled.append((idx, kw)),
         )
+
+        async def _dp_ready(*_a, **_kw):
+            return None
+
+        monkeypatch.setattr(dispatch, "wait_for_data_plane", _dp_ready)
         app = SimpleNamespace(
-            state=SimpleNamespace(pool=postgres_pool, compute_backend_client=object())
+            state=SimpleNamespace(
+                pool=postgres_pool,
+                compute_backend_client=object(),
+                settings=SimpleNamespace(data_plane_url="grpc://unused"),
+                running_dispatches=set(),
+                reconcile_resume_task=None,
+            )
         )
         count = await dispatch.reconcile_inflight_tickets(app)
+        await app.state.reconcile_resume_task
 
         scheduled_idxs = {idx for idx, _ in scheduled}
         # Every non-terminal ticket scheduled for resume.
@@ -3200,6 +3674,64 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
                 "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
                 created_refs,
             )
+
+
+async def test_reconcile_skips_a_ticket_run_while_it_waited_for_the_data_plane(
+    wt_client, postgres_pool, admin_token, reference_action, ticket_seeder, monkeypatch
+):
+    """A ticket `/run` dispatches during the data-plane wait must not be resumed on top of it.
+
+    `/run` on a non-held PENDING ticket changes no column value; the resume's
+    `updated_at` comparison sees it only because the row is written at all.
+    """
+    from types import SimpleNamespace
+
+    from qiita_control_plane import dispatch
+    from qiita_control_plane.routes import work_ticket as work_ticket_routes
+
+    token, admin_idx = admin_token
+    run_by_route = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
+    untouched = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state=WorkTicketState.PENDING.value
+    )
+
+    release = asyncio.Event()
+
+    async def _wait(_url):
+        await release.wait()
+
+    resumed: list[int] = []
+    dispatched_by_route: list[int] = []
+    monkeypatch.setattr(dispatch, "wait_for_data_plane", _wait)
+    monkeypatch.setattr(dispatch, "schedule_dispatch", lambda _app, idx, **_kw: resumed.append(idx))
+    monkeypatch.setattr(
+        work_ticket_routes,
+        "schedule_dispatch",
+        lambda _app, idx, **_kw: dispatched_by_route.append(idx),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            pool=postgres_pool,
+            compute_backend_client=object(),
+            settings=SimpleNamespace(data_plane_url="grpc://unused"),
+            running_dispatches=set(),
+            reconcile_resume_task=None,
+        )
+    )
+    await dispatch.reconcile_inflight_tickets(app)
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=run_by_route),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    assert dispatched_by_route == [run_by_route]
+    release.set()
+    await app.state.reconcile_resume_task
+
+    assert untouched in resumed
+    assert run_by_route not in resumed
 
 
 # ---------------------------------------------------------------------------
@@ -3690,8 +4222,9 @@ async def test_list_work_ticket_limit_caps_results(
 
 # The tagged-union idx column each scope kind fills in (mirrors the DB CHECK on
 # qiita.work_ticket). Keyed on the enum, so the column name interpolated into
-# the INSERT is always one of these three literals.
+# the INSERT is always one of these literals.
 _SCOPE_IDX_COLUMN = {
+    ScopeTargetKind.REFERENCE: "reference_idx",
     ScopeTargetKind.PREP_SAMPLE: "prep_sample_idx",
     ScopeTargetKind.SEQUENCED_POOL: "sequenced_pool_idx",
     ScopeTargetKind.BLOCK: "block_idx",
@@ -3707,19 +4240,25 @@ async def _seed_scoped_ticket(
     kind: ScopeTargetKind,
     idx,
     state: WorkTicketState = WorkTicketState.PROCESSING,
+    action_context: dict | None = None,
+    resource_override: dict | None = None,
 ):
     """Insert one work_ticket of `kind` pointing at `idx` (the tagged-union
     column that kind uses), register it for wt_client teardown, and return its
-    work_ticket_idx. Only the column NAME is interpolated — both closed-set
-    labels bind through their enum twin."""
+    work_ticket_idx. A FAILED ticket carries the failure columns its CHECK
+    requires. Only the column NAME is interpolated — each closed-set label binds
+    through its enum twin."""
     action_id, version = action
     column = _SCOPE_IDX_COLUMN[kind]
+    failed = state is WorkTicketState.FAILED
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
-        f"  scope_target_kind, {column}, state)"
+        f"  scope_target_kind, {column}, state, action_context, resource_override,"
+        "  failure_type, failure_stage, failure_reason)"
         " VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5,"
-        "         $6::qiita.work_ticket_state)"
+        "         $6::qiita.work_ticket_state, $7::jsonb, $8::jsonb,"
+        "         $9::qiita.failure_type, $10::qiita.work_ticket_failure_stage, $11)"
         " RETURNING work_ticket_idx",
         action_id,
         version,
@@ -3727,6 +4266,11 @@ async def _seed_scoped_ticket(
         kind.value,
         idx,
         state.value,
+        json.dumps(action_context or {}),
+        None if resource_override is None else json.dumps(resource_override),
+        FailureType.PERMANENT.value if failed else None,
+        WorkTicketFailureStage.SUBMISSION.value if failed else None,
+        "test seed" if failed else None,
     )
     wt_client._created_tickets.append(work_ticket_idx)
     return work_ticket_idx

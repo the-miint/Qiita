@@ -20,10 +20,8 @@ import uuid
 import pytest
 from qiita_common.hashing import canonical_params_hash
 
-from qiita_control_plane.repositories.alignment_definition import (
-    ParamsDoNotSurviveStorageError,
-    mint_alignment_definition,
-)
+from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
+from qiita_control_plane.repositories.params_storage import ParamsDoNotSurviveStorageError
 from qiita_control_plane.testing.db_seeds import seed_user_principal
 
 pytestmark = pytest.mark.db

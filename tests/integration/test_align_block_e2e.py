@@ -815,6 +815,7 @@ async def test_rerun_block_replaces_a_completed_block_under_a_new_lake_name(
             reason="e2e",
             principal_idx=align_block_pool["owner"],
             ticket_root=ticket_root,
+            show_reap_note=True,
             action_steps=definition,
         )
         assert outcome["pending_prep_sample_idx"] == [prep_a]
