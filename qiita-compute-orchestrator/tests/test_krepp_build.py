@@ -1,0 +1,244 @@
+"""krepp_build: the inventory, the files registration writes, and the per-job check,
+against a small index the staged miint builds.
+
+The index is built once per session in a subprocess with a timeout:
+`krepp_index_create` can hang (duckdb-miint#318), and a hang must fail the session's
+fixture rather than the whole run. Building it also pins what krepp writes — seven
+files per partition named `<stem>-m<m>r<r>-no_frac`, and a `key: value` metadata
+text carrying SHARED_METADATA_KEYS — because `inventory_index` succeeding on it is
+that check.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from qiita_compute_orchestrator.krepp_build import (
+    JEST_LABELLED_TREE,
+    JEST_NULL,
+    MANIFEST,
+    SHA256SUMS,
+    SHARED_METADATA_KEYS,
+    VERIFY_SCRIPT,
+    KreppBuildInvalid,
+    inventory_index,
+    verify_build,
+    write_build_files,
+)
+
+_BUILD_TIMEOUT_S = 300
+TREE_NEWICK = "((g0:1,g1:1):1,(g2:1,g3:1):1);\n"
+
+_BUILD = textwrap.dedent(
+    """
+    import random, sys
+    from qiita_compute_orchestrator.miint import open_miint_conn
+    out, nwk = sys.argv[1], sys.argv[2]
+    conn = open_miint_conn()
+    rng = random.Random(1)
+    conn.execute("CREATE TABLE ref (read_id VARCHAR, sequence1 VARCHAR)")
+    conn.executemany(
+        "INSERT INTO ref VALUES (?, ?)",
+        [(f"g{i}", "".join(rng.choice("ACGT") for _ in range(20000))) for i in range(4)],
+    )
+    conn.execute(
+        "CREATE TABLE tree AS SELECT * REPLACE (node_index AS edge_id) FROM read_newick(?)",
+        [nwk],
+    )
+    for r in (0, 1):
+        status = conn.execute(
+            f"SELECT status FROM krepp_index_create('ref', '{out}', tree_table := 'tree',"
+            f" k := 19, w := 25, h := 9, m := 4, r := {r}, frac := false)"
+        ).fetchone()[0]
+        assert status == "ok", status
+    """
+)
+
+
+@pytest.fixture(scope="session")
+def built_index(tmp_path_factory) -> Path:
+    """`index/` of a two-partition (m=4, r=0 and r=1) index over four random genomes."""
+    root = tmp_path_factory.mktemp("krepp-index")
+    nwk = root / "tree.nwk"
+    nwk.write_text(TREE_NEWICK)
+    out = root / "index"
+    subprocess.run(
+        [sys.executable, "-c", _BUILD, str(out), str(nwk)],
+        check=True,
+        timeout=_BUILD_TIMEOUT_S,
+        capture_output=True,
+    )
+    return out
+
+
+@pytest.fixture
+def build(built_index, tmp_path) -> Path:
+    """A build folder: the index plus the two JEST files, not yet registered."""
+    folder = tmp_path / "w43_test"
+    shutil.copytree(built_index, folder / "index")
+    (folder / "jest").mkdir()
+    (folder / JEST_LABELLED_TREE).write_text(
+        "((g0:1{0},g1:1{1}):1{2},(g2:1{3},g3:1{4}):1{5}){6};\n"
+    )
+    (folder / JEST_NULL).write_text("0.1\n0.2\n")
+    return folder
+
+
+def _register(folder: Path) -> tuple[str, dict]:
+    return write_build_files(folder, reference_idx=18, build_label=folder.name, threads=2)
+
+
+def test_inventory_reads_what_krepp_writes(built_index):
+    inv = inventory_index(built_index)
+    assert inv.m == 4
+    assert inv.partitions == (0, 1)
+    assert len(inv.files) == 14
+    assert set(inv.settings) == set(SHARED_METADATA_KEYS)
+    assert (inv.settings["k"], inv.settings["w"], inv.settings["h"]) == ("19", "25", "9")
+    assert inv.settings["krepp version"].startswith("v")
+    # krepp writes the backbone tree as Newick carrying the edge numbers it was given.
+    assert "{6}" in (built_index / "tree-m4r0-no_frac").read_text()
+
+
+def test_registration_is_deterministic(build):
+    first, manifest = _register(build)
+    again, _ = _register(build)
+    assert first == again
+    assert first == hashlib.sha256((build / SHA256SUMS).read_bytes()).hexdigest()
+    assert manifest["partitions"] == [0, 1]
+    listed = [line.split("  ", 1)[1] for line in (build / SHA256SUMS).read_text().splitlines()]
+    assert SHA256SUMS not in listed and VERIFY_SCRIPT in listed and MANIFEST in listed
+
+
+def test_registration_refuses_a_folder_edited_since(build):
+    _register(build)
+    (build / JEST_NULL).write_text("0.3\n")
+    with pytest.raises(KreppBuildInvalid, match="changed since it was registered"):
+        _register(build)
+
+
+@pytest.mark.parametrize(
+    ("edit", "check"),
+    [
+        (lambda f: (f / "index" / "reflist-m4r1-no_frac").unlink(), "inventory"),
+        (lambda f: (f / "index" / "notes.txt").write_text("x"), "inventory"),
+        (lambda f: (f / "extra.txt").write_text("x"), "inventory"),
+        (lambda f: (f / JEST_NULL).unlink(), "inventory"),
+    ],
+)
+def test_registration_refuses_a_folder_that_is_not_a_build(build, edit, check):
+    edit(build)
+    with pytest.raises(KreppBuildInvalid) as exc:
+        _register(build)
+    assert exc.value.check == check
+
+
+def test_registration_refuses_partitions_that_disagree(build):
+    txt = build / "index" / "metadata-m4r1-no_frac.txt"
+    txt.write_text(txt.read_text().replace("seed: 0", "seed: 7"))
+    with pytest.raises(KreppBuildInvalid, match=r"differs from r0 on \['seed'\]"):
+        _register(build)
+
+
+def test_registration_refuses_differing_trees(build):
+    tree = build / "index" / "tree-m4r1-no_frac"
+    tree.write_text(tree.read_text().replace("{6}", "{9}"))
+    with pytest.raises(KreppBuildInvalid) as exc:
+        _register(build)
+    assert exc.value.check == "tree"
+
+
+def test_verify_accepts_the_registered_copy(build):
+    sums, _ = _register(build)
+    copy = build.parent / "node-copy"
+    shutil.copytree(build, copy)
+    manifest = verify_build(copy, sums, linked_krepp_version=None)
+    assert manifest["build_label"] == build.name
+
+
+@pytest.mark.parametrize(
+    ("edit", "check"),
+    [
+        (lambda f: (f / "index" / "extra").write_text("x"), "files"),
+        (lambda f: (f / "index" / "cmer-m4r0-no_frac").unlink(), "files"),
+        (lambda f: (f / "index" / "cmer-m4r0-no_frac").write_bytes(b"x"), "size"),
+        (lambda f: _same_size_edit(f / "index" / "metadata-m4r0-no_frac.txt"), "hash"),
+        (lambda f: _same_size_edit(f / MANIFEST), "manifest"),
+    ],
+)
+def test_verify_refuses_a_changed_copy(build, edit, check):
+    sums, _ = _register(build)
+    edit(build)
+    with pytest.raises(KreppBuildInvalid) as exc:
+        verify_build(build, sums, linked_krepp_version=None)
+    assert exc.value.check == check
+
+
+def _same_size_edit(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[-2] = ord("x") if data[-2] != ord("x") else ord("y")
+    path.write_bytes(bytes(data))
+
+
+def test_verify_refuses_another_build(build):
+    _register(build)
+    with pytest.raises(KreppBuildInvalid) as exc:
+        verify_build(build, "0" * 64, linked_krepp_version=None)
+    assert exc.value.check == "sha256sums"
+
+
+def test_verify_tells_missing_from_unreadable(build, tmp_path):
+    sums, _ = _register(build)
+    with pytest.raises(KreppBuildInvalid) as exc:
+        verify_build(tmp_path / "absent", sums, linked_krepp_version=None)
+    assert exc.value.check == "missing"
+    (build / SHA256SUMS).chmod(0)
+    try:
+        with pytest.raises(KreppBuildInvalid) as exc:
+            verify_build(build, sums, linked_krepp_version=None)
+        assert exc.value.check == "unreadable"
+    finally:
+        (build / SHA256SUMS).chmod(0o644)
+
+
+def test_verify_refuses_a_build_from_another_krepp(build):
+    sums, manifest = _register(build)
+    built = manifest["settings"]["krepp version"]
+    assert verify_build(build, sums, linked_krepp_version=built)
+    with pytest.raises(KreppBuildInvalid) as exc:
+        verify_build(build, sums, linked_krepp_version=built + "-other")
+    assert exc.value.check == "krepp-version"
+
+
+def _gnu_sha256sum() -> bool:
+    try:
+        out = subprocess.run(["sha256sum", "--version"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return False
+    return "GNU coreutils" in out.stdout
+
+
+@pytest.mark.skipif(not _gnu_sha256sum(), reason="verify.sh targets GNU coreutils on the nodes")
+def test_verify_script(build):
+    sums, _ = _register(build)
+    script = build / VERIFY_SCRIPT
+
+    def run() -> subprocess.CompletedProcess:
+        return subprocess.run([str(script), sums], capture_output=True, text=True)
+
+    assert run().returncode == 0
+    (build / "index" / "stray").write_text("x")
+    result = run()
+    assert result.returncode != 0 and "not in SHA256SUMS: index/stray" in result.stderr
+    (build / "index" / "stray").unlink()
+    _same_size_edit(build / JEST_NULL)
+    assert run().returncode != 0
+    assert json.loads((build / MANIFEST).read_text())["build_label"] == build.name
