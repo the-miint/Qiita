@@ -86,6 +86,7 @@ from .force_fail import (
     _handle_ticket_force_fail,
     _validate_force_fail_args,
 )
+from .krepp_index import add_krepp_index_subparsers
 from .masked_export import (
     _READ_MASKED_COLUMNS,
     _SAFE_ACCESSION,
@@ -381,6 +382,8 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_terminology_load.set_defaults(handler=_handle_terminology_load)
+
+    add_krepp_index_subparsers(sub)
 
     p_reference = sub.add_parser("reference", help="Reference maintenance operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)

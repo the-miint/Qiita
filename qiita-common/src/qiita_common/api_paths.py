@@ -90,6 +90,12 @@ PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
 # (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
 # to read. Param path, 3 segments, no literal shadow.
 PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
+# Operator: mark a registered or retired krepp build removed. A verb segment on one
+# index row. Param path, 4 segments, no literal shadow.
+PATH_REFERENCE_INDEX_REMOVE = "/{reference_idx}/index/{reference_index_idx}/remove"
+# Every reference's active krepp build, for the compute-readiness probe. Literal
+# path, 2 segments; no `/{reference_idx}/...` route of 2 segments ends in `active`.
+PATH_REFERENCE_KREPP_BUILD_ACTIVE = "/krepp-build/active"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -106,6 +112,8 @@ URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOM
 URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
     f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
 )
+URL_REFERENCE_INDEX_REMOVE = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX_REMOVE}"
+URL_REFERENCE_KREPP_BUILD_ACTIVE = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_KREPP_BUILD_ACTIVE}"
 
 # =============================================================================
 # /host-filter-profile/*

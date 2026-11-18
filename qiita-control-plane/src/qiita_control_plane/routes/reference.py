@@ -33,6 +33,8 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
+    PATH_REFERENCE_INDEX_REMOVE,
+    PATH_REFERENCE_KREPP_BUILD_ACTIVE,
     PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -45,7 +47,9 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_TABLE,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.krepp import KreppBuildRecord
 from qiita_common.models import (
+    INDEX_TYPE_KREPP,
     DoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
@@ -58,6 +62,7 @@ from qiita_common.models import (
     ReferenceExclusionSyncResponse,
     ReferenceGenomeMember,
     ReferenceIndex,
+    ReferenceIndexState,
     ReferenceKind,
     ReferencePhylogenyEdgeIdMintResponse,
     ReferenceResponse,
@@ -107,6 +112,11 @@ from ..repositories.reference_exclusion import (
     add_exclusion,
     list_for_reference,
     remove_exclusion,
+)
+from ..repositories.reference_index import (
+    KreppBuildNotFound,
+    KreppBuildTransitionRefused,
+    remove_krepp_build,
 )
 from ..repositories.reference_membership import (
     count_genome_map,
@@ -201,6 +211,71 @@ async def list_references(
         *args,
     )
     return [ReferenceResponse(**dict(r)) for r in rows]
+
+
+@router.get(PATH_REFERENCE_KREPP_BUILD_ACTIVE)
+async def list_active_krepp_builds(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_any_scope(Scope.REFERENCE_READ, Scope.TICKET_DOGET)),
+) -> list[KreppBuildRecord]:
+    """Every reference's active krepp build: where its copy is, relative to
+    PATH_NODE_LOCAL, and the SHA256SUMS hash a copy must have. The compute-readiness
+    probe checks each on the node it runs on. Accepts `reference:read` or
+    `ticket:doget`, as the reference DoGet route does, because the compute service
+    account holds the latter."""
+    rows = await pool.fetch(
+        "SELECT reference_index_idx, reference_idx, fs_path, params->>'sha256sums_sha256' AS sums"
+        " FROM qiita.reference_index WHERE index_type = $1 AND state = $2"
+        " ORDER BY reference_idx",
+        INDEX_TYPE_KREPP,
+        ReferenceIndexState.ACTIVE.value,
+    )
+    return [
+        KreppBuildRecord(
+            reference_index_idx=r["reference_index_idx"],
+            reference_idx=r["reference_idx"],
+            fs_path=r["fs_path"],
+            sha256sums_sha256=r["sums"],
+        )
+        for r in rows
+    ]
+
+
+@router.post(PATH_REFERENCE_INDEX_REMOVE, status_code=200)
+async def remove_reference_krepp_build(
+    reference_idx: Annotated[int, Field(gt=0)],
+    reference_index_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_DELETE)),
+) -> ReferenceIndex:
+    """Mark a registered or retired krepp build `removed` (`reference:delete`,
+    system_admin). 404 when the row is not a krepp build of this reference; 409 when
+    it is the active build or a ticket fixed to it is still running
+    (`repositories.reference_index.remove_krepp_build`). The files are deleted by the
+    operator afterwards; tickets fixed to the build keep it, and `/run` refuses them."""
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            owner = await conn.fetchval(
+                "SELECT reference_idx FROM qiita.reference_index WHERE reference_index_idx = $1",
+                reference_index_idx,
+            )
+            if owner != reference_idx:
+                raise KreppBuildNotFound(reference_index_idx)
+            await remove_krepp_build(conn, reference_index_idx)
+    except KreppBuildNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KreppBuildTransitionRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    row = dict(
+        await pool.fetchrow(
+            "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
+            " shard_id, state, fs_path_root FROM qiita.reference_index"
+            " WHERE reference_index_idx = $1",
+            reference_index_idx,
+        )
+    )
+    row["params"] = json.loads(row["params"])
+    return ReferenceIndex(**row)
 
 
 @router.get(PATH_REFERENCE_INDEX)

@@ -1,12 +1,18 @@
-"""`POST /work-ticket/{idx}/run` refuses a ticket whose krepp build was removed, and
-lets one whose build is retired run (repositories.reference_index)."""
+"""The krepp build routes: `POST /reference/{idx}/index/{idx}/remove`, `GET
+/reference/krepp-build/active`, and `POST /work-ticket/{idx}/run` refusing a ticket whose
+build was removed while letting one whose build is retired run
+(repositories.reference_index)."""
 
 import secrets
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_RUN
+from qiita_common.api_paths import (
+    URL_REFERENCE_INDEX_REMOVE,
+    URL_REFERENCE_KREPP_BUILD_ACTIVE,
+    URL_WORK_TICKET_RUN,
+)
 
 pytestmark = pytest.mark.db
 
@@ -101,7 +107,14 @@ async def failed_ticket_on_build(postgres_pool, human_admin_session, monkeypatch
             state,
         )
 
-    yield {"ticket": ticket, "build": build, "set_state": set_state, "dispatched": dispatched}
+    yield {
+        "ticket": ticket,
+        "build": build,
+        "reference_idx": reference_idx,
+        "set_state": set_state,
+        "dispatched": dispatched,
+        "pool": pool,
+    }
     await pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", reference_idx)
     await pool.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx)
     await pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
@@ -122,3 +135,57 @@ async def test_run_redrives_a_ticket_whose_build_is_retired(client, failed_ticke
     resp = await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=w["ticket"]))
     assert resp.is_success, resp.text
     assert w["dispatched"] == [w["ticket"]]
+
+
+def _remove_url(w, reference_idx=None, build=None) -> str:
+    return URL_REFERENCE_INDEX_REMOVE.format(
+        reference_idx=reference_idx or w["reference_idx"],
+        reference_index_idx=build or w["build"],
+    )
+
+
+async def test_remove_marks_a_retired_build_removed(client, failed_ticket_on_build):
+    w = failed_ticket_on_build
+    resp = await client.post(_remove_url(w))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == "removed"
+
+
+async def test_remove_refuses_while_a_ticket_runs_on_the_build(client, failed_ticket_on_build):
+    w = failed_ticket_on_build
+    await w["pool"].execute(
+        "UPDATE qiita.work_ticket SET state = 'processing', failure_type = NULL,"
+        " failure_stage = NULL, failure_reason = NULL WHERE work_ticket_idx = $1",
+        w["ticket"],
+    )
+    resp = await client.post(_remove_url(w))
+    assert resp.status_code == 409
+    assert str(w["ticket"]) in resp.json()["detail"]
+
+
+async def test_remove_404s_a_build_of_another_reference(client, failed_ticket_on_build):
+    w = failed_ticket_on_build
+    resp = await client.post(_remove_url(w, reference_idx=w["reference_idx"] + 100000))
+    assert resp.status_code == 404
+
+
+async def test_active_builds_lists_only_active_krepp_builds(client, failed_ticket_on_build):
+    w = failed_ticket_on_build
+    listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
+    assert w["build"] not in [b["reference_index_idx"] for b in listed]
+    await w["pool"].execute(
+        "UPDATE qiita.reference_index SET state = 'active',"
+        " params = jsonb_build_object('sha256sums_sha256', repeat('e', 64))"
+        " WHERE reference_index_idx = $1",
+        w["build"],
+    )
+    listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
+    mine = [b for b in listed if b["reference_index_idx"] == w["build"]]
+    assert mine == [
+        {
+            "reference_index_idx": w["build"],
+            "reference_idx": w["reference_idx"],
+            "fs_path": "references/x/krepp/a",
+            "sha256sums_sha256": "e" * 64,
+        }
+    ]
