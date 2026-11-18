@@ -32,6 +32,12 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+# The statuses whose data is servable over Flight: `active` (loaded) or `indexing`
+# (mid-reindex, still serving the prior index). Any other status may hold partial or
+# stale rows.
+SERVABLE_REFERENCE_STATUSES = (ReferenceStatus.ACTIVE, ReferenceStatus.INDEXING)
+
+
 class ReadMaskReason(StrEnum):
     """Why a read is kept or dropped by a read mask.
 

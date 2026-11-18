@@ -50,6 +50,7 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    SERVABLE_REFERENCE_STATUSES,
     DoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
@@ -1009,17 +1010,19 @@ async def create_doget_ticket(
             detail=f"Unknown table {body.table!r}; allowed: {sorted(_REFERENCE_DOGET_TABLES)}",
         )
 
-    _STREAMABLE_STATUSES = (ReferenceStatus.ACTIVE.value, ReferenceStatus.INDEXING.value)
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if status is None:
         raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
-    if status not in _STREAMABLE_STATUSES:
+    if status not in SERVABLE_REFERENCE_STATUSES:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be one of {list(_STREAMABLE_STATUSES)}",
+            detail=(
+                f"Reference status is {status!r}, must be one of "
+                f"{[s.value for s in SERVABLE_REFERENCE_STATUSES]}"
+            ),
         )
 
     filter: dict[str, list[int]] = {"reference_idx": [reference_idx]}

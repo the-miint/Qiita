@@ -265,6 +265,7 @@ from qiita_common.models.reference import (
     INDEX_TYPE_RYPE_ROUTER,
     MAX_EXPORTED_FEATURE_ENTITIES,
     READ_MASK_BUCKET,
+    SERVABLE_REFERENCE_STATUSES,
     STORABLE_ACCESS_TIERS,
     VALID_STATUS_TRANSITIONS,
     AssemblyGenomeMapResponse,
@@ -642,6 +643,7 @@ __all__ = [
     "ReferenceShardIndexStatus",
     "ReferenceStatus",
     "ReferenceStatusUpdate",
+    "SERVABLE_REFERENCE_STATUSES",
     "Tier",
     "STORABLE_ACCESS_TIERS",
     # Terminology.
