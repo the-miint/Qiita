@@ -710,7 +710,7 @@ async def _process_one_study(
                 item.idx,
                 BatchItemState.FAILED,
                 failure_reason=(
-                    "nothing to download: every run this import names has stored reads, a recorded"
+                    "nothing to download: every run this import names has stored reads, a permanent"
                     " download failure, or is retired or ENA-flagged"
                     if any_skipped
                     else "study registered but no pool holds an active sequenced_sample"

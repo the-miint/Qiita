@@ -110,7 +110,10 @@ from ..repositories.reference_membership import (
     GENOME_MAP_ROWS_SQL,
     count_reference_shards,
 )
-from ..repositories.sequence_range import lock_prep_sample_range
+from ..repositories.sequence_range import (
+    lock_prep_sample_range,
+    release_sequence_range_minted_by,
+)
 from ..repositories.sequenced_sample import (
     fetch_empty_ingest_tickets,
     set_sequenced_sample_download_failure,
@@ -2255,14 +2258,19 @@ async def persist_read_metrics(
 
 
 async def persist_ena_run_outcomes(
-    pool: asyncpg.Pool, sequenced_pool_idx: int, run_outcomes_path: Path
+    pool: asyncpg.Pool, sequenced_pool_idx: int, run_outcomes_path: Path, *, work_ticket_idx: int
 ) -> int:
-    """Record each run in `run_outcomes_path` as a failed download on its sequenced_sample;
+    """Record each run in `run_outcomes_path` as a failed download on its sequenced_sample,
+    and release the range `work_ticket_idx` minted for it (no reads were stored);
     raises if one is not in the pool."""
     if not run_outcomes_path.exists():
         raise FileNotFoundError(f"run_outcomes file not found: {run_outcomes_path}")
     failed = TypeAdapter(list[FailedRunOutcome]).validate_json(run_outcomes_path.read_bytes())
     async with pool.acquire() as conn, conn.transaction():
+        for f in sorted(failed, key=lambda f: f.prep_sample_idx):
+            await release_sequence_range_minted_by(
+                conn, prep_sample_idx=f.prep_sample_idx, work_ticket_idx=work_ticket_idx
+            )
         strangers = [
             f"{f.ena_run_accession} (prep_sample {f.prep_sample_idx})"
             for f in failed

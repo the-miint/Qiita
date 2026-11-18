@@ -147,6 +147,7 @@ Failure classification is finer-grained at the backend layer: `BackendFailure.ki
 
 Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
 - On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
+- A native step can opt in, through a `final_attempt` entry in its `params:`, to learn that its attempt is the last (`retry_count >= max_retries`), so it can land partial results instead of failing.
 - On `BackendFailure(transient=True)` with retries exhausted: transition to `FAILED` with `failure_type=permanent` and kind `RETRIES_EXHAUSTED`, identified by the `retries_exhausted` prefix of `failure_reason`, which carries the last attempt's kind and reason, so the notify sweeper emails it. `failure_type=retriable` is left to failures outside the step retry loop (a transient runner DB error, a transient pre-loop resolver failure), which are held for a `/run` redrive.
 - On `BackendFailure(transient=False)`: skip the retry loop, transition straight to `FAILED` with `failure_type=permanent`.
 - On any other unwrapped `Exception` (LIBRARY primitive raising plain Python, programming bug): treat as `permanent`, `failure_type=permanent`, `failure_reason="<ExceptionType>: <message>"` truncated to 2000 chars.
@@ -206,7 +207,7 @@ download did not read get a new, forced ticket on that pool). That ticket then
 runs like any other workflow: a native `ingest_ena_reads` step (`read_ena_sequences`
 + the same mint-then-sort-and-assign pipeline `ingest_reads` uses), the standard
 `register-files` action into DuckLake, and `persist-ena-run-outcomes`, which records
-each run that could not be stored. One item's failure — resolver
+each run that could not be stored and releases the read numbering minted for it. One item's failure — resolver
 error, unmappable platform, a DB conflict — is isolated to that item; it never
 aborts the batch or its siblings. See
 [`docs/runbooks/ena-import.md`](../runbooks/ena-import.md) for the operator-facing

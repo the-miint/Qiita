@@ -9,6 +9,7 @@ import pytest_asyncio
 from qiita_common.models import FailureType
 
 from qiita_control_plane.actions.library import persist_ena_run_outcomes
+from qiita_control_plane.repositories.sequence_range import mint_sequence_range
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
@@ -21,6 +22,9 @@ from qiita_control_plane.testing.db_teardown import (
 )
 
 pytestmark = pytest.mark.db
+
+_TICKET = 7_000_001
+_OTHER_TICKET = 7_000_002
 
 
 @pytest_asyncio.fixture
@@ -105,7 +109,7 @@ async def test_records_reason_and_failure_type_on_each_listed_run(pools, tmp_pat
     (bad_psi, bad_acc), (ok_psi, _) = members[0]
     path = _outcomes_file(tmp_path, [(bad_psi, bad_acc, "no sequence data found")])
 
-    await persist_ena_run_outcomes(pool, pool_idxs[0], path)
+    await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
 
     assert await _failure(pool, bad_psi) == ("no sequence data found", FailureType.PERMANENT)
     assert await _failure(pool, ok_psi) == (None, None)
@@ -115,7 +119,7 @@ async def test_empty_list_writes_nothing(pools, tmp_path):
     pool, members, pool_idxs = pools
     path = _outcomes_file(tmp_path, [])
 
-    await persist_ena_run_outcomes(pool, pool_idxs[0], path)
+    await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
 
     for psi, _ in members[0]:
         assert await _failure(pool, psi) == (None, None)
@@ -130,7 +134,7 @@ async def test_run_outside_the_pool_fails_loud_and_writes_nothing(pools, tmp_pat
     )
 
     with pytest.raises(RuntimeError, match=str(stranger_psi)):
-        await persist_ena_run_outcomes(pool, pool_idxs[0], path)
+        await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
 
     assert await _failure(pool, own_psi) == (None, None)
     assert await _failure(pool, stranger_psi) == (None, None)
@@ -142,7 +146,7 @@ async def test_accession_that_does_not_match_the_prep_sample_fails_loud(pools, t
     path = _outcomes_file(tmp_path, [(psi, other_acc, "boom")])
 
     with pytest.raises(RuntimeError, match=other_acc):
-        await persist_ena_run_outcomes(pool, pool_idxs[0], path)
+        await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
 
     assert await _failure(pool, psi) == (None, None)
 
@@ -150,7 +154,52 @@ async def test_accession_that_does_not_match_the_prep_sample_fails_loud(pools, t
 async def test_missing_outcomes_file_fails_loud(pools, tmp_path):
     pool, _, pool_idxs = pools
     with pytest.raises(FileNotFoundError):
-        await persist_ena_run_outcomes(pool, pool_idxs[0], tmp_path / "absent.json")
+        await persist_ena_run_outcomes(
+            pool, pool_idxs[0], tmp_path / "absent.json", work_ticket_idx=_TICKET
+        )
+
+
+async def _mint(pool, prep_sample_idx, minted_by):
+    principal_idx = await pool.fetchval("SELECT idx FROM qiita.principal LIMIT 1")
+    await mint_sequence_range(
+        pool,
+        prep_sample_idx=prep_sample_idx,
+        count=5,
+        principal_idx=principal_idx,
+        work_ticket_idx=minted_by,
+    )
+
+
+async def _has_range(pool, prep_sample_idx) -> bool:
+    return await pool.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM qiita.sequence_range WHERE prep_sample_idx = $1)",
+        prep_sample_idx,
+    )
+
+
+async def test_releases_the_range_of_a_failed_run_its_ticket_minted(pools, tmp_path):
+    """A range minted before the fetch failed would otherwise read as registered reads."""
+    pool, members, pool_idxs = pools
+    (bad_psi, bad_acc), (ok_psi, _) = members[0]
+    await _mint(pool, bad_psi, _TICKET)
+    await _mint(pool, ok_psi, _TICKET)
+    path = _outcomes_file(tmp_path, [(bad_psi, bad_acc, "boom")])
+
+    await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
+
+    assert not await _has_range(pool, bad_psi)
+    assert await _has_range(pool, ok_psi)
+
+
+async def test_keeps_the_range_of_a_failed_run_another_ticket_minted(pools, tmp_path):
+    pool, members, pool_idxs = pools
+    (bad_psi, bad_acc), _ = members[0]
+    await _mint(pool, bad_psi, _OTHER_TICKET)
+    path = _outcomes_file(tmp_path, [(bad_psi, bad_acc, "boom")])
+
+    await persist_ena_run_outcomes(pool, pool_idxs[0], path, work_ticket_idx=_TICKET)
+
+    assert await _has_range(pool, bad_psi)
 
 
 @pytest.mark.parametrize(

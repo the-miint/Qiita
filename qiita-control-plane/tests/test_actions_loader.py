@@ -1220,6 +1220,7 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
     from qiita_common.models import ScopeTargetKind
 
     from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.runner._workflow import FINAL_ATTEMPT_BINDING
 
     repo_root = Path(__file__).resolve().parents[2]
     actions = load_actions(repo_root / "workflows")
@@ -1255,6 +1256,7 @@ def test_load_actions_loads_on_disk_download_ena_study_yaml():
     assert ingest.params == {
         "download_method": "download_method",
         "run_concurrency": "run_concurrency",
+        FINAL_ATTEMPT_BINDING: "final_attempt",
     }
     assert ingest.outputs == ["read_staging_dir", "run_outcomes"]
 
