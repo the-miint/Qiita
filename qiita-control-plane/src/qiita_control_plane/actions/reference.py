@@ -43,7 +43,7 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 class ReferenceDeleteBlocked(Exception):
     """Raised when a reference cannot be deleted. `alignment_definitions` and
-    `genome_derivations` block UNCONDITIONALLY (even with force); `in_flight` work
+    `genome_derivations` block unconditionally (even with force); `in_flight` work
     tickets always block; `terminal` work tickets block only when the caller did not
     pass force=True."""
 
