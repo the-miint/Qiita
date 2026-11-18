@@ -1562,7 +1562,8 @@ def test_load_actions_read_mask_persists_syndna_counts_after_the_gate():
 def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
     """The mask-model fastq-to-parquet (1.3.0) mints a mask_idx and writes read_mask
     exactly like read-mask, so it owes the SAME first-class completion gate: its last
-    step is `finalize-mask-sample`, after the read_mask `register-files`. The
+    gate step is `finalize-mask-sample`, after the read_mask `register-files`; only the
+    raw QC report persist follows it. The
     pre-mask-model versions (1.0.0–1.2.0) never mint a mask_idx and carry no such
     step; they are not checked here. Keyed by (action_id, version) because several
     fastq-to-parquet versions coexist on disk."""
@@ -1577,28 +1578,40 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
         if a.action_id == "fastq-to-parquet" and a.version == "1.3.0"
     )
     names = [s.name for s in ftp_130.steps]
-    assert names[-1] == "finalize-mask-sample"
-    assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
+    assert names[-2] == "finalize-mask-sample"
+    assert names[-3] == "register-files"  # register-files immediately precedes the gate flip
 
 
-def test_load_actions_fastq_to_parquet_v140_persists_raw_qc_report():
-    """1.3.0 computed `raw_qc_report` and never stored it; 1.4.0 persists it, binding
-    only the raw report because the mask model has no filtered one."""
+def test_load_actions_fastq_to_parquet_v130_persists_raw_qc_report_last():
+    """1.3.0 computed `raw_qc_report` and never stored it; `persist-qc-report` is
+    appended after the gate flip, binding only the raw report (the mask model has no
+    filtered one). Every earlier entry keeps its index and name so resume still
+    matches in-flight tickets."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
 
     repo_root = Path(__file__).resolve().parents[2]
-    by_key = {(a.action_id, a.version): a for a in load_actions(repo_root / "workflows")}
-    names = [s.name for s in by_key[("fastq-to-parquet", "1.4.0")].steps]
-    assert names.index("persist-qc-report") > names.index("qc_report_raw")
-    assert names[-2:] == ["register-files", "finalize-mask-sample"]
-    persist = next(
-        s for s in by_key[("fastq-to-parquet", "1.4.0")].steps if s.name == "persist-qc-report"
+    ftp_130 = next(
+        a
+        for a in load_actions(repo_root / "workflows")
+        if a.action_id == "fastq-to-parquet" and a.version == "1.3.0"
     )
+    names = [s.name for s in ftp_130.steps]
+    assert names == [
+        "fastq",
+        "register-files",
+        "qc_report_raw",
+        "qc",
+        "host_filter",
+        "persist-read-metrics",
+        "register-files",
+        "finalize-mask-sample",
+        "persist-qc-report",
+    ]
+    persist = ftp_130.steps[-1]
     assert persist.inputs == ["raw_qc_report"]
     assert persist.outputs == []
-    assert "persist-qc-report" not in [s.name for s in by_key[("fastq-to-parquet", "1.3.0")].steps]
 
 
 def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():

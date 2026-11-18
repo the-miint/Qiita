@@ -40,7 +40,10 @@ description: >
   There is only ONE QC report (qc_report_raw, on the full raw reads), by design.
   Nothing is physically filtered now — qc/host_filter emit masks over the full
   `read` rows — so a separate "filtered reads" QC report would describe a file
-  that does not exist. The raw report is the QC report for this workflow.
+  that does not exist. The raw report is the QC report for this workflow, and
+  persist-qc-report stores it alone, so filtered_qc_report is NULL. Added to this
+  version in place, as its last step; a prep_sample processed before that has no
+  stored report.
 
   host_filter's host indexes are GATED. When action_context sets
   `host_filter_enabled: true`, `host_rype_reference_idx` names an ACTIVE reference
@@ -237,10 +240,17 @@ steps:
   # and writes read_mask exactly like read-mask, so it owes the same first-class
   # completion gate its consumers (masked-read export, long-read-assembly,
   # alignment) require. No file inputs: mask_idx from the ticket, prep_sample_idx
-  # from the scope target. MUST run last — after register-files makes the reads
+  # from the scope target. MUST run after register-files makes the reads
   # durable — so 'completed' never advertises reads that aren't in DuckLake.
   - action: finalize-mask-sample
     inputs: []
+    outputs: []
+
+  # Store the qc_report_raw sidecar on this prep_sample's sequenced_sample. Binds the
+  # raw report only: the pool QC report route reads it from there. Last so steps
+  # already recorded keep their indexes on resume.
+  - action: persist-qc-report
+    inputs: [raw_qc_report]
     outputs: []
 
 # Ceiling must stay strictly ABOVE every step baseline on the escalating axes

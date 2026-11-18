@@ -5651,6 +5651,67 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     assert by_index[2].state is StepProgressState.COMPLETED
 
 
+async def test_resume_runs_an_entry_appended_after_the_recorded_ones(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """Rows recorded under the 3-entry list resume into a list with a fourth entry
+    appended: no StepProgressMismatch, the recorded entries are fast-forwarded and
+    only the appended one runs."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    for index, name in ((0, "compute"), (2, "finish")):
+        await _seed_submitted_step(
+            postgres_pool,
+            multi_step_ticket,
+            step_name=name,
+            slurm_job_id=952 + index,
+            step_index=index,
+        )
+        await step_progress.record_running(
+            postgres_pool, work_ticket_idx=multi_step_ticket, step_index=index, attempt=0
+        )
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=1,
+        attempt=0,
+        step_name="mint-features",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    for index in (0, 1, 2):
+        await step_progress.record_completed(
+            postgres_pool, work_ticket_idx=multi_step_ticket, step_index=index, attempt=0
+        )
+    appended = {
+        "kind": "action",
+        "name": "write-membership",
+        "inputs": ["manifest", "feature_map"],
+        "outputs": [],
+    }
+    await postgres_pool.execute(
+        "UPDATE qiita.action SET steps = $1::jsonb WHERE (action_id, version) ="
+        " (SELECT action_id, action_version FROM qiita.work_ticket WHERE work_ticket_idx = $2)",
+        json.dumps([*_MULTI_STEP_WORKFLOW, appended]),
+        multi_step_ticket,
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[],
+        result_script=[{"manifest": "manifest.parquet"}, {"result": "result.parquet"}],
+    )
+    await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", multi_step_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 0
+    assert [c[0] for c in library_spy.calls] == ["write-membership"]
+    rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
+    assert {r.step_index: r.state for r in rows} == dict.fromkeys(
+        range(4), StepProgressState.COMPLETED
+    )
+
+
 async def test_resume_fails_a_ticket_whose_completed_entry_moved(
     postgres_pool, multi_step_ticket, library_spy, tmp_path
 ):
