@@ -2,8 +2,9 @@
 
 - **A feature table's taxonomy on demand.** `POST /feature-table/taxonomy` answers the
   same cohort request as the feature table with each observed feature's taxonomic lineage
-  — its md5 and the reference's ranks `(domain … strain)` with their `d__/p__…` prefixes
-  — as an Arrow IPC stream. The lineage is a direct lookup: a feature's canonical
+  — keyed by the same exported-feature handle the table uses, with the reference's ranks
+  `(domain … strain)` and their `d__/p__…` prefixes — as an Arrow IPC stream. The lineage
+  is a direct lookup: a feature's canonical
   `feature_idx` joins to the taxonomy of the reference the request names, so matching is
   strand-robust, and a feature the reference does not place keeps its row with NULL ranks
   rather than being dropped. It is served separately from the table itself — the feature

@@ -3,7 +3,6 @@ answers — an amplicon table's values, columns, each feature's sequence and md5
 (on `--taxonomy`) its lineage."""
 
 import hashlib
-
 import json
 
 import duckdb
@@ -130,13 +129,13 @@ def _taxonomy(rows):
     return pa.table(cols).cast(TAXONOMY_SCHEMA)
 
 
-def test_taxonomy_flag_writes_each_asvs_lineage_beside_the_bundle(monkeypatch, tmp_path):
+def test_taxonomy_flag_writes_each_features_lineage_beside_the_bundle(monkeypatch, tmp_path):
     out = _run(
         monkeypatch,
         tmp_path,
         "amplicon",
-        _values([("QM1", "md5a", 5.0)]),
-        _features([("md5a", "ACGT"), ("md5b", "TTTT")]),
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT"), ("QF2", "TTTT")]),
         extra=(
             "--taxonomy",
             "--taxonomy-reference-name",
@@ -146,8 +145,8 @@ def test_taxonomy_flag_writes_each_asvs_lineage_beside_the_bundle(monkeypatch, t
         ),
         taxonomy=_taxonomy(
             [
-                ("md5a", "d__Bacteria", "p__Bacillota", None, None, None, None, None, None),
-                ("md5b", "d__Archaea", None, None, None, None, None, None, None),
+                ("QF1", "d__Bacteria", "p__Bacillota", None, None, None, None, None, None),
+                ("QF2", "d__Archaea", None, None, None, None, None, None, None),
             ]
         ),
     )
@@ -156,8 +155,8 @@ def test_taxonomy_flag_writes_each_asvs_lineage_beside_the_bundle(monkeypatch, t
             "SELECT feature_id, domain, phylum FROM read_parquet(?) ORDER BY feature_id",
             [str(out.with_name("table.taxonomy.parquet"))],
         ).fetchall()
-    # Only the feature the table names (md5a); the unused md5b is not written.
-    assert lineage == [("md5a", "d__Bacteria", "p__Bacillota")]
+    # Only the feature the table names (QF1); the unused QF2 is not written.
+    assert lineage == [("QF1", "d__Bacteria", "p__Bacillota")]
     # The manifest records which reference classified the lineage, by public handle.
     manifest = json.loads(out.with_name("table.manifest.json").read_text())
     assert manifest["taxonomy_reference"] == {"name": "greengenes2", "version": "2024.09"}

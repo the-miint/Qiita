@@ -154,30 +154,30 @@ def _taxonomy(rows):
     return pa.table(cols)
 
 
-def test_taxonomy_keys_each_asv_by_md5_and_restores_rank_prefixes():
+def test_taxonomy_keys_each_feature_by_handle_and_restores_rank_prefixes():
     table = build_taxonomy(
-        _sequences([(10, "ACGTACGT")]),
+        _labels([(10, "QF10")]),
         _taxonomy([(10, "Bacteria", "Bacillota", None, None, None, None, None, None)]),
     )
     assert table.column_names == ["feature", *_RANKS]
     row = table.to_pylist()[0]
-    assert row["feature"] == md5("ACGTACGT")
+    assert row["feature"] == "QF10"
     # Prefixes restored; an unresolved rank stays NULL, not a bare "c__".
     assert row["domain"] == "d__Bacteria"
     assert row["phylum"] == "p__Bacillota"
     assert row["class"] is None
 
 
-def test_taxonomy_keeps_an_asv_the_reference_does_not_place():
-    # An observed ASV (20) with no taxonomy row survives with all-NULL ranks — the
+def test_taxonomy_keeps_a_feature_the_reference_does_not_place():
+    # An observed feature (20) with no taxonomy row survives with all-NULL ranks — the
     # query is a lookup, not a filter.
     table = build_taxonomy(
-        _sequences([(10, "ACGT"), (20, "TTTT")]),
+        _labels([(10, "QF10"), (20, "QF20")]),
         _taxonomy([(10, "Bacteria", None, None, None, None, None, None, None)]),
     )
     rows = {r["feature"]: r for r in table.to_pylist()}
-    assert rows[md5("TTTT")]["domain"] is None
-    assert rows[md5("ACGT")]["domain"] == "d__Bacteria"
+    assert rows["QF20"]["domain"] is None
+    assert rows["QF10"]["domain"] == "d__Bacteria"
 
 
 # --- fetch_taxonomy: the two-ticket readiness logic, over a fake Flight stream ---

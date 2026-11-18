@@ -508,19 +508,18 @@ def fetch_taxonomy(
     return taxonomy
 
 
-def build_taxonomy(sequences: pa.Table, taxonomy: pa.Table) -> pa.Table:
+def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
     """The taxonomy answer `(feature, <ranks>)` as Arrow, for the REST answer: each
-    feature the cohort observed, keyed by its md5, with the reference's ranks for it
-    (all NULL for one the reference does not place). `sequences` is the sequence
-    relation (for the md5 of each feature_idx); `taxonomy` is the reference's rows for
-    those feature_idxs.
+    feature the cohort observed under its handle (`labels`, the mint response), with the
+    reference's ranks for it (all NULL for one the reference does not place). `taxonomy`
+    is the reference's rows for those feature_idxs.
 
     The join is the shared feature-axis sidecar, so serving and the client-written sidecar
     are one definition rather than two."""
     with duckdb.connect() as duck:
-        duck.register("sequences", sequences)
+        duck.register("labels", labels)
         duck.register("tax_stream", taxonomy)
-        duck.execute(ft.feature_label_table_sql("sequences"))
+        duck.execute(ft.feature_label_table_sql("labels"))
         duck.execute(ft.taxonomy_table_sql("tax_stream"))
         duck.execute(ft.feature_taxonomy_sidecar_sql())
         table = duck.sql(

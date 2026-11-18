@@ -237,5 +237,8 @@ async def feature_table_taxonomy(
         ) from exc
     if taxonomy is None:
         raise HTTPException(status_code=409, detail="that reference carries no taxonomy")
-    table = build_taxonomy(sequences, taxonomy)
+    labels = await mint_feature_labels(
+        pool, created_by_idx=caller.principal_idx, features=sequences
+    )
+    table = build_taxonomy(labels, taxonomy)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)

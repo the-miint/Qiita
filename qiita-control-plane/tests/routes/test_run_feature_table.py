@@ -517,7 +517,7 @@ async def test_taxonomy_answers_each_asvs_lineage(
         "feature_idxs": [77],
     }
     table = _arrow(resp).to_pydict()
-    assert table["feature"] == [hashlib.md5(ASV.encode()).hexdigest()]
+    assert table["feature"] == ["QF77"]
     # Ranks come back with their source prefixes restored; an unresolved rank is NULL.
     assert table["domain"] == ["d__Bacteria"]
     assert table["phylum"] == ["p__Bacillota"]
@@ -546,7 +546,7 @@ async def test_taxonomy_keeps_an_unplaced_asv_with_null_ranks(
     )
     assert resp.status_code == 200, resp.text
     table = _arrow(resp).to_pydict()
-    assert table["feature"] == [hashlib.md5(ASV.encode()).hexdigest()]
+    assert table["feature"] == ["QF77"]
     assert table["domain"] == [None]
 
 
