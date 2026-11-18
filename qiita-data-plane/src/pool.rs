@@ -573,8 +573,7 @@ impl Drop for PooledConnection {
 /// `pg_pool_idle_timeout_millis` (default 60 s); `0` turns that limit and the
 /// reaper thread off. The setting is read at ATTACH only: measured on DuckDB 2.0.0
 /// against Postgres 16, set after the ATTACH, the pool kept 60000 and the backend
-/// was gone by 90 s. `a_members_catalog_backend_outlives_an_idle_timeout` pins the
-/// retention. `LOAD postgres` first, because the setting is the extension's.
+/// was gone by 90 s. `LOAD postgres` first, because the setting is the extension's.
 const KEEP_CATALOG_BACKEND: &str = "LOAD postgres; SET pg_pool_idle_timeout_millis=0;";
 
 /// What a lake write runs at, for the length of its borrow; the reset on return

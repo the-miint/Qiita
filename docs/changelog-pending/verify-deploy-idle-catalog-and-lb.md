@@ -9,7 +9,7 @@
   It counts each of this host's instances from `QIITA_DATA_PLANE_PORTS` at
   `DUCKLAKE_POOL_SIZE` plus the lock sessions, whether or not the catalog server shows a
   session of it now, and no longer fails when no instance has a session open. An
-  instance with no session is listed as `(no session open)`. Instances on other hosts
+  instance with no session is listed as `(no session under its name)`. Instances on other hosts
   still count only while one of their sessions is open.
 - **`verify-deploy`'s `health/data-plane-lb` row passes against the shipped nginx config
   (#TBD).** nginx's loopback listener now routes gRPC server reflection

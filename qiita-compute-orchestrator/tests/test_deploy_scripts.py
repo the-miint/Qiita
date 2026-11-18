@@ -2965,7 +2965,7 @@ def test_budget_counts_a_local_instance_with_no_session_at_its_configured_pool()
     assert "2 data-plane instance(s), pools 20 + 2 other client backend(s) = 22 of 97" in row
     assert details == [
         "10.0.0.5:50051 pool=10",
-        "10.0.0.5:50052 pool=10 (no session open)",
+        "10.0.0.5:50052 pool=10 (no session under its name)",
         "other: 10.0.0.9 user=admin application_name=psql x2",
     ]
 
@@ -2975,7 +2975,7 @@ def test_budget_passes_with_no_data_plane_session_at_all() -> None:
     assert _passed(row), row
     assert "1 data-plane instance(s), pools 10 + 2 other client backend(s) = 12 of 97" in row
     assert details == [
-        "local:50051 pool=10 (no session open)",
+        "local:50051 pool=10 (no session under its name)",
         "other: 10.0.0.9 user=admin application_name=psql x2",
     ]
 
@@ -2996,7 +2996,7 @@ def test_budget_tells_a_local_instance_from_a_peer_on_the_same_port() -> None:
     assert details == [
         "10.0.0.6:50051 pool=10",
         "[::1]:50059 pool=4",
-        "[::1]:50051 pool=10 (no session open)",
+        "[::1]:50051 pool=10 (no session under its name)",
     ]
 
 
@@ -3107,7 +3107,7 @@ def test_budget_check_counts_this_hosts_instances_from_the_data_plane_env(
     assert proc.returncode == 0, proc.stderr
     assert "counts 1 0" in proc.stdout, proc.stdout
     assert "10.0.0.5:50051 pool=10\n" in proc.stdout
-    assert "10.0.0.5:50052 pool=5 (no session open)" in proc.stdout
+    assert "10.0.0.5:50052 pool=5 (no session under its name)" in proc.stdout
 
 
 def test_budget_check_fails_the_row_on_a_pool_size_it_cannot_read(tmp_path: Path) -> None:

@@ -2707,34 +2707,13 @@ mod tests {
     #[serial]
     #[cfg(feature = "integration")]
     fn catalog_connections_carry_the_instance_application_name() {
-        // A port derived from the process id, so concurrent test processes against one
-        // catalog are unlikely to share a session name.
-        let port = 1 + (std::process::id() % 60000) as u16;
         let base = crate::test_catalog::connstr();
         let data_path = crate::test_catalog::data_path();
-
-        let observer = Connection::open_in_memory().unwrap();
-        observer
-            .execute_batch(&format!(
-                "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
-            ))
-            .unwrap();
-        // Sessions under the name `pool_size` gives; each attach below uses its own
-        // pool size, so a session the other one leaves closing is not counted.
-        let sessions = |pool_size: usize| -> i64 {
-            let name = catalog_application_name(port, pool_size);
-            observer
-                .query_row(
-                    &format!(
-                        "SELECT n FROM postgres_query('observer', \
-                         'SELECT count(*) AS n FROM pg_stat_activity \
-                          WHERE application_name = ''{name}''')"
-                    ),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap()
-        };
+        // Each attach below uses its own pool size, so a session the other one
+        // leaves closing is not counted.
+        let observed = crate::test_catalog::CatalogSessions::new();
+        let port = observed.port;
+        let sessions = |pool_size: usize| observed.count(pool_size);
 
         assert_eq!(sessions(3), 0);
         let lock = Connection::open_in_memory().unwrap();

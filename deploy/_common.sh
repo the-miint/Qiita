@@ -1433,7 +1433,7 @@ qiita_catalog_connection_budget() {
     for entry in $2; do
         port=${entry%%:*} pool=$((10#${entry#*:}))
         case $live_local in *" $port "*) continue ;; esac
-        instances+="    $label:$port pool=$pool (no session open)"$'\n'
+        instances+="    $label:$port pool=$pool (no session under its name)"$'\n'
         n_instances=$((n_instances + 1))
         pools=$((pools + pool))
     done

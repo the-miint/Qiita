@@ -80,8 +80,8 @@ lock sessions (`LOCK_SESSIONS` in `qiita-data-plane/src/lake_locks.rs`), and `ve
 not it has a session open), the pools other hosts' instances name in their open sessions,
 and the other client sessions open now, against `max_connections` less the reserved
 slots. It passes with the numbers and one `<host>:<port> pool=<n>` line per instance, marked
-`(no session open)` for a local instance the catalog server shows no session of, and fails
-when the total does not fit; what it counts, and why, is in
+`(no session under its name)` for a local instance the catalog server shows no session
+named for it, and fails when the total does not fit; what it counts, and why, is in
 `qiita_catalog_connection_budget` (`deploy/_common.sh`). Another host's instance still
 running a build without the name counts only as the sessions it has open; a local one
 counts at its configured pool as well.

@@ -500,7 +500,7 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
 /// (`KEEP_CATALOG_BACKEND`). Two halves, because a short wait cannot tell the
 /// setting from the 60 s default: the member's catalog pool reports no idle limit
 /// (which fails if the setting is not applied, or applied after the ATTACH), and
-/// over a 4 s wait its backend stays open while a control ATTACH with a 1 s limit
+/// over a 6 s wait its backend stays open while a control ATTACH with a 2 s limit
 /// is closed (which fails if `0` stops meaning no limit).
 /// `__ducklake_metadata_<alias>` is the name DuckLake gives the catalog database
 /// it attaches.
@@ -508,33 +508,12 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
 #[cfg(feature = "integration")]
 #[serial_test::serial]
 fn a_members_catalog_backend_outlives_an_idle_timeout() {
-    use crate::ducklake::{catalog_application_name, connect_ducklake, tag_catalog_connstr};
-    // A port derived from the process id, so concurrent test processes against one
-    // catalog are unlikely to share a session name.
-    let port = 1 + (std::process::id() % 60000) as u16;
+    use crate::ducklake::{connect_ducklake, tag_catalog_connstr};
     let base = crate::test_catalog::connstr();
     let data_path = crate::test_catalog::data_path();
-
-    let observer = Connection::open_in_memory().unwrap();
-    observer
-        .execute_batch(&format!(
-            "LOAD postgres; ATTACH '{base}' AS observer (TYPE postgres);"
-        ))
-        .unwrap();
-    let sessions = |pool_size: usize| -> i64 {
-        let name = catalog_application_name(port, pool_size);
-        observer
-            .query_row(
-                &format!(
-                    "SELECT n FROM postgres_query('observer', \
-                     'SELECT count(*) AS n FROM pg_stat_activity \
-                      WHERE application_name = ''{name}''')"
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-    };
+    let observed = crate::test_catalog::CatalogSessions::new();
+    let port = observed.port;
+    let sessions = |pool_size: usize| observed.count(pool_size);
 
     let tmp = tempfile::tempdir().unwrap();
     let pool = LakePool::open(
@@ -561,7 +540,7 @@ fn a_members_catalog_backend_outlives_an_idle_timeout() {
 
     let control = Connection::open_in_memory().unwrap();
     control
-        .execute_batch("LOAD postgres; SET pg_pool_idle_timeout_millis=1000;")
+        .execute_batch("LOAD postgres; SET pg_pool_idle_timeout_millis=2000;")
         .unwrap();
     connect_ducklake(
         &control,
@@ -569,10 +548,10 @@ fn a_members_catalog_backend_outlives_an_idle_timeout() {
         &data_path,
     )
     .unwrap();
-    assert!(sessions(1) >= 1, "the member's backend, before the wait");
     assert!(sessions(2) >= 1, "the control's backend, before the wait");
+    assert!(sessions(1) >= 1, "the member's backend, before the wait");
 
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    std::thread::sleep(std::time::Duration::from_secs(6));
     assert_eq!(
         sessions(2),
         0,
