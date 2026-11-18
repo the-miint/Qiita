@@ -1,9 +1,7 @@
 -- migrate:up
 
 -- One row per derived genome: the genome whose sequence was produced from another
--- assembly, and the assembly it was produced from. The parent is named by its
--- accession and has no FK: an NCBI assembly that no reference loaded has no
--- sequence in Qiita, so it is not minted as a qiita.genome row.
+-- assembly, and that assembly. The COMMENTs below carry each column's rationale.
 CREATE TABLE qiita.genome_derivation (
     genome_idx                BIGINT      PRIMARY KEY
                                           REFERENCES qiita.genome (genome_idx) ON DELETE CASCADE,
@@ -26,16 +24,17 @@ COMMENT ON TABLE qiita.genome_derivation IS
 COMMENT ON COLUMN qiita.genome_derivation.parent_source IS
     'The parent assembly''s archive: genbank (GCA_) or refseq (GCF_).';
 COMMENT ON COLUMN qiita.genome_derivation.parent_source_id IS
-    'The parent''s versioned assembly accession, e.g. GCF_000005825.2. No FK: the parent '
-    'is minted as a qiita.genome only if some reference loaded its sequence, and it then '
-    'joins on (source, source_id).';
+    'The parent''s versioned assembly accession, e.g. GCF_000005825.2. No FK: a '
+    'qiita.genome row stands for sequence that Qiita holds, and Qiita holds none of an '
+    'assembly that no reference loaded. A parent that some reference did load joins on '
+    '(source, source_id).';
 COMMENT ON COLUMN qiita.genome_derivation.method IS
     'How the derived sequence was produced from the parent. wol_concatenated: Web of Life '
     'host-masked the assembly and concatenated its contigs into one sequence, so the '
     'derived genome''s coordinates are not the parent''s.';
 COMMENT ON COLUMN qiita.genome_derivation.asserted_by_reference_idx IS
     'The reference whose release asserts the derivation. RESTRICT: deleting that '
-    'reference must not silently withdraw the provenance it asserted.';
+    'reference must not silently withdraw the provenance that it asserted.';
 
 -- migrate:down
 

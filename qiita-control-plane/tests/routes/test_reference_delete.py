@@ -6,6 +6,7 @@ tier has no data plane — so these tests focus on what the control plane owns:
 authorization, work-ticket gating, and orphan-vs-shared feature GC.
 """
 
+import asyncio
 import json
 import uuid
 
@@ -13,9 +14,16 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 
+from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
 from qiita_control_plane.testing.db_teardown import teardown_entity_graph
 
 pytestmark = pytest.mark.db
+
+_INSERT_DERIVATION = (
+    "INSERT INTO qiita.genome_derivation"
+    " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
+    " VALUES ($1, 'refseq', 'GCF_000005825.2', $3, $2)"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -556,21 +564,12 @@ async def test_delete_reference_blocked_by_alignment_definition_even_with_force(
 
 async def test_delete_reference_blocked_by_genome_derivation_even_with_force(client, postgres_pool):
     """A reference that asserts a genome's derivation cannot be deleted, with or
-    without force: the delete would withdraw provenance nothing else records. The
-    gate refuses before any destructive step, with a 409 that names the reason,
-    rather than failing on the foreign key at the end."""
+    without force (the FK's COMMENT says why). The gate refuses before any destructive
+    step, with a 409 that names the reason, rather than failing on the foreign key at
+    the end."""
     ref_idx = await _create_ref(client, f"del-derivation-{uuid.uuid4()}")
-    genome_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
-        f"G{uuid.uuid4().int % 10**9:09d}",
-    )
-    await postgres_pool.execute(
-        "INSERT INTO qiita.genome_derivation"
-        " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
-        " VALUES ($1, 'refseq', 'GCF_000005825.2', 'wol_concatenated', $2)",
-        genome_idx,
-        ref_idx,
-    )
+    genome_idx = await _derivation_genome(postgres_pool)
+    await postgres_pool.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
     try:
         for params in ({}, {"force": "true"}):
             resp = await client.delete(
@@ -578,6 +577,59 @@ async def test_delete_reference_blocked_by_genome_derivation_even_with_force(cli
             )
             assert resp.status_code == 409, resp.text
             assert "1 genome derivation(s)" in resp.json()["detail"]
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
+                ref_idx,
+            )
+            == 1
+        )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+
+
+async def _derivation_genome(postgres_pool) -> int:
+    return await postgres_pool.fetchval(
+        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
+        f"G{uuid.uuid4().int % 10**9:09d}",
+    )
+
+
+async def test_delete_reference_not_blocked_by_another_references_derivation(client, postgres_pool):
+    """The derivation gate counts the derivations this reference asserts, not any."""
+    asserting = await _create_ref(client, f"del-asserting-{uuid.uuid4()}")
+    other = await _create_ref(client, f"del-other-{uuid.uuid4()}")
+    genome_idx = await _derivation_genome(postgres_pool)
+    await postgres_pool.execute(_INSERT_DERIVATION, genome_idx, asserting, DERIVATION_METHOD)
+    try:
+        resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=other))
+        assert resp.status_code == 200, resp.text
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
+
+
+async def test_delete_reference_waits_for_an_uncommitted_derivation_and_refuses(
+    client, postgres_pool
+):
+    """A derivation written while the delete runs (the WoL repair records them in one
+    long transaction) passes the precheck unseen. The re-gate must wait for that writer
+    and then refuse, not tear down a reference the derivation's foreign key holds."""
+    ref_idx = await _create_ref(client, f"del-racing-derivation-{uuid.uuid4()}")
+    genome_idx = await _derivation_genome(postgres_pool)
+    try:
+        async with postgres_pool.acquire() as writer:
+            pending = writer.transaction()
+            await pending.start()
+            await writer.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
+            delete = asyncio.create_task(
+                client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+            )
+            await asyncio.sleep(0.5)
+            assert not delete.done(), "the delete must wait for the uncommitted derivation"
+            await pending.commit()
+            resp = await delete
+        assert resp.status_code == 409, resp.text
+        assert "1 genome derivation(s)" in resp.json()["detail"]
         assert (
             await postgres_pool.fetchval(
                 "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",

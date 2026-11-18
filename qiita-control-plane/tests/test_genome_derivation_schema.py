@@ -12,9 +12,9 @@ from contextlib import asynccontextmanager
 import asyncpg
 import pytest
 
-pytestmark = pytest.mark.db
+from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
 
-_METHOD = "wol_concatenated"
+pytestmark = pytest.mark.db
 
 
 @asynccontextmanager
@@ -44,7 +44,9 @@ async def _seed(conn) -> tuple[int, int]:
     return reference_idx, genome_idx
 
 
-async def _insert(conn, genome_idx, parent_source, parent_source_id, reference_idx, method=_METHOD):
+async def _insert(
+    conn, genome_idx, parent_source, parent_source_id, reference_idx, method=DERIVATION_METHOD
+):
     await conn.execute(
         "INSERT INTO qiita.genome_derivation"
         " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
@@ -124,7 +126,7 @@ async def test_genome_derivation_cascades_with_its_genome(postgres_pool):
 
 
 async def test_genome_derivation_restricts_deleting_its_asserting_reference(postgres_pool):
-    """A reference delete must not silently withdraw the provenance it asserted."""
+    """The asserting reference is RESTRICT (the column's COMMENT says why)."""
     async with _rolled_back(postgres_pool) as conn:
         reference_idx, genome_idx = await _seed(conn)
         await _insert(conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx)
@@ -180,8 +182,6 @@ async def test_genome_derivation_rejects_unknown_method(postgres_pool):
 
 async def test_method_check_matches_the_repair_constant(postgres_pool):
     """The only writer's constant and the CHECK are the same one-value set."""
-    from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
-
     check_def = await postgres_pool.fetchval(
         "SELECT pg_get_constraintdef(c.oid)"
         "  FROM pg_constraint c"

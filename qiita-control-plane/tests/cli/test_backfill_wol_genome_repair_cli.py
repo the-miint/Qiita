@@ -5,6 +5,7 @@ operator sees, which arguments it insists on, and that a dry run never applies."
 import re
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from qiita_control_plane.backfill.wol_genome_repair import (
@@ -80,9 +81,9 @@ def test_a_dry_run_reports_and_applies_nothing(stubbed, capsys):
     assert stubbed["metadata_path"] == Path(stubbed["metadata"])
     assert stubbed["closed"]
     assert "reference 18: 196062 GCA_G genome(s) to fold" in out
-    assert _shows(out, "A, already linked to G<n>", 195943)
-    assert _shows(out, "B, to link to G<n>", 117)
-    assert _shows(out, "C, G<n> to create", 2)
+    assert _shows(out, "already linked to G<n>", 195943)
+    assert _shows(out, "to link to G<n>", 117)
+    assert _shows(out, "G<n> to create", 2)
     assert _shows(out, "stale WoL links to remove", 117)
     assert _shows(out, "labels to retire", 46621)
     assert _shows(out, "derivations to add", 196062)
@@ -98,6 +99,39 @@ def test_execute_applies_the_plan_and_names_the_manifest(stubbed, tmp_path, caps
     out = capsys.readouterr().out
     assert "DRY RUN" not in out
     assert f"manifest: {manifest}" in out
+    # The report after the run says what was done, not what is to do.
+    done = out[out.index("repaired reference 18") :]
+    assert "repaired reference 18: 196062 GCA_G genome(s) folded" in done
+    assert _shows(done, "linked to G<n>", 117)
+    assert _shows(done, "G<n> created", 2)
+    assert _shows(done, "stale WoL links removed", 117)
+    assert _shows(done, "labels retired", 46621)
+    assert _shows(done, "derivations added", 196062)
+    assert " to " not in done.replace("linked to G<n>", "")
+
+
+def test_execute_with_nothing_to_do_applies_nothing(stubbed, monkeypatch, tmp_path, capsys):
+    """A repaired reference plans no work; --execute then takes no locks and writes no
+    manifest."""
+    repaired = RepairCounts(
+        already_linked=0,
+        to_link=0,
+        to_create=0,
+        stale_links=0,
+        labels_to_retire=0,
+        derivations_to_add=0,
+        derivations_present=196062,
+    )
+
+    async def _plan(pool, *, reference_idx, metadata_path):
+        return RepairPlan(reference_idx=reference_idx, parents=(), counts=repaired)
+
+    monkeypatch.setattr(cli, "plan_repair", _plan)
+    manifest = tmp_path / "manifest.csv"
+    assert main(_args(stubbed, "--execute", "--manifest", str(manifest))) == 0
+    assert stubbed["applied"] is None
+    assert not manifest.exists()
+    assert "nothing to do" in capsys.readouterr().out
 
 
 def test_execute_without_a_manifest_is_refused(stubbed, capsys):
@@ -148,3 +182,22 @@ def test_a_failed_postcondition_exits_non_zero_and_says_rolled_back(
     assert main(_args(stubbed, "--execute", "--manifest", str(tmp_path / "m.csv"))) == 1
     err = capsys.readouterr().err
     assert "rolled back" in err and "feature 7 links to 2 genomes" in err
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        asyncpg.exceptions.DeadlockDetectedError("deadlock detected"),
+        asyncpg.exceptions.ConnectionDoesNotExistError("connection was closed"),
+    ],
+    ids=["postgres", "connection"],
+)
+def test_a_database_error_exits_non_zero_and_says_why(
+    stubbed, monkeypatch, tmp_path, capsys, error
+):
+    async def _fail(pool, plan, *, manifest_path):
+        raise error
+
+    monkeypatch.setattr(cli, "apply_repair", _fail)
+    assert main(_args(stubbed, "--execute", "--manifest", str(tmp_path / "m.csv"))) == 1
+    assert f"error: {error}" in capsys.readouterr().err

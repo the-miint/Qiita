@@ -1,10 +1,11 @@
 """DB tests for `qiita-admin backfill wol-genome-repair`.
 
 A Web of Life reference loaded with a genome map that wrote `GCA_` in front of each WoL
-ID left every one of its sequences linked to two genome rows, `G<n>` and `GCA_G<n>`.
-The repair folds each `GCA_G<n>` into `G<n>` -- the name the reference's own FASTA
-header gave the sequence -- removes links from the same sequence to any other WoL ID,
-and records each genome's NCBI parent assembly from the WoL release's metadata.txt.
+ID gave each of its sequences a second genome row, `GCA_G<n>`, mostly beside the
+`G<n>` that already held it (the classes are on `_World.rc4_genome`). The repair folds
+each `GCA_G<n>` into `G<n>` -- the name the reference's own FASTA header gave the
+sequence -- removes links from the same sequence to any other WoL ID, and records each
+genome's NCBI parent assembly from the WoL release's metadata.txt.
 
 The repair acts on every `GCA_G` genome in the database, so each test starts from
 none and its fixture removes everything it seeded, and everything the repair minted.
@@ -15,9 +16,11 @@ import secrets
 import uuid
 from pathlib import Path
 
+import asyncpg
 import pytest
 import pytest_asyncio
 
+from qiita_control_plane.backfill import wol_genome_repair
 from qiita_control_plane.backfill.wol_genome_repair import (
     DERIVATION_METHOD,
     RepairPostconditionFailed,
@@ -26,7 +29,10 @@ from qiita_control_plane.backfill.wol_genome_repair import (
     plan_repair,
 )
 from qiita_control_plane.testing.db_seeds import (
+    seed_bare_feature,
     seed_biosample_with_sequenced_prep_sample,
+    seed_feature_genome,
+    seed_reference_membership,
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
@@ -73,20 +79,16 @@ class _World:
                 return source_id
 
     async def feature(self) -> int:
-        feature_idx = await self.pool.fetchval(
-            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1) RETURNING feature_idx",
-            uuid.uuid4(),
-        )
+        feature_idx = await seed_bare_feature(self.pool)
         self.features.append(feature_idx)
         return feature_idx
 
     async def member(self, feature_idx: int, accession: str, reference_idx: int | None = None):
-        await self.pool.execute(
-            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx, accession)"
-            " VALUES ($1, $2, $3)",
-            reference_idx or self.reference_idx,
-            feature_idx,
-            accession,
+        await seed_reference_membership(
+            self.pool,
+            reference_idx=reference_idx or self.reference_idx,
+            feature_idx=feature_idx,
+            accession=accession,
         )
 
     async def genome(self, source_id: str, source: str = "genbank") -> int:
@@ -98,11 +100,7 @@ class _World:
         )
 
     async def link(self, feature_idx: int, genome_idx: int) -> None:
-        await self.pool.execute(
-            "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
-            feature_idx,
-            genome_idx,
-        )
+        await seed_feature_genome(self.pool, feature_idx=feature_idx, genome_idx=genome_idx)
 
     async def label(self, genome_idx: int, accession: str) -> int:
         idx = await self.pool.fetchval(
@@ -528,6 +526,76 @@ async def test_a_manifest_in_a_missing_directory_refuses_before_writing(world):
     assert await w.snapshot() == before
 
 
+async def test_a_manifest_whose_write_fails_is_removed_and_nothing_is_written(world, monkeypatch):
+    """The partial manifest is created inside the transaction; a write that fails rolls
+    the transaction back, so the file it left describes nothing and must not survive to
+    block the next run."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    before = await w.snapshot()
+
+    class _FullDisk:
+        def __init__(self, fh):
+            pass
+
+        def writerow(self, row):
+            raise OSError(28, "No space left on device")
+
+        writerows = writerow
+
+    monkeypatch.setattr(wol_genome_repair.csv, "writer", _FullDisk)
+    with pytest.raises(OSError, match="No space left"):
+        await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+    assert await w.snapshot() == before
+    assert list(w.tmp_path.glob("*manifest*")) == []
+
+
+async def test_a_commit_that_does_not_complete_keeps_the_partial_manifest(world, monkeypatch):
+    """A commit that raises may or may not have committed (a connection lost during COMMIT
+    cannot say). The partial is the only record of what a committed run deleted, so it is
+    kept, and the error names it and says the outcome is not known."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    before = await w.snapshot()
+
+    async def _lost(self):
+        await self.rollback()
+        raise asyncpg.ConnectionDoesNotExistError("connection was closed during COMMIT")
+
+    monkeypatch.setattr(asyncpg.transaction.Transaction, "commit", _lost)
+    with pytest.raises(RuntimeError, match="not known") as exc:
+        await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+    partial = w.tmp_path / ".manifest.csv.partial"
+    assert str(partial) in str(exc.value)
+    assert partial.exists()
+    assert not (w.tmp_path / "manifest.csv").exists()
+    assert await w.snapshot() == before
+
+
+async def test_a_manifest_that_appears_during_the_run_is_not_overwritten(world, monkeypatch):
+    """The manifest path is checked before the run, but another run given the same path
+    can create it while this one waits on the lock. The rename must not replace it: the
+    repair still commits, and its own manifest stays at the partial name."""
+    w = world
+    await w.rc4_genome("A")
+    plan = await _plan(w)
+    manifest = w.tmp_path / "manifest.csv"
+    real = wol_genome_repair._postcondition_problems
+
+    async def _another_run_finishes(conn, reference_idx, parents):
+        manifest.write_text("another run\n")
+        return await real(conn, reference_idx, parents)
+
+    monkeypatch.setattr(wol_genome_repair, "_postcondition_problems", _another_run_finishes)
+    with pytest.raises(RuntimeError, match="committed"):
+        await apply_repair(w.pool, plan, manifest_path=manifest)
+    assert manifest.read_text() == "another run\n"
+    assert _manifest(w.tmp_path / ".manifest.csv.partial") != []
+    assert await w.pool.fetchval(_GCA_G_ROWS) == 0
+
+
 # --- preconditions: refuse before writing anything ----------------------------------
 
 
@@ -607,6 +675,16 @@ async def test_refuses_an_exclusion_naming_a_stale_genome(world):
     await _assert_refused(w, b["stale_id"])
 
 
+async def test_an_exclusion_naming_a_genome_the_fold_keeps_does_not_refuse(world):
+    """The guard is about the genomes the fold deletes or unlinks; G<n> keeps its
+    feature, so an exclusion on it still hides what it hid."""
+    w = world
+    a = await w.rc4_genome("A")
+    await w.exclude(a["g"])
+    await _execute(w)
+    assert await w.genomes_of(a["feature_idx"]) == {a["n"]}
+
+
 async def test_refuses_an_assembly_claim_on_a_gca_g_genome(world):
     w = world
     a = await w.rc4_genome("A")
@@ -661,6 +739,15 @@ async def test_refuses_metadata_without_the_columns_it_reads(world):
     await _assert_refused(w, "assembly_accession", path)
 
 
+async def test_refuses_metadata_with_a_row_of_the_wrong_width(world):
+    w = world
+    await w.rc4_genome("A")
+    path = w.metadata()
+    with path.open("a") as fh:
+        fh.write("G000000001\tGCF_000000001.1\n")
+    await _assert_refused(w, "cannot be read", path)
+
+
 async def test_refuses_metadata_missing_a_reference_genome(world):
     w = world
     await w.rc4_genome("A")
@@ -702,6 +789,62 @@ async def test_apply_rechecks_the_preconditions(world):
         await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
     assert await w.snapshot() == before
     assert not (w.tmp_path / "manifest.csv").exists()
+
+
+async def test_refuses_a_reference_that_does_not_exist(world):
+    w = world
+    await w.rc4_genome("A")
+    missing = await w.pool.fetchval("SELECT max(reference_idx) + 1000 FROM qiita.reference")
+    with pytest.raises(RepairRefused, match=rf"reference {missing} does not exist"):
+        await plan_repair(w.pool, reference_idx=missing, metadata_path=w.metadata())
+
+
+async def _refused_while_held(w: _World, monkeypatch, hold: str, *args) -> None:
+    """Run the apply while another session holds a lock it needs, and expect it to give
+    up after the lock timeout, writing nothing."""
+    w_plan = await _plan(w)
+    before = await w.snapshot()
+    monkeypatch.setattr(wol_genome_repair, "_LOCK_TIMEOUT", "100ms")
+    async with w.pool.acquire() as other:
+        held = other.transaction()
+        await held.start()
+        try:
+            await other.execute(hold, *args)
+            with pytest.raises(RepairRefused, match="lock"):
+                await apply_repair(w.pool, w_plan, manifest_path=w.tmp_path / "manifest.csv")
+        finally:
+            await held.rollback()
+    assert await w.snapshot() == before
+    assert list(w.tmp_path.glob("*manifest*")) == []
+
+
+async def test_a_table_held_by_another_session_refuses_after_the_lock_timeout(world, monkeypatch):
+    """A label mint in progress holds exported_feature; the repair waits for it, up to
+    its lock timeout, and then refuses rather than hang."""
+    w = world
+    a = await w.rc4_genome("A")
+    await _refused_while_held(
+        w,
+        monkeypatch,
+        "INSERT INTO qiita.exported_feature"
+        " (entity_kind, genome_idx, accession, accession_published, created_by_idx)"
+        " VALUES ('genome', $1, 'held', true, $2)",
+        a["g"],
+        w.owner_idx,
+    )
+
+
+async def test_a_reference_held_by_a_delete_refuses_after_the_lock_timeout(world, monkeypatch):
+    """A reference delete holds the reference row while it gates and tears down; the
+    repair waits on that row before it locks any table, so the two cannot deadlock."""
+    w = world
+    await w.rc4_genome("A")
+    await _refused_while_held(
+        w,
+        monkeypatch,
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1 FOR UPDATE",
+        w.reference_idx,
+    )
 
 
 # --- postconditions: assert in the transaction, roll back ----------------------------

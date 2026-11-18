@@ -2,11 +2,13 @@
 assembly each of its genomes was derived from.
 
 **What it repairs.** A WoL reference loaded with a genome map that put `GCA_` in front
-of each WoL ID minted a second genome row, `genbank:GCA_G<n>`, beside the `G<n>` an
-earlier WoL load had already minted for the same bytes. `feature_idx` is global, so
-every sequence of the reference then links to both rows and a feature table built
-against it splits each genome's reads between the two names. `GCA_G<n>` is not an
-accession: GenBank's are `GCA_` and nine digits with a version.
+of each WoL ID minted a second genome row, `genbank:GCA_G<n>`, for each of its
+sequences. `feature_idx` is global, so a sequence that an earlier WoL load had already
+linked to `G<n>` then links to both rows, and a feature table built against the
+reference splits that genome's reads between the two names. A few sequences were
+linked instead to a different WoL ID, which an earlier release gave the same bytes, or
+to no `G<n>` at all. `GCA_G<n>` is not an accession: GenBank's are `GCA_` and nine
+digits with a version.
 
 **What it does, in one transaction:**
 
@@ -22,13 +24,17 @@ accession: GenBank's are `GCA_` and nine digits with a version.
    not hold.
 
 **Where `G<n>` comes from.** It must be the name the reference's own FASTA header gave
-the sequence (`reference_membership.accession`); a `GCA_G<n>` whose feature the
-reference names otherwise is refused, not guessed at.
+the sequence (`reference_membership.accession`); a `GCA_G<n>` whose feature has a
+different name there is refused, not guessed at.
 
 Contract per this package: dry-run by default (`plan_repair` writes nothing), and
 idempotent (a second run finds no `GCA_G` genome and every derivation present). There
 is no residue: anything the rules do not settle refuses the whole run, naming the
 rows, because a partial fold would leave tables that still split reads.
+
+**Retirement.** Delete this module, its CLI and their tests once every deployment has
+run it, which its dry run shows by finding no `GCA_G` genome and every derivation
+present.
 """
 
 from __future__ import annotations
@@ -42,18 +48,23 @@ from pathlib import Path
 
 import asyncpg
 import duckdb
+from qiita_common.models.reference import GenomeSource
 
 from ..actions.library import upsert_genomes
+from ..delimited_text import read_headed_tsv
 
 DERIVATION_METHOD = "wol_concatenated"
 
-# A WoL genome's rows are `genbank` until a source of their own exists. Each pattern
-# below is the one copy, matched whole: by `re.fullmatch` here, anchored for SQL.
-_WOL_SOURCE = "genbank"
+# WoL genomes are stored under `genbank`. Each pattern is matched whole: by
+# `re.fullmatch` in Python, and through `_anchored` in SQL.
+_WOL_SOURCE = GenomeSource.GENBANK
 _WOL_ID = "G[0-9]{9}"
 _GCA_G_ID = "GCA_G[0-9]{9}"
+# The accession shapes and the prefix -> archive pairing that the migration's
+# genome_derivation_parent_check also holds; recording a derivation of each archive
+# (the tests do) fails if the two drift apart.
 _ACCESSION = r"GC[AF]_[0-9]{9}\.[0-9]+"
-_PARENT_SOURCE = {"GCA": "genbank", "GCF": "refseq"}
+_PARENT_SOURCE = {"GCA": GenomeSource.GENBANK, "GCF": GenomeSource.REFSEQ}
 _METADATA_COLUMNS = ("genome_id", "assembly_accession")
 _MANIFEST_COLUMNS = (
     "action",
@@ -194,23 +205,18 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
     accession's prefix, not the file's `source` column, which WoL leaves empty for
     genomes carried over from WoL2.
     """
-    if not metadata_path.is_file():
-        raise RepairRefused(f"metadata file {metadata_path} does not exist")
-    read = "read_csv($path, delim='\t', header=true, all_varchar=true, quote='')"
-    path = str(metadata_path)
-    with duckdb.connect() as con:
-        described = con.execute(f"DESCRIBE SELECT * FROM {read}", {"path": path}).fetchall()
-        missing = [c for c in _METADATA_COLUMNS if c not in {r[0] for r in described}]
-        if missing:
-            raise RepairRefused(
-                f"metadata file {metadata_path} lacks column(s): {', '.join(missing)}"
-            )
-        rows = con.execute(
-            "SELECT genome_id, assembly_accession,"
-            "       regexp_full_match(assembly_accession, $accession)"
-            f"  FROM {read}",
-            {"path": path, "accession": _ACCESSION},
-        ).fetchall()
+    try:
+        table = read_headed_tsv(metadata_path, source_name="metadata file")
+    except (ValueError, duckdb.Error) as exc:
+        raise RepairRefused(f"metadata file {metadata_path} cannot be read: {exc}") from exc
+    # A file with a header and no rows yields no parents, which the comparison with the
+    # reference's genomes then refuses.
+    if table and (missing := [c for c in _METADATA_COLUMNS if c not in table[0]]):
+        raise RepairRefused(f"metadata file {metadata_path} lacks column(s): {', '.join(missing)}")
+    rows = [
+        (genome_id, acc, re.fullmatch(_ACCESSION, acc) is not None)
+        for genome_id, acc in ((r["genome_id"], r["assembly_accession"]) for r in table)
+    ]
 
     problems: list[str] = []
     malformed = [str(acc) for _g, acc, ok in rows if not ok]
@@ -222,13 +228,11 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
             f"{len(mismatched)} genome_id(s) not G followed by the accession's nine digits:"
             f" {_listed(mismatched)}"
         )
-    for column, values in (
-        ("genome_id", [g for g, _a, _ok in rows]),
-        ("assembly_accession", [a for _g, a, _ok in rows]),
-    ):
-        repeated = sorted(str(v) for v, n in Counter(values).items() if n > 1)
-        if repeated:
-            problems.append(f"{len(repeated)} {column}(s) repeat: {_listed(repeated)}")
+    # A repeated accession repeats its genome_id too, or breaks the rule above, so only
+    # the genome_id is checked.
+    repeated = sorted(g for g, n in Counter(g for g, _a, _ok in rows).items() if n > 1)
+    if repeated:
+        problems.append(f"{len(repeated)} genome_id(s) repeat: {_listed(repeated)}")
     if problems:
         raise RepairRefused(_bulleted(f"metadata file {metadata_path}", problems))
     return tuple(
@@ -240,19 +244,29 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
 # --- the survey: what the fold touches, and every precondition -------------------------
 
 
+async def _require_reference(conn: asyncpg.Connection, reference_idx: int, *, hold: bool) -> None:
+    lock = " FOR SHARE" if hold else ""
+    found = await conn.fetchval(
+        f"SELECT 1 FROM qiita.reference WHERE reference_idx = $1{lock}", reference_idx
+    )
+    if found is None:
+        raise RepairRefused(f"reference {reference_idx} does not exist")
+
+
 async def _gca_g_folds(
     conn: asyncpg.Connection, reference_idx: int, problems: list[str]
 ) -> tuple[list[int], list[asyncpg.Record], dict[int, str | None]]:
     """Every GCA_G genome, and the reference's header for each feature.
 
-    Returns every GCA_G genome_idx; the GCA_G rows that have exactly one feature (the
-    others are problems, as is one the reference does not hold under `G<n>`); and the
-    reference's feature -> accession map, which the metadata is compared against.
+    Returns every GCA_G genome_idx; the GCA_G rows that have exactly one feature; and
+    the reference's feature -> accession map, which the metadata is compared against.
+    A GCA_G row without exactly one feature is a problem, and so is one whose feature
+    the reference does not hold under `G<n>`; the latter are still returned.
     """
     gca_g = await conn.fetch(
         "SELECT x.genome_idx AS x_idx, x.source_id AS x_id, substr(x.source_id, 5) AS n_id,"
         "       w.genome_idx AS w_idx,"
-        "       array_remove(array_agg(fg.feature_idx ORDER BY fg.feature_idx), NULL)"
+        "       array_remove(array_agg(fg.feature_idx), NULL)"
         "         AS feature_idxs"
         "  FROM qiita.genome x"
         "  LEFT JOIN qiita.feature_genome fg ON fg.genome_idx = x.genome_idx"
@@ -292,7 +306,7 @@ async def _gca_g_folds(
         )
     if misnamed:
         problems.append(
-            f"GCA_G genome(s) whose feature reference {reference_idx} names otherwise:"
+            f"GCA_G genome(s) whose feature has another name in reference {reference_idx}:"
             f" {_listed(misnamed)}"
         )
     return [r["x_idx"] for r in gca_g], single, headers
@@ -347,8 +361,12 @@ async def _links(
 async def _guards(
     conn: asyncpg.Connection, x_idxs: list[int], stale: list[_Stale], problems: list[str]
 ) -> None:
-    """Rows outside the fold that name a genome it deletes or unlinks. An exclusion's
-    genome_idx has no FK, so it would be left dangling rather than refused by Postgres."""
+    """Rows outside the fold that name a genome it deletes or unlinks.
+
+    An exclusion on a genome hides that genome's features, found through feature_genome,
+    so once the fold moves a feature off the genome the exclusion silently stops hiding
+    it; its genome_idx has no FK for Postgres to refuse on. An assembly claim's FK would
+    refuse the genome's delete; checking it here names the claims before any write."""
     excluded = [
         f"exclusion {r['reference_exclusion_idx']} names {r['source_id']}"
         for r in await conn.fetch(
@@ -410,7 +428,7 @@ async def _derivations_present(
     problems: list[str],
 ) -> int:
     """How many parents are already recorded exactly; one recorded otherwise is a
-    problem, since a derivation is never rewritten."""
+    problem, since the repair never rewrites a derivation."""
     existing = {
         r["source_id"]: r
         for r in await conn.fetch(
@@ -472,6 +490,7 @@ async def plan_repair(pool: asyncpg.Pool, *, reference_idx: int, metadata_path: 
     """Check every precondition and count what an apply would do. Writes nothing."""
     parents = read_parents(metadata_path)
     async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        await _require_reference(conn, reference_idx, hold=False)
         survey = await _survey(conn, reference_idx, parents)
     if survey.problems:
         raise RepairRefused(_refusal(reference_idx, survey.problems))
@@ -491,6 +510,9 @@ async def _fold(conn: asyncpg.Connection, survey: _Survey) -> list[tuple]:
     )
     w_of = {f.x_idx: f.w_idx for f in folds if f.w_idx is not None}
     w_of.update({f.x_idx: idx for f, idx in zip(create, minted, strict=True)})
+    # Linked by genome_idx rather than through the reference load's
+    # `_write_genome_associations`, which upserts every genome it links: here that would
+    # rewrite all of the reference's `G<n>` rows to mint the few that are missing.
     await conn.execute(
         "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
         " SELECT * FROM unnest($1::bigint[], $2::bigint[])"
@@ -512,7 +534,7 @@ async def _fold(conn: asyncpg.Connection, survey: _Survey) -> list[tuple]:
     )
     manifest.extend(_link_row(r) for r in unlinked)
     # Captured before the delete below nulls their genome_idx; the tables are locked,
-    # so these are exactly the labels the trigger retires.
+    # so these are exactly the labels that the trigger retires.
     manifest.extend(
         (
             "retire",
@@ -628,8 +650,9 @@ async def _postcondition_problems(
 def _check_manifest_path(manifest_path: Path) -> Path:
     """Refuse a manifest path that would overwrite one, before anything is written.
 
-    The partial file is checked too: one left behind is the manifest of a committed
-    run whose rename failed, and the only record of what that run deleted."""
+    The partial file is checked too. One is left behind only by a run whose commit may
+    have succeeded but whose manifest was not moved into place, and it may be the only
+    record of what that run deleted."""
     partial = manifest_path.with_name(f".{manifest_path.name}.partial")
     for path in (manifest_path, partial):
         if path.exists():
@@ -639,25 +662,42 @@ def _check_manifest_path(manifest_path: Path) -> Path:
     return partial
 
 
+async def _lock(conn: asyncpg.Connection, reference_idx: int) -> None:
+    """Hold the reference row, then the tables the repair reads and writes, waiting at
+    most `_LOCK_TIMEOUT` for either.
+
+    The row comes first because the reference delete takes it first
+    (`assert_reference_deletable`) and then the tables, so the two wait on each other
+    rather than deadlock."""
+    await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
+    try:
+        await _require_reference(conn, reference_idx, hold=True)
+        await conn.execute(f"LOCK TABLE {', '.join(_LOCKED_TABLES)} IN SHARE ROW EXCLUSIVE MODE")
+    except asyncpg.LockNotAvailableError as exc:
+        raise RepairRefused(
+            f"reference {reference_idx} or a table the repair locks was still held by another"
+            f" session after the {_LOCK_TIMEOUT} lock timeout; run it again once that"
+            " session has finished"
+        ) from exc
+
+
 async def apply_repair(
     pool: asyncpg.Pool, plan: RepairPlan, *, manifest_path: Path
 ) -> RepairCounts:
     """Re-check, fold, record the derivations, assert the result, then commit.
 
     Every row deleted and every label retired goes to `manifest_path` (CSV), which is
-    written beside it under a temporary name before the commit and renamed into place
+    written beside it under a temporary name before the commit and moved into place
     after. A precondition that no longer holds raises `RepairRefused`; a result that
     does not hold raises `RepairPostconditionFailed`; either way nothing is written.
     """
     partial = _check_manifest_path(manifest_path)
     reference_idx, parents = plan.reference_idx, plan.parents
-    wrote_partial = False
-    try:
-        async with pool.acquire() as conn, conn.transaction():
-            await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
-            await conn.execute(
-                f"LOCK TABLE {', '.join(_LOCKED_TABLES)} IN SHARE ROW EXCLUSIVE MODE"
-            )
+    async with pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await _lock(conn, reference_idx)
             survey = await _survey(conn, reference_idx, parents)
             if survey.problems:
                 raise RepairRefused(_refusal(reference_idx, survey.problems))
@@ -668,19 +708,36 @@ async def apply_repair(
             if problems:
                 raise RepairPostconditionFailed(_refusal(reference_idx, problems))
             _write_manifest(partial, manifest)
-            wrote_partial = True
-    except BaseException:
-        if wrote_partial:  # the commit failed after the manifest was written
-            partial.unlink(missing_ok=True)
-        raise
+        except BaseException:
+            await transaction.rollback()
+            raise
+        try:
+            await transaction.commit()
+        except BaseException as exc:
+            # A commit that raises may still have committed (a connection lost during
+            # COMMIT cannot tell), and the partial is then the only record of what the
+            # run deleted, so it is kept.
+            raise RuntimeError(
+                f"the commit did not complete ({type(exc).__name__}: {exc}), so whether the"
+                f" repair is in the database is not known. {partial} is kept: if a dry run"
+                f" still finds GCA_G genomes, nothing was written and it can be deleted;"
+                f" otherwise it is this run's manifest"
+            ) from exc
+    _publish_manifest(partial, manifest_path)
+    return counts
+
+
+def _publish_manifest(partial: Path, manifest_path: Path) -> None:
+    """Move the committed run's manifest into place. A hard link, unlike a rename,
+    refuses a manifest another run wrote at the same path while this one waited."""
     try:
-        os.replace(partial, manifest_path)
+        os.link(partial, manifest_path)
+        partial.unlink()
     except OSError as exc:
         raise RuntimeError(
-            f"the repair is COMMITTED, but its manifest could not be moved from {partial}"
+            f"the repair is committed, but its manifest could not be moved from {partial}"
             f" to {manifest_path}: {exc}"
         ) from exc
-    return counts
 
 
 def _link_row(r: asyncpg.Record) -> tuple:
@@ -697,7 +754,14 @@ def _link_row(r: asyncpg.Record) -> tuple:
 
 
 def _write_manifest(path: Path, rows: list[tuple]) -> None:
-    with path.open("x", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(_MANIFEST_COLUMNS)
-        writer.writerows(tuple("" if v is None else v for v in row) for row in rows)
+    """Write the manifest to a new file at `path`, and remove it if the write fails:
+    the transaction it describes is then rolled back."""
+    fh = path.open("x", newline="")
+    try:
+        with fh:
+            writer = csv.writer(fh)
+            writer.writerow(_MANIFEST_COLUMNS)
+            writer.writerows(tuple("" if v is None else v for v in row) for row in rows)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise

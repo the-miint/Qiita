@@ -2,17 +2,18 @@
 genomes into `G<n>` and record each genome's NCBI parent assembly. The work is
 `backfill/wol_genome_repair.py`; this is the operator's view of it.
 
-A one-off, kept in its own module so its removal touches `cli/admin/__init__.py` only
-at the two lines that register the parser.
+A one-off (the work module says when it is retired), kept in its own module so its
+removal touches `cli/admin/__init__.py` only at the two lines that register the parser.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
+
+import asyncpg
 
 from ...backfill.wol_genome_repair import (
     RepairCounts,
@@ -22,7 +23,7 @@ from ...backfill.wol_genome_repair import (
     apply_repair,
     plan_repair,
 )
-from ._helpers import open_admin_pool
+from ._helpers import EXIT_PRECONDITION_FAILED, open_admin_pool, requires_database_url
 
 
 def add_wol_genome_repair_parser(backfill_sub: argparse._SubParsersAction) -> None:
@@ -30,13 +31,13 @@ def add_wol_genome_repair_parser(backfill_sub: argparse._SubParsersAction) -> No
         "wol-genome-repair",
         help="Fold a WoL reference's GCA_G<n> genomes into G<n> and record their parents",
         description=(
-            "A Web of Life reference loaded with GCA_ in front of each WoL ID left every"
-            " one of its sequences linked to two genomes, G<n> and GCA_G<n>, so its"
-            " feature tables split each genome's reads between the two. For each"
+            "A Web of Life reference loaded with GCA_ in front of each WoL ID gave each of"
+            " its sequences a second genome, GCA_G<n>; most were already linked to G<n>,"
+            " so its feature tables split those genomes' reads between the two. For each"
             " GCA_G<n>: link its sequence to G<n> (creating G<n> if missing), remove the"
             " sequence's links to other WoL IDs, then delete GCA_G<n>, which retires its"
             " published labels. Then record, from the WoL release's metadata.txt, the"
-            " GenBank or RefSeq assembly each of the reference's genomes was derived"
+            " GenBank or RefSeq assembly that each of the reference's genomes was derived"
             " from. One transaction; anything unexpected refuses the whole run, naming"
             " the rows. Dry-run by default. Needs DATABASE_URL."
         ),
@@ -78,43 +79,46 @@ async def _run(
         plan = await plan_repair(
             pool, reference_idx=args.reference_idx, metadata_path=args.metadata
         )
-        _print_counts(f"reference {plan.reference_idx}", plan.counts)
-        if not args.execute:
+        _print_counts(f"reference {plan.reference_idx}", plan.counts, done=False)
+        if not args.execute or plan.nothing_to_do:
             return plan, None
         return plan, await apply_repair(pool, plan, manifest_path=args.manifest)
     finally:
         await pool.close()
 
 
-def _print_counts(heading: str, c: RepairCounts) -> None:
+# Each count's label before the run, and after it.
+_COUNT_LABELS = (
+    ("already_linked", "already linked to G<n>", "already linked to G<n>"),
+    ("to_link", "to link to G<n>", "linked to G<n>"),
+    ("to_create", "G<n> to create", "G<n> created"),
+    ("stale_links", "stale WoL links to remove", "stale WoL links removed"),
+    ("labels_to_retire", "labels to retire", "labels retired"),
+    ("derivations_to_add", "derivations to add", "derivations added"),
+    ("derivations_present", "derivations present", "derivations already present"),
+)
+
+
+def _print_counts(heading: str, c: RepairCounts, *, done: bool) -> None:
     folded = c.already_linked + c.to_link + c.to_create
-    print(f"{heading}: {folded} GCA_G genome(s) to fold")
-    for label, n in (
-        ("A, already linked to G<n>", c.already_linked),
-        ("B, to link to G<n>", c.to_link),
-        ("C, G<n> to create", c.to_create),
-        ("stale WoL links to remove", c.stale_links),
-        ("labels to retire", c.labels_to_retire),
-        ("derivations to add", c.derivations_to_add),
-        ("derivations present", c.derivations_present),
-    ):
-        print(f"  {label:<26}: {n}")
+    print(f"{heading}: {folded} GCA_G genome(s) {'folded' if done else 'to fold'}")
+    labels = [(after if done else before, getattr(c, f)) for f, before, after in _COUNT_LABELS]
+    width = max(len(label) for label, _n in labels)
+    for label, n in labels:
+        print(f"  {label:<{width}} : {n}")
 
 
-def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        print("error: DATABASE_URL not set", file=sys.stderr)
-        return 2
+@requires_database_url
+def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser, database_url: str) -> int:
     if args.execute and args.manifest is None:
         print("error: --execute needs --manifest PATH", file=sys.stderr)
-        return 2
+        return EXIT_PRECONDITION_FAILED
     if args.manifest is not None and not args.execute:
         print(
             "error: --manifest is only written with --execute; a dry run writes nothing",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_PRECONDITION_FAILED
 
     try:
         plan, done = asyncio.run(_run(database_url, args))
@@ -124,10 +128,13 @@ def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     except RepairPostconditionFailed as exc:
         print(f"postcondition failed, rolled back; nothing was written: {exc}", file=sys.stderr)
         return 1
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, asyncpg.PostgresError, asyncpg.InterfaceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    if done is None and args.execute:
+        print("\nnothing to do; no manifest written.")
+        return 0
     if done is None:
         print(
             "\nDRY RUN — nothing written. Compare the counts with what you expect, then"
@@ -135,6 +142,6 @@ def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         )
         return 0
     print()
-    _print_counts(f"repaired reference {plan.reference_idx}", done)
+    _print_counts(f"repaired reference {plan.reference_idx}", done, done=True)
     print(f"manifest: {args.manifest}")
     return 0

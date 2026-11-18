@@ -106,27 +106,26 @@ _None yet._
   ticket ended without completing. If the dry run stops with a permission error, run it
   as an account that can read the ticket workspaces.
 - `[operator]` **Fold reference 18's (`web-of-life` `3-rc4`) `GCA_G<n>` genomes into `G<n>`.**
-  Until this runs, every feature table built against reference 18 lists each genome twice, as
-  `G<n>` and `GCA_G<n>`, each with half its reads. The repair also records each rc4 genome's
+  Until this runs, every feature table built against reference 18 lists almost every genome
+  twice, as `G<n>` and `GCA_G<n>`, each with half its reads. The repair also records each rc4 genome's
   NCBI parent assembly. It is one transaction that refuses anything unexpected. It locks the
   genome tables while it runs; its genome delete alone measured 3.3 s at this size, and the whole
   run is unmeasured. A reference load or label mint waits behind it, and the repair gives up after
   30 s rather than hang if one holds them first. (#fix/wol3-genome-fold)
-  1. Fetch the release's metadata into a fresh directory. `version.txt` must read `3.0.0-rc.4`
-     and `genomes: 196062`.
-  2. Dry-run. Expect `196062 GCA_G genome(s) to fold`: A 195943, B 117, C 2; stale WoL links
-     117; derivations to add 196062, present 0. Labels to retire was 46621 on 2026-11-17, and is
+  1. Fetch the release's metadata into a fresh directory. The repair refuses a file whose genomes
+     are not exactly reference 18's.
+  2. Dry-run. Expect `196062 GCA_G genome(s) to fold`: already linked to G<n> 195943, to link
+     117, to create 2; stale WoL links 117; derivations to add 196062, present 0. Labels to retire was 46621 on 2026-11-17, and is
      higher only if reference-18 tables were built since. Any other count, or `refused:`, means
      stop and raise the report.
   3. Execute, writing the manifest somewhere kept. It lists every row deleted and label retired,
      and the run refuses to overwrite one.
-  4. Dry-run again. Expect `0 GCA_G genome(s) to fold` and `derivations present : 196062`.
+  4. Dry-run again. Expect `0 GCA_G genome(s) to fold` and 196062 derivations present.
   5. Ask the builder of the reference-18 feature tables (principal 2, alignment 3; the reporter
      of #893) to rebuild them.
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL as above
-  W=$(mktemp -d) && curl -fsS -o "$W/metadata.txt" https://ftp.microbio.me/wol3/wol3_rc4_ftp/metadata/metadata.txt \
-    && curl -fsS -o "$W/version.txt" https://ftp.microbio.me/wol3/wol3_rc4_ftp/version.txt && cat "$W/version.txt"
+  W=$(mktemp -d) && curl -fsS -o "$W/metadata.txt" https://ftp.microbio.me/wol3/wol3_rc4_ftp/metadata/metadata.txt
   cd ~/qiita-miint/qiita-control-plane
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill wol-genome-repair --reference-idx 18 --metadata "$W/metadata.txt"   # 2 and 4: dry run
   /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill wol-genome-repair --reference-idx 18 --metadata "$W/metadata.txt" \

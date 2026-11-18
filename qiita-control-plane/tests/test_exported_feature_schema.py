@@ -152,9 +152,8 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
 
 
 async def test_a_genome_delete_finds_its_labels_through_a_plain_index(postgres_pool):
-    """The genome_idx FK's ON DELETE SET NULL looks rows up by `genome_idx = $1`,
-    which the partial live-genome index does not cover. Without a plain index every
-    deleted genome scans the table (see the migration that adds it)."""
+    """A plain index on genome_idx serves the FK's ON DELETE SET NULL lookup; the
+    migration that adds it says why the partial live-genome index cannot."""
     rows = await postgres_pool.fetch(
         "SELECT i.indpred IS NULL AS plain,"
         "       array(SELECT a.attname FROM unnest(i.indkey) k"
