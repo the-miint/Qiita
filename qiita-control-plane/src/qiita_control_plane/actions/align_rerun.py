@@ -70,7 +70,7 @@ from ..repositories.block import (
 )
 from ..repositories.mask_definition import MaskDefinitionNotFound, lock_mask
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
-from ..ticket_redrive import drop_dead_step_rows, reset_ticket_to_pending
+from ..ticket_redrive import ReapPending, drop_dead_step_rows, reset_ticket_to_pending
 from ..workspace import step_attempt_dir, ticket_workspace
 from .library import delete_alignment_sample_data
 
@@ -186,10 +186,12 @@ async def rerun_align_block(
     allow_deprecated_mask: bool,
     reason: str,
     principal_idx: int,
+    show_reap_note: bool,
     ticket_root: Path,
     action_steps: list,
 ) -> dict:
     """See the module docstring. Returns the fields of `AlignmentRerunBlockResponse`.
+    `show_reap_note` is the caller's `ticket_redrive.sees_reap_note`.
 
     `deadline` is `pre_txn_deadline()` taken when the route started. `action_steps`
     is the align action's step list. Raises AlignRerunRefused.
@@ -210,6 +212,7 @@ async def rerun_align_block(
                 alignment_idx=alignment_idx,
                 work_ticket_idx=work_ticket_idx,
                 allow_deprecated_mask=allow_deprecated_mask,
+                show_reap_note=show_reap_note,
                 ticket_root=ticket_root,
                 action_steps=action_steps,
                 produce_step=produce_step,
@@ -250,6 +253,7 @@ async def _rearm(
     alignment_idx: int,
     work_ticket_idx: int,
     allow_deprecated_mask: bool,
+    show_reap_note: bool,
     ticket_root: Path,
     action_steps: list,
     produce_step: str,
@@ -437,7 +441,13 @@ async def _rearm(
                 f"cannot tell whether {attempt_dir} exists: {exc}; nothing was changed",
             ) from exc
 
-    if not await reset_ticket_to_pending(conn, work_ticket_idx=work_ticket_idx, from_state=state):
+    try:
+        reset = await reset_ticket_to_pending(
+            conn, work_ticket_idx=work_ticket_idx, from_state=state
+        )
+    except ReapPending as exc:
+        raise _refuse(exc.REASON, exc.message(with_note=show_reap_note)) from exc
+    if not reset:
         raise _refuse("state_changed", f"work_ticket {work_ticket_idx} changed state; retry")
     if rerun_of == WorkTicketState.COMPLETED:
         status = await conn.execute(

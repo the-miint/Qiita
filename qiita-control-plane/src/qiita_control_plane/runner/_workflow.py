@@ -29,13 +29,13 @@ from qiita_common.models import (
 
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.definition_settings_edit import fetch_settings_edit_since_ticket
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
 from ..workspace import step_attempt_dir, ticket_workspace
 from ._alignment import (
     ALIGN_MASK_IDX_BINDING,
     ASSEMBLY_PROCESSING_IDX_BINDING,
     _create_alignment_gate_pending,
-    _persist_alignment_idx,
     _require_assembly_subject,
     _require_masked_query,
     _resolve_denovo_alignment_idx,
@@ -291,6 +291,30 @@ async def run_workflow(
                 reason=str(exc),
             ) from exc
 
+        # A dispatch that keeps step rows from an earlier attempt reuses that
+        # attempt's work: a completed row is fast-forwarded, a submitted one is
+        # re-attached to its live job. When a definition the ticket records had its
+        # settings edited after the ticket was created, that work was done under the
+        # earlier settings and the remaining steps would run under the edited ones, so
+        # the ticket is failed instead. A ticket dispatched with no step row (a first
+        # run, or a rerun-block re-arm, which deletes every step row) is not refused
+        # here: a definition it consumes or carries from its plan runs wholly under
+        # the current settings, and one it mints is refused at its mint when it
+        # already records another (`runner._record`). A settings edit is refused
+        # while the ticket is unfinished
+        # (`definition_settings`), so this is reached by a redrive of a failed or
+        # cancelled ticket.
+        edit = await fetch_settings_edit_since_ticket(pool, work_ticket_idx) if progress else None
+        if edit is not None:
+            raise _submission_bad_input(
+                f"work ticket {work_ticket_idx} records {edit['definition_kind']}"
+                f" {edit['definition_ref']}, whose settings were edited at"
+                f" {edit['occurred_at'].isoformat()}, after the ticket was created; its"
+                " earlier attempts ran under the earlier settings, so it cannot resume."
+                " Submit a new ticket, which runs under the definition its own params"
+                " resolve to"
+            )
+
         # Per-step resource floors a PRIOR run's retry ladder escalated to and
         # persisted. Empty on a first dispatch. This is what makes the ladder
         # continue across a restart / redrive instead of restarting at the YAML
@@ -485,13 +509,11 @@ async def run_workflow(
                         # the hash of a run that did not use the feature.
                         resolved_lima=_resolved_lima(bound),
                         resolved_syndna=_resolved_syndna(bound),
+                        # Recorded on the ticket in the mint's transaction (durable
+                        # traceability and a cheap shared-mask guard).
+                        work_ticket_idx=work_ticket_idx,
                     )
                 )
-                # Persist the minted mask_idx onto the ticket for durable
-                # traceability (and a cheap shared-mask guard). Idempotent: a
-                # re-mint on resume re-resolves to the same mask_idx via the
-                # config-hash upsert and re-writes the same value here.
-                await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
                 minted_mask_idx = bound[MASK_IDX_BINDING]
             elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
                 block_mask_idx = work_ticket["mask_idx"]
@@ -639,8 +661,9 @@ async def run_workflow(
         # membership + load steps), mint the run's processing_idx before the loop —
         # the canonical-params hash of {workflow, version, result-affecting knobs
         # like the assembler}. Same inside-try placement so a mint failure lands in
-        # the FAILED handler. Idempotent: a re-mint on resume re-resolves the same
-        # id via the params-hash upsert.
+        # the FAILED handler. A re-mint on resume re-resolves the same id via the
+        # params-hash upsert, unless the processing's settings were edited since the
+        # first attempt, which fails the ticket (`_mint_processing_idx`).
         if _workflow_needs_processing(action.steps):
             # Single-source the assembler default from the action's context_schema
             # (the one result-affecting knob today) — the same default the hash and
@@ -652,6 +675,7 @@ async def run_workflow(
                 action_version=action.version,
                 bound=bound,
                 assembler_default=assembler_default,
+                work_ticket_idx=work_ticket_idx,
             )
             bound.update(processing_bindings)
             minted_processing_idx = processing_bindings[PROCESSING_IDX_BINDING]
@@ -750,10 +774,9 @@ async def run_workflow(
                     work_ticket_idx=work_ticket_idx,
                 )
             )
-            # The ticket column, not just the binding: `delete-alignment-sample` and
-            # `finalize-alignment-sample` both read it and refuse on NULL, and a resume
-            # re-attaches to it rather than re-deriving the identity.
-            await _persist_alignment_idx(pool, work_ticket_idx, bound[ALIGNMENT_IDX_BINDING])
+            # `_resolve_denovo_alignment_idx` has recorded the alignment on the
+            # ticket: a mint records it in its own transaction; a re-attach finds it
+            # already recorded and writes nothing.
             await _create_alignment_gate_pending(
                 pool,
                 alignment_idx=bound[ALIGNMENT_IDX_BINDING],

@@ -17,6 +17,7 @@ declares the third.
 from __future__ import annotations
 
 import json
+from functools import partial
 from typing import Any
 
 import asyncpg
@@ -31,13 +32,13 @@ from qiita_common.api_paths import (
     LibraryPrimitive,
 )
 from qiita_common.backend_failure import StepNoData
-from qiita_common.models import AlignmentDefinitionStatus
+from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import DefinitionKind
 
 from ..feature_table import SUBJECT_ASSEMBLY
 from ..repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_INVALIDATED,
     AlignmentDefinitionDeprecated,
-    ParamsDoNotSurviveStorageError,
     fetch_alignment_definition_by_idx,
     lock_active_alignment,
     mint_alignment_definition,
@@ -53,7 +54,11 @@ from ..repositories.block import (
     create_alignment_sample_pending,
     fetch_mask_sample_state,
 )
+from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
+from ..repositories.definition_settings_edit import fetch_settings_edit_since_ticket
+from ..repositories.params_storage import ParamsDoNotSurviveStorageError
 from ._base import _workflow_declares_action
+from ._record import fail_exhausted_hold, record_minted
 from ._upload import _submission_bad_input
 
 # action_context keys the de novo resolver reads. Prefixed like `align/1.0.0.yaml`'s
@@ -139,7 +144,7 @@ def _build_denovo_alignment_params(
     admits both `1` and `1.0`, and `type: integer` admits `42.0` as well — it matches
     any number with a zero fractional part, so `{"minimum": 1, "type": "integer"}`
     validates a float. `json.dumps` renders each pair as two different strings, so one
-    config would take two alignment_idx. `_assert_params_survive_storage` cannot catch
+    config would take two alignment_idx. `assert_params_survive_storage` cannot catch
     it: `42.0` round-trips jsonb unchanged, hashing the same before and after.
 
     **This key set is disjoint from the block path's** (`align_planner` hashes
@@ -181,44 +186,23 @@ def _build_denovo_alignment_params(
     }
 
 
-async def _persist_alignment_idx(
-    pool: asyncpg.Pool, work_ticket_idx: int, alignment_idx: int
-) -> None:
-    """Write the minted `alignment_idx` onto the ticket row.
-
-    `delete-alignment-sample` and `finalize-alignment-sample` both read this COLUMN
-    rather than action_context, and refuse on NULL; so does the resume path in
-    `_resolve_denovo_alignment_idx`, which re-attaches to it instead of re-deriving.
-    Writing it again on a resume writes the same value.
-
-    Holds the definition row `FOR SHARE` across the write and refuses a deprecated
-    alignment (`lock_active_alignment`), so a deprecation that counted this ticket's
-    work as absent cannot be followed by the ticket recording it."""
-    async with pool.acquire() as conn, conn.transaction():
-        try:
-            await lock_active_alignment(conn, alignment_idx)
-        except AlignmentDefinitionDeprecated as exc:
-            raise _submission_bad_input(exc.detail) from exc
-        await conn.execute(
-            "UPDATE qiita.work_ticket SET alignment_idx = $1 WHERE work_ticket_idx = $2",
-            alignment_idx,
-            work_ticket_idx,
-        )
-
-
 async def _create_alignment_gate_pending(
     pool: asyncpg.Pool, *, alignment_idx: int, prep_sample_idx: int
 ) -> None:
     """Materialize this run's alignment_sample gate row at 'pending'.
 
-    Run immediately after the mint, which is the earliest point the row's key exists.
-    Idempotent, and it never resurrects a row an earlier run flipped to 'completed'
+    Run right after the alignment is resolved, by a mint or by a re-attach to the one
+    the ticket records, which is the earliest point the row's key exists. Idempotent,
+    and it never resurrects a row an earlier run flipped to 'completed'
     (`create_alignment_sample_pending`'s ON CONFLICT DO NOTHING).
 
     Refuses a row an earlier run's withdrawal set 'invalidated', before any step
     runs: the workflow's first tail step deletes this prep_sample's alignment rows, which
     would destroy the output the withdrawal was a judgment about, and its terminal
     step could not complete the row anyway (`AlignmentSampleInvalidated`).
+
+    Refuses a deprecated alignment, under `FOR SHARE` (`lock_active_alignment`). For a
+    re-attach, which does not call the mint, this is the only deprecation refusal.
     """
     async with pool.acquire() as conn, conn.transaction():
         try:
@@ -356,9 +340,15 @@ async def _resolve_denovo_alignment_idx(
     prevent.
 
     So the knobs are read back from the STORED params rather than re-resolved, and the
-    job runs the configuration the identity actually names. Both branches refuse a
-    deprecated alignment: the mint by `AlignmentDefinitionDeprecated`, the re-attach by
-    reading the stored status, since it never calls the mint.
+    job runs the configuration the identity actually names. The mint refuses a
+    deprecated alignment (`AlignmentDefinitionDeprecated`); a re-attach's refusal is
+    `_create_alignment_gate_pending`'s.
+
+    The re-attach also refuses a recorded alignment whose settings an admin edited
+    after the ticket was created: the stored params are then not the ones the ticket
+    resolved, as a re-mint would find (`runner._record`). The mint records the
+    alignment on the ticket in its own transaction, holding the row `FOR SHARE` from
+    the mint through that write (`repositories.definition_hold`).
 
     Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
     BAD_INPUT the outer handler turns into a FAILED ticket.
@@ -368,12 +358,20 @@ async def _resolve_denovo_alignment_idx(
         work_ticket_idx,
     )
     if existing is not None:
-        row = await fetch_alignment_definition_by_idx(pool, existing)
-        if row["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
+        edit = await fetch_settings_edit_since_ticket(
+            pool, work_ticket_idx, definition=(DefinitionKind.ALIGNMENT, existing)
+        )
+        if edit is not None:
             raise _submission_bad_input(
-                f"alignment definition {existing} on this ticket is deprecated: "
-                f"{row['deprecation_reason']}"
+                f"work ticket {work_ticket_idx} first ran under alignment definition"
+                f" {existing}, whose settings were edited at"
+                f" {edit['occurred_at'].isoformat()}, after the ticket was created, so it"
+                " cannot resume; submit a new ticket, which is recorded under the"
+                " alignment definition minted for its own params"
             )
+        row = await fetch_alignment_definition_by_idx(pool, existing)
+        if row is None:
+            raise _submission_bad_input(f"alignment {existing} not found")
         stored = json.loads(row["params"])
         absent = sorted(key for key in _KNOB_BINDINGS if key not in stored)
         if absent:
@@ -391,11 +389,29 @@ async def _resolve_denovo_alignment_idx(
     params = _build_denovo_alignment_params(
         action_id, action_version, bound, defaults=_knob_defaults(context_schema)
     )
+
+    async def held_params_hash(conn: asyncpg.Connection, row: asyncpg.Record) -> bytes:
+        return (await lock_active_alignment(conn, row["alignment_idx"]))["params_hash"]
+
     try:
-        async with pool.acquire() as conn:
-            row = await mint_alignment_definition(
-                conn, params=params, principal_idx=originator_principal_idx
+        async with pool.acquire() as conn, conn.transaction():
+            row = await mint_and_hold(
+                conn,
+                mint=lambda: mint_alignment_definition(
+                    conn, params=params, principal_idx=originator_principal_idx
+                ),
+                held_params_hash=partial(held_params_hash, conn),
+                params_hash=canonical_params_hash(params),
+                what=f"de novo alignment for {action_id} {action_version}",
             )
+            await record_minted(
+                conn,
+                work_ticket_idx=work_ticket_idx,
+                column="alignment_idx",
+                definition_idx=row["alignment_idx"],
+            )
+    except MintHoldExhausted as exc:
+        raise fail_exhausted_hold(exc) from exc
     except ParamsDoNotSurviveStorageError as exc:
         raise _submission_bad_input(str(exc)) from exc
     except AlignmentDefinitionDeprecated as exc:

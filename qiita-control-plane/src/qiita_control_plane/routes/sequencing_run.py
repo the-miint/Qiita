@@ -83,11 +83,15 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
+    AS_OF_SCOPE,
     AlignPlanRequest,
     AlignPlanResponse,
     BlockMaskPlanRequest,
     BlockMaskPlanResponse,
+    DecisionSetToken,
+    DefinitionKind,
     PoolAlignmentCohort,
+    PoolAlignmentCohortLeftOut,
     PoolAlignmentList,
     PoolAlignmentSummary,
     PoolCompletionStatus,
@@ -97,6 +101,8 @@ from qiita_common.models import (
     PoolReadMetrics,
     PoolWorkTicketSummary,
     SampleQCReport,
+    SampleResolution,
+    SampleResolutionState,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
@@ -141,6 +147,13 @@ from ..auth.guards import (
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
+from ..definition_resolver import (
+    exact_read_left_out,
+    resolve_exact,
+    resolve_group,
+    upstream_read_left_out,
+)
+from ..definition_similarity import deprecated_upstreams
 from ..deps import (
     TxConnFactory,
     get_data_plane_url,
@@ -156,6 +169,7 @@ from ..repositories.alignment_definition import (
     list_completed_alignment_samples,
     list_pool_prep_sample_idxs,
 )
+from ..repositories.biosample import fetch_biosample_handles
 from ..repositories.mask_definition import MaskDefinitionDeprecated
 from ..repositories.sequencing_run import (
     PayloadMismatch,
@@ -177,8 +191,11 @@ from ..repositories.sequencing_run import (
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
+    alignment_exact_read,
     cap_rows,
-    refuse_deprecated_alignment,
+    deprecated_upstream_read,
+    load_groups_as_of,
+    require_known_decision_set,
     resolve_idxs_by_natural_key,
 )
 
@@ -804,14 +821,28 @@ async def get_sequenced_pool_alignment_cohort(
     caller: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    include_deprecated: bool = Query(
+        default=False, description="List the cohort of a deprecated alignment."
+    ),
+    include_deprecated_upstream: bool = Query(
+        default=False,
+        description="List the cohort of an active alignment whose upstream is deprecated.",
+    ),
+    as_of_event: DecisionSetToken | None = Query(
+        default=None,
+        description=(
+            "Group under this earlier decision set (a `decisions.decision_set`) when"
+            f" reading past a deprecated upstream; {AS_OF_SCOPE}."
+        ),
+    ),
 ) -> PoolAlignmentCohort:
     """Resolve the cohort to mint an alignment DoGet ticket for: this pool's
     prep_samples that are both readable by the caller and `'completed'` for this
     alignment.
 
-    Two filters, and both are load-bearing. Readability makes the result a valid
-    mint body by construction — the mint is all-or-nothing, so a cohort this
-    route hands back can never 403 there. Completion is a first-class state:
+    Two filters. Readability means a cohort this route hands back never 403s at
+    the all-or-nothing mint; the mint can still 409 a prep_sample that resolves to
+    another alignment of the group (`definition_resolver`). Completion is a first-class state:
     alignment rows are NOT 1:1 with reads (cross-shard routing and paired-end
     mates both multiply rows per read), so the presence of rows says nothing
     about whether a sample is done.
@@ -820,23 +851,121 @@ async def get_sequenced_pool_alignment_cohort(
     "nothing here you may mint", and unlike a rejection it does not confirm
     which of the pool's alignments touch data the caller lacks.
 
-    A deprecated alignment with a non-empty cohort is 409: no mint accepts it, so
-    the cohort is not a valid mint body. Checked after the cohort is resolved, so
-    the status is told only to a caller who may read some of it, as in
-    `authorize_completed_alignment_cohort`.
+    A deprecated alignment with a non-empty cohort is 409 unless
+    `include_deprecated` (`alignment_exact_read`): no mint accepts it without the
+    flag, so the cohort is not a valid mint body. Checked after the cohort is
+    resolved, so the status is told only to a caller who may read some of it, as in
+    `authorize_completed_alignment_cohort`. An active alignment whose upstream is
+    deprecated is likewise 409 unless `include_deprecated_upstream`
+    (`deprecated_upstream_read`).
+
+    For a deprecated alignment under `include_deprecated`, the cohort is the readable
+    prep_samples that its exact read (`resolve_exact`) resolves `processed`, and
+    `left_out` lists the readable prep_samples the exact read leaves out
+    (`definition_resolver.NO_RUN_TO_READ` states the rule), with their biosample
+    handles. For an active alignment read past a deprecated upstream under
+    `include_deprecated_upstream`, the cohort's prep_samples whose upstream run is
+    withdrawn are left out and listed the same way (the rule is stated at the same
+    site). A build reading that alignment leaves them out and records them. That
+    read resolves each upstream in its group, so it groups under `as_of_event`'s
+    decision set when given; the exact read forms no group. An unknown `as_of_event`
+    is 422 whichever read runs.
     """
+    await require_known_decision_set(pool, as_of_event)
     prep_sample_idxs = await _readable_pool_prep_samples(
         pool, sequenced_pool_idx=sequenced_pool_idx, caller=caller
     )
     cohort = await list_completed_alignment_samples(pool, alignment_idx, prep_sample_idxs)
-    if cohort:
-        refuse_deprecated_alignment(await fetch_alignment_definition_by_idx(pool, alignment_idx))
+    left_out: list[PoolAlignmentCohortLeftOut] = []
+    alignment = await fetch_alignment_definition_by_idx(pool, alignment_idx)
+    if alignment is not None and (cohort or include_deprecated):
+        exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
+        admitted: frozenset[DefinitionKind] = frozenset()
+        if cohort and not exact:
+            admitted = deprecated_upstream_read(
+                kind=DefinitionKind.ALIGNMENT,
+                idx=alignment_idx,
+                upstreams=await deprecated_upstreams(pool, alignment),
+                include_deprecated=include_deprecated,
+                include_deprecated_upstream=include_deprecated_upstream,
+            )
+        if exact and prep_sample_idxs:
+            cohort, left_out = await _exact_cohort(pool, alignment_idx, prep_sample_idxs)
+        elif admitted:
+            cohort, left_out = await _upstream_read_cohort(
+                pool, alignment_idx, cohort, admitted, as_of_event
+            )
     return PoolAlignmentCohort(
         sequencing_run_idx=sequencing_run_idx,
         sequenced_pool_idx=sequenced_pool_idx,
         alignment_idx=alignment_idx,
         prep_sample_idx=cohort,
+        left_out=left_out,
     )
+
+
+async def _upstream_read_cohort(
+    pool: asyncpg.Pool,
+    alignment_idx: int,
+    cohort: list[int],
+    admitted: frozenset[DefinitionKind],
+    as_of_event: str | None,
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`cohort` resolved in `alignment_idx`'s group past the `admitted` deprecated
+    upstream kinds, under `as_of_event`'s decision set when given: the prep_samples it
+    keeps, and those it leaves out (`definition_resolver.upstream_read_left_out`) with
+    their biosample handles; both ascending."""
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_group(
+            conn,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=alignment_idx,
+            prep_sample_idxs=cohort,
+            admitted_upstream_kinds=admitted,
+            groups=await load_groups_as_of(conn, as_of_event),
+        )
+        left = upstream_read_left_out(resolution.samples.values())
+        return await _with_handles(conn, cohort, left)
+
+
+async def _with_handles(
+    conn: asyncpg.Connection, cohort: list[int], left: list[SampleResolution]
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`cohort` less `left`, and `left` as listing entries with their biosample's
+    accession and `QB<n>` handle."""
+    handles = await fetch_biosample_handles(conn, [r.prep_sample_idx for r in left])
+    gone = {r.prep_sample_idx for r in left}
+    return sorted(ps for ps in cohort if ps not in gone), [
+        PoolAlignmentCohortLeftOut(
+            prep_sample_idx=r.prep_sample_idx,
+            biosample_accession=handles[r.prep_sample_idx][0],
+            biosample_export_entity_id=handles[r.prep_sample_idx][1],
+            state=r.state,
+            reason=r.reason,
+        )
+        for r in left
+    ]
+
+
+async def _exact_cohort(
+    pool: asyncpg.Pool, alignment_idx: int, prep_sample_idxs: list[int]
+) -> tuple[list[int], list[PoolAlignmentCohortLeftOut]]:
+    """`prep_sample_idxs` read under `alignment_idx` alone (`resolve_exact`): those it
+    resolves `processed`, and those it leaves out (`definition_resolver.NO_RUN_TO_READ`
+    states the rule), each with its biosample's accession and `QB<n>` handle; both ascending."""
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        resolution = await resolve_exact(
+            conn,
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=alignment_idx,
+            prep_sample_idxs=prep_sample_idxs,
+        )
+        processed = [
+            ps for ps, r in resolution.samples.items() if r.state is SampleResolutionState.PROCESSED
+        ]
+        left = exact_read_left_out(resolution.samples.values())
+        _, entries = await _with_handles(conn, processed, left)
+    return sorted(processed), entries
 
 
 @router.get(PATH_SEQUENCED_POOL_COMPLETION)
@@ -1129,7 +1258,7 @@ async def submit_block_mask_plan(
         # unmapped 500 an unhandled raise gives: the request is well-formed
         # and would have succeeded before the deprecation.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail) from exc
-    except block_planner.BlockPlanSampleGainedReads as exc:
+    except (block_planner.BlockPlanSampleGainedReads, block_planner.BlockPlanMaskEdited) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except block_planner.BlockMaskResubmitError as exc:
         # A sample already gated for the resolved mask would be re-masked
@@ -1257,7 +1386,10 @@ async def submit_align_plan(
         # Reference exists but is not ACTIVE + sharded — the operator must build /
         # shard it (or wait for it to go active) before aligning against it.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except align_planner.AlignDefinitionDeprecated as exc:
+    except (
+        align_planner.AlignDefinitionDeprecated,
+        align_planner.AlignPlanDefinitionEdited,
+    ) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except align_planner.AlignResubmitError as exc:
         # The exception's message carries the way out for each gate state.
@@ -1302,7 +1434,8 @@ async def delete_sequenced_pool(
     study link they hold — not only the run/pool the operator is thinking of. It also
     deletes the qiita-origin genomes this pool's assemblies minted, which retires any
     published `QF<n>` handle naming one (`exported_feature.genome_idx` is ON DELETE SET
-    NULL behind a retire trigger).
+    NULL behind a retire trigger), and it retires every published `QM<n>` handle
+    naming one of the prep_samples (`delete_sequenced_pool_cascade` says how).
 
     Gating: in-flight work tickets (pending/queued/processing) block the delete
     unconditionally (409), as does a qiita-origin genome from one of these

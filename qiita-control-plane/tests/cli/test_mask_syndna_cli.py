@@ -1,9 +1,11 @@
 """`qiita mask syndna-read-count` with the HTTP read faked — real miint, real BIOM and
 Parquet writers. The route's refusals are `tests/routes/test_syndna_read_count.py`."""
 
+import json
+
 import pyarrow as pa
 import pytest
-from qiita_common.models import SyndnaReadCountResponse
+from qiita_common.models import AS_OF_SCOPE, SyndnaReadCountResponse
 
 from qiita_control_plane.cli import user as cli
 from qiita_control_plane.cli.user import mask as mx
@@ -12,7 +14,22 @@ from qiita_control_plane.miint import connect_with_miint
 _H1, _H2 = "synDNA_16SrRNA_seq_1_gc=0.26", "synDNA_16SrRNA_seq_2_gc=0.36"
 
 
-def _response(samples, inserts=((11, _H1), (12, _H2))) -> SyndnaReadCountResponse:
+_DECISIONS = {
+    "decision_set": "sha256:" + "1" * 64,
+    "newest_event_at": "2026-11-16T10:00:00Z",
+    "as_of": True,
+    "as_of_scope": AS_OF_SCOPE,
+    "equivalences_used": 1,
+    "equivalences_used_set": "sha256:" + "2" * 64,
+}
+
+
+def _response(
+    samples, inserts=((11, _H1), (12, _H2)), left_out=(), left_out_accession=None
+) -> SyndnaReadCountResponse:
+    left_out = list(left_out)
+    if left_out_accession is None:
+        left_out_accession = {r["prep_sample_idx"]: None for r in left_out}
     return SyndnaReadCountResponse.model_validate(
         {
             "mask_idx": 3,
@@ -21,12 +38,17 @@ def _response(samples, inserts=((11, _H1), (12, _H2))) -> SyndnaReadCountRespons
             "samples": [
                 {
                     "prep_sample_idx": ps,
+                    "mask_idx": 3,
+                    "mask_export_processing_id": "QP31",
                     "biosample_accession": acc,
                     "sequenced_pool_idx": pool,
                     "read_counts": counts,
                 }
                 for ps, acc, pool, counts in samples
             ],
+            "left_out": left_out,
+            "left_out_biosample_accession": left_out_accession,
+            "decisions": _DECISIONS,
         }
     )
 
@@ -140,6 +162,60 @@ def test_main_writes_a_biom_named_by_species_by_default(monkeypatch, tmp_path, c
     assert "2 sample(s) x 2 insert(s)" in capsys.readouterr().out
 
 
+def test_main_lists_the_samples_the_table_leaves_out(monkeypatch, tmp_path, capsys):
+    """The route leaves out a sample that is not processed in the mask's group; the
+    table is still written, and each left-out sample is one stderr line with its
+    reason."""
+    _fake_species(monkeypatch)
+    out = tmp_path / "syndna.biom"
+    partial = _response(
+        [(1, "SAMEA1", 40, [5, 0])],
+        left_out=[
+            {
+                "prep_sample_idx": 2,
+                "state": "incomplete",
+                "definition_kind": "mask",
+                "definition_idx": 9,
+                "reason": "in_progress",
+                "work_ticket_idx": 77,
+            },
+            {
+                "prep_sample_idx": 4,
+                "state": "not_processed",
+                "definition_kind": "mask",
+                "reason": "no_run",
+            },
+            {
+                "prep_sample_idx": 6,
+                "state": "not_processed",
+                "definition_kind": "mask",
+                "definition_idx": 9,
+                "reason": "no_syndna_counts",
+            },
+        ],
+        left_out_accession={2: "SAMEA2", 4: None, 6: "SAMEA6"},
+    )
+    rc = _run(
+        monkeypatch, tmp_path, "--study-idx", "1", "--output", str(out), *_DP, response=partial
+    )
+    assert rc == 0
+    assert {r[0] for r in _cells(out, "biom")} == {"SAMEA1"}
+    err = capsys.readouterr().err
+    assert "left out 3 prep_sample(s)" in err
+    assert "prep_sample 2: incomplete (in_progress), mask 9, work_ticket 77" in err
+    assert "prep_sample 4: not_processed (no_run)" in err
+    assert "prep_sample 6: not_processed (no_syndna_counts), mask 9" in err
+    sidecar = json.loads(mx.syndna_sidecar_path(out).read_text())
+    assert sidecar["left_out"] == [
+        {"biosample_accession": "SAMEA2", "state": "incomplete", "reason": "in_progress"},
+        {"biosample_accession": "SAMEA6", "state": "not_processed", "reason": "no_syndna_counts"},
+        {"biosample_accession": None, "state": "not_processed", "reason": "no_run"},
+    ]
+    assert sidecar["samples"] == {
+        "SAMEA1": {"biosample_accession": "SAMEA1", "mask_export_processing_id": "QP31"}
+    }
+
+
 def test_accession_names_need_no_data_plane(monkeypatch, tmp_path):
     out = tmp_path / "syndna.parquet"
     rc = _run(
@@ -214,3 +290,142 @@ def test_species_without_a_data_plane_url_and_no_selector_are_usage_errors(monke
         _run(monkeypatch, tmp_path, "--study-idx", "1", "--output", out)
     with pytest.raises(SystemExit):
         _run(monkeypatch, tmp_path, "--output", out, *_DP)
+
+
+def test_include_deprecated_reaches_the_route_and_the_read_is_marked(monkeypatch, tmp_path, capsys):
+    """--include-deprecated is sent as `include_deprecated=true`; a response marked
+    deprecated is said so on stderr."""
+    seen: list[dict] = []
+    body = _TWO.model_dump(mode="json") | {"deprecated": True, "deprecation_reason": "bad host"}
+
+    def fake_call(method, base_url, token, path, **kw):
+        seen.append(kw.get("params"))
+        return body
+
+    monkeypatch.setenv("QIITA_TOKEN", "t")
+    monkeypatch.setattr(mx._common, "call", fake_call)
+    out = tmp_path / "syndna.parquet"
+    argv = ["--base-url", "https://cp", "mask", "syndna-read-count", "--mask-idx", "3"]
+    argv += ["--study-idx", "1", "--output", str(out), "--format", "parquet"]
+    argv += ["--feature-names", "accession", "--include-deprecated"]
+    assert cli.main(argv) == 0
+    assert seen == [{"study_idx": "1", "include_deprecated": "true"}]
+    err = capsys.readouterr().err
+    assert "mask 3 is deprecated (bad host)" in err
+    assert "--include-deprecated" in err
+
+
+def test_as_of_event_reaches_the_route_and_the_sidecar_records_the_decisions(monkeypatch, tmp_path):
+    seen: list[dict] = []
+
+    def fake_call(method, base_url, token, path, **kw):
+        seen.append(kw.get("params"))
+        return _TWO.model_dump(mode="json")
+
+    monkeypatch.setenv("QIITA_TOKEN", "t")
+    monkeypatch.setattr(mx._common, "call", fake_call)
+    out = tmp_path / "syndna.parquet"
+    argv = ["--base-url", "https://cp", "mask", "syndna-read-count", "--mask-idx", "3"]
+    argv += ["--study-idx", "1", "--output", str(out), "--format", "parquet"]
+    argv += ["--feature-names", "accession", "--as-of-event", _DECISIONS["decision_set"]]
+    assert cli.main(argv) == 0
+    assert seen == [{"study_idx": "1", "as_of_event": _DECISIONS["decision_set"]}]
+    sidecar = json.loads(mx.syndna_sidecar_path(out).read_text())
+    assert sidecar["decisions"]["decision_set"] == _DECISIONS["decision_set"]
+    assert sidecar["decisions"]["as_of_scope"] == AS_OF_SCOPE
+
+
+def _idx_free(value) -> None:
+    """No key or string anywhere in `value` names one of our `_idx` identifiers."""
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            assert "_idx" not in key, key
+            _idx_free(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            _idx_free(inner)
+    elif isinstance(value, str):
+        assert "_idx" not in value, value
+
+
+@pytest.mark.parametrize("fmt", ["biom", "parquet"])
+def test_the_table_and_its_sidecar_cite_the_mask_handle_and_carry_no_idx(tmp_path, fmt):
+    """Each sample's counts cite the mask they came from by its public handle (the
+    sidecar for both formats; a column too in Parquet), the sidecar records the
+    deprecated read and the left-out prep_samples, and no output names an `_idx`."""
+    out = tmp_path / f"t.{fmt}"
+    body = _response(
+        [(1, "SAMEA1", 40, [5, 0]), (2, "SAMEA2", 41, [1, 9])],
+        left_out=[
+            {
+                "prep_sample_idx": 5,
+                "state": "not_processed",
+                "definition_kind": "mask",
+                "definition_idx": 3,
+                "reason": "withdrawn",
+            }
+        ],
+        left_out_accession={5: "SAMEA5"},
+    ).model_dump(mode="json")
+    body["samples"][1]["mask_idx"] = 4
+    body["samples"][1]["mask_export_processing_id"] = "QP40"
+    body |= {"deprecated": True, "deprecation_reason": "host reference was wrong"}
+    response = SyndnaReadCountResponse.model_validate(body)
+    with connect_with_miint() as con:
+        mx.write_syndna_table(
+            con,
+            response,
+            sample_names=["SAMEA1", "SAMEA2"],
+            feature_names=[_H1, _H2],
+            output=out,
+            fmt=fmt,
+        )
+        if fmt == "parquet":
+            columns = [
+                r[0]
+                for r in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{out}')").fetchall()
+            ]
+            handles = dict(
+                con.execute(
+                    f"SELECT DISTINCT sample_id, mask_export_processing_id"
+                    f" FROM read_parquet('{out}')"
+                ).fetchall()
+            )
+            cells = con.execute(f"SELECT * FROM read_parquet('{out}')").fetchall()
+        else:
+            columns = [
+                r[0] for r in con.execute(f"DESCRIBE SELECT * FROM read_biom('{out}')").fetchall()
+            ]
+            cells = con.execute(f"SELECT * FROM read_biom('{out}')").fetchall()
+    sidecar = json.loads(mx.syndna_sidecar_path(out).read_text())
+
+    assert sidecar == {
+        "schema_version": 1,
+        "samples": {
+            "SAMEA1": {"biosample_accession": "SAMEA1", "mask_export_processing_id": "QP31"},
+            "SAMEA2": {"biosample_accession": "SAMEA2", "mask_export_processing_id": "QP40"},
+        },
+        "left_out": [
+            {"biosample_accession": "SAMEA5", "state": "not_processed", "reason": "withdrawn"}
+        ],
+        "deprecated": True,
+        "deprecation_reason": "host reference was wrong",
+        "decisions": {**_DECISIONS, "newest_event_at": "2026-11-16T10:00:00Z"},
+    }
+    if fmt == "parquet":
+        assert handles == {"SAMEA1": "QP31", "SAMEA2": "QP40"}
+    _idx_free(sidecar)
+    _idx_free(columns)
+    _idx_free([str(v) for row in cells for v in row])
+    assert not any(p.name.endswith(".partial") for p in tmp_path.iterdir())
+
+
+def test_an_existing_sidecar_is_refused_and_nothing_is_written(tmp_path):
+    out = tmp_path / "t.biom"
+    mx.syndna_sidecar_path(out).write_text("mine")
+    with connect_with_miint() as con, pytest.raises(ValueError, match="already exists"):
+        mx.write_syndna_table(
+            con, _TWO, sample_names=["a", "b"], feature_names=["x", "y"], output=out, fmt="biom"
+        )
+    assert not out.exists()
+    assert mx.syndna_sidecar_path(out).read_text() == "mine"

@@ -1,19 +1,29 @@
 """Route + reap-helper tests for POST /api/v1/work-ticket/cancel and
 `work_ticket_cancel.cancel_work_ticket`.
 
-Covers: the terminal-first flip (non-terminal → cancelled) + scancel reap, the
-already-terminal no-op (still reaps), the not-found path, the action_id (+pool)
-filter, the missing-scope 403, and the reap_error surface (flip lands, scancel
-fails). A fake backend client records the reap and scripts its result / failure.
+Covers: the terminal-first flip (non-terminal or failed → cancelled) + scancel
+reap, the completed / no_data / cancelled no-op (still reaps), the not-found path,
+the action_id (+pool) filter, the missing-scope 403, and the reap_error surface
+(flip lands, scancel fails). A fake backend client records the reap and scripts
+its result / failure.
 """
 
+import asyncio
 import uuid
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_CANCEL
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_CANCEL,
+    URL_WORK_TICKET_LIST,
+)
 from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import WorkTicketState
+
+from qiita_control_plane.ticket_redrive import ReapPending, reset_ticket_to_pending
+from qiita_control_plane.work_ticket_cancel import cancel_work_ticket
 
 pytestmark = pytest.mark.db
 
@@ -141,6 +151,7 @@ async def ctx(postgres_pool):
         "backend": backend,
         "admin_tok": admin_tok,
         "user_tok": user_tok,
+        "user_idx": user_idx,
         "seed_ticket": seed_ticket,
         "action_id": action_id,
     }
@@ -196,10 +207,14 @@ async def test_cancel_flips_terminal_then_reaps(ctx):
     assert ctx["backend"].cancel_calls == [idx]
 
 
-async def test_cancel_already_terminal_is_no_op_but_still_reaps(ctx):
-    """An already-terminal ticket is not re-flipped (cancelled=False) but its jobs
-    are still reaped — the defensive orphan-reap property."""
-    idx = await ctx["seed_ticket"]("failed")
+@pytest.mark.parametrize(
+    "state",
+    [WorkTicketState.COMPLETED, WorkTicketState.NO_DATA, WorkTicketState.CANCELLED],
+)
+async def test_cancel_completed_no_data_or_cancelled_is_no_op_but_still_reaps(ctx, state):
+    """A completed, no_data or cancelled ticket is not flipped (cancelled=False) but
+    its jobs are still reaped — the defensive orphan-reap property."""
+    idx = await ctx["seed_ticket"](state.value)
     async with _client() as c:
         resp = await c.post(
             URL_WORK_TICKET_CANCEL,
@@ -209,10 +224,75 @@ async def test_cancel_already_terminal_is_no_op_but_still_reaps(ctx):
     assert resp.status_code == 200, resp.text
     (r,) = resp.json()["results"]
     assert r["cancelled"] is False
-    assert r["previous_state"] == "failed"
-    assert r["state"] == "failed"  # unchanged
-    assert await _state(ctx["pool"], idx) == "failed"
+    assert r["previous_state"] == state.value
+    assert r["state"] == state.value  # unchanged
+    assert await _state(ctx["pool"], idx) == state.value
     assert ctx["backend"].cancel_calls == [idx]  # reap still ran
+
+
+async def test_cancel_failed_ticket_flips_clears_failure_and_reaps(ctx):
+    """A failed ticket named by idx is flipped to cancelled, its failure_* columns
+    are cleared (work_ticket_failure_consistent allows them only on failed), and the
+    reap runs after the flip."""
+    idx = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["cancelled"] == 1
+    (r,) = body["results"]
+    assert (r["previous_state"], r["state"], r["cancelled"]) == (
+        WorkTicketState.FAILED.value,
+        WorkTicketState.CANCELLED.value,
+        True,
+    )
+    assert r["cancelled_job_ids"] == [518235]
+    assert r["reap_error"] is None
+    row = await ctx["pool"].fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert dict(row) == {
+        "state": WorkTicketState.CANCELLED.value,
+        "failure_type": None,
+        "failure_stage": None,
+        "failure_step_name": None,
+        "failure_reason": None,
+    }
+    assert ctx["backend"].cancel_calls == [idx]
+
+    # A second cancel is a no-op on the now-cancelled ticket and reaps again.
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    (r,) = resp.json()["results"]
+    assert (r["previous_state"], r["cancelled"]) == (WorkTicketState.CANCELLED.value, False)
+    assert ctx["backend"].cancel_calls == [idx, idx]
+
+
+async def test_cancel_failed_ticket_reap_error_keeps_the_flip(ctx):
+    """A failed ticket whose reap fails is still cancelled; reap_error says so."""
+    idx = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
+    ctx["backend"].raise_on = idx
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    (r,) = resp.json()["results"]
+    assert r["cancelled"] is True
+    assert r["reap_error"] is not None
+    assert await _state(ctx["pool"], idx) == WorkTicketState.CANCELLED.value
 
 
 async def test_cancel_not_found_idx(ctx):
@@ -231,10 +311,12 @@ async def test_cancel_not_found_idx(ctx):
 
 async def test_cancel_filter_by_action_id(ctx):
     """The action_id filter selects the non-terminal tickets for that action; a
-    terminal ticket for the same action is excluded from the filter."""
+    terminal ticket for the same action, failed included, is excluded from the
+    filter."""
     a = await ctx["seed_ticket"]("processing")
     b = await ctx["seed_ticket"]("queued")
     done = await ctx["seed_ticket"]("completed")  # terminal → excluded from filter
+    failed = await ctx["seed_ticket"](WorkTicketState.FAILED.value)
     async with _client() as c:
         resp = await c.post(
             URL_WORK_TICKET_CANCEL,
@@ -246,6 +328,8 @@ async def test_cancel_filter_by_action_id(ctx):
     got = {r["work_ticket_idx"] for r in body["results"]}
     assert {a, b} <= got
     assert done not in got
+    assert failed not in got
+    assert await _state(ctx["pool"], failed) == WorkTicketState.FAILED.value
     assert await _state(ctx["pool"], a) == "cancelled"
     assert await _state(ctx["pool"], b) == "cancelled"
 
@@ -286,3 +370,160 @@ async def test_cancel_anonymous_401(ctx):
     async with _client() as c:
         resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]})
     assert resp.status_code == 401
+
+
+async def _reap_mark(pool, idx):
+    row = await pool.fetchrow(
+        "SELECT reap_pending_since, reap_note FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    return row["reap_pending_since"], row["reap_note"]
+
+
+@pytest.mark.parametrize("state", ["processing", "failed", "completed"])
+async def test_a_failed_reap_is_recorded_and_a_later_reap_clears_it(ctx, state):
+    """Any cancel whose reap fails marks the ticket, whatever its state; re-running the
+    cancel is the retry, and a reap without error clears the mark."""
+    idx = await ctx["seed_ticket"](state)
+    ctx["backend"].raise_on = idx
+    h = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    async with _client() as c:
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        assert resp.status_code == 200, resp.text
+        pending_since, failure = await _reap_mark(ctx["pool"], idx)
+        assert pending_since is not None
+        assert failure == "RuntimeError: orchestrator unreachable"
+
+        ctx["backend"].raise_on = None
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"][0]["reap_error"] is None
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)
+
+
+class _BlockingBackendClient(_FakeBackendClient):
+    """A reap that waits on `release` before returning or raising."""
+
+    def __init__(self, *, fail: bool) -> None:
+        super().__init__()
+        self.reaping = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fail = fail
+
+    async def cancel(self, work_ticket_idx: int) -> list[int]:
+        self.cancel_calls.append(work_ticket_idx)
+        self.reaping.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("orchestrator unreachable")
+        return list(self.result_ids)
+
+
+async def _redrive(pool, idx) -> bool:
+    async with pool.acquire() as conn, conn.transaction():
+        return await reset_ticket_to_pending(
+            conn, work_ticket_idx=idx, from_state=WorkTicketState.CANCELLED.value
+        )
+
+
+@pytest.mark.parametrize("fail", [True, False])
+async def test_a_redrive_during_the_reap_is_refused(ctx, fail):
+    """The flip commits with the reap mark set, so a redrive that lands while the reap
+    is still running is refused rather than dispatching a ticket whose jobs the reap
+    has yet to reach. A failed reap keeps the ticket refused; a clean one clears it."""
+    from qiita_control_plane.main import app
+
+    idx = await ctx["seed_ticket"]("processing")
+    backend = _BlockingBackendClient(fail=fail)
+    app.state.compute_backend_client = backend
+    h = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    async with _client() as c:
+        cancel = asyncio.create_task(
+            c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=h)
+        )
+        await asyncio.wait_for(backend.reaping.wait(), timeout=10)
+        assert await _state(ctx["pool"], idx) == "cancelled"
+        with pytest.raises(ReapPending, match="has not finished") as refused:
+            await _redrive(ctx["pool"], idx)
+        assert "failed" not in str(refused.value)
+        backend.release.set()
+        assert (await cancel).status_code == 200
+    if fail:
+        with pytest.raises(ReapPending) as exc:
+            await _redrive(ctx["pool"], idx)
+        # The note rides on the exception, outside its str (`sees_reap_note`).
+        assert "orchestrator unreachable" not in str(exc.value)
+        assert "failed: RuntimeError: orchestrator unreachable" in exc.value.message(with_note=True)
+    else:
+        assert await _reap_mark(ctx["pool"], idx) == (None, None)
+        assert await _redrive(ctx["pool"], idx) is True
+
+
+async def test_an_earlier_cancels_clean_reap_leaves_a_later_cancels_mark(ctx):
+    """Two cancels of one ticket overlap: A's reap finishing cleanly does not clear B's
+    mark while B's reap still runs, so a redrive stays refused until B's reap ends."""
+    idx = await ctx["seed_ticket"]("processing")
+    first = _BlockingBackendClient(fail=False)
+    second = _BlockingBackendClient(fail=False)
+    a = asyncio.create_task(cancel_work_ticket(ctx["pool"], first, idx))
+    await asyncio.wait_for(first.reaping.wait(), timeout=10)
+    b = asyncio.create_task(cancel_work_ticket(ctx["pool"], second, idx))
+    await asyncio.wait_for(second.reaping.wait(), timeout=10)
+
+    first.release.set()
+    assert (await a)["reap_error"] is None
+    with pytest.raises(ReapPending, match="has not finished"):
+        await _redrive(ctx["pool"], idx)
+
+    second.release.set()
+    assert (await b)["reap_error"] is None
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)
+    assert await _redrive(ctx["pool"], idx) is True
+
+
+async def test_a_cancel_whose_reap_succeeds_leaves_no_mark(ctx):
+    idx = await ctx["seed_ticket"]("processing")
+    async with _client() as c:
+        resp = await c.post(
+            URL_WORK_TICKET_CANCEL,
+            json={"work_ticket_idxs": [idx]},
+            headers={"Authorization": f"Bearer {ctx['admin_tok']}"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert await _reap_mark(ctx["pool"], idx) == (None, None)
+
+
+async def test_the_ticket_reads_show_the_reap_mark_and_its_note_to_a_system_admin_only(ctx):
+    """Every caller who may read the ticket sees `reap_pending_since`; `reap_note`
+    (the orchestrator client's error text) is returned to a system_admin only."""
+    idx = await ctx["seed_ticket"]("processing")
+    ctx["backend"].raise_on = idx
+    admin = {"Authorization": f"Bearer {ctx['admin_tok']}"}
+    user = {"Authorization": f"Bearer {ctx['user_tok']}"}
+    async with _client() as c:
+        resp = await c.post(URL_WORK_TICKET_CANCEL, json={"work_ticket_idxs": [idx]}, headers=admin)
+        assert resp.status_code == 200, resp.text
+        # The originator reads its own ticket; make the regular user the originator.
+        await ctx["pool"].execute(
+            "UPDATE qiita.work_ticket SET originator_principal_idx = $2 WHERE work_ticket_idx = $1",
+            idx,
+            ctx["user_idx"],
+        )
+        url = URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx)
+
+        by_admin = (await c.get(url, headers=admin)).json()
+        assert by_admin["reap_pending_since"] is not None
+        assert by_admin["reap_note"] == "RuntimeError: orchestrator unreachable"
+
+        by_user = await c.get(url, headers=user)
+        assert by_user.status_code == 200, by_user.text
+        assert by_user.json()["reap_pending_since"] == by_admin["reap_pending_since"]
+        assert by_user.json()["reap_note"] is None
+
+        listed = await c.get(URL_WORK_TICKET_LIST, headers=user)
+        assert listed.status_code == 200, listed.text
+        [row] = [t for t in listed.json()["tickets"] if t["work_ticket_idx"] == idx]
+        assert (row["reap_pending_since"] is not None, row["reap_note"]) == (True, None)
+        listed = await c.get(URL_WORK_TICKET_LIST, headers=admin, params={"all": "true"})
+        [row] = [t for t in listed.json()["tickets"] if t["work_ticket_idx"] == idx]
+        assert row["reap_note"] == "RuntimeError: orchestrator unreachable"

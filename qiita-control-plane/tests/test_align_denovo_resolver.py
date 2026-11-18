@@ -33,7 +33,6 @@ from qiita_control_plane.runner._alignment import (
     MIN_QUERY_COVERAGE_BINDING,
     PRESET_BINDING,
     _create_alignment_gate_pending,
-    _persist_alignment_idx,
     _require_assembly_subject,
     _require_masked_query,
     _resolve_denovo_alignment_idx,
@@ -238,11 +237,9 @@ async def test_the_ticket_column_and_the_gate_row_are_both_written(sample):
     resolver that bound the identity without writing these two would produce a ticket
     that dies at its second entry."""
     pool = sample["pool"]
-    minted = await _resolve(sample)
-    alignment_idx = minted["alignment_idx"]
     work_ticket_idx = await _seed_ticket(sample)
+    alignment_idx = (await _resolve(sample, work_ticket_idx=work_ticket_idx))["alignment_idx"]
 
-    await _persist_alignment_idx(pool, work_ticket_idx, alignment_idx)
     await _create_alignment_gate_pending(
         pool, alignment_idx=alignment_idx, prep_sample_idx=sample["prep_sample_idx"]
     )
@@ -294,7 +291,6 @@ async def test_a_resume_re_attaches_to_the_ticket_column_instead_of_re_deriving(
     come back with the SAME idx and the STORED knobs, not the new default's."""
     ticket = await _seed_ticket(sample)
     first = await _resolve(sample, work_ticket_idx=ticket)
-    await _persist_alignment_idx(sample["pool"], ticket, first["alignment_idx"])
 
     resumed = await _resolve(
         sample,
@@ -315,7 +311,7 @@ async def test_a_resume_re_attaches_to_the_ticket_column_instead_of_re_deriving(
 async def test_an_integer_and_a_float_threshold_are_one_identity(sample):
     """The action's `type: number` admits both `1` and `1.0`, and the hash is over
     canonical JSON, which renders them as different strings. Without the coercion the
-    same configuration mints two alignment_idx — and `_assert_params_survive_storage`
+    same configuration mints two alignment_idx — and `assert_params_survive_storage`
     cannot catch it, because an integer round-trips jsonb unchanged."""
     as_int = await _resolve(sample, **{MIN_IDENTITY_BINDING: 1})
     as_float = await _resolve(sample, **{MIN_IDENTITY_BINDING: 1.0})
@@ -389,9 +385,10 @@ async def test_an_invalidated_run_is_not_re_run_under_the_same_identity(sample):
 
 
 async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
+    """The mint refuses a deprecated alignment; a re-attach is refused by
+    `_create_alignment_gate_pending`."""
     ticket = await _seed_ticket(sample)
     first = await _resolve(sample, work_ticket_idx=ticket)
-    await _persist_alignment_idx(sample["pool"], ticket, first["alignment_idx"])
     await sample["pool"].execute(
         "UPDATE qiita.alignment_definition SET status = 'deprecated', deprecated_at = now(),"
         "       deprecated_by_idx = $2, deprecation_reason = 'bad preset'"
@@ -399,7 +396,196 @@ async def test_a_deprecated_alignment_is_refused_on_mint_and_on_resume(sample):
         first["alignment_idx"],
         sample["principal_idx"],
     )
+    resumed = await _resolve(sample, work_ticket_idx=ticket)
+    assert resumed["alignment_idx"] == first["alignment_idx"]
     with pytest.raises(Exception, match="bad preset"):
-        await _resolve(sample, work_ticket_idx=ticket)
+        await _create_alignment_gate_pending(
+            sample["pool"],
+            alignment_idx=resumed["alignment_idx"],
+            prep_sample_idx=sample["prep_sample_idx"],
+        )
     with pytest.raises(Exception, match="bad preset"):
         await _resolve(sample)
+
+
+async def test_the_mint_records_the_alignment_on_the_ticket(sample):
+    """The mint records the alignment on the ticket in its own transaction
+    (`runner._record`)."""
+    ticket = await _seed_ticket(sample)
+    minted = await _resolve(sample, work_ticket_idx=ticket)
+    assert (
+        await sample["pool"].fetchval(
+            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+        )
+        == minted["alignment_idx"]
+    )
+
+
+async def test_a_re_attach_after_an_admin_edit_of_the_recorded_alignment_fails(
+    sample, human_admin_session
+):
+    """A resume re-attaches to the recorded alignment while its settings are unchanged;
+    once an admin edited them after the ticket was created, the stored params are not
+    the ones the ticket resolved, and the ticket fails as bad input."""
+    from qiita_common.backend_failure import BackendFailure
+    from qiita_common.models import DefinitionKind, DefinitionSettingsEditKind
+
+    pool = sample["pool"]
+    ticket = await _seed_ticket(sample)
+    first = await _resolve(sample, work_ticket_idx=ticket)
+    assert await _resolve(sample, work_ticket_idx=ticket) == first
+    # Append-only, with no FK to the definition, so the row is left as the other
+    # settings-edit tests leave theirs.
+    await pool.execute(
+        "INSERT INTO qiita.definition_settings_edit (definition_kind, definition_ref,"
+        "  edit_kind, actor_principal_idx, old_settings, new_settings, reason)"
+        " VALUES ($1, $2, $3, $4, '{\"params\": 1}', '{\"params\": 2}', 'corrected in a test')",
+        DefinitionKind.ALIGNMENT.value,
+        first["alignment_idx"],
+        DefinitionSettingsEditKind.ADMIN_EDIT.value,
+        human_admin_session["principal_idx"],
+    )
+    with pytest.raises(BackendFailure, match="submit a new ticket"):
+        await _resolve(sample, work_ticket_idx=ticket)
+
+
+async def test_an_earlier_edit_of_the_tickets_mask_does_not_hide_an_alignment_edit(
+    sample, human_admin_session
+):
+    """The ticket also records a mask. An edit of the mask alone does not stop the
+    re-attach; once the alignment is edited too, after the mask, the re-attach finds
+    the alignment's edit and fails, rather than reading only the ticket's earliest
+    edit."""
+    from qiita_common.backend_failure import BackendFailure
+    from qiita_common.models import DefinitionKind, DefinitionSettingsEditKind
+
+    from qiita_control_plane.repositories.mask_definition import mint_mask_definition
+
+    pool = sample["pool"]
+    ticket = await _seed_ticket(sample)
+    first = await _resolve(sample, work_ticket_idx=ticket)
+    async with pool.acquire() as conn:
+        mask_idx = (
+            await mint_mask_definition(
+                conn,
+                filter_workflow="read-mask",
+                filter_version="1.0.0",
+                params={"filter_workflow": "read-mask", "probe": secrets.token_hex(4)},
+                principal_idx=human_admin_session["principal_idx"],
+            )
+        )["mask_idx"]
+    try:
+        await pool.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = $2 WHERE work_ticket_idx = $1",
+            ticket,
+            mask_idx,
+        )
+
+        # Append-only, with no FK to the definition, so the rows are left as the
+        # other settings-edit tests leave theirs. The mask's edit is the earlier.
+        async def edit(kind, ref, minutes):
+            await pool.execute(
+                "INSERT INTO qiita.definition_settings_edit (definition_kind, definition_ref,"
+                "  edit_kind, actor_principal_idx, old_settings, new_settings, reason,"
+                "  occurred_at)"
+                " VALUES ($1, $2, $3, $4, '{\"params\": 1}', '{\"params\": 2}',"
+                "  'corrected in a test', now() + make_interval(mins => $5))",
+                kind.value,
+                ref,
+                DefinitionSettingsEditKind.ADMIN_EDIT.value,
+                human_admin_session["principal_idx"],
+                minutes,
+            )
+
+        await edit(DefinitionKind.MASK, mask_idx, 1)
+        assert await _resolve(sample, work_ticket_idx=ticket) == first
+        await edit(DefinitionKind.ALIGNMENT, first["alignment_idx"], 2)
+        with pytest.raises(BackendFailure, match="submit a new ticket"):
+            await _resolve(sample, work_ticket_idx=ticket)
+    finally:
+        await pool.execute(
+            "UPDATE qiita.work_ticket SET mask_idx = NULL WHERE work_ticket_idx = $1", ticket
+        )
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+
+
+async def test_an_edit_committed_inside_the_de_novo_mint_re_mints(
+    sample, human_admin_session, monkeypatch
+):
+    """The real mint path: the alignment the ticket's params resolve to already exists,
+    and an admin edit of it commits during the mint, before the hold. The mint
+    re-mints, so the ticket records an alignment with the params it hashed, and the
+    edited row keeps the edit."""
+    import json
+
+    from qiita_common.models import DefinitionKind
+
+    from qiita_control_plane.definition_settings import edit_definition_settings
+    from qiita_control_plane.runner import _alignment
+
+    pool = sample["pool"]
+    first_ticket = await _seed_ticket(sample)
+    existing = (await _resolve(sample, work_ticket_idx=first_ticket))["alignment_idx"]
+    # Finished, so the edit's live-work check does not count it.
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET state = 'cancelled', notified_at = now()"
+        " WHERE work_ticket_idx = $1",
+        first_ticket,
+    )
+    stored = json.loads(
+        await pool.fetchval(
+            "SELECT params FROM qiita.alignment_definition WHERE alignment_idx = $1", existing
+        )
+    )
+    real_mint = _alignment.mint_alignment_definition
+    edits: list[int] = []
+
+    async def mint_then_edit(conn, **kwargs):
+        row = await real_mint(conn, **kwargs)
+        if not edits:
+            async with pool.acquire() as other, other.transaction():
+                await edit_definition_settings(
+                    other,
+                    kind=DefinitionKind.ALIGNMENT,
+                    idx=row["alignment_idx"],
+                    params={**stored, "edited": True},
+                    workflow=None,
+                    version=None,
+                    reason="corrected in a test",
+                    principal_idx=human_admin_session["principal_idx"],
+                )
+            edits.append(row["alignment_idx"])
+        return row
+
+    monkeypatch.setattr(_alignment, "mint_alignment_definition", mint_then_edit)
+    ticket = await _seed_ticket(sample)
+    recorded = (await _resolve(sample, work_ticket_idx=ticket))["alignment_idx"]
+    assert edits == [existing]
+    assert recorded != existing
+    assert (
+        await pool.fetchval(
+            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+        )
+        == recorded
+    )
+    params_of = "SELECT params FROM qiita.alignment_definition WHERE alignment_idx = $1"
+    assert json.loads(await pool.fetchval(params_of, recorded)) == stored
+    assert json.loads(await pool.fetchval(params_of, existing))["edited"] is True
+
+
+async def test_a_mint_whose_row_moves_before_every_hold_fails_as_bad_input(sample, monkeypatch):
+    """When the held row's hash differs on every attempt, the ticket fails as bad
+    submission input (`runner._record.fail_exhausted_hold`), not the runner's
+    catch-all. The held hash is stubbed: a real edit cannot reach a row the mint's
+    own transaction inserted."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    from qiita_control_plane.runner import _alignment
+
+    async def moved_hash(conn, alignment_idx):
+        return {"params_hash": b"\x00" * 32}
+
+    monkeypatch.setattr(_alignment, "lock_active_alignment", moved_hash)
+    with pytest.raises(BackendFailure, match="edited between the mint and its hold") as ei:
+        await _resolve(sample)
+    assert ei.value.kind == FailureKind.BAD_INPUT

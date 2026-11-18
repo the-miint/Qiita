@@ -7,9 +7,55 @@ dispatches: the caller dispatches after commit.
 from __future__ import annotations
 
 import asyncpg
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import StepProgressState, WorkTicketState
 
+from .auth.principal import Principal
 from .repositories import require_transaction
+from .work_ticket_cancel import REAP_IN_FLIGHT
+
+
+def sees_reap_note(principal: Principal) -> bool:
+    """Whether `principal` is shown a failed reap's note: a system_admin only. The
+    note is the orchestrator client's exception text, which can name the orchestrator's
+    address and the SLURM error; `reap_pending_since` shows every caller who may read
+    the ticket that a reap is pending."""
+    return principal.has_role(SystemRole.SYSTEM_ADMIN)
+
+
+class ReapPending(Exception):
+    """A cancel's reap of the ticket's SLURM jobs has not succeeded: it is running, was
+    interrupted, or failed (`work_ticket.reap_pending_since`, `reap_note`). A job it has
+    not reached may still be running under the ticket, so the ticket is not redriven
+    until a cancel reaps without error."""
+
+    # The `reason` code of the 409 every redrive route answers it with.
+    REASON = "reap_pending"
+
+    def __init__(self, work_ticket_idx: int, pending_since: object, note: str) -> None:
+        self.work_ticket_idx = work_ticket_idx
+        self.pending_since = pending_since
+        self.note = note
+        super().__init__(self.message(with_note=False))
+
+    def message(self, *, with_note: bool) -> str:
+        """The refusal text. A failed reap's note (the orchestrator client's error) is
+        included only when `with_note` (`sees_reap_note`)."""
+        idx, since = self.work_ticket_idx, self.pending_since
+        if self.note == REAP_IN_FLIGHT:
+            what = (
+                f"the reap of its SLURM jobs by a cancel started at {since} has not"
+                " finished: it is running, or the cancel was interrupted"
+            )
+        else:
+            what = f"the reap of its SLURM jobs by a cancel started at {since} failed"
+            if with_note:
+                what += f": {self.note}"
+        return (
+            f"work_ticket {idx}: {what}. It is not redriven until a reap"
+            f" succeeds; reap it with `qiita-admin ticket cancel {idx}`"
+            f" (POST /work-ticket/cancel with work_ticket_idxs [{idx}])"
+        )
 
 
 async def reset_ticket_to_pending(
@@ -17,7 +63,9 @@ async def reset_ticket_to_pending(
 ) -> bool:
     """Set the ticket PENDING and clear what its last outcome left on it. Guarded on
     `from_state`, so a ticket that changed state since the caller read it is left
-    alone: returns False then, True when the row was updated."""
+    alone: returns False then, True when the row was updated. Raises `ReapPending`
+    while a cancel's reap of the ticket has not succeeded, so every
+    redrive path refuses it."""
     require_transaction(conn)
     updated = await conn.fetchval(
         "UPDATE qiita.work_ticket"
@@ -37,12 +85,22 @@ async def reset_ticket_to_pending(
         "     dispatch_held = false"
         " WHERE work_ticket_idx = $2"
         "   AND state = $3::qiita.work_ticket_state"
+        "   AND reap_pending_since IS NULL"
         " RETURNING work_ticket_idx",
         WorkTicketState.PENDING.value,
         work_ticket_idx,
         from_state,
     )
-    return updated is not None
+    if updated is not None:
+        return True
+    # Read only on refusal, so a redrive that goes through runs one statement here.
+    reap = await conn.fetchrow(
+        "SELECT reap_pending_since, reap_note FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if reap is not None and reap["reap_pending_since"] is not None:
+        raise ReapPending(work_ticket_idx, reap["reap_pending_since"], reap["reap_note"])
+    return False
 
 
 async def drop_dead_step_rows(
