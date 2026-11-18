@@ -17,7 +17,10 @@ from qiita_control_plane.repositories.amplicon import (
     create_amplicon_samples_pending,
 )
 from qiita_control_plane.repositories.processing import mint_processing
-from qiita_control_plane.runner._processing import _create_amplicon_gate_pending
+from qiita_control_plane.runner._processing import (
+    _create_amplicon_gate_pending,
+    _record_amplicon_gate_no_data,
+)
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_sequenced_sample_subtype,
@@ -188,4 +191,37 @@ async def test_closing_leaves_another_pools_pending_rows_alone(postgres_pool, ru
         a: "completed",
         b: "no_data",
         other: "pending",
+    }
+
+
+async def test_the_no_data_handler_closes_the_whole_pool(postgres_pool, run):
+    # amplicon_deblur raised StepNoData — the pool produced no ASV for any sample, so
+    # finalize never runs. The handler's close takes every pending row to no_data.
+    await _create_amplicon_gate_pending(
+        postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
+    )
+    await _record_amplicon_gate_no_data(
+        postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
+    )
+    assert await _states(postgres_pool, run["processing_idx"]) == {
+        ps: "no_data" for ps in run["prep_sample_idxs"]
+    }
+
+
+async def test_a_sample_retired_mid_run_is_still_closed(postgres_pool, run):
+    # The row is created at submit; retiring the sample drops it from the filtered
+    # population, but the close scopes to the pool's raw membership, so its pending row
+    # is reached and closed rather than stranded forever.
+    a, b, c = run["prep_sample_idxs"]
+    await _create_amplicon_gate_pending(
+        postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
+    )
+    await postgres_pool.execute("UPDATE qiita.prep_sample SET retired = true WHERE idx = $1", a)
+    await _record_amplicon_gate_no_data(
+        postgres_pool, processing_idx=run["processing_idx"], sequenced_pool_idx=run["pool_idx"]
+    )
+    assert await _states(postgres_pool, run["processing_idx"]) == {
+        a: "no_data",
+        b: "no_data",
+        c: "no_data",
     }

@@ -20,6 +20,22 @@ AMPLICON_SAMPLE_COMPLETED = gate_state_literal("completed", AmpliconSampleState)
 AMPLICON_SAMPLE_NO_DATA = gate_state_literal("no_data", AmpliconSampleState)
 
 
+async def pool_prep_sample_idxs(
+    conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> list[int]:
+    """Every prep_sample of a pool, by its 1:1 sequenced_sample — the raw membership
+    the gate closes over. Unlike `list_pool_prep_sample_idxs` it keeps retired and
+    ENA-flagged samples, so a 'pending' row for a sample retired mid-run is still
+    reached and closed, not stranded at 'pending' for a run that has ended."""
+    return [
+        r["prep_sample_idx"]
+        for r in await conn.fetch(
+            "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
+            sequenced_pool_idx,
+        )
+    ]
+
+
 async def create_amplicon_samples_pending(
     conn: asyncpg.Connection, *, processing_idx: int, prep_sample_idxs: list[int]
 ) -> None:

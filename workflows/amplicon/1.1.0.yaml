@@ -21,9 +21,9 @@ description: >
   `mint-features` mints a feature_idx per ASV against the shared `qiita.feature`
   space; `amplicon_load` joins the counts to the feature map and writes the
   DuckLake `amplicon_membership` (prep_sample_idx, processing_idx, feature_idx,
-  count) plus the ASV sequences themselves (`amplicon_sequence` +
-  `amplicon_sequence_chunks`, keyed by feature_idx, so an ASV is never recomputed
-  to read back); register-files loads them. The ASV-reference-match (e.g. GG2)
+  count) plus the ASV sequences themselves (`amplicon_sequence`, keyed by
+  feature_idx with the bytes inline, so an ASV is never recomputed to read back);
+  register-files loads them. The ASV-reference-match (e.g. GG2)
   feature table is derived on demand by intersecting feature_idx with a
   reference's membership (an exact ASV match, not similarity-based
   closed-reference) — never stored here. mint-amplicon-identifiers then mints
@@ -99,8 +99,9 @@ steps:
     inputs: [asv_counts]
     outputs: []
 
-  # close the run's per-sample gate (qiita.amplicon_sample): 'completed' with its
-  # ASV count for each sample denoise counted, 'no_data' for the rest of the pool.
+  # close the run's per-sample gate (qiita.amplicon_sample): 'completed' for each
+  # sample denoise produced ASVs for, 'no_data' for the rest of the pool (the gate
+  # records state only; the count is read from amplicon_membership in the lake).
   # the runner materialized the pool's 'pending' rows when it minted the run.
   - action: finalize-amplicon-sample
     inputs: [asv_counts]

@@ -251,10 +251,11 @@ class LibraryPrimitive(StrEnum):
     # register-files, so an identifier never names data that did not land. See
     # qiita_control_plane.actions.library.mint_amplicon_identifiers.
     MINT_AMPLICON_IDENTIFIERS = "mint-amplicon-identifiers"
-    # Amplicon: close the run's qiita.amplicon_sample gate — 'completed' with an
-    # ASV count for each sample denoise counted, 'no_data' for the rest of the
-    # pool. The runner materializes the 'pending' rows for any workflow that
-    # declares it. See qiita_control_plane.actions.library.finalize_amplicon_sample.
+    # Amplicon: close the run's qiita.amplicon_sample gate — 'completed' for each
+    # sample denoise produced ASVs for, 'no_data' for the rest of the pool (state
+    # only; the count is read from amplicon_membership in the lake). The runner
+    # materializes the 'pending' rows for any workflow that declares it. See
+    # qiita_control_plane.actions.library.finalize_amplicon_sample.
     FINALIZE_AMPLICON_SAMPLE = "finalize-amplicon-sample"
 
 
