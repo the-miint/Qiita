@@ -20,12 +20,15 @@ import sys
 import types
 from pathlib import Path
 
+import duckdb
 import pytest
 from pydantic import BaseModel
+from qiita_common.log_tail import contains_oom_signature
 from qiita_common.step_log import summarize
 
 from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
 from qiita_compute_orchestrator.jobs.__main__ import _flatten_params, main
+from qiita_compute_orchestrator.slurm.launcher_failure import parse_launcher_failure
 
 
 class _Inputs(BaseModel):
@@ -424,10 +427,12 @@ def test_main_writes_a_no_data_receipt(monkeypatch, io_dirs, capsys):
     assert "summary" not in out
 
 
-def test_main_writes_a_receipt_for_an_unhandled_exception(monkeypatch, io_dirs, capsys):
+def test_main_writes_a_receipt_for_an_unhandled_exception(monkeypatch, io_dirs, capsys, tmp_path):
     """An exception run_native_job does not classify (it maps the ones it knows to
-    BackendFailure and lets the rest propagate) still ends the step with a receipt —
-    a typed permanent failure carrying the exception — rather than an empty stdout."""
+    BackendFailure and lets the rest propagate) still ends the step with a receipt on
+    stdout — a typed permanent failure carrying the exception — rather than an empty
+    stdout. It writes no outcome line to stderr, so `parse_launcher_failure` finds
+    nothing and the backend's state-based classification governs the kind."""
     input_path, _ = io_dirs
 
     async def execute(inputs, workspace):
@@ -438,8 +443,46 @@ def test_main_writes_a_receipt_for_an_unhandled_exception(monkeypatch, io_dirs, 
 
     rc = main(["--job", "boom"])
     assert rc == 1
-    out = _outcome(capsys.readouterr())
-    assert out["kind"] == "unknown_permanent"
-    assert out["step_name"] == "fastq"
-    assert "RuntimeError" in out["reason"]
-    assert "something unexpected blew up" in out["reason"]
+    captured = capsys.readouterr()
+    receipt = json.loads(captured.out.strip())
+    assert receipt["kind"] == "unknown_permanent"
+    assert receipt["step_name"] == "fastq"
+    assert "RuntimeError" in receipt["reason"]
+    assert "something unexpected blew up" in receipt["reason"]
+    # The traceback is in the narrative, but there is no launcher outcome line to parse.
+    assert "RuntimeError" in captured.err
+    stderr_file = tmp_path / "stderr"
+    stderr_file.write_text(captured.err)
+    assert parse_launcher_failure(stderr_file) is None
+
+
+def test_an_unhandled_oom_leaves_classification_to_the_backend(
+    monkeypatch, io_dirs, capsys, tmp_path
+):
+    """An in-process DuckDB OOM surfaces as an unclassified exception whose message
+    carries an OOM signature. The catch-all must not stamp an `unknown_permanent` line on
+    stderr: `parse_launcher_failure` returns None, so `result_step` runs its state-based
+    path, sees the OOM signature in the stderr tail (`contains_oom_signature`), and
+    upgrades to the retriable OOM_KILLED (its own tests cover that upgrade). A stderr line
+    here would make the OOM permanent."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        # The real exception run_native_job does not map (it is not a ValueError), with
+        # the message DuckDB actually raises.
+        raise duckdb.OutOfMemoryException(
+            "Out of Memory Error: could not allocate block of size 256.0 KiB"
+        )
+
+    _install_stub(monkeypatch, short_name="oom", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    assert main(["--job", "oom"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip())["kind"] == "unknown_permanent"
+    stderr_file = tmp_path / "stderr"
+    stderr_file.write_text(captured.err)
+    # No launcher line to pre-empt the backend, and the OOM signature the backend keys on
+    # is present in the narrative for it to find.
+    assert parse_launcher_failure(stderr_file) is None
+    assert contains_oom_signature(captured.err)

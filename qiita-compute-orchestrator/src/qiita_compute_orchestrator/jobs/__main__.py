@@ -27,6 +27,12 @@ stripped (e.g. `fastq_to_parquet`). The launcher:
    real `kind` / `step_name` / `reason` end up on the work_ticket
    row's `failure_*` columns instead of a generic state-based
    classification ("job FAILED with exit_code=1").
+6. On any other exception from `execute` (one `run_native_job` did not
+   map to a `BackendFailure`), writes a failure receipt to stdout
+   carrying the exception, with the traceback in the stderr narrative,
+   and no outcome line on stderr — the launcher cannot classify it, so
+   `SlurmBackend`'s state-based path (exit code plus an OOM signature in
+   the stderr tail) decides the kind.
 
 The manifest format mirrors what container steps produce so the
 verifier walks both uniformly:
@@ -49,6 +55,7 @@ from pathlib import Path
 
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.log import install_authorization_scrub
 from qiita_common.step_log import COMPLETED_KIND, receipt, step_handler, step_scope
 
 from ..slurm.contract import (
@@ -192,6 +199,10 @@ def main(argv: list[str] | None = None) -> int:
     # its helpers make, so keep those out of it.
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # INFO reaches the step narrative now, and an httpx INFO line can carry an
+    # `Authorization` header verbatim; scrub bearer tokens from log messages (`log.py`
+    # rewrites the record message, not an exception traceback) before they reach disk.
+    install_authorization_scrub()
 
     input_path = Path(os.environ["QIITA_INPUT_PATH"])
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
@@ -221,16 +232,24 @@ def main(argv: list[str] | None = None) -> int:
             # run_native_job maps the failures it knows to BackendFailure and lets the
             # rest propagate, so an unexpected error from execute() would otherwise end
             # the step with no receipt. The step-log contract is a receipt for every
-            # outcome, so write one — a typed permanent failure carrying the exception —
-            # and leave the traceback in the narrative. A SIGKILL (a true OOM) still
-            # writes nothing, so SlurmBackend's state-based fallback classifies that.
+            # outcome, so write one to stdout — carrying the exception — and leave the
+            # traceback in the narrative. No outcome line on stderr: the launcher cannot
+            # classify this, and an `unknown_permanent` line would pre-empt SlurmBackend's
+            # state-based classification (exit code plus an OOM signature in the stderr
+            # tail). A DuckDB OutOfMemoryException, whose message carries that signature,
+            # is classified oom_killed and retried; writing a line here made it a permanent
+            # failure instead. With no line, the state-based classification runs as before.
             _LOG.exception("unhandled error in step %s", step_name)
-            return _outcome(
-                FailureKind.UNKNOWN_PERMANENT.value,
-                step_name,
-                f"unhandled {type(exc).__name__}: {exc}",
-                started,
+            _LOG.info("ended %s after %s", FailureKind.UNKNOWN_PERMANENT.value, _elapsed(started))
+            print(
+                receipt(
+                    FailureKind.UNKNOWN_PERMANENT.value,
+                    step_name,
+                    reason=f"unhandled {type(exc).__name__}: {exc}",
+                ),
+                flush=True,
             )
+            return 1
 
         try:
             files = _collect_files(output_path)
