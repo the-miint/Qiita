@@ -144,7 +144,7 @@ keep reporting `download_failed`. It tickets the runs a completed download never
 those that failed `retriable` (the retries ran out): a new ticket for the same pool,
 restricted to them; if every run of that ticket fails again it ends FAILED, not
 `completed_partial`. A run that fails every time but is classed retriable (a gzip that ends
-early because ENA serves no file, or a file whose bytes do not match the `fastq_md5` ENA
+early because ENA serves no file (duckdb-miint#460), or a file whose bytes do not match the `fastq_md5` ENA
 publishes for it; check the run on the ENA Portal) is downloaded again on each re-import. A run counts as downloaded once its minting ticket completed, so
 a failed ticket that had already reserved a run's read numbering does not hide it from a
 re-import; the new ticket stops at that run, naming the failed ticket, which `/run` re-drives.
