@@ -231,3 +231,33 @@ def test_resolve_slurm_settings_requires_miint_gpl_boundary_path(monkeypatch):
     monkeypatch.delenv("MIINT_GPL_BOUNDARY_PATH", raising=False)
     with pytest.raises(RuntimeError, match="MIINT_GPL_BOUNDARY_PATH"):
         _resolve_slurm_settings()
+
+
+def test_path_node_local_required_and_absolute_under_slurm(monkeypatch):
+    """PATH_NODE_LOCAL is required at SLURM boot, so a missing value stops the
+    orchestrator rather than failing a placement step after the steps before it."""
+    from qiita_compute_orchestrator.config import _resolve_path_node_local
+
+    monkeypatch.delenv("PATH_NODE_LOCAL", raising=False)
+    with pytest.raises(RuntimeError, match="requires PATH_NODE_LOCAL"):
+        _resolve_path_node_local()
+    monkeypatch.setenv("PATH_NODE_LOCAL", "scratch/qiita-miint")
+    with pytest.raises(RuntimeError, match="must be absolute"):
+        _resolve_path_node_local()
+    monkeypatch.setenv("PATH_NODE_LOCAL", "/scratch/qiita-miint")
+    assert _resolve_path_node_local() == "/scratch/qiita-miint"
+
+
+def test_path_node_local_is_read_from_the_job_env_off_slurm(monkeypatch):
+    """On the launcher path (no COMPUTE_BACKEND) the value comes from the job env
+    that node_local_job_env wrote, and is None when absent."""
+    from qiita_compute_orchestrator.config import node_local_job_env
+
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    monkeypatch.delenv("PATH_NODE_LOCAL", raising=False)
+    assert Settings.from_env(require_cp_to_co_token=False).path_node_local is None
+    assert node_local_job_env(None) == {}
+    for k, v in node_local_job_env("/scratch/qiita-miint").items():
+        monkeypatch.setenv(k, v)
+    assert Settings.from_env(require_cp_to_co_token=False).path_node_local == "/scratch/qiita-miint"

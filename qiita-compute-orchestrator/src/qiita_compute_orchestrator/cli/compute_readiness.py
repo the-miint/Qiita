@@ -68,6 +68,7 @@ from ..config import (
     CORRECT_COMPUTE_READINESS_INVOCATION,
     ORCHESTRATOR_ENV_PATH,
     Settings,
+    node_local_job_env,
 )
 from ..native_import_check import MAX_DETAIL
 from ..slurm.client import (
@@ -608,6 +609,7 @@ def build_probe_submit_payload(
     # single source for which miint vars a remote job needs — SlurmBackend feeds
     # its real jobs from the same helper, so probe and jobs can't drift.
     env.update(miint_job_env())
+    env.update(node_local_job_env(settings.path_node_local))
     if settings.cp_url:
         env["QIITA_CP_URL"] = settings.cp_url
     if settings.co_to_cp_token:

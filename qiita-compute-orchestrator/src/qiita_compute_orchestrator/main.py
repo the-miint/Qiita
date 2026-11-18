@@ -63,6 +63,7 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.
             path_derived_images=settings.path_derived_images,
+            path_node_local=settings.path_node_local,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

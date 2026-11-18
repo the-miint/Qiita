@@ -39,10 +39,14 @@ helpers must live outside that package.
 
 from __future__ import annotations
 
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 
 __all__ = [
+    "KREPP_INDEX_SUBDIR",
     "bowtie2_index_path",
+    "krepp_build_relpath",
+    "node_relative_path",
     "minimap2_index_path",
     "reference_derived_dir",
     "rype_index_path",
@@ -148,3 +152,40 @@ def shard_bowtie2_index_prefix(derived_root: Path | str, reference_idx: int, sha
     ``shard_name = str(shard_id)``). Written by ``build_bowtie2_index`` in shard
     mode."""
     return shard_bowtie2_dir(derived_root, reference_idx) / str(shard_id) / "index"
+
+
+# --- krepp builds --------------------------------------------------------------
+#
+# A krepp build lives at the same RELATIVE path under two roots: the master copy
+# under PATH_DERIVED, which the registration job reads and the cluster admins copy
+# from, and a copy under every compute node's PATH_NODE_LOCAL, which placement reads.
+# `reference_index.fs_path` holds the relative path (fs_path_root 'node_local').
+# The folder carries README.md, SHA256SUMS, manifest.json and verify.sh at its top
+# level and the krepp files in KREPP_INDEX_SUBDIR, which is what `place_krepp` is
+# given as its index directory.
+
+KREPP_INDEX_SUBDIR = "index"
+
+# A build label is one path segment: letters, digits, '.', '_', '-', not starting
+# with '.', so it can neither climb out of the reference's krepp directory nor hide.
+_BUILD_LABEL = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}")
+
+
+def krepp_build_relpath(reference_idx: int, build_label: str) -> str:
+    """``references/{reference_idx}/krepp/{build_label}``, the build's path relative
+    to either root. Raises ValueError on a label that is not one plain segment."""
+    if not _BUILD_LABEL.fullmatch(build_label):
+        raise ValueError(f"krepp build label {build_label!r} must match {_BUILD_LABEL.pattern}")
+    return f"references/{reference_idx}/krepp/{build_label}"
+
+
+def node_relative_path(root: Path | str, relpath: str) -> Path:
+    """``root / relpath`` for a relative ``fs_path`` (``fs_path_root`` node_local).
+    Raises ValueError when ``relpath`` is absolute or has a ``..`` or empty segment,
+    so a row can only name a folder below the root it is resolved against."""
+    # Split the raw string: PurePosixPath would drop the "." and empty segments
+    # before they could be refused.
+    parts = relpath.split("/")
+    if PurePosixPath(relpath).is_absolute() or any(p in ("..", ".", "") for p in parts):
+        raise ValueError(f"node-relative path {relpath!r} must be relative with no '..'")
+    return Path(root).joinpath(*parts)
