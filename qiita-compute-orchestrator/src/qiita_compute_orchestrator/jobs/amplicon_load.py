@@ -6,10 +6,9 @@ parquets, both keyed off mint-features' feature_map:
   amplicon_membership (prep_sample_idx, processing_idx, feature_idx, count)
     asv_counts JOIN feature_map on sequence_hash
   amplicon_sequence (feature_idx, sequence_hash, sequence_length_bp, sequence)
-    one row per ASV feature, its bytes stored inline — reassembled from deblur's
-    hash-keyed asv_chunks and joined to feature_idx. an ASV is short (a single
-    64 KB chunk at most), so there is no separate chunk table: the chunking the
-    reference tail needs for genomes is pure overhead here.
+    one row per ASV feature, its bytes stored inline — deblur's asv_sequences joined
+    to feature_idx. an ASV is shorter than one 64 KB chunk, so it is stored whole:
+    the chunking the reference tail needs for genomes is pure overhead here.
 
 each output basename is the table name, so register-files loads it by stem.
 membership is replace-keyed on (prep_sample_idx, processing_idx); amplicon_sequence
@@ -54,7 +53,7 @@ class Inputs(BaseModel):
     asv_counts: deblur's per-sample counts (prep_sample_idx, sequence_hash, count).
     feature_map: mint-features' (sequence_hash, feature_idx) map.
     manifest: deblur's (read_id, sequence_hash, sequence_length_bp) per ASV.
-    asv_chunks: deblur's hash-keyed chunk directory carrying each ASV's bytes.
+    asv_sequences: deblur's (sequence_hash, sequence) — each ASV's bytes inline.
     processing_idx: threaded via the step's `params:`. work_ticket_idx is injected.
         no prep_sample_idx; it comes from asv_counts (the pool is the scope).
     """
@@ -62,7 +61,7 @@ class Inputs(BaseModel):
     asv_counts: Path
     feature_map: Path
     manifest: Path
-    asv_chunks: Path
+    asv_sequences: Path
     processing_idx: int
     work_ticket_idx: int
 
@@ -72,7 +71,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ("asv_counts", inputs.asv_counts),
         ("feature_map", inputs.feature_map),
         ("manifest", inputs.manifest),
-        ("asv_chunks", inputs.asv_chunks),
+        ("asv_sequences", inputs.asv_sequences),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -105,7 +104,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 processing_idx=inputs.processing_idx,
                 out=membership_out,
             )
-            _write_amplicon_sequences(conn, inputs.asv_chunks, sequences_out)
+            _write_amplicon_sequences(conn, inputs.asv_sequences, sequences_out)
             samples, features = conn.execute(
                 "SELECT count(DISTINCT prep_sample_idx), count(DISTINCT feature_idx)"
                 " FROM read_parquet(?)",
@@ -161,28 +160,21 @@ def _write_amplicon_membership(
 
 def _write_amplicon_sequences(
     conn: duckdb.DuckDBPyConnection,
-    asv_chunks_path: Path,
+    asv_sequences_path: Path,
     out: str,
 ) -> None:
     """write `amplicon_sequence`: one row per ASV feature_idx with its hash, length,
-    and the sequence inline. Reassembles each ASV from deblur's hash-keyed `asv_chunks`
-    (a directory of `part_*.parquet` of `(sequence_hash, chunk_index, chunk_data)`) and
-    joins the feature_map TEMP TABLE for the feature_idx. An ASV is short, so this is a
-    plain `string_agg` per hash — none of the bin-packing the genome chunk writer needs.
-    The inner join drops nothing: `build_feature_id_map` already failed loud on any
-    manifest hash without a feature_idx, and asv_chunks carries the same hash set."""
+    and the sequence inline. Reads deblur's `asv_sequences` (`(sequence_hash, sequence)`)
+    and joins the feature_map TEMP TABLE for the feature_idx. The inner join drops
+    nothing: `build_feature_id_map` already failed loud on any manifest hash without a
+    feature_idx, and asv_sequences carries the same hash set."""
     conn.execute(
         "COPY ("
-        "  WITH seq AS ("
-        "    SELECT sequence_hash,"
-        "           string_agg(chunk_data, '' ORDER BY chunk_index) AS sequence"
-        "    FROM read_parquet(?) GROUP BY sequence_hash"
-        "  )"
-        "  SELECT fm.feature_idx, seq.sequence_hash,"
-        "         length(seq.sequence)::INTEGER AS sequence_length_bp,"
-        "         seq.sequence"
-        "  FROM seq JOIN feature_map fm ON seq.sequence_hash = fm.sequence_hash"
+        "  SELECT fm.feature_idx, s.sequence_hash,"
+        "         length(s.sequence)::INTEGER AS sequence_length_bp,"
+        "         s.sequence"
+        "  FROM read_parquet(?) s JOIN feature_map fm ON s.sequence_hash = fm.sequence_hash"
         "  ORDER BY fm.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS_AT_REST})",
-        [str(asv_chunks_path / "part_*.parquet")],
+        [str(asv_sequences_path)],
     )

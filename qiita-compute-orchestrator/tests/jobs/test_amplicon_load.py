@@ -1,7 +1,7 @@
 """tests for the amplicon_load job.
 
 call execute() directly on synthesized asv_counts + feature_map + manifest +
-asv_chunks, and assert the two staging parquets (membership + the ASV sequence
+asv_sequences, and assert the two staging parquets (membership + the ASV sequence
 table, bytes inline). no miint; a plain in-memory DuckDB writes the fixtures and
 reads the results back.
 """
@@ -62,17 +62,17 @@ def inputs(tmp_path):
         "read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT",
         [("A", ha, 1), ("B", hb, 1), ("C", hc, 1)],
     )
-    chunks = tmp_path / "asv_chunks"
+    sequences = tmp_path / "asv_sequences.parquet"
     _write(
-        chunks / "part_00000.parquet",
-        "sequence_hash UUID, chunk_index INTEGER, chunk_data VARCHAR",
-        [(ha, 0, "A"), (hb, 0, "B"), (hc, 0, "C")],
+        sequences,
+        "sequence_hash UUID, sequence VARCHAR",
+        [(ha, "A"), (hb, "B"), (hc, "C")],
     )
     return Inputs(
         asv_counts=tmp_path / "asv_counts.parquet",
         feature_map=tmp_path / "feature_map.parquet",
         manifest=tmp_path / "manifest.parquet",
-        asv_chunks=chunks,
+        asv_sequences=sequences,
         processing_idx=42,
         work_ticket_idx=1,
     ), ws
@@ -107,8 +107,8 @@ def test_shared_asv_keeps_per_sample_rows(inputs):
 
 def test_writes_asv_sequence_table(inputs):
     """The ASV bytes are stored inline: amplicon_sequence carries one row per
-    feature_idx with its hash, length, and the sequence itself — reassembled from the
-    deblur chunks and re-keyed hash -> feature_idx. No separate chunk table."""
+    feature_idx with its hash, length, and the sequence itself — deblur's asv_sequences
+    re-keyed hash -> feature_idx. No separate chunk table."""
     inp, ws = inputs
     out = asyncio.run(execute(inp, ws))
     staging = out["staging_dir"]
@@ -144,7 +144,7 @@ def test_missing_input_raises_file_not_found(tmp_path):
         asv_counts=tmp_path / "nope.parquet",
         feature_map=tmp_path / "nope2.parquet",
         manifest=tmp_path / "nope3.parquet",
-        asv_chunks=tmp_path / "nope_chunks",
+        asv_sequences=tmp_path / "nope_seq.parquet",
         processing_idx=1,
         work_ticket_idx=1,
     )

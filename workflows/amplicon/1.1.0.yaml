@@ -61,7 +61,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
     inputs: [sortmerna_ref]
     params: {trim: trim}
-    outputs: [asv_counts, manifest, asv_chunks]
+    outputs: [asv_counts, manifest, asv_sequences]
     baseline_resources:
       cpu: 8
       mem_gb: 64
@@ -77,7 +77,7 @@ steps:
   - step: amplicon_load
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_load
-    inputs: [asv_counts, feature_map, manifest, asv_chunks]
+    inputs: [asv_counts, feature_map, manifest, asv_sequences]
     params: {processing_idx: processing_idx}
     outputs: [staging_dir]
     baseline_resources:
