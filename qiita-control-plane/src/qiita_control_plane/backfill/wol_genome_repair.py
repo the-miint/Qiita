@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,9 +47,12 @@ from ..actions.library import upsert_genomes
 
 DERIVATION_METHOD = "wol_concatenated"
 
+# A WoL genome's rows are `genbank` until a source of their own exists. Each pattern
+# below is the one copy, matched whole: by `re.fullmatch` here, anchored for SQL.
 _WOL_SOURCE = "genbank"
-_WOL_ID = r"^G[0-9]{9}$"
-_GCA_G_ID = r"^GCA_G[0-9]{9}$"
+_WOL_ID = "G[0-9]{9}"
+_GCA_G_ID = "GCA_G[0-9]{9}"
+_ACCESSION = r"GC[AF]_[0-9]{9}\.[0-9]+"
 _PARENT_SOURCE = {"GCA": "genbank", "GCF": "refseq"}
 _METADATA_COLUMNS = ("genome_id", "assembly_accession")
 _MANIFEST_COLUMNS = (
@@ -76,6 +80,10 @@ _LOCKED_TABLES = (
     "qiita.assembly_membership",
     "qiita.exported_feature",
 )
+
+
+def _anchored(pattern: str) -> str:
+    return f"^{pattern}$"
 
 
 class RepairRefused(Exception):
@@ -133,10 +141,16 @@ class _Fold:
     w_linked: bool
 
 
+@dataclass(frozen=True)
+class _Stale:
+    feature_idx: int
+    genome_idx: int
+
+
 @dataclass
 class _Survey:
     folds: list[_Fold]
-    stale: list[tuple[int, int, str]]  # (feature_idx, genome_idx, source_id)
+    stale: list[_Stale]
     labels: list[asyncpg.Record]
     derivations_present: int
     problems: list[str]
@@ -158,10 +172,19 @@ def _listed(items: list[str]) -> str:
     return shown if len(items) <= _LISTED else f"{shown} … and {len(items) - _LISTED} more"
 
 
+def _bulleted(heading: str, problems: list[str]) -> str:
+    return f"{heading}:\n" + "\n".join(f"  - {p}" for p in problems)
+
+
 def _refusal(reference_idx: int, problems: list[str]) -> str:
-    return f"reference {reference_idx} cannot be repaired:\n" + "\n".join(
-        f"  - {p}" for p in problems
-    )
+    return _bulleted(f"reference {reference_idx} cannot be repaired", problems)
+
+
+def _is_wol_genome(source: str, source_id: str, pattern: str) -> bool:
+    return source == _WOL_SOURCE and re.fullmatch(pattern, source_id) is not None
+
+
+# --- metadata --------------------------------------------------------------------------
 
 
 def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
@@ -173,20 +196,20 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
     """
     if not metadata_path.is_file():
         raise RepairRefused(f"metadata file {metadata_path} does not exist")
-    read = "read_csv(?, delim='\t', header=true, all_varchar=true, quote='')"
+    read = "read_csv($path, delim='\t', header=true, all_varchar=true, quote='')"
     path = str(metadata_path)
     with duckdb.connect() as con:
-        columns = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {read}", [path]).fetchall()}
-        missing = [c for c in _METADATA_COLUMNS if c not in columns]
+        described = con.execute(f"DESCRIBE SELECT * FROM {read}", {"path": path}).fetchall()
+        missing = [c for c in _METADATA_COLUMNS if c not in {r[0] for r in described}]
         if missing:
             raise RepairRefused(
                 f"metadata file {metadata_path} lacks column(s): {', '.join(missing)}"
             )
         rows = con.execute(
             "SELECT genome_id, assembly_accession,"
-            "       regexp_full_match(assembly_accession, 'GC[AF]_[0-9]{9}\\.[0-9]+')"
+            "       regexp_full_match(assembly_accession, $accession)"
             f"  FROM {read}",
-            [path],
+            {"path": path, "accession": _ACCESSION},
         ).fetchall()
 
     problems: list[str] = []
@@ -207,21 +230,25 @@ def read_parents(metadata_path: Path) -> tuple[Parent, ...]:
         if repeated:
             problems.append(f"{len(repeated)} {column}(s) repeat: {_listed(repeated)}")
     if problems:
-        raise RepairRefused(
-            f"metadata file {metadata_path}:\n" + "\n".join(f"  - {p}" for p in problems)
-        )
+        raise RepairRefused(_bulleted(f"metadata file {metadata_path}", problems))
     return tuple(
         Parent(genome_id=g, parent_source=_PARENT_SOURCE[acc[:3]], parent_source_id=acc)
         for g, acc, _ok in rows
     )
 
 
-async def _survey(
-    conn: asyncpg.Connection, reference_idx: int, parents: tuple[Parent, ...]
-) -> _Survey:
-    """Read everything the fold touches and every precondition it relies on."""
-    problems: list[str] = []
+# --- the survey: what the fold touches, and every precondition -------------------------
 
+
+async def _gca_g_folds(
+    conn: asyncpg.Connection, reference_idx: int, problems: list[str]
+) -> tuple[list[int], list[asyncpg.Record], dict[int, str | None]]:
+    """Every GCA_G genome, and the reference's header for each feature.
+
+    Returns every GCA_G genome_idx; the GCA_G rows that have exactly one feature (the
+    others are problems, as is one the reference does not hold under `G<n>`); and the
+    reference's feature -> accession map, which the metadata is compared against.
+    """
     gca_g = await conn.fetch(
         "SELECT x.genome_idx AS x_idx, x.source_id AS x_id, substr(x.source_id, 5) AS n_id,"
         "       w.genome_idx AS w_idx,"
@@ -230,19 +257,13 @@ async def _survey(
         "  FROM qiita.genome x"
         "  LEFT JOIN qiita.feature_genome fg ON fg.genome_idx = x.genome_idx"
         "  LEFT JOIN qiita.genome w ON w.source = x.source AND w.source_id = substr(x.source_id, 5)"
-        f" WHERE x.source = '{_WOL_SOURCE}' AND x.source_id ~ '{_GCA_G_ID}'"
+        " WHERE x.source = $1 AND x.source_id ~ $2"
         " GROUP BY x.genome_idx, x.source_id, w.genome_idx"
-        " ORDER BY x.source_id"
+        " ORDER BY x.source_id",
+        _WOL_SOURCE,
+        _anchored(_GCA_G_ID),
     )
-    not_one = [
-        f"{r['x_id']} has {len(r['feature_idxs'])}" for r in gca_g if len(r["feature_idxs"]) != 1
-    ]
-    if not_one:
-        problems.append(f"GCA_G genome(s) without exactly one feature: {_listed(not_one)}")
-    single = [r for r in gca_g if len(r["feature_idxs"]) == 1]
-    feature_idxs = [r["feature_idxs"][0] for r in single]
-
-    headers = {
+    headers: dict[int, str | None] = {
         r["feature_idx"]: r["accession"]
         for r in await conn.fetch(
             "SELECT feature_idx, accession FROM qiita.reference_membership"
@@ -250,45 +271,59 @@ async def _survey(
             reference_idx,
         )
     }
-    outside = [
-        f"{r['x_id']} (feature {r['feature_idxs'][0]})"
-        for r in single
-        if r["feature_idxs"][0] not in headers
-    ]
+    not_one, outside, misnamed, single = [], [], [], []
+    for r in gca_g:
+        features = r["feature_idxs"]
+        if len(features) != 1:
+            not_one.append(f"{r['x_id']} has {len(features)}")
+            continue
+        f = features[0]
+        single.append(r)
+        if f not in headers:
+            outside.append(f"{r['x_id']} (feature {f})")
+        elif headers[f] != r["n_id"]:
+            misnamed.append(f"{r['x_id']} (feature {f} is {headers[f]!r})")
+    if not_one:
+        problems.append(f"GCA_G genome(s) without exactly one feature: {_listed(not_one)}")
     if outside:
         problems.append(
             f"GCA_G genome(s) whose feature is not a member of reference {reference_idx}:"
             f" {_listed(outside)}"
         )
-    misnamed = [
-        f"{r['x_id']} (feature {r['feature_idxs'][0]} is {headers[r['feature_idxs'][0]]!r})"
-        for r in single
-        if r["feature_idxs"][0] in headers and headers[r["feature_idxs"][0]] != r["n_id"]
-    ]
     if misnamed:
         problems.append(
             f"GCA_G genome(s) whose feature reference {reference_idx} names otherwise:"
             f" {_listed(misnamed)}"
         )
+    return [r["x_idx"] for r in gca_g], single, headers
 
+
+async def _links(
+    conn: asyncpg.Connection, single: list[asyncpg.Record], problems: list[str]
+) -> tuple[list[_Fold], list[_Stale]]:
+    """Each fold, whether its `G<n>` already holds the feature, and the stale WoL links
+    the fold removes (from the same feature to a WoL ID other than `G<n>`)."""
     links: dict[int, list[asyncpg.Record]] = defaultdict(list)
     for r in await conn.fetch(
         "SELECT fg.feature_idx, g.genome_idx, g.source, g.source_id"
         "  FROM qiita.feature_genome fg JOIN qiita.genome g USING (genome_idx)"
         " WHERE fg.feature_idx = ANY($1::bigint[])",
-        feature_idxs,
+        [r["feature_idxs"][0] for r in single],
     ):
         links[r["feature_idx"]].append(r)
-    doubled = sorted(
-        f"feature {f} ({', '.join(sorted(g['source_id'] for g in gs if _is_gca_g(g)))})"
-        for f, gs in links.items()
-        if sum(_is_gca_g(g) for g in gs) > 1
-    )
+    doubled = []
+    for f, genomes in sorted(links.items()):
+        gca_g = sorted(
+            g["source_id"]
+            for g in genomes
+            if _is_wol_genome(g["source"], g["source_id"], _GCA_G_ID)
+        )
+        if len(gca_g) > 1:
+            doubled.append(f"feature {f} ({', '.join(gca_g)})")
     if doubled:
         problems.append(f"feature(s) linked to more than one GCA_G genome: {_listed(doubled)}")
 
-    folds: list[_Fold] = []
-    stale: list[tuple[int, int, str]] = []
+    folds, stale = [], []
     for r in single:
         f = r["feature_idxs"][0]
         folds.append(
@@ -302,12 +337,18 @@ async def _survey(
             )
         )
         stale.extend(
-            (f, g["genome_idx"], g["source_id"])
+            _Stale(feature_idx=f, genome_idx=g["genome_idx"])
             for g in links[f]
-            if _is_wol_id(g) and g["source_id"] != r["n_id"]
+            if _is_wol_genome(g["source"], g["source_id"], _WOL_ID) and g["source_id"] != r["n_id"]
         )
+    return folds, stale
 
-    x_idxs = [r["x_idx"] for r in gca_g]
+
+async def _guards(
+    conn: asyncpg.Connection, x_idxs: list[int], stale: list[_Stale], problems: list[str]
+) -> None:
+    """Rows outside the fold that name a genome it deletes or unlinks. An exclusion's
+    genome_idx has no FK, so it would be left dangling rather than refused by Postgres."""
     excluded = [
         f"exclusion {r['reference_exclusion_idx']} names {r['source_id']}"
         for r in await conn.fetch(
@@ -315,7 +356,7 @@ async def _survey(
             "  FROM qiita.reference_exclusion e JOIN qiita.genome g USING (genome_idx)"
             " WHERE e.genome_idx = ANY($1::bigint[])"
             " ORDER BY e.reference_exclusion_idx",
-            x_idxs + [g for _f, g, _s in stale],
+            x_idxs + [s.genome_idx for s in stale],
         )
     ]
     if excluded:
@@ -335,38 +376,53 @@ async def _survey(
     if claimed:
         problems.append(f"assembly claim(s) on a GCA_G genome: {_listed(claimed)}")
 
-    named = set(headers.values())
+
+def _metadata_matches_reference(
+    reference_idx: int,
+    headers: dict[int, str | None],
+    parents: tuple[Parent, ...],
+    problems: list[str],
+) -> None:
     unnamed = sorted(str(f) for f, acc in headers.items() if acc is None)
     if unnamed:
         problems.append(
             f"reference {reference_idx} has {len(unnamed)} feature(s) with no accession:"
             f" {_listed(unnamed)}"
         )
+    named = {acc for acc in headers.values() if acc is not None}
     in_metadata = {p.genome_id for p in parents}
-    not_in_metadata = sorted(a for a in named - in_metadata if a is not None)
-    if not_in_metadata:
+    if not_in_metadata := sorted(named - in_metadata):
         problems.append(
             f"genome(s) of reference {reference_idx} missing from the metadata:"
             f" {_listed(not_in_metadata)}"
         )
-    not_in_reference = sorted(in_metadata - named)
-    if not_in_reference:
+    if not_in_reference := sorted(in_metadata - named):
         problems.append(
             f"metadata genome(s) that are not members of reference {reference_idx}:"
             f" {_listed(not_in_reference)}"
         )
 
+
+async def _derivations_present(
+    conn: asyncpg.Connection,
+    reference_idx: int,
+    parents: tuple[Parent, ...],
+    problems: list[str],
+) -> int:
+    """How many parents are already recorded exactly; one recorded otherwise is a
+    problem, since a derivation is never rewritten."""
     existing = {
         r["source_id"]: r
         for r in await conn.fetch(
             "SELECT g.source_id, d.parent_source, d.parent_source_id, d.method,"
             "       d.asserted_by_reference_idx"
             "  FROM qiita.genome_derivation d JOIN qiita.genome g USING (genome_idx)"
-            f" WHERE g.source = '{_WOL_SOURCE}' AND g.source_id = ANY($1::text[])",
+            " WHERE g.source = $1 AND g.source_id = ANY($2::text[])",
+            _WOL_SOURCE,
             [p.genome_id for p in parents],
         )
     }
-    disagree = []
+    present, disagree = 0, []
     for p in parents:
         row = existing.get(p.genome_id)
         if row is None:
@@ -377,8 +433,9 @@ async def _survey(
             row["method"],
             row["asserted_by_reference_idx"],
         )
-        want = (p.parent_source, p.parent_source_id, DERIVATION_METHOD, reference_idx)
-        if have != want:
+        if have == (p.parent_source, p.parent_source_id, DERIVATION_METHOD, reference_idx):
+            present += 1
+        else:
             disagree.append(
                 f"{p.genome_id} derives from {row['parent_source_id']} by {row['method']},"
                 f" asserted by reference {row['asserted_by_reference_idx']}"
@@ -386,7 +443,19 @@ async def _survey(
             )
     if disagree:
         problems.append(f"existing derivation(s) that disagree: {_listed(disagree)}")
+    return present
 
+
+async def _survey(
+    conn: asyncpg.Connection, reference_idx: int, parents: tuple[Parent, ...]
+) -> _Survey:
+    """Read everything the fold touches and every precondition it relies on."""
+    problems: list[str] = []
+    x_idxs, single, headers = await _gca_g_folds(conn, reference_idx, problems)
+    folds, stale = await _links(conn, single, problems)
+    await _guards(conn, x_idxs, stale, problems)
+    _metadata_matches_reference(reference_idx, headers, parents, problems)
+    present = await _derivations_present(conn, reference_idx, parents, problems)
     labels = await conn.fetch(
         "SELECT ef.idx, ef.genome_idx, ef.export_feature_id, g.source, g.source_id"
         "  FROM qiita.exported_feature ef JOIN qiita.genome g USING (genome_idx)"
@@ -395,22 +464,8 @@ async def _survey(
         x_idxs,
     )
     return _Survey(
-        folds=folds,
-        stale=stale,
-        labels=labels,
-        derivations_present=len(existing) - len(disagree),
-        problems=problems,
+        folds=folds, stale=stale, labels=labels, derivations_present=present, problems=problems
     )
-
-
-def _is_gca_g(g: asyncpg.Record) -> bool:
-    s = g["source_id"]
-    return g["source"] == _WOL_SOURCE and len(s) == 14 and s.startswith("GCA_G") and s[5:].isdigit()
-
-
-def _is_wol_id(g: asyncpg.Record) -> bool:
-    s = g["source_id"]
-    return g["source"] == _WOL_SOURCE and len(s) == 10 and s[0] == "G" and s[1:].isdigit()
 
 
 async def plan_repair(pool: asyncpg.Pool, *, reference_idx: int, metadata_path: Path) -> RepairPlan:
@@ -423,13 +478,102 @@ async def plan_repair(pool: asyncpg.Pool, *, reference_idx: int, metadata_path: 
     return RepairPlan(reference_idx=reference_idx, parents=parents, counts=survey.counts(parents))
 
 
+# --- the apply -------------------------------------------------------------------------
+
+
+async def _fold(conn: asyncpg.Connection, survey: _Survey) -> list[tuple]:
+    """Link each feature to its `G<n>`, drop the stale and `GCA_G` links, delete the
+    `GCA_G` rows. Returns the manifest rows: what was deleted, and what was retired."""
+    folds = survey.folds
+    create = [f for f in folds if f.w_idx is None]
+    minted = await upsert_genomes(
+        conn, [_WOL_SOURCE] * len(create), [f.n_id for f in create], [None] * len(create)
+    )
+    w_of = {f.x_idx: f.w_idx for f in folds if f.w_idx is not None}
+    w_of.update({f.x_idx: idx for f, idx in zip(create, minted, strict=True)})
+    await conn.execute(
+        "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
+        " SELECT * FROM unnest($1::bigint[], $2::bigint[])"
+        " ON CONFLICT DO NOTHING",
+        [f.feature_idx for f in folds],
+        [w_of[f.x_idx] for f in folds],
+    )
+
+    manifest: list[tuple] = []
+    unlinked = await conn.fetch(
+        "DELETE FROM qiita.feature_genome fg"
+        " USING unnest($1::bigint[], $2::bigint[]) AS s(feature_idx, genome_idx),"
+        "       qiita.genome g"
+        " WHERE fg.feature_idx = s.feature_idx AND fg.genome_idx = s.genome_idx"
+        "   AND g.genome_idx = fg.genome_idx"
+        " RETURNING fg.feature_idx, g.genome_idx, g.source, g.source_id",
+        [s.feature_idx for s in survey.stale],
+        [s.genome_idx for s in survey.stale],
+    )
+    manifest.extend(_link_row(r) for r in unlinked)
+    # Captured before the delete below nulls their genome_idx; the tables are locked,
+    # so these are exactly the labels the trigger retires.
+    manifest.extend(
+        (
+            "retire",
+            "exported_feature",
+            r["genome_idx"],
+            r["source"],
+            r["source_id"],
+            None,
+            r["idx"],
+            r["export_feature_id"],
+        )
+        for r in survey.labels
+    )
+    x_idxs = [f.x_idx for f in folds]
+    unlinked = await conn.fetch(
+        "DELETE FROM qiita.feature_genome fg USING qiita.genome g"
+        " WHERE fg.genome_idx = ANY($1::bigint[]) AND g.genome_idx = fg.genome_idx"
+        " RETURNING fg.feature_idx, g.genome_idx, g.source, g.source_id",
+        x_idxs,
+    )
+    manifest.extend(_link_row(r) for r in unlinked)
+    deleted = await conn.fetch(
+        "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])"
+        " RETURNING genome_idx, source, source_id",
+        x_idxs,
+    )
+    manifest.extend(
+        ("delete", "genome", r["genome_idx"], r["source"], r["source_id"], None, None, None)
+        for r in deleted
+    )
+    return manifest
+
+
+async def _record_derivations(
+    conn: asyncpg.Connection, reference_idx: int, parents: tuple[Parent, ...]
+) -> None:
+    await conn.execute(
+        "INSERT INTO qiita.genome_derivation"
+        " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
+        " SELECT g.genome_idx, p.parent_source, p.parent_source_id, $5, $6"
+        "   FROM unnest($2::text[], $3::text[], $4::text[])"
+        "          AS p(genome_id, parent_source, parent_source_id)"
+        "   JOIN qiita.genome g ON g.source = $1 AND g.source_id = p.genome_id"
+        " ON CONFLICT (genome_idx) DO NOTHING",
+        _WOL_SOURCE,
+        [p.genome_id for p in parents],
+        [p.parent_source for p in parents],
+        [p.parent_source_id for p in parents],
+        DERIVATION_METHOD,
+        reference_idx,
+    )
+
+
 async def _postcondition_problems(
     conn: asyncpg.Connection, reference_idx: int, parents: tuple[Parent, ...]
 ) -> list[str]:
     problems: list[str] = []
     left = await conn.fetchval(
-        "SELECT count(*) FROM qiita.genome"
-        f" WHERE source = '{_WOL_SOURCE}' AND source_id ~ '{_GCA_G_ID}'"
+        "SELECT count(*) FROM qiita.genome WHERE source = $1 AND source_id ~ $2",
+        _WOL_SOURCE,
+        _anchored(_GCA_G_ID),
     )
     if left:
         problems.append(f"{left} GCA_G genome(s) remain")
@@ -443,10 +587,11 @@ async def _postcondition_problems(
             "  LEFT JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
             " WHERE rm.reference_idx = $1"
             " GROUP BY rm.feature_idx, rm.accession"
-            f" HAVING count(g.genome_idx) <> 1"
-            f"     OR bool_or(g.source <> '{_WOL_SOURCE}' OR g.source_id <> rm.accession)"
+            " HAVING count(g.genome_idx) <> 1"
+            "     OR bool_or(g.source <> $2 OR g.source_id <> rm.accession)"
             " ORDER BY rm.feature_idx",
             reference_idx,
+            _WOL_SOURCE,
         )
     ]
     if wrong:
@@ -458,16 +603,16 @@ async def _postcondition_problems(
         r["genome_id"]
         for r in await conn.fetch(
             "SELECT p.genome_id"
-            "  FROM unnest($1::text[], $2::text[], $3::text[]) AS p(genome_id, parent_source,"
-            "                                                    parent_source_id)"
-            "  LEFT JOIN qiita.genome g"
-            f"    ON g.source = '{_WOL_SOURCE}' AND g.source_id = p.genome_id"
+            "  FROM unnest($2::text[], $3::text[], $4::text[])"
+            "         AS p(genome_id, parent_source, parent_source_id)"
+            "  LEFT JOIN qiita.genome g ON g.source = $1 AND g.source_id = p.genome_id"
             "  LEFT JOIN qiita.genome_derivation d ON d.genome_idx = g.genome_idx"
             "   AND d.parent_source = p.parent_source"
             "   AND d.parent_source_id = p.parent_source_id"
-            "   AND d.method = $4 AND d.asserted_by_reference_idx = $5"
+            "   AND d.method = $5 AND d.asserted_by_reference_idx = $6"
             " WHERE d.genome_idx IS NULL"
             " ORDER BY p.genome_id",
+            _WOL_SOURCE,
             [p.genome_id for p in parents],
             [p.parent_source for p in parents],
             [p.parent_source_id for p in parents],
@@ -506,7 +651,6 @@ async def apply_repair(
     """
     partial = _check_manifest_path(manifest_path)
     reference_idx, parents = plan.reference_idx, plan.parents
-    manifest: list[tuple] = []
     wrote_partial = False
     try:
         async with pool.acquire() as conn, conn.transaction():
@@ -518,92 +662,8 @@ async def apply_repair(
             if survey.problems:
                 raise RepairRefused(_refusal(reference_idx, survey.problems))
             counts = survey.counts(parents)
-            folds = survey.folds
-
-            create = [f for f in folds if f.w_idx is None]
-            minted = await upsert_genomes(
-                conn,
-                [_WOL_SOURCE] * len(create),
-                [f.n_id for f in create],
-                [None] * len(create),
-            )
-            w_of = {f.x_idx: f.w_idx for f in folds if f.w_idx is not None}
-            w_of.update({f.x_idx: idx for f, idx in zip(create, minted, strict=True)})
-
-            await conn.execute(
-                "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
-                " SELECT * FROM unnest($1::bigint[], $2::bigint[])"
-                " ON CONFLICT DO NOTHING",
-                [f.feature_idx for f in folds],
-                [w_of[f.x_idx] for f in folds],
-            )
-            for r in await conn.fetch(
-                "DELETE FROM qiita.feature_genome fg"
-                " USING unnest($1::bigint[], $2::bigint[]) AS s(feature_idx, genome_idx),"
-                "       qiita.genome g"
-                " WHERE fg.feature_idx = s.feature_idx AND fg.genome_idx = s.genome_idx"
-                "   AND g.genome_idx = fg.genome_idx"
-                " RETURNING fg.feature_idx, g.genome_idx, g.source, g.source_id",
-                [f for f, _g, _s in survey.stale],
-                [g for _f, g, _s in survey.stale],
-            ):
-                manifest.append(_link_row(r))
-            for r in survey.labels:
-                manifest.append(
-                    (
-                        "retire",
-                        "exported_feature",
-                        r["genome_idx"],
-                        r["source"],
-                        r["source_id"],
-                        None,
-                        r["idx"],
-                        r["export_feature_id"],
-                    )
-                )
-            x_idxs = [f.x_idx for f in folds]
-            for r in await conn.fetch(
-                "DELETE FROM qiita.feature_genome fg USING qiita.genome g"
-                " WHERE fg.genome_idx = ANY($1::bigint[]) AND g.genome_idx = fg.genome_idx"
-                " RETURNING fg.feature_idx, g.genome_idx, g.source, g.source_id",
-                x_idxs,
-            ):
-                manifest.append(_link_row(r))
-            for r in await conn.fetch(
-                "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])"
-                " RETURNING genome_idx, source, source_id",
-                x_idxs,
-            ):
-                manifest.append(
-                    (
-                        "delete",
-                        "genome",
-                        r["genome_idx"],
-                        r["source"],
-                        r["source_id"],
-                        None,
-                        None,
-                        None,
-                    )
-                )
-
-            await conn.execute(
-                "INSERT INTO qiita.genome_derivation"
-                " (genome_idx, parent_source, parent_source_id, method,"
-                "  asserted_by_reference_idx)"
-                " SELECT g.genome_idx, p.parent_source, p.parent_source_id, $4, $5"
-                "   FROM unnest($1::text[], $2::text[], $3::text[])"
-                "          AS p(genome_id, parent_source, parent_source_id)"
-                "   JOIN qiita.genome g"
-                f"    ON g.source = '{_WOL_SOURCE}' AND g.source_id = p.genome_id"
-                " ON CONFLICT (genome_idx) DO NOTHING",
-                [p.genome_id for p in parents],
-                [p.parent_source for p in parents],
-                [p.parent_source_id for p in parents],
-                DERIVATION_METHOD,
-                reference_idx,
-            )
-
+            manifest = await _fold(conn, survey)
+            await _record_derivations(conn, reference_idx, parents)
             problems = await _postcondition_problems(conn, reference_idx, parents)
             if problems:
                 raise RepairPostconditionFailed(_refusal(reference_idx, problems))
