@@ -269,9 +269,10 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
     # A SIF name names the image, so it moves only with the version that changed the
-    # image: checkm with 1.0.1 (the unbinned residue), assemble with 1.0.2 (the
-    # myloasm provenance dump). binning and dastool are one image for all three.
-    checkm_sif = f"long-read-assembly-checkm-{'1.0.0' if version == '1.0.0' else '1.0.1'}.sif"
+    # image: checkm with each version (1.0.1 the unbinned residue, 1.0.2 the gene_call
+    # step's genes), assemble with 1.0.2 (the myloasm provenance dump). binning and
+    # dastool are one image for all three.
+    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
     assemble_sif = f"long-read-assembly-assemble-{'1.0.2' if version == '1.0.2' else '1.0.0'}.sif"
     assert {s.container for s in container_steps} == {
         assemble_sif,
