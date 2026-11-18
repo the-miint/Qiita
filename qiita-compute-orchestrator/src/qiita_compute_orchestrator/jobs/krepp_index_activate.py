@@ -39,10 +39,11 @@ from ..miint import (
 # Tips placed, chosen by md5 of their feature_idx so a re-run checks the same tips.
 KNOWN_ANSWER_TIPS = 100
 
-# The step's `cpu:` (pinned to it by a test). DuckDB's limit covers the tips' sequences
-# only, not the index: a 258 MB index placed under memory_limit=16MB in the same peak
-# RSS as with none (372 vs 371 MB, miint a88f3d33, 2026-11-18). 8 GB is a starting
-# figure, not a measured one; the rest of the allocation is left to the index.
+# The step's `cpu:` (pinned to it by a test). The index's memory is not counted against
+# DuckDB's memory_limit: a 258 MB index placed under memory_limit=16MB at the same peak
+# RSS as with none (372 vs 371 MB; miint a88f3d33, osx_arm64, not measured on Linux;
+# 2026-11-18). 8 GB is a starting figure, not a measured one; the rest of the
+# allocation is left to the index.
 _DUCKDB_THREADS = 4
 _DUCKDB_MEMORY_GB = 8
 # Bases placed per tip, from the middle of its sequence (all of a shorter one): about
