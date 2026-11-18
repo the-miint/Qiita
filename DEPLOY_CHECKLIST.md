@@ -56,6 +56,16 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
   workspaces, and the build deployed now does not know to keep them. From this deploy,
   reclaim skips every ticket that backfill can still recover or is recovering. (#888)
+- `[operator]` **Before `make migrate`, check that no ENA-imported study holds data that did
+  not come from ENA.** The bucket-3 migration makes every study an ENA import created
+  public, and refuses to apply while one holds an active biosample with no
+  `ena_sample_accession` or a sequenced_sample with no `ena_run_accession`. Expect no rows;
+  otherwise settle each study listed with its owner before the deploy. The second query
+  counts the studies that become public. (#feat/default-tier-review)
+  ```bash
+  psql "$DATABASE_URL" -tAc "WITH imported AS (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) SELECT bts.study_idx, 'biosample', count(*) FROM qiita.biosample_to_study bts JOIN qiita.biosample b ON b.idx = bts.biosample_idx WHERE NOT bts.retired AND b.ena_sample_accession IS NULL AND bts.study_idx IN (SELECT study_idx FROM imported) GROUP BY 1 UNION ALL SELECT pts.study_idx, 'sequenced_sample', count(*) FROM qiita.prep_sample_to_study pts JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx WHERE NOT pts.retired AND ss.ena_run_accession IS NULL AND pts.study_idx IN (SELECT study_idx FROM imported) GROUP BY 1"
+  psql "$DATABASE_URL" -tAc "SELECT count(DISTINCT study_idx) FROM qiita.ena_import_batch_item WHERE study_created"
+  ```
 
 ### 3. Migrations
 
@@ -64,6 +74,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   first. (#864)
 - `20261113000000_output_equivalence` adds `qiita.output_equivalence` and `qiita.output_equivalence_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. `20261116000002_exported_identifier_prep_sample_delete` makes `qiita.exported_identifier.prep_sample_idx` nullable and ON DELETE SET NULL, adds two nullable description columns and a CHECK that every live row names a prep_sample (every existing row does: the column was NOT NULL), and adds a BEFORE DELETE trigger on `qiita.prep_sample`; no row changes. `20261116000003_work_ticket_reap_pending` adds two nullable columns to `qiita.work_ticket` (`reap_pending_since`, `reap_note`) and a CHECK that they are set together; no row changes. `20261116000004_definition_settings_lock` adds `qiita.definition_settings_edit` (empty), the function `qiita.edit_definition_settings`, and BEFORE UPDATE triggers on `qiita.mask_definition`, `qiita.alignment_definition` and `qiita.processing` that refuse a change to a definition's settings outside that function; no row changes. (#874)
 - `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
+- `[operator]` (#feat/default-tier-review) `make migrate` applies `20261118000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 
@@ -72,6 +83,8 @@ _None yet._
 ### 5. Verify
 
 - `[operator]` (#874) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin output-equivalence list` exits 0 and prints `0 output equivalence(s)` on stderr (the output-equivalence routes are mounted and the new table is readable).
+- `[operator]` (#feat/default-tier-review) Every study an ENA import created is public. Expect 0:
+  `psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.study WHERE idx IN (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) AND default_tier <> 'public'"`
 
 ### 6. After the deploy verifies green
 
@@ -193,6 +206,7 @@ _None yet._
 - The checkm step reads the gene_call step's genes, from a new image, `long-read-assembly-checkm-1.0.2.sif`, which the deploy builds. **Keep `long-read-assembly-checkm-1.0.1.sif`**: 1.0.1 still names it and no spec builds it any more (`sif-build.d/checkm.env`). (#898)
 - `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise, for a ticket in a redrivable state, the refusal a submit of that work would get (403/422). The ticket is checked against its action's current definition, so a ticket stored under a version since edited in place (a tighter `context_schema`, a lower `mem_ceiling_gb`) is refused with 422 and the work must be submitted again. Scripts that re-run other users' tickets need an admin token. (#902)
 - (#872) New field-exception routes `GET`/`PUT`/`DELETE /study/{S}/biosample/{B}/field-exception/{F}` and `.../sequenced-sample/{SS}/field-exception/{F}` (CLI `qiita biosample|sequenced-sample get-/set-/clear-field-exception`). Soft contract change: a field `PATCH` declaring `unique_in_study` now answers 409 when field exceptions are set on the field.
+- (#feat/default-tier-review) `GET /study/{idx}` gains a third `view`, `public`, for a caller whom only a study's `public` default admits: it leaves out the notes, `extra_metadata`, submission state, `created_at` and the owner / PI / creator idxs. In `GET /study` that study's row has `record_view: "public"` and no `study_idx` (key such rows on `export_entity_id`). A study that an ENA import creates is now `public`, so it is listed for every signed-in user.
 
 ## Deployed history
 

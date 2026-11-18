@@ -4,10 +4,11 @@
 -- EVERY STUDY AN ENA IMPORT CREATED BECOMES PUBLIC
 -- =============================================================================
 --
--- ENA already publishes an imported study's data, and the import now creates
--- its studies public (`repositories.study.get_or_create_study_by_ena_accessions`).
--- This brings the studies that imports created before it to the same tier. A
--- study that an import only matched by accession is not one it created
+-- An ENA import now creates its studies public
+-- (`repositories.study.get_or_create_study_by_ena_accessions`;
+-- docs/architecture/data-model.md, "Default tiers", says why). This brings the
+-- studies that imports created before it to the same tier. A study that an
+-- import only matched by accession is not one it created
 -- (`qiita.ena_import_batch_item.study_created`), and keeps its tier.
 --
 -- Making a study public publishes everything in it, so the migration refuses

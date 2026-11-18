@@ -391,8 +391,8 @@ async def get_or_create_study_by_ena_accessions(
                 title=title,
                 ena_study_accession=ena_study_accession,
                 bioproject_accession=bioproject_accession,
-                # ENA already publishes the study's data, so the study an import
-                # creates is public. A study matched above keeps its own tier.
+                # A study an import creates is public, and one matched above keeps
+                # its tier: docs/architecture/data-model.md ("Default tiers").
                 default_tier=Tier.PUBLIC,
             )
         return row, True
