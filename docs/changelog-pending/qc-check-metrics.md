@@ -18,3 +18,10 @@
   `marker_5s_5_8s_ref` gets one FASTA per class from the matching `marker_*_reference_idx`
   context key; a step whose `params:` names `prep_protocol` gets the prep_sample's protocol
   name, which a submitted value cannot override.
+
+### Changed
+
+- **A reference named by a QC check's marker metrics, or by an in-flight `verify-data-type`
+  ticket, cannot be deleted (#912).** The ticket blocks even with `force`; the recorded check
+  blocks without it. A prep_sample whose protocol has no data-type threshold is refused at
+  submission as `BAD_INPUT`.
