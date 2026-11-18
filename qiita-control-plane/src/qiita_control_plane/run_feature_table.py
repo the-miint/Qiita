@@ -114,7 +114,7 @@ FEATURES_SCHEMA = pa.schema(
         ("md5", pa.string()),
     ]
 )
-# The taxonomy answer: a feature's md5 and its taxonomic ranks (`RANK_COLUMNS`, the
+# The taxonomy answer: a feature's handle and its taxonomic ranks (`RANK_COLUMNS`, the
 # reference schema's own rank set), coarsest first, their source `d__/p__/…` prefixes
 # restored. A reference that does not define a rank leaves it NULL for every feature (a
 # seven-rank lineage has no strain); a rank the reference does not resolve for a feature
@@ -463,7 +463,7 @@ def feature_idxs_of(sequences: pa.Table) -> list[int]:
 
     These are the only features a taxonomy query asks the reference about, so they
     scope its ticket; they are internal join keys and never reach the answer (which is
-    keyed by each feature's md5)."""
+    keyed by each feature's handle)."""
     return sorted({int(x) for x in sequences.column("feature_idx").to_pylist()})
 
 
@@ -521,6 +521,13 @@ def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
         duck.register("tax_stream", taxonomy)
         duck.execute(ft.feature_label_table_sql("labels"))
         duck.execute(ft.taxonomy_table_sql("tax_stream"))
+        # Fail loud on a malformed reference, as the genome axis does: with no
+        # representative reduction here, a duplicate taxonomy row fans a feature into two
+        # answer rows with (possibly disagreeing) lineages instead of one.
+        (repeated,) = duck.execute(
+            f"SELECT count(*) - count(DISTINCT feature_idx) FROM {ft.TAXONOMY_TABLE}"
+        ).fetchone()
+        ft.refuse_repeated_features(repeated)
         duck.execute(ft.feature_taxonomy_sidecar_sql())
         table = duck.sql(
             f"SELECT feature_id AS feature, {rank_columns_sql()} "

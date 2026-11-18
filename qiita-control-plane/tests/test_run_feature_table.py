@@ -180,6 +180,22 @@ def test_taxonomy_keeps_a_feature_the_reference_does_not_place():
     assert rows["QF10"]["domain"] == "d__Bacteria"
 
 
+def test_a_reference_with_two_rows_for_one_feature_is_refused():
+    # A malformed reference: two taxonomy rows for feature 10. With no representative
+    # reduction on this axis the LEFT JOIN would fan the feature into two answer rows with
+    # disagreeing lineages, so fail loud as the genome axis does rather than publish one.
+    with pytest.raises(ValueError, match="more than one row"):
+        build_taxonomy(
+            _labels([(10, "QF10")]),
+            _taxonomy(
+                [
+                    (10, "Bacteria", None, None, None, None, None, None, None),
+                    (10, "Archaea", None, None, None, None, None, None, None),
+                ]
+            ),
+        )
+
+
 # --- fetch_taxonomy: the two-ticket readiness logic, over a fake Flight stream ---
 
 

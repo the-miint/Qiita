@@ -109,7 +109,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     if args.taxonomy:
         # A second request: the table is served without taxonomy, so lineage is fetched
         # on its own, against the reference the caller names, and written as a companion
-        # keyed by the same md5 the table uses. Staged here, next to the features, so no
+        # keyed by the same handle the table uses. Staged here, next to the features, so no
         # open result is pending when the Arrow relation is registered.
         taxonomy_request = {
             **request,
@@ -162,8 +162,8 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             # table is the one artifact that carries prep_sample_idx, and it says so.
             "cohort": sorted(s["export_id"] for s in columns["samples"]),
             # The reference that classified the lineage companion, by its public
-            # (name, version) handle — the table carries the same md5s whichever
-            # reference named them, so the record is what makes the taxonomy
+            # (name, version) handle — the table's features are the same whichever
+            # reference named them, so this record is what makes the taxonomy
             # reproducible. Absent when no taxonomy was requested.
             **(
                 {

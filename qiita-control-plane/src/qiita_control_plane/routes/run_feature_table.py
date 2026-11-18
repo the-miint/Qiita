@@ -41,7 +41,7 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_VALUE,
 )
 from qiita_common.auth_constants import Scope
-from qiita_common.models.reference import ReferenceStatus
+from qiita_common.models.reference import SERVABLE_REFERENCE_STATUSES
 from qiita_common.models.run_feature_table import (
     FeatureTableRequest,
     FeatureTableSamples,
@@ -70,11 +70,6 @@ from ..run_feature_table import (
 from ._helpers import authorize_prep_sample_cohort
 
 router = APIRouter(prefix=PATH_FEATURE_TABLE_PREFIX, tags=["feature-table"])
-
-# The reference statuses whose taxonomy is servable — the same gate the reference
-# DoGet route applies (`routes/reference.py`): `active` (loaded) or `indexing`
-# (mid-reindex). Any other status may hold partial or stale rows.
-_STREAMABLE_REFERENCE_STATUSES = (ReferenceStatus.ACTIVE, ReferenceStatus.INDEXING)
 
 
 async def _authorized_cohort(
@@ -183,7 +178,7 @@ async def feature_table_taxonomy(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
     """Each feature the cohort observed, `(feature, <ranks>)`, an Arrow IPC stream:
-    a feature's md5 and its taxonomic lineage, looked up by joining the feature's
+    a feature's handle and its taxonomic lineage, looked up by joining the feature's
     feature_idx to the taxonomy of the reference the request names by its public
     `(name, version)` handle. A feature the reference does not place keeps its row with
     all-NULL ranks — a lookup, not a filter.
@@ -205,7 +200,7 @@ async def feature_table_taxonomy(
             ),
         )
     reference_idx, status = resolved
-    if status not in _STREAMABLE_REFERENCE_STATUSES:
+    if status not in SERVABLE_REFERENCE_STATUSES:
         raise HTTPException(
             status_code=409,
             detail=(

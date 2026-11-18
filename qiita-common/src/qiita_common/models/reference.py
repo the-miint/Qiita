@@ -32,6 +32,14 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+# The statuses whose data is servable over Flight: `active` (loaded) or `indexing`
+# (mid-reindex, still serving the prior index). Any other status may hold partial or
+# stale rows. Members, not `.value`, but either compares equal to the DB's TEXT status
+# since this is a StrEnum. The reference DoGet route and the feature-table taxonomy route
+# share this one gate.
+SERVABLE_REFERENCE_STATUSES = (ReferenceStatus.ACTIVE, ReferenceStatus.INDEXING)
+
+
 class ReadMaskReason(StrEnum):
     """Why a read is kept or dropped by a read mask.
 
