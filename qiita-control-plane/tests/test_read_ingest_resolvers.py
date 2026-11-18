@@ -1351,6 +1351,14 @@ def test_resolve_prep_protocol_binds_the_name_of_the_samples_protocol():
     assert bound == {"prep_protocol": "short_read_amplicon"}
 
 
+def test_resolve_prep_protocol_refuses_a_protocol_with_no_data_type_threshold():
+    scope = {"kind": "prep_sample", "prep_sample_idx": 5}
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_resolve_prep_protocol(_ProtocolPool("made_up_protocol"), scope))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "made_up_protocol" in exc.value.reason
+
+
 @pytest.mark.parametrize("kind", ["sequenced_pool", "block", "reference"])
 def test_resolve_prep_protocol_refuses_a_non_prep_sample_scope(kind):
     with pytest.raises(BackendFailure) as exc:

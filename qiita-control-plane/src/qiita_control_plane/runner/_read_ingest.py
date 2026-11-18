@@ -16,6 +16,7 @@ from qiita_common.api_paths import (
 from qiita_common.backend_failure import StepNoData
 from qiita_common.models import ScopeTargetKind
 from qiita_common.parquet import PARQUET_COMPRESSION_INTERMEDIATE, validate_parquet_path
+from qiita_common.qc_metrics import DATA_TYPE_THRESHOLD_KINDS
 from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 import qiita_control_plane.runner as _runner_pkg
@@ -701,7 +702,8 @@ async def _resolve_prep_protocol(
 ) -> dict[str, str]:
     """Bind `prep_protocol` to the prep_sample's protocol name. Never taken from the client,
     so a submitted value cannot steer a protocol-keyed verdict. The ticket's RESTRICT FK and
-    `prep_sample.prep_protocol_idx NOT NULL` guarantee the name exists."""
+    `prep_sample.prep_protocol_idx NOT NULL` guarantee the name exists. A protocol with no
+    data-type threshold is refused here, before any export."""
     if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
         raise _submission_bad_input(
             f"a workflow that binds prep_protocol must be prep_sample-scoped; "
@@ -713,6 +715,8 @@ async def _resolve_prep_protocol(
         " WHERE ps.idx = $1",
         scope_target["prep_sample_idx"],
     )
+    if name not in DATA_TYPE_THRESHOLD_KINDS:
+        raise _submission_bad_input(f"no data-type threshold for prep_protocol {name!r}")
     return {PREP_PROTOCOL_BINDING: name}
 
 

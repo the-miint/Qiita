@@ -19,6 +19,22 @@ class MarkerClass(StrEnum):
     MARKER_5S_5_8S = "marker_5s_5_8s"
 
 
+class DataTypeThresholdKind(StrEnum):
+    """How a prep_protocol's `data_type` check is graded."""
+
+    AMPLICON = "amplicon"
+    METAGENOMIC = "metagenomic"
+    TRANSCRIPTOMIC = "transcriptomic"
+
+
+DATA_TYPE_THRESHOLD_KINDS = {
+    "short_read_amplicon": DataTypeThresholdKind.AMPLICON,
+    "long_read_amplicon": DataTypeThresholdKind.AMPLICON,
+    "short_read_metagenomics": DataTypeThresholdKind.METAGENOMIC,
+    "long_read_metagenomics": DataTypeThresholdKind.METAGENOMIC,
+    "short_read_transcriptomics": DataTypeThresholdKind.TRANSCRIPTOMIC,
+}
+
 MARKER_REF_BINDINGS = {cls: f"{cls}_ref" for cls in MarkerClass}
 MARKER_REFERENCE_IDX_KEYS = {cls: f"{cls}_reference_idx" for cls in MarkerClass}
 
