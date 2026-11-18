@@ -7,8 +7,8 @@
     its QM, and its biosample's public name (to join to metadata); with the runs'
     method and what their values are (`count`);
   * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
-  * features — `(feature, sequence, length)` for every feature the values name
-    (an ASV's md5, its sequence and length), as an Arrow IPC stream.
+  * features — `(feature, sequence, length, md5)` for every feature the values name:
+    its handle, its sequence and length, and the sequence's md5, as an Arrow IPC stream.
 
 What a feature table is, which runs it can merge, and why COO, is in
 `run_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,

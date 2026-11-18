@@ -122,11 +122,14 @@ _INSERT_FEATURE = (
 
 # The observed-feature kind: a feature with no reference and no accession (an ASV),
 # so the handle is always 'QF<idx>' and there is no accession pass. Idempotent on
-# `exported_feature_live_observed_feature`.
+# `exported_feature_live_observed_feature`. The JOIN proves the feature exists, like
+# `_INSERT_GENOME`/`_INSERT_FEATURE`: an unknown feature_idx drops out here and is
+# reported by the caller's completeness check rather than raising a foreign-key error.
 _INSERT_OBSERVED = (
     "INSERT INTO qiita.exported_feature (entity_kind, feature_idx, created_by_idx)"
     " SELECT 'observed_feature', f.feature_idx, $2"
     "   FROM unnest($1::bigint[]) AS f(feature_idx)"
+    "   JOIN qiita.feature ft ON ft.feature_idx = f.feature_idx"
     "  ORDER BY f.feature_idx" + _ON_CONFLICT
 )
 
