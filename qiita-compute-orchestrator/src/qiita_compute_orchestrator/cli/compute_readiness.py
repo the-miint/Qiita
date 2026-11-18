@@ -103,17 +103,18 @@ _PROBE_LINE_PREFIX = "compute-readiness:"
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One row in the report. `status` is "pass" | "fail" | "skip"; the
+    """One row in the report. `status` is "pass" | "fail" | "skip" | "warn"; the
     aggregate exit code is 1 iff any row is "fail" (skip is non-fatal —
     a skipped CP check on a host with no CP_URL is informational, not
-    broken)."""
+    broken; warn is non-fatal too — a finding about the one node the probe
+    ran on, which the operator acts on without the deploy failing)."""
 
     name: str
     status: str
     detail: str
 
     def render(self) -> str:
-        glyph = {"pass": "✓", "fail": "✗", "skip": "·"}[self.status]
+        glyph = {"pass": "✓", "fail": "✗", "skip": "·", "warn": "!"}[self.status]
         return f"  {glyph} {self.name}: {self.detail}"
 
 
@@ -279,12 +280,14 @@ fi
 #
 # The row name stays a literal at each call site: the script-vs-parser parity
 # test reads `<key>=<value>` out of this script's text.
+#
+# MODULE_PROBE_RC keeps the module's exit code for a probe whose codes mean more than
+# ok/fail (krepp-index), and MODULE_PROBE_ERR keeps its output on success too.
 run_module_probe() {{
-    if MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"; then
-        return 0
-    fi
+    MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"
+    MODULE_PROBE_RC=$?
     MODULE_PROBE_ERR="$(printf '%s' "$MODULE_PROBE_ERR" | tr -s '[:space:]' ' ')"
-    return 1
+    [ "$MODULE_PROBE_RC" -eq 0 ]
 }}
 
 # The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
@@ -574,6 +577,16 @@ else
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 
+# This node's copies of the active krepp builds, checked as a placement job checks
+# them; the exit code is the row's status (qiita_compute_orchestrator.krepp_node_check).
+run_module_probe qiita_compute_orchestrator.krepp_node_check
+case "$MODULE_PROBE_RC" in
+    0) echo "{_PROBE_LINE_PREFIX} krepp-index=ok detail=$MODULE_PROBE_ERR" ;;
+    3) echo "{_PROBE_LINE_PREFIX} krepp-index=skip detail=$MODULE_PROBE_ERR" ;;
+    4) echo "{_PROBE_LINE_PREFIX} krepp-index=warn err=$MODULE_PROBE_ERR" ;;
+    *) echo "{_PROBE_LINE_PREFIX} krepp-index=fail err=$MODULE_PROBE_ERR" ;;
+esac
+
 # Outbound HTTPS from this compute node to the ENA archives — why the deploy
 # checks it at all, and what a green row does and does not prove, is on
 # `ena_reachability_check` itself.
@@ -767,6 +780,7 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
       - shared-fs-visible=yes/no           → pass / fail
       - shared-fs-writable=yes/no          → pass / fail
       - cp-from-compute=ok/fail/skip       → pass / fail / skip
+      - krepp-index=ok/fail/skip/warn      → pass / fail / skip / warn
       - hostname / uid / user              → informational (pass with detail)
     """
     results: list[CheckResult] = []
@@ -799,6 +813,7 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
 _PROBE_PASS_VALUES = {"ok"}
 _PROBE_FAIL_VALUES = {"fail"}
 _PROBE_SKIP_VALUES = {"skip"}
+_PROBE_WARN_VALUES = {"warn"}
 # `hostname`, `uid`, `user` are informational — never a fail condition;
 # the operator reads the actual value to confirm the job ran as the
 # expected SLURM user.
@@ -828,6 +843,8 @@ def _classify_probe_pair(key: str, value: str) -> str:
         return "pass"
     if value in _PROBE_SKIP_VALUES:
         return "skip"
+    if value in _PROBE_WARN_VALUES:
+        return "warn"
     # `_PROBE_FAIL_VALUES` and any unknown value collapse here: an
     # unrecognized probe line is contract drift and the operator
     # should see the row as a failure.

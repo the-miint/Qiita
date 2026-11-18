@@ -239,7 +239,7 @@ compute-readiness: ena-from-compute=fail err=URLError: no route to host
 def test_probe_script_emits_only_known_values():
     """Script-vs-parser contract test. The bash probe script's emitted
     `<key>=<value>` literals must all be drawn from the parser's known
-    alphabet (pass / fail / skip), otherwise the parser would reject
+    alphabet (pass / fail / skip / warn), otherwise the parser would reject
     them as contract drift and the report would silently show every
     drifted line as `fail`.
 
@@ -251,7 +251,12 @@ def test_probe_script_emits_only_known_values():
     import re
 
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
-    known = cr._PROBE_PASS_VALUES | cr._PROBE_FAIL_VALUES | cr._PROBE_SKIP_VALUES
+    known = (
+        cr._PROBE_PASS_VALUES
+        | cr._PROBE_FAIL_VALUES
+        | cr._PROBE_SKIP_VALUES
+        | cr._PROBE_WARN_VALUES
+    )
     # Match `<prefix> <key>=<value>` where value is a bare word (no
     # `$(...)`, no quotes, no shell expansion). Informational lines
     # like `hostname=$(hostname)` are deliberately excluded by the
@@ -289,14 +294,14 @@ def test_probe_script_checks_ena_reachability_from_compute():
     assert "ena-from-compute=fail err=$MODULE_PROBE_ERR" in script
 
 
-def test_probe_script_runs_both_module_probes_through_one_helper():
-    """native-import and ena-from-compute share one capture path, so they cannot
+def test_probe_script_runs_every_module_probe_through_one_helper():
+    """native-import, ena-from-compute and krepp-index share one capture path, so they cannot
     drift into different ideas of what reaches the operator's `err=` field. The
     row names stay literals at the call sites — `_parse_probe_log` and the
     script-vs-parser parity test both read them out of the script's text."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert script.count("run_module_probe() {") == 1
-    assert script.count("run_module_probe qiita_compute_orchestrator.") == 2
+    assert script.count("run_module_probe qiita_compute_orchestrator.") == 3
     # No call site re-implements the capture the helper owns.
     assert "-P -m" not in script.split("run_module_probe() {", 1)[1].split("}", 1)[1]
 
@@ -707,3 +712,20 @@ def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "0 fail" in out
+
+
+def test_probe_script_maps_the_krepp_node_check_exit_codes():
+    """krepp_node_check's exit code is the krepp-index row's status: a bad copy on the
+    probe's one node warns, a krepp mismatch fails."""
+    from qiita_compute_orchestrator import krepp_node_check as kc
+
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "run_module_probe qiita_compute_orchestrator.krepp_node_check" in script
+    for code, value in (
+        (kc.EXIT_OK, "ok"),
+        (kc.EXIT_SKIP, "skip"),
+        (kc.EXIT_WARN, "warn"),
+    ):
+        assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} krepp-index={value}' in script
+    assert '*) echo "' + cr._PROBE_LINE_PREFIX + " krepp-index=fail" in script
+    assert cr._classify_probe_pair("krepp-index", "warn") == "warn"
