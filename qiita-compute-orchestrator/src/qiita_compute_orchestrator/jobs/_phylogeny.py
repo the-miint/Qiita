@@ -46,7 +46,7 @@ def tree_difference(
     """Compare the trees in tables `expected` and `actual`. With equal node counts, no
     missing node means the two multisets of node shapes are equal. `compare_lengths`
     False leaves branch lengths out, for a tree whose lengths are not the placement's
-    (a JEST labelled tree is read for its edge numbers)."""
+    (JEST's `labelled.nwk` is read for its edge numbers)."""
     length = "c.branch_length" if compare_lengths else "NULL::DOUBLE AS branch_length"
     diff = (
         f"{_SHAPE.format(t=expected, length=length)}"

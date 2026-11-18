@@ -173,10 +173,11 @@ async def assert_reference_deletable(
         "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
         reference_idx,
     )
-    # A krepp build is placed by tickets scoped to a prep_sample, which the
-    # reference_idx gate above cannot see; a build is removed only once none of them
-    # runs on it (repositories.reference_index.remove_krepp_build), so "every build
-    # removed" covers them. Blocks even with force.
+    # Tickets fixed to a krepp build (work_ticket.reference_index_idx) are not
+    # scoped to the reference, so the reference_idx gate above cannot see them; a
+    # build is removed only once none of them runs on it
+    # (repositories.reference_index.remove_krepp_build), so "every build removed"
+    # covers them. Blocks even with force.
     krepp_builds = await conn.fetchval(
         "SELECT count(*) FROM qiita.reference_index"
         " WHERE reference_idx = $1 AND index_type = $2 AND state <> $3",

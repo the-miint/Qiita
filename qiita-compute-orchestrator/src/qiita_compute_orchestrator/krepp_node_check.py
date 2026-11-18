@@ -6,17 +6,17 @@ Run as a module by the compute-readiness probe, from the interpreter under test:
 
 It asks the control plane for every reference's active build
 (`GET /reference/krepp-build/active`) and runs the per-job check
-(`krepp_build.verify_build`) on this node's copy of each, as a placement job would.
+(`krepp_build.verify_build`) on this node's copy of each, as the activation job does.
 The exit code is the row's status, so the probe script can tell them apart:
 
 - 0 `ok`: every active build's copy here passes;
 - 3 `skip`: no reference has an active krepp build;
-- 4 `warn`: a copy here is missing or does not pass. This is one node: a placement
-  job that lands here fails naming it, and the cluster admins re-copy the folder
-  and run its verify.sh (docs/runbooks/krepp-index.md). It does not fail the deploy;
+- 4 `warn`: a copy here is missing or does not pass. This is one node: a krepp job
+  that lands here fails, and the cluster admins re-copy the folder and run its
+  verify.sh (docs/runbooks/krepp-index.md). It does not fail the deploy;
 - 1 `fail`: PATH_NODE_LOCAL is not in the job env, the control plane cannot be
   asked, or a build was written by a krepp other than the one the staged miint
-  links, which fails every placement on every node.
+  links, which fails every krepp job on every node.
 
 One line on stdout says which build and why.
 """
@@ -29,13 +29,13 @@ import sys
 import duckdb
 import httpx
 from qiita_common.api_paths import URL_REFERENCE_KREPP_BUILD_ACTIVE
-from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
 from qiita_common.krepp import KreppBuildRecord
 
 from .config import get_settings
 from .cp_client import make_cp_client
 from .derived_store import node_relative_path
-from .krepp_build import KreppBuildInvalid, linked_krepp_version, verify_build
+from .krepp_build import CHECK_KREPP_VERSION, KreppBuildInvalid, linked_krepp_version, verify_build
+from .miint import open_miint_conn
 from .native_import_check import MAX_DETAIL
 
 EXIT_OK, EXIT_FAIL, EXIT_SKIP, EXIT_WARN = 0, 1, 3, 4
@@ -63,7 +63,7 @@ def check(builds: list[KreppBuildRecord], node_root: str | None, linked: str) ->
                 linked_krepp_version=linked,
             )
         except KreppBuildInvalid as exc:
-            if exc.check == "krepp-version":
+            if exc.check == CHECK_KREPP_VERSION:
                 return EXIT_FAIL, f"build {b.reference_index_idx}: {exc.detail}"
             bad.append(f"build {b.reference_index_idx} ({b.fs_path}): {exc.check}: {exc.detail}")
     if bad:
@@ -74,9 +74,11 @@ def check(builds: list[KreppBuildRecord], node_root: str | None, linked: str) ->
 def main() -> int:
     try:
         builds = asyncio.run(_active_builds())
-        conn = duckdb.connect(":memory:", config=miint_connect_config())
-        conn.execute(miint_load_sql())
-        linked = linked_krepp_version(conn)
+        conn = open_miint_conn()
+        try:
+            linked = linked_krepp_version(conn)
+        finally:
+            conn.close()
         code, detail = check(builds, get_settings().path_node_local, linked)
     except (httpx.HTTPError, RuntimeError, duckdb.Error) as exc:
         code, detail = EXIT_FAIL, f"{type(exc).__name__}: {exc}"

@@ -13,10 +13,9 @@ Layout::
     manifest.json   partitions, the shared index settings, every file's size
     verify.sh       the full check of one copy, run by the cluster admins
     index/          the krepp files, 7 per partition (`place_krepp`'s index directory)
-    jest/           JEST's labelled tree and null distribution
+    jest/           labelled.nwk (the backbone tree with JEST's clade labels), null.txt
 
-The krepp file names and the ``metadata-*.txt`` format are krepp's
-(``src/index.cpp`` ``save_index`` / ``save_info``); ``tests/test_krepp_build.py``
+The krepp file names and the ``metadata-*.txt`` format are what krepp writes; a test
 pins them against an index built by the staged miint. Everything Qiita writes is a
 function of the folder's content only, so registering the same folder twice yields
 the same ``SHA256SUMS`` and the same hash.
@@ -44,7 +43,7 @@ JEST_NULL = f"{JEST_SUBDIR}/null.txt"
 MANIFEST_FORMAT = 1
 
 # Each partition r of an index with m partitions is these seven files, `<stem>-m<m>r<r>-
-# <frac tag>` plus the text twin of `metadata` (krepp `IndexMultiple::save_index`).
+# <frac tag>` plus the text twin of `metadata`.
 _PARTITION_STEMS = ("cmer", "crecord", "inc", "metadata", "reflist", "tree")
 _PARTITION_FILE = re.compile(
     r"(?P<stem>cmer|crecord|inc|metadata|reflist|tree)-m(?P<m>\d+)r(?P<r>\d+)-"
@@ -71,6 +70,11 @@ SHARED_METADATA_KEYS = (
 _HASH_CHUNK = 8 << 20
 
 
+# The `check` of a KreppBuildInvalid raised because the build's krepp is not the linked
+# one. The readiness probe fails on it rather than warning, so it is compared by name.
+CHECK_KREPP_VERSION = "krepp-version"
+
+
 class KreppBuildInvalid(ValueError):
     """The folder is not the build it should be. `check` names the check that failed
     (stable, for logs and the readiness probe); `detail` says what was found."""
@@ -94,7 +98,7 @@ class Inventory:
 
 
 def parse_metadata_text(text: str) -> dict[str, str]:
-    """`key: value` lines (krepp `IndexMultiple::save_info`) into a dict."""
+    """`key: value` lines (krepp's metadata text) into a dict."""
     out: dict[str, str] = {}
     for line in text.splitlines():
         if not line.strip():
@@ -191,8 +195,15 @@ def _hash_all(folder: Path, relpaths: list[str], threads: int) -> dict[str, str]
 
 
 def _all_files(folder: Path) -> list[str]:
+    """Every file under `folder`, relative. A directory os.walk cannot list raises
+    KreppBuildInvalid (`unreadable`); os.walk alone skips it, which would drop its
+    files from both the stray-file check and SHA256SUMS."""
+
+    def _unreadable(exc: OSError) -> None:
+        raise KreppBuildInvalid("unreadable", f"{exc.filename}: {exc.strerror}") from exc
+
     out = []
-    for root, dirs, files in os.walk(folder):
+    for root, dirs, files in os.walk(folder, onerror=_unreadable):
         dirs.sort()
         for name in sorted(files):
             out.append((Path(root) / name).relative_to(folder).as_posix())
@@ -205,8 +216,8 @@ def _readme(manifest: dict) -> str:
     return (
         f"# krepp build {manifest['build_label']}\n\n"
         f"A krepp placement index for Qiita reference {manifest['reference_idx']}, registered by\n"
-        "Qiita. Do not edit, add or remove files: a changed copy fails every job on the node\n"
-        "it is on.\n\n"
+        "Qiita. Do not edit, add or remove files: a changed copy fails every krepp job on\n"
+        "the node it is on.\n\n"
         f"- krepp version: {s['krepp version']}\n"
         f"- k {s['k']}, w {s['w']}, h {s['h']}, m {s['m']}, frac {s['frac']}\n"
         f"- partitions: {len(parts)} ({', '.join(f'r{r}' for r in parts)})\n"
@@ -348,14 +359,18 @@ def verify_build(
         if sha256_file(folder / rel) != listed[rel]:
             raise KreppBuildInvalid("hash", f"{rel} does not match SHA256SUMS")
     if linked_krepp_version is not None:
-        built = manifest["settings"]["krepp version"]
-        if built != linked_krepp_version:
-            raise KreppBuildInvalid(
-                "krepp-version",
-                f"the build was written by krepp {built};"
-                f" the loaded miint links {linked_krepp_version}",
-            )
+        check_krepp_version(manifest["settings"]["krepp version"], linked_krepp_version)
     return manifest
+
+
+def check_krepp_version(built: str, linked: str) -> None:
+    """Raise KreppBuildInvalid (`CHECK_KREPP_VERSION`) when the build's krepp version is
+    not the one the loaded miint links."""
+    if built != linked:
+        raise KreppBuildInvalid(
+            CHECK_KREPP_VERSION,
+            f"the build was written by krepp {built}; the loaded miint links {linked}",
+        )
 
 
 def linked_krepp_version(conn) -> str:

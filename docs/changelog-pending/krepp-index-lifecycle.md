@@ -10,7 +10,7 @@
   `reference-index-activate` workflow checks a node's copy, places pieces of up to 100
   backbone tips with it, and makes it the reference's active build when enough land on
   their own edge, retiring the previous one. `qiita-admin krepp-index remove` marks a
-  registered or retired build removed. Nothing places contigs with a build yet. The
+  registered or retired build removed. No workflow places contigs with a build. The
   krepp version check reads `miint_versions()`'s `krepp-version` row (duckdb-miint#473,
   added by duckdb-miint#475), so it needs a miint that has it.
 - **`qiita.reference_index` rows carry `state` (`registered`, `active`, `retired`,

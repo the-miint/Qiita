@@ -651,18 +651,29 @@ def test_render_human_summary():
         cr.CheckResult("a", "pass", "ok"),
         cr.CheckResult("b", "fail", "bad"),
         cr.CheckResult("c", "skip", "n/a"),
+        cr.CheckResult("d", "warn", "copy missing"),
     ]
     text = cr._render_human(results)
     assert "✓ a: ok" in text
     assert "✗ b: bad" in text
     assert "· c: n/a" in text
-    assert "1 pass, 1 fail, 1 skip" in text
+    assert "! d: copy missing" in text
+    assert "1 pass, 1 fail, 1 skip, 1 warn" in text
+
+
+def test_summary_counts_every_row():
+    results = [
+        cr.CheckResult(str(i), s, "") for i, s in enumerate(["pass", "warn", "warn", "skip"])
+    ]
+    summary = json.loads(cr._render_json(results))["summary"]
+    assert sum(summary.values()) == len(results)
+    assert summary["warn"] == 2
 
 
 def test_render_json_shape():
     results = [cr.CheckResult("a", "pass", "ok"), cr.CheckResult("b", "fail", "bad")]
     parsed = json.loads(cr._render_json(results))
-    assert parsed["summary"] == {"pass": 1, "fail": 1, "skip": 0}
+    assert parsed["summary"] == {"pass": 1, "fail": 1, "skip": 0, "warn": 0}
     assert parsed["results"][0] == {"name": "a", "status": "pass", "detail": "ok"}
 
 

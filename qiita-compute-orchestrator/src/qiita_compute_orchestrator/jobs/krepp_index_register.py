@@ -14,11 +14,10 @@ Checks, cheapest first, before any file is hashed:
 - it was written by the krepp the staged miint links (``linked_krepp_version``);
 - its tree is the reference's tree as a placement sees it
   (``_phylogeny.tree_difference``): every edge number, parent edge number, branch
-  length and tip name. ``place_krepp`` returns the index's edge numbers verbatim
-  (miint phylogeny docs, `tree_table`), so a build over another numbering would
-  place every contig on the wrong edge. The reference's tree must be fully numbered
+  length and tip name, for the reason docs/architecture/reference-data.md "Edge
+  numbering" gives. The reference's tree must be fully numbered
   (``POST /reference/{idx}/phylogeny/mint-edge-id``);
-- JEST's labelled tree carries the same edges (branch lengths not compared).
+- JEST's tree (``labelled.nwk``) carries the same edges (branch lengths not compared).
 
 Then every file is hashed once and SHA256SUMS written (``write_build_files``).
 """
@@ -31,6 +30,7 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
 from qiita_common.models import INDEX_TYPE_KREPP, IndexPathRoot, ReferenceIndexState
 
 from ..config import get_settings
@@ -39,6 +39,7 @@ from ..derived_store import KREPP_INDEX_SUBDIR, krepp_build_relpath, node_relati
 from ..krepp_build import (
     JEST_LABELLED_TREE,
     KreppBuildInvalid,
+    check_krepp_version,
     inventory_index,
     linked_krepp_version,
     write_build_files,
@@ -65,7 +66,7 @@ def _hash_threads() -> int:
 async def check_trees(
     conn: duckdb.DuckDBPyConnection, reference_idx: int, folder: Path, tree_file: str
 ) -> None:
-    """Raise KreppBuildInvalid unless the build's tree, and JEST's labelled tree by its
+    """Raise KreppBuildInvalid unless the build's tree, and JEST's tree by its
     edges, are the reference's tree in the lake."""
     conn.execute(
         f"CREATE OR REPLACE TEMP TABLE krepp_tree AS SELECT {_TREE_COLUMNS} FROM read_newick(?)",
@@ -108,13 +109,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     inventory = inventory_index(folder / KREPP_INDEX_SUBDIR)
     conn = open_miint_conn()
     try:
-        linked = linked_krepp_version(conn)
-        built = inventory.settings["krepp version"]
-        if built != linked:
-            raise KreppBuildInvalid(
-                "krepp-version",
-                f"the build was written by krepp {built}; the staged miint links {linked}",
-            )
+        check_krepp_version(inventory.settings["krepp version"], linked_krepp_version(conn))
         await check_trees(conn, inputs.reference_idx, folder, inventory.tree_file)
     finally:
         conn.close()
@@ -131,7 +126,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         "state": ReferenceIndexState.REGISTERED.value,
         "fs_path_root": IndexPathRoot.NODE_LOCAL.value,
         "params": {
-            "sha256sums_sha256": sums_sha256,
+            SHA256SUMS_SHA256_PARAM: sums_sha256,
             "build_label": inputs.build_label,
             "krepp_version": settings["krepp version"],
             "k": int(settings["k"]),

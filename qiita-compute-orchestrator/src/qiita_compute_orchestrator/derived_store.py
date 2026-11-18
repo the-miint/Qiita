@@ -17,8 +17,15 @@ Every touch point of derived storage is an orchestrator concern:
   * ``jobs/build_rype_index`` writes the rype ``.ryxdi``;
   * ``jobs/build_minimap2_index`` writes the minimap2 ``.mmi``;
   * ``jobs/host_filter`` reads them (via the DB-recorded ``reference_index.fs_path``);
+  * ``jobs/krepp_index_register`` registers a krepp build placed by hand under it
+    (``krepp_build_relpath``);
   * the ``DELETE /reference-artifact/{idx}`` endpoint (``reference_artifact``)
     purges the whole per-reference subtree.
+
+A krepp build's row holds a path relative to two roots: its master copy under
+``PATH_DERIVED`` and the node copies under ``PATH_NODE_LOCAL`` (on each compute
+node's own disk). ``node_relative_path`` resolves it under either, so the
+node-local copies share this module's layout rather than having one of their own.
 
 Before this module the ``{PATH_DERIVED}/references/{idx}/...`` layout was
 reconstructed by hand in each of those places; centralizing it here removes the

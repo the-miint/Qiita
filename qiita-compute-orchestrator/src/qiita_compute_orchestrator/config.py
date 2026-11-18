@@ -227,9 +227,9 @@ class Settings:
 def _resolve_path_node_local() -> str:
     """PATH_NODE_LOCAL, required and absolute under COMPUTE_BACKEND=slurm.
 
-    Fail-fast at boot: a krepp placement step reads its index from this tier, and
-    an unset value would otherwise surface only when such a step runs, after the
-    steps before it."""
+    Fail-fast at boot: the krepp activation job and the readiness probe's
+    krepp-index row read a build's node copy from this tier, and an unset value would
+    otherwise surface only when one of them runs."""
     raw = os.environ.get("PATH_NODE_LOCAL")
     if not raw:
         raise RuntimeError(

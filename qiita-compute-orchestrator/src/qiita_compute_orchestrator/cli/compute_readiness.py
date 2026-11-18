@@ -114,8 +114,15 @@ class CheckResult:
     detail: str
 
     def render(self) -> str:
-        glyph = {"pass": "✓", "fail": "✗", "skip": "·", "warn": "!"}[self.status]
-        return f"  {glyph} {self.name}: {self.detail}"
+        return f"  {_GLYPHS[self.status]} {self.name}: {self.detail}"
+
+
+# Every row status, with its glyph; the summary counts each.
+_GLYPHS = {"pass": "✓", "fail": "✗", "skip": "·", "warn": "!"}
+
+
+def _summary(results: list[CheckResult]) -> dict[str, int]:
+    return {status: sum(1 for r in results if r.status == status) for status in _GLYPHS}
 
 
 # ---------------------------------------------------------------------------
@@ -930,10 +937,9 @@ def _render_human(results: list[CheckResult]) -> str:
     lines = ["compute-readiness report:"]
     for r in results:
         lines.append(r.render())
-    n_fail = sum(1 for r in results if r.status == "fail")
-    n_pass = sum(1 for r in results if r.status == "pass")
-    n_skip = sum(1 for r in results if r.status == "skip")
-    lines.append(f"summary: {n_pass} pass, {n_fail} fail, {n_skip} skip")
+    lines.append(
+        "summary: " + ", ".join(f"{n} {status}" for status, n in _summary(results).items())
+    )
     return "\n".join(lines)
 
 
@@ -941,11 +947,7 @@ def _render_json(results: list[CheckResult]) -> str:
     return json.dumps(
         {
             "results": [asdict(r) for r in results],
-            "summary": {
-                "pass": sum(1 for r in results if r.status == "pass"),
-                "fail": sum(1 for r in results if r.status == "fail"),
-                "skip": sum(1 for r in results if r.status == "skip"),
-            },
+            "summary": _summary(results),
         },
         indent=2,
     )

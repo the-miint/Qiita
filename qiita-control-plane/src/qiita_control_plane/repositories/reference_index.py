@@ -4,9 +4,15 @@ A build is registered by `actions.library.register_index` (`registered`), activa
 once its node copies have passed the activation checks (`activate_krepp_build`), and
 removed once no running ticket uses it (`remove_krepp_build`). Each change locks the
 reference's krepp rows `FOR UPDATE` first, so two changes to one reference's builds
-serialise. A ticket records the build it is fixed to in `work_ticket.reference_index_idx`
-and keeps it; `/run` refuses a ticket whose build is removed
-(`removed_build_of_ticket`).
+serialize. `/run` refuses a ticket whose build is removed (`removed_build_of_ticket`).
+
+`work_ticket.reference_index_idx` is the build a ticket is fixed to. Nothing writes it
+yet. The code that will (the placement workflow's step that fixes a ticket to the
+reference's active build) has to hold the build row `FOR SHARE`, re-read under that
+lock that the build is `active`, and keep the lock until it commits the ticket's
+column: `remove_krepp_build` counts the running tickets on a build under `FOR UPDATE`
+of the same row, and a write made outside that lock could fix a ticket to a build
+being removed.
 """
 
 from dataclasses import dataclass
@@ -61,6 +67,8 @@ async def _lock_reference_builds(
     )
     if reference_idx is None:
         raise KreppBuildNotFound(reference_index_idx)
+    # Locked in reference_index_idx order, so two changes to one reference take the
+    # rows in the same order.
     await conn.execute(
         "SELECT 1 FROM qiita.reference_index"
         " WHERE reference_idx = $1 AND index_type = $2"

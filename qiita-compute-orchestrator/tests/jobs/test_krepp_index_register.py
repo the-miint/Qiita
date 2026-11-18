@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from helpers import KREPP_TREE_NEWICK
+from helpers import KREPP_TREE_NEWICK, krepp_recorded_version
 
 from qiita_compute_orchestrator.derived_store import krepp_build_relpath
 from qiita_compute_orchestrator.jobs import krepp_index_register as job
@@ -19,7 +19,6 @@ from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
     JEST_NULL,
     KreppBuildInvalid,
-    inventory_index,
 )
 
 _JOB = "qiita_compute_orchestrator.jobs.krepp_index_register"
@@ -41,7 +40,7 @@ def derived(krepp_built_index, tmp_path, monkeypatch):
     monkeypatch.setattr(f"{_JOB}.get_settings", lambda: types.SimpleNamespace(path_derived=root))
     state = {
         "lake_sql": "SELECT * REPLACE (node_index AS edge_id) FROM read_newick('{nwk}')",
-        "linked": inventory_index(folder / "index").settings["krepp version"],
+        "linked": krepp_recorded_version(folder / "index"),
     }
     nwk = tmp_path / "lake.nwk"
     nwk.write_text(KREPP_TREE_NEWICK)

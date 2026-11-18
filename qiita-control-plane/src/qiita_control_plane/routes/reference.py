@@ -47,7 +47,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_TABLE,
 )
 from qiita_common.auth_constants import Scope
-from qiita_common.krepp import KreppBuildRecord
+from qiita_common.krepp import SHA256SUMS_SHA256_PARAM, KreppBuildRecord
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
     DoGetTicketRequest,
@@ -224,21 +224,14 @@ async def list_active_krepp_builds(
     `ticket:doget`, as the reference DoGet route does, because the compute service
     account holds the latter."""
     rows = await pool.fetch(
-        "SELECT reference_index_idx, reference_idx, fs_path, params->>'sha256sums_sha256' AS sums"
+        "SELECT reference_index_idx, reference_idx, fs_path, params->>$3 AS sha256sums_sha256"
         " FROM qiita.reference_index WHERE index_type = $1 AND state = $2"
         " ORDER BY reference_idx",
         INDEX_TYPE_KREPP,
         ReferenceIndexState.ACTIVE.value,
+        SHA256SUMS_SHA256_PARAM,
     )
-    return [
-        KreppBuildRecord(
-            reference_index_idx=r["reference_index_idx"],
-            reference_idx=r["reference_idx"],
-            fs_path=r["fs_path"],
-            sha256sums_sha256=r["sums"],
-        )
-        for r in rows
-    ]
+    return [KreppBuildRecord.model_validate(dict(r)) for r in rows]
 
 
 @router.post(PATH_REFERENCE_INDEX_REMOVE, status_code=200)

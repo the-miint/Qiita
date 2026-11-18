@@ -47,6 +47,7 @@ from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.flight_stream import counted_doget
 from qiita_common.krepp import (
     KREPP_BUILD_RECORD_BASENAME,
+    SHA256SUMS_SHA256_PARAM,
     KreppActivationReport,
     KreppBuildRecord,
 )
@@ -2023,6 +2024,11 @@ async def register_index(
     registered again after its build was retired or removed, raises ValueError —
     a rebuild takes a new folder name.
     """
+    if index_type == INDEX_TYPE_KREPP and state != ReferenceIndexState.REGISTERED:
+        raise ValueError(
+            f"a krepp build is registered {ReferenceIndexState.REGISTERED.value}, not"
+            f" {state.value}; only activation moves it on"
+        )
     row = await pool.fetchrow(
         "INSERT INTO qiita.reference_index"
         " (reference_idx, index_type, fs_path, params, shard_id, state, fs_path_root)"
@@ -2056,7 +2062,7 @@ async def register_index(
                 " params; the folder changed after it was registered. Register the new"
                 " build under a new folder name."
             )
-        if existing["state"] in (ReferenceIndexState.RETIRED, ReferenceIndexState.REMOVED):
+        if existing["state"] not in (ReferenceIndexState.REGISTERED, ReferenceIndexState.ACTIVE):
             raise ValueError(
                 f"the krepp build at {fs_path!r} (reference_index_idx"
                 f" {existing['reference_index_idx']}) is {existing['state']}; a build is not"
@@ -2077,9 +2083,10 @@ async def export_krepp_build(
     or removed (activation applies to a registered build; an active one is checked
     again and left active)."""
     row = await pool.fetchrow(
-        "SELECT reference_idx, index_type, fs_path, params, state FROM qiita.reference_index"
-        " WHERE reference_index_idx = $1",
+        "SELECT reference_idx, index_type, fs_path, state, params->>$2 AS sha256sums_sha256"
+        " FROM qiita.reference_index WHERE reference_index_idx = $1",
         reference_index_idx,
+        SHA256SUMS_SHA256_PARAM,
     )
     if row is None or row["index_type"] != INDEX_TYPE_KREPP:
         raise ValueError(f"reference_index_idx {reference_index_idx} is not a krepp build")
@@ -2094,7 +2101,7 @@ async def export_krepp_build(
         reference_index_idx=reference_index_idx,
         reference_idx=reference_idx,
         fs_path=row["fs_path"],
-        sha256sums_sha256=json.loads(row["params"])["sha256sums_sha256"],
+        sha256sums_sha256=row["sha256sums_sha256"],
     )
     out = output_dir / KREPP_BUILD_RECORD_BASENAME
     out.write_text(record.model_dump_json())

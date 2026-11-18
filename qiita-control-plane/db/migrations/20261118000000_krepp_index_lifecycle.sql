@@ -5,9 +5,8 @@
 -- cluster admins to every compute node's local disk, and it is not served until it
 -- has been checked on a node and activated. This migration adds what that needs.
 
--- 1. `krepp` joins the index_type allow-list (plain TEXT + CHECK, as
---    20260711000000 explains; INDEX_TYPE_KREPP in qiita_common.models is the
---    Python constant).
+-- 1. `krepp` joins the index_type allow-list (plain TEXT + CHECK;
+--    INDEX_TYPE_KREPP in qiita_common.models is the Python constant).
 ALTER TABLE qiita.reference_index
     DROP CONSTRAINT IF EXISTS reference_index_index_type_check;
 ALTER TABLE qiita.reference_index
@@ -23,6 +22,9 @@ ALTER TABLE qiita.reference_index
     ADD COLUMN state TEXT NOT NULL DEFAULT 'active'
         CONSTRAINT reference_index_state_check
         CHECK (state IN ('registered', 'active', 'retired', 'removed'));
+ALTER TABLE qiita.reference_index
+    ADD CONSTRAINT reference_index_lifecycle_is_krepp
+    CHECK (index_type = 'krepp' OR state = 'active');
 
 -- 3. What fs_path is relative to. 'absolute': fs_path is a host path (every type
 --    before krepp). 'node_local': fs_path is relative, and resolves under the
@@ -42,18 +44,19 @@ CREATE UNIQUE INDEX reference_index_one_active_krepp
     ON qiita.reference_index (reference_idx)
     WHERE index_type = 'krepp' AND state = 'active';
 
--- 4. The krepp build a ticket is fixed to, written once by the runner when the
---    ticket first resolves its build, as it writes mask_idx, alignment_idx and
---    processing_idx. ON DELETE SET NULL mirrors those columns.
+-- 4. The krepp build a ticket is fixed to. Nothing writes it yet: the placement
+--    workflow's runner step is to write it once, when the ticket first resolves its
+--    build, as it writes mask_idx, alignment_idx and processing_idx. What reads it
+--    now: the /run refusal for a ticket whose build was removed, and the remove
+--    gate (repositories.reference_index). ON DELETE SET NULL mirrors those columns.
 ALTER TABLE qiita.work_ticket
     ADD COLUMN reference_index_idx BIGINT
         REFERENCES qiita.reference_index(reference_index_idx) ON DELETE SET NULL;
 
 COMMENT ON COLUMN qiita.work_ticket.reference_index_idx IS
     'The krepp build (qiita.reference_index.reference_index_idx) this ticket is fixed '
-    'to, written by the runner the first time the ticket resolves its build and read '
-    'back on every later run. NULL for a ticket that uses none. ON DELETE SET NULL so '
-    'deleting a reference''s index rows detaches the ticket.';
+    'to. NULL for a ticket that uses none. ON DELETE SET NULL so deleting a '
+    'reference''s index rows detaches the ticket.';
 
 CREATE INDEX work_ticket_reference_index_idx
     ON qiita.work_ticket (reference_index_idx)
@@ -75,6 +78,7 @@ DROP INDEX IF EXISTS qiita.work_ticket_reference_index_idx;
 ALTER TABLE qiita.work_ticket DROP COLUMN IF EXISTS reference_index_idx;
 DROP INDEX IF EXISTS qiita.reference_index_one_active_krepp;
 ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_krepp_is_node_local;
+ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_lifecycle_is_krepp;
 ALTER TABLE qiita.reference_index DROP COLUMN IF EXISTS fs_path_root;
 ALTER TABLE qiita.reference_index DROP COLUMN IF EXISTS state;
 ALTER TABLE qiita.reference_index

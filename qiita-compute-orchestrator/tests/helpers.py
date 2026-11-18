@@ -84,6 +84,21 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
 KREPP_TREE_NEWICK = "((g0:1,g1:1):1,(g2:1,g3:1):1);\n"
 
 
+def krepp_recorded_version(index_dir: Path) -> str:
+    """The `krepp version:` an index's metadata texts record, read with DuckDB's
+    read_text rather than krepp_build's parser, so a test comparing against it does
+    not grade that parser with itself. Raises unless every partition records one and
+    the same version."""
+    import duckdb
+
+    versions = duckdb.sql(
+        "SELECT DISTINCT regexp_extract(content, '(?m)^krepp version: ([^\\r\\n]*)', 1)"
+        f" FROM read_text('{index_dir}/metadata*.txt')"
+    ).fetchall()
+    assert len(versions) == 1 and versions[0][0], versions
+    return versions[0][0]
+
+
 def krepp_genomes() -> dict[str, str]:
     """The four genomes the conftest `krepp_built_index` index is built from: tips g0..g3
     of KREPP_TREE_NEWICK, 20 kb each, random with a fixed seed."""

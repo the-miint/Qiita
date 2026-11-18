@@ -26,7 +26,8 @@ same folder overwritten.
 PATH_DERIVED/references/18/krepp/w43_r0-15/
   index/   the krepp files: 7 per partition (cmer, crecord, inc, metadata,
            metadata .txt, reflist, tree), all partitions of one index, nothing else
-  jest/    labelled.nwk (JEST's labelled tree) and null.txt (its null distribution)
+  jest/    labelled.nwk (the backbone tree with JEST's clade labels) and null.txt
+           (its null distribution)
 ```
 
 The SLURM job user must be able to write into the top-level folder (registration writes
@@ -60,9 +61,9 @@ It prints `verify.sh: ok`, or names the file that does not match or should not b
 there. Report back when every node is done. Copy into a new folder only; never over a
 build folder that is in use.
 
-A node added or reimaged later gets the same copy and `verify.sh`. Until it does, a
-placement job that lands there fails, naming the node, and the readiness probe's
-`krepp-index` row warns when it runs there.
+A node added or reimaged later gets the same copy and `verify.sh`. Until it does, an
+activation job that lands there fails, and the readiness probe's `krepp-index` row
+warns when it runs there.
 
 ## 4. Activate
 

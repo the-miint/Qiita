@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from helpers import krepp_recorded_version
 
 from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
@@ -165,6 +166,26 @@ def test_verify_tells_missing_from_unreadable(build, tmp_path):
         (build / SHA256SUMS).chmod(0o644)
 
 
+def test_an_unreadable_subdirectory_is_refused_not_skipped(build):
+    """A directory that cannot be listed would otherwise drop out of the stray-file
+    check and SHA256SUMS."""
+    sums, _ = _register(build)
+    stray = build / "stray"
+    stray.mkdir()
+    (stray / "f").write_text("x")
+    stray.chmod(0)
+    try:
+        for attempt in (
+            lambda: _register(build),
+            lambda: verify_build(build, sums, linked_krepp_version=None),
+        ):
+            with pytest.raises(KreppBuildInvalid) as exc:
+                attempt()
+            assert exc.value.check == "unreadable"
+    finally:
+        stray.chmod(0o755)
+
+
 def test_verify_refuses_a_build_from_another_krepp(build):
     sums, manifest = _register(build)
     built = manifest["settings"]["krepp version"]
@@ -182,7 +203,7 @@ def test_linked_version_is_the_one_an_index_records(krepp_built_index):
         linked = linked_krepp_version(conn)
     finally:
         conn.close()
-    assert linked == inventory_index(krepp_built_index).settings["krepp version"]
+    assert linked == krepp_recorded_version(krepp_built_index)
 
 
 def _gnu_sha256sum() -> bool:

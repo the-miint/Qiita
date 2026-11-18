@@ -299,8 +299,8 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
 # A krepp phylogenetic-placement index, built outside Qiita and registered onto an
-# existing reference (20261117000000_krepp_index_lifecycle.sql). The only type with a
-# lifecycle (ReferenceIndexState) and a node-local `fs_path` (IndexPathRoot.NODE_LOCAL).
+# existing reference. The only type with a lifecycle (ReferenceIndexState) and a
+# node-local `fs_path` (IndexPathRoot.NODE_LOCAL).
 INDEX_TYPE_KREPP = "krepp"
 
 
@@ -310,8 +310,9 @@ class ReferenceIndexState(StrEnum):
     Every index type but krepp is written `active` and stays there. A krepp build is
     written `registered`, becomes `active` when activation passes on a compute node
     (retiring the reference's previous active build in the same transaction), and is
-    `removed` once no running ticket uses it. Only an active build is chosen for a new
-    ticket; a retired one is still served to the tickets already fixed to it."""
+    `removed` once no running ticket uses it. A retired build stays usable by the
+    tickets already fixed to it (work_ticket.reference_index_idx); a removed one is
+    refused to them."""
 
     REGISTERED = "registered"
     ACTIVE = "active"

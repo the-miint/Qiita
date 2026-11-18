@@ -13,6 +13,8 @@ from qiita_common.api_paths import (
     URL_REFERENCE_KREPP_BUILD_ACTIVE,
     URL_WORK_TICKET_RUN,
 )
+from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
+from qiita_common.models import INDEX_TYPE_KREPP, IndexPathRoot, ReferenceIndexState
 
 pytestmark = pytest.mark.db
 
@@ -72,9 +74,12 @@ async def failed_ticket_on_build(postgres_pool, human_admin_session, monkeypatch
     build = await pool.fetchval(
         "INSERT INTO qiita.reference_index"
         " (reference_idx, index_type, fs_path, params, state, fs_path_root)"
-        " VALUES ($1, 'krepp', 'references/x/krepp/a', '{}'::jsonb, 'retired', 'node_local')"
+        " VALUES ($1, $2, 'references/x/krepp/a', '{}'::jsonb, $3, $4)"
         " RETURNING reference_index_idx",
         reference_idx,
+        INDEX_TYPE_KREPP,
+        ReferenceIndexState.RETIRED,
+        IndexPathRoot.NODE_LOCAL,
     )
     ticket = await pool.fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
@@ -122,7 +127,7 @@ async def failed_ticket_on_build(postgres_pool, human_admin_session, monkeypatch
 
 async def test_run_refuses_a_ticket_whose_build_was_removed(client, failed_ticket_on_build):
     w = failed_ticket_on_build
-    await w["set_state"]("removed")
+    await w["set_state"](ReferenceIndexState.REMOVED)
     resp = await client.post(URL_WORK_TICKET_RUN.format(work_ticket_idx=w["ticket"]))
     assert resp.status_code == 409
     assert f"krepp build {w['build']}, which was removed" in resp.json()["detail"]
@@ -148,7 +153,7 @@ async def test_remove_marks_a_retired_build_removed(client, failed_ticket_on_bui
     w = failed_ticket_on_build
     resp = await client.post(_remove_url(w))
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == "removed"
+    assert resp.json()["state"] == ReferenceIndexState.REMOVED
 
 
 async def test_remove_refuses_while_a_ticket_runs_on_the_build(client, failed_ticket_on_build):
@@ -174,10 +179,12 @@ async def test_active_builds_lists_only_active_krepp_builds(client, failed_ticke
     listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
     assert w["build"] not in [b["reference_index_idx"] for b in listed]
     await w["pool"].execute(
-        "UPDATE qiita.reference_index SET state = 'active',"
-        " params = jsonb_build_object('sha256sums_sha256', repeat('e', 64))"
+        "UPDATE qiita.reference_index SET state = $2,"
+        " params = jsonb_build_object($3::text, repeat('e', 64))"
         " WHERE reference_index_idx = $1",
         w["build"],
+        ReferenceIndexState.ACTIVE,
+        SHA256SUMS_SHA256_PARAM,
     )
     listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
     mine = [b for b in listed if b["reference_index_idx"] == w["build"]]

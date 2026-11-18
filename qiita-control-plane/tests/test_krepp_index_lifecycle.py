@@ -1,7 +1,8 @@
 """The krepp build lifecycle in Postgres: the reference_index columns and constraints
-20261117000000_krepp_index_lifecycle.sql adds, `register_index`'s krepp refusals, the
+the krepp_index_lifecycle migration adds, `register_index`'s krepp refusals, the
 state changes in `repositories.reference_index`, and the reference-delete gate."""
 
+import asyncio
 import json
 import uuid
 
@@ -87,6 +88,24 @@ async def _activate(pool, reference_index_idx: int):
         return await activate_krepp_build(conn, reference_index_idx)
 
 
+async def test_two_changes_to_one_reference_take_turns(world):
+    """A second activation on the reference waits for the first to commit, then sees
+    its result: the first build is the one it retires."""
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    b = await _register(world, "b", "b" * 64)
+    async with pool.acquire() as first:
+        tx = first.transaction()
+        await tx.start()
+        await activate_krepp_build(first, a)
+        second = asyncio.create_task(_activate(pool, b))
+        await asyncio.sleep(0.5)
+        assert not second.done()
+        await tx.commit()
+    change = await asyncio.wait_for(second, timeout=10)
+    assert change.retired_reference_index_idx == a
+
+
 async def _remove(pool, reference_index_idx: int):
     async with pool.acquire() as conn, conn.transaction():
         return await remove_krepp_build(conn, reference_index_idx)
@@ -128,12 +147,15 @@ async def test_existing_index_types_default_to_active_absolute(world):
         "SELECT state, fs_path_root FROM qiita.reference_index WHERE reference_index_idx = $1",
         idx,
     )
-    assert (row["state"], row["fs_path_root"]) == ("active", "absolute")
+    assert (row["state"], row["fs_path_root"]) == (
+        ReferenceIndexState.ACTIVE,
+        IndexPathRoot.ABSOLUTE,
+    )
 
 
 @pytest.mark.parametrize(
     ("index_type", "root"),
-    [("krepp", "absolute"), ("rype", "node_local")],
+    [(INDEX_TYPE_KREPP, IndexPathRoot.ABSOLUTE), ("rype", IndexPathRoot.NODE_LOCAL)],
 )
 async def test_node_local_root_is_krepp_only(world, index_type, root):
     with pytest.raises(asyncpg.CheckViolationError):
@@ -147,15 +169,47 @@ async def test_node_local_root_is_krepp_only(world, index_type, root):
         )
 
 
+@pytest.mark.parametrize(
+    "state",
+    [ReferenceIndexState.REGISTERED, ReferenceIndexState.RETIRED, ReferenceIndexState.REMOVED],
+)
+async def test_only_krepp_leaves_active(world, state):
+    with pytest.raises(asyncpg.CheckViolationError):
+        await world["pool"].execute(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, state)"
+            " VALUES ($1, 'rype', '/srv/x.ryxdi', '{}'::jsonb, $2)",
+            world["reference_idx"],
+            state,
+        )
+
+
+@pytest.mark.parametrize("state", [ReferenceIndexState.ACTIVE, ReferenceIndexState.RETIRED])
+async def test_register_index_writes_krepp_registered_only(world, state):
+    with pytest.raises(ValueError, match="registered"):
+        await register_index(
+            world["pool"],
+            reference_idx=world["reference_idx"],
+            index_type=INDEX_TYPE_KREPP,
+            fs_path=f"references/{world['reference_idx']}/krepp/x",
+            params=_params("c" * 64),
+            state=state,
+            fs_path_root=IndexPathRoot.NODE_LOCAL,
+        )
+
+
 async def test_one_active_krepp_build_per_reference(world):
     a = await _register(world, "a", "a" * 64)
     b = await _register(world, "b", "b" * 64)
     await world["pool"].execute(
-        "UPDATE qiita.reference_index SET state = 'active' WHERE reference_index_idx = $1", a
+        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+        a,
+        ReferenceIndexState.ACTIVE,
     )
     with pytest.raises(asyncpg.UniqueViolationError):
         await world["pool"].execute(
-            "UPDATE qiita.reference_index SET state = 'active' WHERE reference_index_idx = $1", b
+            "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+            b,
+            ReferenceIndexState.ACTIVE,
         )
 
 
@@ -188,7 +242,7 @@ async def test_register_krepp_refuses_changed_params(world):
         await _register(world, "a", "c" * 64)
 
 
-@pytest.mark.parametrize("state", ["retired", "removed"])
+@pytest.mark.parametrize("state", [ReferenceIndexState.RETIRED, ReferenceIndexState.REMOVED])
 async def test_register_krepp_refuses_a_retired_or_removed_build(world, state):
     build = await _register(world, "a")
     await world["pool"].execute(
@@ -229,7 +283,10 @@ async def test_activate_retires_the_previous_build(world):
     assert first.retired_reference_index_idx is None
     second = await _activate(pool, b)
     assert second.retired_reference_index_idx == a
-    assert (await _state(pool, a), await _state(pool, b)) == ("retired", "active")
+    assert (await _state(pool, a), await _state(pool, b)) == (
+        ReferenceIndexState.RETIRED,
+        ReferenceIndexState.ACTIVE,
+    )
 
 
 async def test_activate_is_a_no_op_on_the_active_build(world):
@@ -241,7 +298,7 @@ async def test_activate_is_a_no_op_on_the_active_build(world):
     assert again.retired_reference_index_idx is None
 
 
-@pytest.mark.parametrize("state", ["retired", "removed"])
+@pytest.mark.parametrize("state", [ReferenceIndexState.RETIRED, ReferenceIndexState.REMOVED])
 async def test_activate_refuses_a_retired_or_removed_build(world, state):
     pool = world["pool"]
     a = await _register(world, "a")
@@ -272,7 +329,7 @@ async def test_remove_refuses_while_a_ticket_runs_on_the_build(world, ticket_sta
     ticket = await _ticket(world, a, ticket_state)
     with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
         await _remove(pool, a)
-    assert await _state(pool, a) == "retired"
+    assert await _state(pool, a) == ReferenceIndexState.RETIRED
 
 
 @pytest.mark.parametrize("ticket_state", ["completed", "failed", "cancelled", "no_data"])
@@ -364,7 +421,9 @@ async def test_export_refuses_another_reference_and_a_retired_build(world, tmp_p
     with pytest.raises(ValueError, match="belongs to reference"):
         await export_krepp_build(world["pool"], world["reference_idx"] + 1000, a, tmp_path)
     await world["pool"].execute(
-        "UPDATE qiita.reference_index SET state = 'retired' WHERE reference_index_idx = $1", a
+        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+        a,
+        ReferenceIndexState.RETIRED,
     )
     with pytest.raises(ValueError, match="retired"):
         await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
@@ -380,7 +439,7 @@ async def test_activate_from_a_passing_report_records_it(world, tmp_path):
     row = await world["pool"].fetchrow(
         "SELECT state, params FROM qiita.reference_index WHERE reference_index_idx = $1", a
     )
-    assert row["state"] == "active"
+    assert row["state"] == ReferenceIndexState.ACTIVE
     activation = json.loads(row["params"])["activation"]
     assert activation["own_edge_share"] == 0.97 and activation["node"] == "b-cn-01"
 
@@ -396,4 +455,4 @@ async def test_activate_refuses_a_failing_or_foreign_report(world, tmp_path):
     report.write_text(_report(a + 1, own=97))
     with pytest.raises(ValueError, match="is for krepp build"):
         await activate_krepp_build_from_report(world["pool"], a, report)
-    assert await _state(world["pool"], a) == "registered"
+    assert await _state(world["pool"], a) == ReferenceIndexState.REGISTERED

@@ -13,6 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field
 # The workflow context key naming the build (`qiita.reference_index.reference_index_idx`).
 REFERENCE_INDEX_IDX_BINDING = "reference_index_idx"
 
+# The key in a krepp row's `params` holding the sha256 of the build's SHA256SUMS file;
+# KreppBuildRecord's field of the same name carries it to the jobs.
+SHA256SUMS_SHA256_PARAM = "sha256sums_sha256"
+
 KREPP_BUILD_RECORD_BASENAME = "krepp_build.json"
 KREPP_ACTIVATION_REPORT_BASENAME = "krepp_activation_report.json"
 
