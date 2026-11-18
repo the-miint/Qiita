@@ -15,8 +15,6 @@ import hashlib
 import json
 import shutil
 import subprocess
-import sys
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -34,56 +32,12 @@ from qiita_compute_orchestrator.krepp_build import (
     write_build_files,
 )
 
-_BUILD_TIMEOUT_S = 300
-TREE_NEWICK = "((g0:1,g1:1):1,(g2:1,g3:1):1);\n"
-
-_BUILD = textwrap.dedent(
-    """
-    import random, sys
-    from qiita_compute_orchestrator.miint import open_miint_conn
-    out, nwk = sys.argv[1], sys.argv[2]
-    conn = open_miint_conn()
-    rng = random.Random(1)
-    conn.execute("CREATE TABLE ref (read_id VARCHAR, sequence1 VARCHAR)")
-    conn.executemany(
-        "INSERT INTO ref VALUES (?, ?)",
-        [(f"g{i}", "".join(rng.choice("ACGT") for _ in range(20000))) for i in range(4)],
-    )
-    conn.execute(
-        "CREATE TABLE tree AS SELECT * REPLACE (node_index AS edge_id) FROM read_newick(?)",
-        [nwk],
-    )
-    for r in (0, 1):
-        status = conn.execute(
-            f"SELECT status FROM krepp_index_create('ref', '{out}', tree_table := 'tree',"
-            f" k := 19, w := 25, h := 9, m := 4, r := {r}, frac := false)"
-        ).fetchone()[0]
-        assert status == "ok", status
-    """
-)
-
-
-@pytest.fixture(scope="session")
-def built_index(tmp_path_factory) -> Path:
-    """`index/` of a two-partition (m=4, r=0 and r=1) index over four random genomes."""
-    root = tmp_path_factory.mktemp("krepp-index")
-    nwk = root / "tree.nwk"
-    nwk.write_text(TREE_NEWICK)
-    out = root / "index"
-    subprocess.run(
-        [sys.executable, "-c", _BUILD, str(out), str(nwk)],
-        check=True,
-        timeout=_BUILD_TIMEOUT_S,
-        capture_output=True,
-    )
-    return out
-
 
 @pytest.fixture
-def build(built_index, tmp_path) -> Path:
+def build(krepp_built_index, tmp_path) -> Path:
     """A build folder: the index plus the two JEST files, not yet registered."""
     folder = tmp_path / "w43_test"
-    shutil.copytree(built_index, folder / "index")
+    shutil.copytree(krepp_built_index, folder / "index")
     (folder / "jest").mkdir()
     (folder / JEST_LABELLED_TREE).write_text(
         "((g0:1{0},g1:1{1}):1{2},(g2:1{3},g3:1{4}):1{5}){6};\n"
@@ -96,8 +50,8 @@ def _register(folder: Path) -> tuple[str, dict]:
     return write_build_files(folder, reference_idx=18, build_label=folder.name, threads=2)
 
 
-def test_inventory_reads_what_krepp_writes(built_index):
-    inv = inventory_index(built_index)
+def test_inventory_reads_what_krepp_writes(krepp_built_index):
+    inv = inventory_index(krepp_built_index)
     assert inv.m == 4
     assert inv.partitions == (0, 1)
     assert len(inv.files) == 14
@@ -105,7 +59,7 @@ def test_inventory_reads_what_krepp_writes(built_index):
     assert (inv.settings["k"], inv.settings["w"], inv.settings["h"]) == ("19", "25", "9")
     assert inv.settings["krepp version"].startswith("v")
     # krepp writes the backbone tree as Newick carrying the edge numbers it was given.
-    assert "{6}" in (built_index / "tree-m4r0-no_frac").read_text()
+    assert "{6}" in (krepp_built_index / "tree-m4r0-no_frac").read_text()
 
 
 def test_registration_is_deterministic(build):

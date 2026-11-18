@@ -77,3 +77,8 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
             )
             return mem_gb
     raise AssertionError(f"build-shard-index declares no {step_name} step")
+
+
+# The backbone of the conftest `krepp_built_index` fixture; the index numbers its edges
+# edge_id = node_index, as Qiita numbers an undecorated tree.
+KREPP_TREE_NEWICK = "((g0:1,g1:1):1,(g2:1,g3:1):1);\n"

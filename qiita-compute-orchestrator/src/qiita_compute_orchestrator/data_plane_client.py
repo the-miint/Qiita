@@ -209,6 +209,30 @@ async def open_reference_chunk_stream(
         yield rel
 
 
+@asynccontextmanager
+async def open_reference_phylogeny_stream(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    reference_idx: int,
+    relation: str = "reference_phylogeny",
+) -> AsyncIterator[str]:
+    """Mint a whole-reference `reference_phylogeny` DoGet ticket (CO→CP) and stream
+    the reference's tree rows (`read_newick`'s shape plus `reference_idx` and
+    `feature_idx`) into `conn` as `relation`. The krepp registration job compares
+    them with the tree a build carries."""
+
+    async def _mint(http: httpx.AsyncClient) -> bytes:
+        return await fetch_reference_doget_ticket(
+            http=http,
+            reference_idx=reference_idx,
+            table="reference_phylogeny",
+            feature_idx=None,
+        )
+
+    async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
+        yield rel
+
+
 async def fetch_read_doget_ticket(
     *,
     http: httpx.AsyncClient,

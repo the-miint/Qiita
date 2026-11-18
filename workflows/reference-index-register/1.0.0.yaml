@@ -1,0 +1,59 @@
+action_id: reference-index-register
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Register a krepp placement index that was built outside Qiita onto an existing
+  reference. The build is placed by hand at
+  `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` (`index/` with the
+  krepp files, `jest/` with JEST's labelled tree and null), and this workflow checks
+  it — the folder is a krepp build, written by the krepp the staged miint links, over
+  the reference's own tree with its edge numbers — writes README.md, manifest.json,
+  verify.sh and SHA256SUMS into it, and records it in qiita.reference_index as
+  `registered`. A registered build is not used: the cluster admins copy the folder to
+  every node's PATH_NODE_LOCAL, and `reference-index-activate` makes it the
+  reference's active build. docs/runbooks/krepp-index.md has the whole procedure.
+
+  The reference stays as it is (it must already be active, with its phylogeny in
+  the lake), so the action carries no success_status or failure_status: an active
+  reference has no transition to make.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required: [build_label]
+  properties:
+    # One path segment (derived_store.krepp_build_relpath enforces the same rule).
+    build_label:
+      type: string
+      pattern: "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$"
+
+steps:
+  - step: krepp_index_register
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.krepp_index_register
+    inputs: []
+    params: {build_label: build_label}
+    outputs: [krepp_index_meta]
+    # Not measured. The step reads every file of the build once to hash it
+    # (111,220,176,217 bytes for w43 r0-15, per the build's own listing), on `cpu`
+    # threads; the checks before that read only the metadata text and the trees.
+    baseline_resources:
+      cpu: 8
+      mem_gb: 8
+      walltime: PT6H
+
+  - action: register-index
+    inputs: [krepp_index_meta]
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 32
+  walltime: PT24H
