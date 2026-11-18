@@ -870,6 +870,108 @@ def test_transient_and_permanent_failures_beside_a_stored_run_retry_first(
     assert exc.value.kind == FailureKind.EXTERNAL_FETCH_TRANSIENT
 
 
+_MD5_MISMATCH = "read_ena_sequences: md5 mismatch for run: expected a got b"
+_MALFORMED = "read_ena_sequences: malformed FASTQ record"
+
+
+def _final_inputs(tmp_path, roster) -> Inputs:
+    return Inputs(**{**_inputs(tmp_path, roster).model_dump(), "final_attempt": True})
+
+
+def test_final_attempt_lands_the_stored_run_and_records_the_transient_failure(
+    fake_mint, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        ingest_module,
+        "_stage_run_reads",
+        _fake_with_failing_run("ERR001", duckdb.IOException(_MD5_MISMATCH)),
+    )
+    inputs = _final_inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
+
+    outputs = _run(inputs, tmp_path / "ws")
+
+    assert fake_mint == [(11, 1)]
+    assert [p.name for p in (outputs["read_staging_dir"] / "read").iterdir()] == ["11.parquet"]
+    (failed,) = _read_run_outcomes(outputs)
+    assert failed["ena_run_accession"] == "ERR001"
+    assert failed["failure_type"] == FailureType.RETRIABLE.value
+
+
+def test_final_attempt_gives_each_failure_its_own_type(fake_mint, monkeypatch, tmp_path):
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        if run_accession == "ERR001":
+            raise duckdb.InvalidInputException(_MALFORMED)
+        if run_accession == "ERR002":
+            raise duckdb.IOException(_MD5_MISMATCH)
+        _write_intermediate(intermediate_path, _GOOD_ROWS)
+        return 1
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _final_inputs(tmp_path, [(10, "ERR001"), (11, "ERR002"), (12, "ERR003")])
+
+    outputs = _run(inputs, tmp_path / "ws")
+
+    types = {o["ena_run_accession"]: o["failure_type"] for o in _read_run_outcomes(outputs)}
+    assert types == {
+        "ERR001": FailureType.PERMANENT.value,
+        "ERR002": FailureType.RETRIABLE.value,
+    }
+
+
+def test_final_attempt_still_raises_when_no_run_was_stored(fake_mint, monkeypatch, tmp_path):
+    def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
+        raise duckdb.IOException(_MD5_MISMATCH)
+
+    monkeypatch.setattr(ingest_module, "_stage_run_reads", _fake)
+    inputs = _final_inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.transient is True
+
+
+def test_final_attempt_still_fails_the_step_on_an_unrecognised_error(
+    fake_mint, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        ingest_module,
+        "_stage_run_reads",
+        _fake_with_failing_run("ERR001", duckdb.OutOfMemoryException("Out of Memory Error")),
+    )
+    inputs = _final_inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
+
+    with pytest.raises(duckdb.OutOfMemoryException):
+        _run(inputs, tmp_path / "ws")
+
+
+def test_final_attempt_counts_an_earlier_attempts_stored_run_as_stored(
+    fake_mint, monkeypatch, tmp_path
+):
+    """The only run that fetches fails, but a prior attempt stored the other one."""
+    inputs = _final_inputs(tmp_path, [(10, "ERR001"), (11, "ERR002")])
+    durable = compute_reads_staging_path(inputs.reads_staging_root, 11)
+    durable.parent.mkdir(parents=True)
+    _write_intermediate(durable, [(1, "r1", "ACGT", None, None, None)])
+    monkeypatch.setattr(
+        ingest_module,
+        "_stage_run_reads",
+        _fake_with_failing_run("ERR001", duckdb.IOException(_MD5_MISMATCH)),
+    )
+
+    outputs = _run(inputs, tmp_path / "ws")
+
+    assert [p.name for p in (outputs["read_staging_dir"] / "read").iterdir()] == ["11.parquet"]
+    (failed,) = _read_run_outcomes(outputs)
+    assert failed["ena_run_accession"] == "ERR001"
+
+
+def test_final_attempt_defaults_to_false_and_parses_the_runners_string(tmp_path):
+    assert _inputs(tmp_path, [(10, "ERR001")]).final_attempt is False
+    base = _inputs(tmp_path, [(10, "ERR001")]).model_dump()
+    assert Inputs(**{**base, "final_attempt": "True"}).final_attempt is True
+    assert Inputs(**{**base, "final_attempt": "False"}).final_attempt is False
+
+
 def test_permanent_mint_failure_fails_the_step_beside_a_good_run(monkeypatch, tmp_path):
     """Only fetch failures are landable. A permanent failure in the mint is a
     fault in the ticket, not a bad run, so it fails the whole step."""

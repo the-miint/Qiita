@@ -23,10 +23,10 @@ description: >
   fetches every run with `read_ena_sequences`, mints a sequence_idx range
   per run, and writes the FULL reads into the DuckLake `read` table (once,
   independent of any mask) plus a durable per-sample copy the repeatable
-  read-mask workflow consumes. A run whose fetch fails permanently does not
-  fail the pool when another run was stored: `persist-ena-run-outcomes`
-  records it on its sequenced_sample. Transport is pinned to `download_method:
-  http` (no Aspera key-staging exists in the compute env; see
+  read-mask workflow consumes. A run whose fetch fails permanently, or transiently
+  once the ticket's retries are spent, does not fail the pool when another run was
+  stored: `persist-ena-run-outcomes` records it on its sequenced_sample and
+  releases the range minted for it. Transport is pinned to `download_method: http` (no Aspera key-staging exists in the compute env; see
   `docs/architecture.md`'s ENA Study Import download-ticket-granularity decision).
 
 scopes: []
@@ -87,7 +87,10 @@ steps:
     # scalar, not a path) — optional; the job defaults to 'http' when
     # a submitter omits it.
     inputs: [ena_run_map, reads_staging_root]
-    params: { download_method: download_method, run_concurrency: run_concurrency }
+    params:
+      download_method: download_method
+      run_concurrency: run_concurrency
+      final_attempt: final_attempt
     outputs: [read_staging_dir, run_outcomes]
     baseline_resources:
       # Bounded-concurrent per-run loop (`run_concurrency` runs fetched at
