@@ -154,10 +154,10 @@ Curation is a system-admin surface: `POST` / `DELETE /reference/exclusion` (glob
 
 ## Aligner Index Storage
 
-Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem. The tier root is `/scratch/persistent-local/` for random-access aligner indices, or `/scratch/persistent/` for built reference data whose access pattern doesn't justify the local-SSD copy; the subtree below is identical either way:
+Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem, under `PATH_DERIVED` (`/scratch/persistent/`):
 
 ```
-<persistent-tier-root>/references/{reference_idx}/
+PATH_DERIVED/references/{reference_idx}/
 ├── minimap2/
 │   └── index.mmi
 ├── bowtie2/
@@ -174,6 +174,18 @@ The control plane records which indices exist for each reference version in the 
 The host-filter indexes (a rype `.ryxdi` over every feature and a minimap2 `.mmi` sidecar) are the first indexes minted through this table. They follow the same per-reference `references/{reference_idx}/{rype,minimap2}/` subtree shown above, but their root is specifically the orchestrator's **`PATH_DERIVED`** (the `build_rype_index` and `build_minimap2_index` native jobs read `get_settings().path_derived`); the deploy may point `PATH_DERIVED` at a different tier than the aligner-index `<persistent-tier-root>`, so don't assume the two roots are identical. The jobs write `{PATH_DERIVED}/references/{reference_idx}/rype/index.ryxdi` (a directory) and `.../minimap2/index.mmi` (a file), then a `register-index` action records each row. Because those paths are derived on the compute node, the SLURM backend propagates `PATH_DERIVED` into the job env (otherwise it would resolve to the `$TMPDIR/qiita/derived` default). The rype build manifest (buckets, k/w, salt) lives inside the `.ryxdi`; `reference_index.params` keeps only a small copy (`{k, w, bucket_name}` for rype, `{preset, source_chunks, num_subjects}` for minimap2).
 
 This `PATH_DERIVED` tree is **derived storage**, the orchestrator's third storage concern alongside the data plane's persistent DuckLake data and the orchestrator's own per-attempt scratch workspace. It is durable but per-reference and compute-side: the two builder jobs write it, `host_filter` reads it (via the DB-recorded `reference_index.fs_path`), and `DELETE /reference-artifact/{idx}` purges the whole `references/{idx}` subtree. The `{PATH_DERIVED}/references/{idx}/...` layout has one owner — `qiita_compute_orchestrator/derived_store.py` (`reference_derived_dir` / `rype_index_path` / `rype_router_index_path` / `minimap2_index_path` / `bowtie2_index_path` / `shard_minimap2_dir` / `shard_minimap2_index_path` / `shard_bowtie2_dir` / `shard_bowtie2_index_prefix`) — which all consumers call rather than rebuilding the path by hand. **The per-shard aligner layout is pinned to the exact `shard_directory` shape miint's `align_{minimap2,bowtie2}_sharded` expects** (verified against the real build — see [duckdb-miint.md](../duckdb-miint.md)): each aligner has ONE per-reference shard-directory root that `align_sharded` is pointed at, holding one entry per shard — minimap2 a FLAT `references/{idx}/minimap2-shards/{shard_id}.mmi` (`shard_minimap2_dir` / `shard_minimap2_index_path`), bowtie2 a per-shard SUBDIR `references/{idx}/bowtie2-shards/{shard_id}/index*` (the multi-file `.bt2` set; `shard_bowtie2_dir` / `shard_bowtie2_index_prefix`). The read router is a single whole-reference multi-bucket rype `.ryxdi` at `references/{idx}/rype-router.ryxdi` (`rype_router_index_path`). **There is no per-shard rype `.ryxdi`** — the per-shard rype build was removed (the whole-reference router replaced it for routing), so `derived_store` no longer carries `shard_rype_index_path` / `reference_shard_dir`. All of these stay under `references/{idx}`, so the same single-subtree `DELETE /reference-artifact/{idx}` purge covers them. Because these paths sit outside `$QIITA_OUTPUT_PATH`, a builder must never declare its index as a step output (it would fail gate 4); the location travels in the step's in-tree meta JSON, which `register-index` reads. See the native-step note under "Container contract".
+
+## krepp placement index builds
+
+A krepp index is built outside Qiita and registered onto an existing reference whose tree is in the lake. It is the one index type with a lifecycle (`qiita.reference_index.state`) and a node-local copy:
+
+1. The build is placed by hand at `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` — `index/` with krepp's files, `jest/` with JEST's labelled tree and null.
+2. `reference-index-register` checks it and records it `registered` (`jobs/krepp_index_register.py` says what it checks). Its tree must be the reference's tree by edge number, parent edge, branch length and tip name: `place_krepp` returns the index's edge numbers verbatim, and `reference_phylogeny.edge_id` is what they are joined on (see *Edge numbering* above). The row's `params` carry the hash of the `SHA256SUMS` registration writes into the folder.
+3. The cluster admins copy the folder to every node's `PATH_NODE_LOCAL` ([storage](storage.md)) and run its `verify.sh`.
+4. `reference-index-activate` checks a node copy and places pieces of known backbone tips with it; when enough land on their own edge it makes the build `active`, retiring the reference's previous active build in the same transaction. At most one krepp build per reference is active.
+5. `qiita-admin krepp-index remove` marks a registered or retired build `removed` once no running ticket uses it. A reference with a build not yet removed cannot be deleted.
+
+A ticket that places with a build records it in `work_ticket.reference_index_idx` and keeps it: a restarted ticket uses the same build, still served once retired; `/run` refuses one whose build is removed. Every job that reads a node copy runs `krepp_build.verify_build` on it first and fails, naming the node, when it does not match. [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) is the operator procedure.
 
 ## Shard planner
 

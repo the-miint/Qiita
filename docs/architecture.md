@@ -39,6 +39,7 @@ Three-level identity model, taxonomy, phylogeny, exclusion, aligner indices, hos
 - [Phylogeny and Placements](architecture/reference-data.md#phylogeny-and-placements)
 - [Reference exclusion (curated blocklist)](architecture/reference-data.md#reference-exclusion-curated-blocklist)
 - [Aligner Index Storage](architecture/reference-data.md#aligner-index-storage)
+- [krepp placement index builds](architecture/reference-data.md#krepp-placement-index-builds)
 - [Shard planner](architecture/reference-data.md#shard-planner)
 - [Reference sequence streaming (build jobs)](architecture/reference-data.md#reference-sequence-streaming-build-jobs)
 - [Sharded-index fan-out](architecture/reference-data.md#sharded-index-fan-out)

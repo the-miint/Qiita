@@ -48,6 +48,6 @@ def add_krepp_index_subparsers(sub) -> None:
         "--reference-index-idx",
         type=int,
         required=True,
-        help="the build's reference_index_idx (`qiita reference list --index-type krepp`)",
+        help="the build's reference_index_idx (GET /api/v1/reference/{idx}/index)",
     )
     p_remove.set_defaults(handler=_handle_remove)

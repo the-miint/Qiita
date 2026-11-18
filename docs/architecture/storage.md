@@ -39,22 +39,22 @@ PATH_PERSISTENT/                            durable, backed up
   duckdb-spill/<host>-<pid>-<random>/       one data-plane connection's DuckDB spill
   references/staging/<name>/<version>/     operator-staged reference source files (docs/reference-data-staging.md)
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
-    references/<reference_idx>/<aligner>/   built reference data that doesn't need local-SSD random access
-  persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
-    references/<reference_idx>/<aligner>/   built reference data that needs local-SSD random access (e.g. aligner indices); rebuild-on-miss is the safety net
+    references/<reference_idx>/<index>/     built reference indexes (PATH_DERIVED/references; derived_store.py)
+    references/<reference_idx>/krepp/<build_label>/  master copy of a krepp build, placed by hand
+  qiita-miint/                              recommended PATH_NODE_LOCAL: each compute node's own disk, same content on every node
+    references/<reference_idx>/krepp/<build_label>/  a node's copy of a krepp build, made by the cluster admins
 ```
 
-Two persistent tiers under `/scratch/`:
+Two tiers hold built reference data:
 
-- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Hosts built reference data whose access pattern doesn't justify the local-SSD copy (large databases, sequentially read inputs, anything streamed once per job).
-- `/scratch/persistent-local/` — **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
-
-Built reference data therefore lives under exactly one of `/scratch/persistent/references/<reference_idx>/<aligner>/` or `/scratch/persistent-local/references/<reference_idx>/<aligner>/`, picked per-reference at ingest time based on the database's access pattern. The path structure is the same; only the tier root differs.
+- `PATH_DERIVED` (`/scratch/persistent/`) — the shared-FS persistent tier. Visible to every node, durable. Every index Qiita builds lives here (`derived_store.py` owns the layout), and the master copy of a krepp build.
+- `PATH_NODE_LOCAL` (`/scratch/qiita-miint/`) — a directory on each compute node's own disk that the cluster admins keep identical on every node. It holds the node copies of krepp builds, which placement reads in place rather than from the shared filesystem, where `place_krepp` with an index read by mmap stalled intermittently for 20–55 min (2026-09-28; the same queries from memory ran in seconds). Reading from a node's own disk has not been measured yet. The orchestrator requires it at SLURM boot and forwards it into every job. A krepp build's `reference_index.fs_path` is relative (`fs_path_root` `node_local`) and names the same folder under both roots. Nothing rebuilds a node copy: a job that finds its node's copy missing or changed fails, naming the node (`krepp_build.verify_build`). [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) has the copy procedure.
 
 Retention:
 
 - `PATH_PERSISTENT/` — never auto-deleted. Backed up by cluster policy.
-- `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
+- `/scratch/persistent/` — never auto-deleted by us; cluster purge exemption requested. Deleting a reference removes its `references/<reference_idx>/` subtree (`DELETE /reference-artifact/{idx}`), which the delete refuses while the reference has a krepp build not yet removed.
+- `PATH_NODE_LOCAL` — never written by Qiita; the cluster admins copy builds in and delete removed ones (`docs/runbooks/krepp-index.md`).
 - `PATH_SCRATCH/duckdb-spill/` — each directory is removed when the data-plane connection that owns it goes, which no stop reaches: the process has no shutdown path that drops its pool. A data plane at boot removes the directories its own host left whose process is gone (`sweep_abandoned_spill_directories` in `qiita-data-plane/src/pool.rs`); another host's are left to that host.
 - `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` — nothing reclaims them automatically: no sweep deletes a ticket's workspace or an upload's staging directory after the ticket ends, so both grow with every ticket. Registration moves a registered file out of its output dir; everything else (inputs, logs, `tmp/`, outputs no step registered) stays. `qiita-admin scratch reclaim --older-than DAYS [--execute]` deletes everything under `ticket/<idx>/<step>/attempt-<N>/` except `logs/` for finished tickets (see `--help` for eligibility; `--older-than` counts from the ticket's last update). It must run as the user that owns the job output dirs (the SLURM job user), since it restores owner write on 0550 container output dirs before deleting. It never touches `staging/`. A reclaimed ticket can no longer feed a backfill that reads its workspace, so the command skips the read-mask tickets the SynDNA read-count backfill would still write and the long-read-assembly tickets the gene-call recovery can still recover or is recovering; once a ticket is reclaimed, its backfill gap is permanent.
 
