@@ -3188,7 +3188,9 @@ def register_index_spy(monkeypatch):
 
     calls: list[tuple[str, dict]] = []
 
-    async def register_index(pool, *, reference_idx, index_type, fs_path, params, shard_id=None):
+    async def register_index(
+        pool, *, reference_idx, index_type, fs_path, params, shard_id=None, state, fs_path_root
+    ):
         calls.append((index_type, params))
 
     monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_INDEX, register_index)

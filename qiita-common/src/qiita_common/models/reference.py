@@ -298,6 +298,38 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 # carried it yet.
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
+# A krepp phylogenetic-placement index, built outside Qiita and registered onto an
+# existing reference (20261117000000_krepp_index_lifecycle.sql). The only type with a
+# lifecycle (ReferenceIndexState) and a node-local `fs_path` (IndexPathRoot.NODE_LOCAL).
+INDEX_TYPE_KREPP = "krepp"
+
+
+class ReferenceIndexState(StrEnum):
+    """`qiita.reference_index.state` (TEXT + CHECK, no Postgres ENUM).
+
+    Every index type but krepp is written `active` and stays there. A krepp build is
+    written `registered`, becomes `active` when activation passes on a compute node
+    (retiring the reference's previous active build in the same transaction), and is
+    `removed` once no running ticket uses it. Only an active build is chosen for a new
+    ticket; a retired one is still served to the tickets already fixed to it."""
+
+    REGISTERED = "registered"
+    ACTIVE = "active"
+    RETIRED = "retired"
+    REMOVED = "removed"
+
+
+class IndexPathRoot(StrEnum):
+    """`qiita.reference_index.fs_path_root` (TEXT + CHECK): what `fs_path` is relative to.
+
+    ABSOLUTE: `fs_path` is a host path. NODE_LOCAL: `fs_path` is relative; it resolves
+    under the orchestrator's PATH_NODE_LOCAL on a compute node, and under PATH_DERIVED
+    for the master copy the node copies are made from. A CHECK ties NODE_LOCAL to
+    index_type krepp."""
+
+    ABSOLUTE = "absolute"
+    NODE_LOCAL = "node_local"
+
 
 class ReferenceIndex(BaseModel):
     """A built search index for a reference (e.g. a rype `.ryxdi` directory).
@@ -320,6 +352,8 @@ class ReferenceIndex(BaseModel):
     params: dict[str, Any]
     created_at: AwareDatetime
     shard_id: int | None = None
+    state: ReferenceIndexState = ReferenceIndexState.ACTIVE
+    fs_path_root: IndexPathRoot = IndexPathRoot.ABSOLUTE
 
 
 class ReferenceShardIndexStatus(BaseModel):

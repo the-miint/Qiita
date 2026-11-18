@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncpg
 from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_STATUS
 from qiita_common.models import (
+    INDEX_TYPE_KREPP,
     NON_TERMINAL_WORK_TICKET_STATES,
     TERMINAL_WORK_TICKET_STATES,
     VALID_STATUS_TRANSITIONS,
+    ReferenceIndexState,
     ReferenceResponse,
     ReferenceStatus,
 )
@@ -45,9 +47,9 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 class ReferenceDeleteBlocked(Exception):
     """Raised when a reference cannot be deleted. `alignment_definitions` and
-    `genome_derivations` block unconditionally (even with force); `in_flight` work
-    tickets always block; `terminal` work tickets block only when the caller did not
-    pass force=True."""
+    `genome_derivations` and `krepp_builds` (krepp builds not yet removed) block
+    unconditionally (even with force); `in_flight` work tickets always block;
+    `terminal` work tickets block only when the caller did not pass force=True."""
 
     def __init__(
         self,
@@ -57,15 +59,17 @@ class ReferenceDeleteBlocked(Exception):
         terminal: int,
         alignment_definitions: int = 0,
         genome_derivations: int = 0,
+        krepp_builds: int = 0,
     ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
         self.genome_derivations = genome_derivations
-        # Alignment definitions and genome derivations both block even with force;
-        # alignment definitions are the one the operator most needs to act on, so they
-        # are reported first when present. The DuckLake
+        self.krepp_builds = krepp_builds
+        # Alignment definitions, genome derivations and krepp builds all block even with
+        # force; alignment definitions are the one the operator most needs to act on, so
+        # they are reported first when present. The DuckLake
         # `alignment` rows are keyed on `feature_idx`, which this delete would
         # orphan-GC, and no route deletes a completed alignment's rows, so a
         # reference that has been aligned against is kept.
@@ -84,6 +88,13 @@ class ReferenceDeleteBlocked(Exception):
             reason = (
                 f"it asserts {genome_derivations} genome derivation(s) "
                 "(qiita.genome_derivation), so it cannot be deleted, with or without force"
+            )
+        elif krepp_builds:
+            reason = (
+                f"{krepp_builds} krepp build(s) of it are not removed; the delete would "
+                "take the master copy under PATH_DERIVED with it, and Qiita cannot rebuild "
+                "a krepp index. Remove each build first (`qiita-admin krepp-index remove`), "
+                "with or without force"
             )
         elif in_flight:
             reason = (
@@ -162,13 +173,31 @@ async def assert_reference_deletable(
         "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
         reference_idx,
     )
-    if alignment_definitions or genome_derivations or in_flight or (terminal and not force):
+    # A krepp build is placed by tickets scoped to a prep_sample, which the
+    # reference_idx gate above cannot see; a build is removed only once none of them
+    # runs on it (repositories.reference_index.remove_krepp_build), so "every build
+    # removed" covers them. Blocks even with force.
+    krepp_builds = await conn.fetchval(
+        "SELECT count(*) FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND state <> $3",
+        reference_idx,
+        INDEX_TYPE_KREPP,
+        ReferenceIndexState.REMOVED.value,
+    )
+    if (
+        alignment_definitions
+        or genome_derivations
+        or krepp_builds
+        or in_flight
+        or (terminal and not force)
+    ):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
             alignment_definitions=alignment_definitions,
             genome_derivations=genome_derivations,
+            krepp_builds=krepp_builds,
         )
     return status
 

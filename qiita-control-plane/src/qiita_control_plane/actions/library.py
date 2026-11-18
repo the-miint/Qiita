@@ -46,12 +46,15 @@ from qiita_common.assembly_constants import (
 from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
+    INDEX_TYPE_KREPP,
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
     GenomeSource,
+    IndexPathRoot,
     QcCheckResult,
     ReadMaskBucket,
     ReadMaskReason,
+    ReferenceIndexState,
     ReferenceStatus,
     read_mask_reason_sql_list,
 )
@@ -1976,6 +1979,8 @@ async def register_index(
     fs_path: str,
     params: dict[str, Any],
     shard_id: int | None = None,
+    state: ReferenceIndexState = ReferenceIndexState.ACTIVE,
+    fs_path_root: IndexPathRoot = IndexPathRoot.ABSOLUTE,
 ) -> int:
     """Record a built search index (e.g. a rype `.ryxdi`) for a reference in
     qiita.reference_index. `fs_path` is the on-disk location; `params` is the
@@ -1985,6 +1990,11 @@ async def register_index(
     `shard_id` is recorded verbatim: None for an unsharded whole-reference index
     (host `rype`/`minimap2`), or the shard's index (0..N-1) for a sharded
     analysis index that writes one row per shard.
+
+    `state` and `fs_path_root` default to what every index type but krepp is: a
+    served index at a host path. A krepp build is registered
+    `ReferenceIndexState.REGISTERED` with a `IndexPathRoot.NODE_LOCAL` relative path
+    (the table's CHECK ties the two together), and only activation serves it.
 
     Returns the reference_index_idx. Idempotent on
     (reference_idx, index_type, fs_path): a workflow retried from the start
@@ -2000,10 +2010,17 @@ async def register_index(
     preserve that shard->path bijection. This guards the sequential re-run path;
     truly concurrent registrations of the same reference are not expected (one
     workflow runs per reference at a time).
+
+    For krepp the existing row is returned only when it is the same build: its
+    `params` equal these (they carry the build's `SHA256SUMS` hash) and it is
+    still `registered` or `active`. A folder edited after registration, or one
+    registered again after its build was retired or removed, raises ValueError —
+    a rebuild takes a new folder name.
     """
     row = await pool.fetchrow(
-        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
-        " SELECT $1, $2, $3, $4::jsonb, $5"
+        "INSERT INTO qiita.reference_index"
+        " (reference_idx, index_type, fs_path, params, shard_id, state, fs_path_root)"
+        " SELECT $1, $2, $3, $4::jsonb, $5, $6, $7"
         " WHERE NOT EXISTS ("
         "   SELECT 1 FROM qiita.reference_index"
         "   WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3)"
@@ -2013,16 +2030,34 @@ async def register_index(
         fs_path,
         json.dumps(params),
         shard_id,
+        state.value,
+        fs_path_root.value,
     )
     if row is not None:
         return row["reference_index_idx"]
-    return await pool.fetchval(
-        "SELECT reference_index_idx FROM qiita.reference_index"
+    existing = await pool.fetchrow(
+        "SELECT reference_index_idx, params, state FROM qiita.reference_index"
         " WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3",
         reference_idx,
         index_type,
         fs_path,
     )
+    if index_type == INDEX_TYPE_KREPP:
+        if json.loads(existing["params"]) != params:
+            raise ValueError(
+                f"reference {reference_idx} already has a krepp build at {fs_path!r}"
+                f" (reference_index_idx {existing['reference_index_idx']}) with different"
+                " params; the folder changed after it was registered. Register the new"
+                " build under a new folder name."
+            )
+        if existing["state"] in (ReferenceIndexState.RETIRED, ReferenceIndexState.REMOVED):
+            raise ValueError(
+                f"the krepp build at {fs_path!r} (reference_index_idx"
+                f" {existing['reference_index_idx']}) is {existing['state']}; a build is not"
+                " registered again after it has been retired or removed. Register it under"
+                " a new folder name."
+            )
+    return existing["reference_index_idx"]
 
 
 async def finalize_shard(

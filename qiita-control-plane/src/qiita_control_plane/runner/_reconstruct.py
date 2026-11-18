@@ -27,6 +27,8 @@ from qiita_common.data_plane_errors import (
 from qiita_common.models import (
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
+    IndexPathRoot,
+    ReferenceIndexState,
     ScopeTargetKind,
     StepHandleWire,
     StepProgressState,
@@ -722,6 +724,10 @@ async def _run_action_primitive(
             fs_path=meta["fs_path"],
             params=meta["params"],
             shard_id=meta.get("shard_id"),
+            # A krepp registration meta names both (`registered`, `node_local`);
+            # every other builder's meta omits them and keeps the defaults.
+            state=ReferenceIndexState(meta.get("state", ReferenceIndexState.ACTIVE)),
+            fs_path_root=IndexPathRoot(meta.get("fs_path_root", IndexPathRoot.ABSOLUTE)),
         )
         return {}
 

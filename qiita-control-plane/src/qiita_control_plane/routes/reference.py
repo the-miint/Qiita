@@ -221,11 +221,14 @@ async def get_reference_index(
     consumes (the runner injects it directly; this endpoint is for general
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
     reference metadata GETs — because fs_path exposes internal filesystem
-    layout; reference:read is held by every human role and service account."""
+    layout; reference:read is held by every human role and service account.
+
+    A krepp build's `fs_path` is relative (`fs_path_root` node_local): it names the
+    same folder under every compute node's PATH_NODE_LOCAL and under PATH_DERIVED."""
     await require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
-        " shard_id"
+        " shard_id, state, fs_path_root"
         " FROM qiita.reference_index WHERE reference_idx = $1"
         " ORDER BY created_at DESC, reference_index_idx DESC",
         reference_idx,

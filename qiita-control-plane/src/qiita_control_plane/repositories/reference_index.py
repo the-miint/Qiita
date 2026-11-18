@@ -1,0 +1,176 @@
+"""State changes of a krepp build (`qiita.reference_index` rows with index_type krepp).
+
+A build is registered by `actions.library.register_index` (`registered`), activated
+once its node copies have passed the activation checks (`activate_krepp_build`), and
+removed once no running ticket uses it (`remove_krepp_build`). Each change locks the
+reference's krepp rows `FOR UPDATE` first, so two changes to one reference's builds
+serialise. A ticket records the build it is fixed to in `work_ticket.reference_index_idx`
+and keeps it; `/run` refuses a ticket whose build is removed
+(`removed_build_of_ticket`).
+"""
+
+from dataclasses import dataclass
+
+import asyncpg
+from qiita_common.models import (
+    INDEX_TYPE_KREPP,
+    NON_TERMINAL_WORK_TICKET_STATES,
+    ReferenceIndexState,
+)
+
+from . import require_transaction
+
+
+class KreppBuildNotFound(LookupError):
+    """No krepp row has this reference_index_idx."""
+
+    def __init__(self, reference_index_idx: int):
+        self.reference_index_idx = reference_index_idx
+        super().__init__(f"no krepp build with reference_index_idx {reference_index_idx}")
+
+
+class KreppBuildTransitionRefused(Exception):
+    """The requested state change is not allowed from the build's current state, or a
+    running ticket still uses the build. `reason` is the sentence an operator reads."""
+
+    def __init__(self, reference_index_idx: int, reason: str):
+        self.reference_index_idx = reference_index_idx
+        self.reason = reason
+        super().__init__(f"krepp build {reference_index_idx}: {reason}")
+
+
+@dataclass(frozen=True)
+class KreppBuildChange:
+    """What a state change did: the build changed, and the build it retired, if any."""
+
+    reference_index_idx: int
+    reference_idx: int
+    state: ReferenceIndexState
+    retired_reference_index_idx: int | None = None
+
+
+async def _lock_reference_builds(
+    conn: asyncpg.Connection, reference_index_idx: int
+) -> asyncpg.Record:
+    """Lock every krepp row of the build's reference and return the build's row."""
+    reference_idx = await conn.fetchval(
+        "SELECT reference_idx FROM qiita.reference_index"
+        " WHERE reference_index_idx = $1 AND index_type = $2",
+        reference_index_idx,
+        INDEX_TYPE_KREPP,
+    )
+    if reference_idx is None:
+        raise KreppBuildNotFound(reference_index_idx)
+    await conn.execute(
+        "SELECT 1 FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2"
+        " ORDER BY reference_index_idx FOR UPDATE",
+        reference_idx,
+        INDEX_TYPE_KREPP,
+    )
+    return await conn.fetchrow(
+        "SELECT reference_index_idx, reference_idx, state FROM qiita.reference_index"
+        " WHERE reference_index_idx = $1",
+        reference_index_idx,
+    )
+
+
+async def activate_krepp_build(
+    conn: asyncpg.Connection, reference_index_idx: int
+) -> KreppBuildChange:
+    """Make a `registered` build the reference's active one, retiring the build that
+    was active. The previous build is retired before this one is activated, because
+    `reference_index_one_active_krepp` is a unique index checked row by row. Activating
+    the build that is already active returns without a change, so a retried
+    activation step succeeds."""
+    require_transaction(conn)
+    row = await _lock_reference_builds(conn, reference_index_idx)
+    state = ReferenceIndexState(row["state"])
+    if state is ReferenceIndexState.ACTIVE:
+        return KreppBuildChange(reference_index_idx, row["reference_idx"], state)
+    if state is not ReferenceIndexState.REGISTERED:
+        raise KreppBuildTransitionRefused(
+            reference_index_idx, f"is {state}; only a registered build can be activated"
+        )
+    retired = await conn.fetchval(
+        "UPDATE qiita.reference_index SET state = $3"
+        " WHERE reference_idx = $1 AND index_type = $2 AND state = $4"
+        " RETURNING reference_index_idx",
+        row["reference_idx"],
+        INDEX_TYPE_KREPP,
+        ReferenceIndexState.RETIRED.value,
+        ReferenceIndexState.ACTIVE.value,
+    )
+    await conn.execute(
+        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+        reference_index_idx,
+        ReferenceIndexState.ACTIVE.value,
+    )
+    return KreppBuildChange(
+        reference_index_idx,
+        row["reference_idx"],
+        ReferenceIndexState.ACTIVE,
+        retired_reference_index_idx=retired,
+    )
+
+
+async def tickets_running_on_build(conn: asyncpg.Connection, reference_index_idx: int) -> list[int]:
+    """The non-terminal tickets fixed to the build, oldest first."""
+    rows = await conn.fetch(
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE reference_index_idx = $1 AND state = ANY($2::qiita.work_ticket_state[])"
+        " ORDER BY work_ticket_idx",
+        reference_index_idx,
+        list(NON_TERMINAL_WORK_TICKET_STATES),
+    )
+    return [r["work_ticket_idx"] for r in rows]
+
+
+async def remove_krepp_build(
+    conn: asyncpg.Connection, reference_index_idx: int
+) -> KreppBuildChange:
+    """Mark a `registered` or `retired` build `removed`. Refused for the active build
+    (activate another first) and while a non-terminal ticket is fixed to the build.
+    Finished tickets keep their `reference_index_idx`; `/run` refuses to restart one
+    whose build is removed. Removing a removed build returns without a change. The
+    files are deleted by the operator afterwards (docs/runbooks/krepp-index.md)."""
+    require_transaction(conn)
+    row = await _lock_reference_builds(conn, reference_index_idx)
+    state = ReferenceIndexState(row["state"])
+    if state is ReferenceIndexState.REMOVED:
+        return KreppBuildChange(reference_index_idx, row["reference_idx"], state)
+    if state is ReferenceIndexState.ACTIVE:
+        raise KreppBuildTransitionRefused(
+            reference_index_idx,
+            "is the reference's active build; activate another build first",
+        )
+    running = await tickets_running_on_build(conn, reference_index_idx)
+    if running:
+        raise KreppBuildTransitionRefused(
+            reference_index_idx,
+            f"work tickets {running} are running on it; wait for them to finish",
+        )
+    await conn.execute(
+        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+        reference_index_idx,
+        ReferenceIndexState.REMOVED.value,
+    )
+    return KreppBuildChange(reference_index_idx, row["reference_idx"], ReferenceIndexState.REMOVED)
+
+
+async def removed_build_of_ticket(conn: asyncpg.Connection, work_ticket_idx: int) -> int | None:
+    """For a redrive: the `reference_index_idx` the ticket is fixed to when that build
+    is removed, else None. The build row is held `FOR SHARE` whatever its state, so a
+    `remove_krepp_build` (which locks it `FOR UPDATE` and counts running tickets)
+    either commits first and is refused here, or waits for the redrive to commit and
+    then sees the revived ticket as running."""
+    row = await conn.fetchrow(
+        "SELECT ri.reference_index_idx, ri.state FROM qiita.work_ticket wt"
+        " JOIN qiita.reference_index ri USING (reference_index_idx)"
+        " WHERE wt.work_ticket_idx = $1"
+        " FOR SHARE OF ri",
+        work_ticket_idx,
+    )
+    if row is None or row["state"] != ReferenceIndexState.REMOVED:
+        return None
+    return row["reference_index_idx"]
