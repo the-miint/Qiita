@@ -24,6 +24,14 @@ import pyarrow as pa
 import pytest
 from qiita_common import analytic as ft
 from qiita_common.hashing import canonical_params_hash
+from qiita_common.models import (
+    AS_OF_SCOPE,
+    INCLUDE_DEPRECATED_FLAG,
+    INCLUDE_DEPRECATED_UPSTREAM_FLAG,
+    DefinitionGroupResolveResponse,
+    DefinitionKind,
+    deprecated_read_refusal,
+)
 
 from qiita_control_plane.cli.user import feature_table as ftc
 from qiita_control_plane.cli.user._helpers import _UNSET
@@ -224,8 +232,9 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
     fields = {
         "base_url": "http://cp",
         "data_plane_url": "grpc://dp:50051",
-        "sequencing_run_idx": 4,
-        "sequenced_pool_idx": 5,
+        # Lists, as the repeatable flags parse: one pool unless a test names more.
+        "sequencing_run_idx": [4],
+        "sequenced_pool_idx": [5],
         "alignment_idx": 3,
         # Reference-only by default: the combined arm is opt-in, and every existing
         # test here is about the analytic the reference arm alone produces.
@@ -242,9 +251,83 @@ def _namespace(tmp_path, **overrides) -> argparse.Namespace:
         "format": ftc.DEFAULT_TABLE_FORMAT,
         "taxonomy": False,
         "tree": False,
+        "include_deprecated": False,
+        "include_deprecated_upstream": False,
+        "as_of_event": None,
         "output": tmp_path / "table.parquet",
     }
     return argparse.Namespace(**(fields | overrides))
+
+
+_UNRESOLVED = {
+    "mask_idx": None,
+    "reason": None,
+    "work_ticket_idx": None,
+    "upstream_kind": None,
+    "upstream_definition_idx": None,
+}
+
+
+# The decisions block every fake resolve answers with.
+DECISIONS = {
+    "decision_set": "sha256:" + "6" * 64,
+    "newest_event_at": None,
+    "as_of": False,
+    "as_of_scope": AS_OF_SCOPE,
+    "equivalences_used": 0,
+    "equivalences_used_set": "sha256:" + "7" * 64,
+}
+
+
+def _fake_resolve(rec, *, members=None, groups=None, unprocessed=None):
+    """Stands in for POST /definition-group/resolve, keyed `(kind, definition_idx)`.
+
+    By default every requested sample is processed under the definition named and the
+    group is that definition alone — the state of a deploy with no output-equivalence
+    verdicts, which is what every single-part test here runs under. `members` moves a
+    sample to another member, `unprocessed` gives it another state (a partial
+    `SampleResolution`), and `groups` sets the `group` answered. Every call is recorded
+    in `resolve_calls`."""
+    members, groups, unprocessed = members or {}, groups or {}, unprocessed or {}
+    rec["resolve_calls"] = []
+
+    def resolve(
+        base_url,
+        token,
+        *,
+        kind,
+        definition_idx,
+        prep_sample_idx,
+        as_of_event=None,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+    ):
+        rec.setdefault("resolve_upstream", []).append((definition_idx, include_deprecated_upstream))
+        rec.setdefault("resolve_flags", []).append(
+            (definition_idx, include_deprecated, include_deprecated_upstream)
+        )
+        key = (DefinitionKind(kind).value, definition_idx)
+        rec["resolve_calls"].append((*key, list(prep_sample_idx)))
+        rec.setdefault("resolve_as_of", []).append(as_of_event)
+        samples = []
+        for sample in sorted(set(prep_sample_idx)):
+            base = {**_UNRESOLVED, "prep_sample_idx": sample, "definition_kind": key[0]}
+            if sample in unprocessed.get(key, {}):
+                samples.append(base | unprocessed[key][sample])
+            else:
+                member = members.get(key, {}).get(sample, definition_idx)
+                samples.append(base | {"state": "processed", "definition_idx": member})
+        return DefinitionGroupResolveResponse.model_validate(
+            {
+                "definition_kind": key[0],
+                "definition_idx": definition_idx,
+                "group": groups.get(key, [definition_idx]),
+                "samples": samples,
+                "decisions": {**DECISIONS, "as_of": as_of_event is not None},
+            }
+        )
+
+    return resolve
 
 
 def _patched(
@@ -257,11 +340,15 @@ def _patched(
     taxonomy_rows=None,
     phylogeny_rows=None,
     blocked_features=(),
+    resolve=None,
 ):
     """Patch the REST seams, both ticket mints, and the Flight client; return the
     recorder every assertion below reads. A test that wants a seam to RAISE re-patches
-    it itself afterwards, rather than this growing a parameter per failure mode."""
+    it itself afterwards, rather than this growing a parameter per failure mode.
+
+    `resolve` is `_fake_resolve`'s keyword arguments."""
     rec: dict = {"lengths_minted": 0, "taxonomy_minted": 0, "phylogeny_minted": 0}
+    monkeypatch.setattr(ftc, "_resolve_definition_group", _fake_resolve(rec, **(resolve or {})))
     _FakeFlightClient.instances = []
 
     monkeypatch.setattr(ftc._common, "read_token", lambda *a, **k: "qk_tok")
@@ -281,7 +368,10 @@ def _patched(
     monkeypatch.setattr(
         ftc,
         "_fetch_alignment_cohort",
-        lambda *a, **k: {"prep_sample_idx": [1, 2] if cohort is None else cohort},
+        lambda *a, **k: (
+            rec.setdefault("listing_as_of", []).append(k.get("as_of_event"))
+            or {"prep_sample_idx": [1, 2] if cohort is None else cohort}
+        ),
     )
     monkeypatch.setattr(
         ftc,
@@ -295,7 +385,16 @@ def _patched(
 
     monkeypatch.setattr(ftc, "_fetch_reference_exclusion", _exclusion)
 
-    def _mint_ids(base_url, token, *, alignment_idx, prep_sample_idx):
+    def _mint_ids(
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+    ):
+        rec.setdefault("flags", []).append(("identifier", alignment_idx, include_deprecated))
         rec["minted_cohort"] = prep_sample_idx
         return [i for i in _IDENTIFIERS if i["prep_sample_idx"] in prep_sample_idx]
 
@@ -324,11 +423,22 @@ def _patched(
 
     monkeypatch.setattr(ftc, "_mint_exported_features", _mint_features)
 
-    def _mint_processing(base_url, token, *, alignment_idx, prep_sample_idx):
-        """The processing mint. `prep_sample_idx` authorizes and is not part of the
+    def _mint_processing(
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+    ):
+        """The processing mint, answering `QP<alignment_idx + 4>` (QP7 for the
+        reference alignment). `prep_sample_idx` authorizes and is not part of the
         handle, so the fake records it to prove the cohort is what gets sent."""
         rec["processing_cohort"] = list(prep_sample_idx)
-        return "QP7"
+        rec.setdefault("flags", []).append(("processing", alignment_idx, include_deprecated))
+        rec.setdefault("processing_minted", {})[alignment_idx] = list(prep_sample_idx)
+        return f"QP{alignment_idx + 4}"
 
     monkeypatch.setattr(ftc, "_mint_exported_processing", _mint_processing)
     monkeypatch.setattr(
@@ -346,7 +456,21 @@ def _patched(
         },
     )
 
-    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+    def _alignment_ticket(
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+        upstreams_read=None,
+        exact=False,
+    ):
+        rec.setdefault("flags", []).append(("doget", alignment_idx, include_deprecated))
+        rec.setdefault("doget_as_of", []).append(as_of_event)
         rec["columns"] = list(columns)
         rec["ticket_cohort"] = list(prep_sample_idx)
         return _ALIGNMENT_TICKET
@@ -1246,9 +1370,15 @@ def test_the_manifest_records_the_processing_by_its_public_handle(monkeypatch, t
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     manifest = _manifest(tmp_path)
 
-    assert manifest["processing"]["export_processing_id"] == "QP7"
-    assert manifest["processing"]["params_hash"] == canonical_params_hash(_PARAMS).hex()
-    assert manifest["processing"]["aligner"] == "minimap2"
+    # One part, since every sample resolved to the alignment named.
+    assert manifest["processing"]["parts"] == [
+        {
+            "export_processing_id": "QP7",
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "aligner": "minimap2",
+        }
+    ]
+    assert manifest["processing"]["sample_part"] == {"QM1": "QP7", "QM2": "QP7"}
     # The reference by name and version, resolved rather than carried as an idx.
     assert manifest["processing"]["reference"] == {
         "name": "gg2",
@@ -1469,7 +1599,7 @@ _DENOVO_ALIGNMENT = [
 _DENOVO_LENGTHS = [(50, 1000)]
 
 
-def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
+def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None, resolve=None):
     """`_patched`, plus the three de novo seams. Returns the same recorder, with
     `denovo_map_samples`, `denovo_lengths_samples` and `arm_tickets` added."""
     # The exported-feature mint has to answer for BOTH arms' genomes: a qiita genome
@@ -1478,6 +1608,7 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
     rec = _patched(
         monkeypatch,
         feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+        resolve=resolve,
     )
     rec["denovo_map_samples"] = []
     rec["denovo_lengths_samples"] = []
@@ -1531,7 +1662,19 @@ def _patched_combined(monkeypatch, *, denovo_map=None, denovo_alignment=None):
     # before a gate row exists. A fake that signed any cohort would let the driver
     # ask for the whole build's samples and still go green, which is exactly the
     # difference between the two drivers this module exists to catch.
-    def _alignment_ticket(base_url, token, *, alignment_idx, prep_sample_idx, columns):
+    def _alignment_ticket(
+        base_url,
+        token,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+        upstreams_read=None,
+        exact=False,
+    ):
         rec["arm_tickets"].append(alignment_idx)
         rec["columns"] = list(columns)
         rec["ticket_cohort"] = list(prep_sample_idx)
@@ -1588,6 +1731,7 @@ def test_the_client_refuses_a_deprecated_denovo_run(monkeypatch, tmp_path, capsy
     assert "deprecated" in err
     # The replacement is named, which is the whole point of reading the row.
     assert "assembly run 3 replaces it" in err
+    assert f"pass {INCLUDE_DEPRECATED_FLAG}" in err
     # Nothing is written: the refusal is before any staging.
     assert not args.output.exists()
 
@@ -1753,9 +1897,12 @@ def test_a_cohort_where_nothing_assembled_degrades_to_a_reference_only_build(
     # reference-only ask leave no distinguishable trace, and the caller has no way to
     # tell a degraded build from the one they asked for.
     denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
-    assert denovo["requested_alignment_idx"] == 4
-    assert denovo["applied"] is False
-    assert denovo["prep_samples_with_a_de_novo_arm"] == 0
+    assert denovo == {
+        "applied": False,
+        "parts": [],
+        "sample_part": {},
+        "prep_samples_with_a_de_novo_arm": 0,
+    }
     assert "reference-only table" in capsys.readouterr().err
 
 
@@ -1767,10 +1914,12 @@ def test_a_partly_assembled_cohort_says_how_many_samples_had_no_arm(monkeypatch,
     args = _namespace(tmp_path, denovo_alignment_idx=4)
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
-    assert "1 of 2 prep_sample(s) have no contigs" in capsys.readouterr().err
+    assert "1 of 2 prep_sample(s) have no de novo arm" in capsys.readouterr().err
     denovo = json.loads((tmp_path / "table.manifest.json").read_text())["table"]["denovo"]
     assert denovo["applied"] is True
-    assert denovo["processing_idx"] == 11
+    # The de novo alignment by its own minted handle, never by an internal id.
+    assert [part["export_processing_id"] for part in denovo["parts"]] == ["QP8"]
+    assert denovo["sample_part"] == {"QM1": "QP8"}
     assert denovo["prep_samples_with_a_de_novo_arm"] == 1
 
 
@@ -1782,3 +1931,1105 @@ def test_a_reference_only_build_records_no_denovo_block(monkeypatch, tmp_path):
 
     assert ftc._handle_feature_table_build(args, parser=None) == 0
     assert "denovo" not in json.loads((tmp_path / "table.manifest.json").read_text())["table"]
+
+
+# ---------------------------------------------------------------------------
+# A cohort across pools and a similarity group: one part per resolved alignment.
+#
+# Pool (4, 5) carries alignment 3 at mask 2; pool (6, 8) carries alignment 13 at
+# mask 12, in alignment 3's group. Sample 1 resolves to 3 and sample 2 to 13, so the
+# build reads each from its own alignment and unions the two before the analytic.
+# The fixture's G200 is the discriminator: 0.6% in each sample, so it clears the 1%
+# threshold only when coverage is pooled over BOTH parts.
+# ---------------------------------------------------------------------------
+
+_PARAMS_B = {**_PARAMS, "mask_idx": 12}
+_DENOVO_PARAMS_B = {**_DENOVO_PARAMS, "mask_idx": 12, "processing_idx": 21}
+_POOL_A, _POOL_B = (4, 5), (6, 8)
+
+
+def _listed(alignment_idx: int, params: dict) -> dict:
+    return {
+        "alignment_idx": alignment_idx,
+        "params": params,
+        "params_hash": canonical_params_hash(params).hex(),
+        "samples_completed": 1,
+        "samples_total": 1,
+    }
+
+
+_TWO_POOL_RESOLVE = {
+    "members": {("alignment", 3): {2: 13}},
+    "groups": {("alignment", 3): [3, 13]},
+}
+
+
+def _patched_two_pools(
+    monkeypatch, *, resolve=None, listings=None, denovo_map=None, alignment=None
+):
+    """`_patched` over the two pools above, with an alignment ticket per alignment and
+    the de novo seams keyed by `(prep_sample_idx, processing_idx)`. Records each
+    alignment ticket's cohort in `tickets`, the cohort reads in `cohort_reads`, and the
+    de novo maps fetched in `denovo_maps`."""
+    rec = _patched(
+        monkeypatch,
+        feature_handles={100: "GCF_100", 200: "GCF_200", 900: "qiita-900", 901: "qiita-901"},
+        resolve=_TWO_POOL_RESOLVE if resolve is None else resolve,
+    )
+    listings = (
+        {
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), _listed(4, _DENOVO_PARAMS)]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        }
+        if listings is None
+        else listings
+    )
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_pool_alignments",
+        lambda b, t, *, sequencing_run_idx, sequenced_pool_idx: listings[
+            (sequencing_run_idx, sequenced_pool_idx)
+        ],
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2]}
+    rec["cohort_reads"] = []
+
+    def _cohort(
+        b,
+        t,
+        *,
+        sequencing_run_idx,
+        sequenced_pool_idx,
+        alignment_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+    ):
+        pool = (sequencing_run_idx, sequenced_pool_idx)
+        rec["cohort_reads"].append((pool, alignment_idx))
+        return {"prep_sample_idx": completed.get((pool, alignment_idx), [])}
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+
+    rec["tickets"] = {}
+    rec["events"] = []
+    columns_of: dict[int, list[str]] = {}
+
+    def _ticket(
+        b,
+        t,
+        *,
+        alignment_idx,
+        prep_sample_idx,
+        columns,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+        upstreams_read=None,
+        exact=False,
+    ):
+        rec["tickets"][alignment_idx] = list(prep_sample_idx)
+        rec["events"].append(("minted", alignment_idx))
+        columns_of[alignment_idx] = list(columns)
+        return f"alignment-{alignment_idx}".encode()
+
+    monkeypatch.setattr(ftc, "_create_alignment_doget_ticket", _ticket)
+
+    the_map = (
+        {(1, 11): _DENOVO_MAP[1], (2, 21): _DENOVO_MAP[2]} if denovo_map is None else denovo_map
+    )
+    rec["denovo_maps"] = []
+
+    def _assembly_map(base_url, token, *, prep_sample_idx, processing_idx):
+        rec["denovo_maps"].append((prep_sample_idx, processing_idx))
+        if (prep_sample_idx, processing_idx) not in the_map:
+            raise httpx.HTTPStatusError(
+                "no contigs",
+                request=httpx.Request("GET", "http://cp"),
+                response=httpx.Response(404),
+            )
+        return genome_map_table(the_map[(prep_sample_idx, processing_idx)])
+
+    monkeypatch.setattr(ftc, "_fetch_assembly_genome_map", _assembly_map)
+    rec["denovo_lengths"] = []
+
+    def _assembly_ticket(base_url, token, *, prep_sample_idx, processing_idx, table):
+        rec["denovo_lengths"].append((prep_sample_idx, processing_idx))
+        return _DENOVO_LENGTHS_TICKET
+
+    monkeypatch.setattr(ftc, "_create_assembly_run_doget_ticket", _assembly_ticket)
+
+    def _slice(alignment_idx, rows):
+        def reader():
+            inner = _alignment_reader(
+                columns_of[alignment_idx],
+                [r for r in rows if r[0] in rec["tickets"][alignment_idx]],
+            )
+
+            def batches():
+                yield from inner
+                rec["events"].append(("drained", alignment_idx))
+
+            return pa.RecordBatchReader.from_batches(inner.schema, batches())
+
+        return reader
+
+    rows = _ALIGNMENT if alignment is None else alignment
+    readers = {
+        b"alignment-3": _slice(3, rows),
+        b"alignment-13": _slice(13, rows),
+        b"alignment-4": _slice(4, _DENOVO_ALIGNMENT),
+        b"alignment-14": _slice(14, _DENOVO_ALIGNMENT),
+        _LENGTHS_TICKET: _lengths_reader,
+        _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
+    }
+    monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
+    return rec
+
+
+def _two_pool_args(tmp_path, **overrides) -> argparse.Namespace:
+    return _namespace(
+        tmp_path,
+        sequencing_run_idx=[_POOL_A[0], _POOL_B[0]],
+        sequenced_pool_idx=[_POOL_A[1], _POOL_B[1]],
+        **overrides,
+    )
+
+
+def test_a_cohort_across_pools_is_read_per_part_and_pooled_once(monkeypatch, tmp_path):
+    """Each sample is read from the alignment it resolved to, and the two parts are one
+    cohort to the analytic: G200 (0.6% per sample) survives the 1% threshold only
+    because coverage is pooled over both parts."""
+    rec = _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["tickets"] == {3: [1], 13: [2]}
+    assert _table_rows(args.output) == [
+        ("QM1", "GCF_100", 1.0),
+        ("QM1", "GCF_200", 1.0),
+        ("QM2", "GCF_200", 1.0),
+    ]
+    # Resolved against the alignment named, over the whole cohort.
+    assert ("alignment", 3, [1, 2]) in rec["resolve_calls"]
+    # Each part's processing handle is minted with that part's own samples.
+    assert rec["processing_minted"] == {3: [1], 13: [2]}
+    assert all(client.closed for client in _FakeFlightClient.instances)
+
+
+def test_each_parts_ticket_is_minted_after_the_part_before_it_drained(monkeypatch, tmp_path):
+    """A signed ticket expires, so part 2's is minted only once part 1's stream has
+    drained, not when the build starts; the same for the de novo arm's parts."""
+    rec = _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["events"] == [
+        ("minted", 3),
+        ("drained", 3),
+        ("minted", 13),
+        ("drained", 13),
+        ("minted", 4),
+        ("drained", 4),
+        ("minted", 14),
+        ("drained", 14),
+    ]
+
+
+@pytest.mark.parametrize(("cigar", "refused"), [("60=", False), ("60M", True)])
+def test_the_gate_diagnostics_run_per_part(monkeypatch, tmp_path, capsys, cigar, refused):
+    """Part 13's only row carries a legacy `M` CIGAR, which no identity gate can score.
+    Over the union of parts, part 3's scorable rows would clear the gate and part 13's
+    row would be dropped without a refusal; per part, part 13 is refused by name."""
+    alignment = [*_ALIGNMENT[:2], (2, 3, 20, 0, 60, 120, cigar)]
+    _patched_two_pools(monkeypatch, alignment=alignment)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], min_identity=0.9)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == (1 if refused else 0)
+    err = capsys.readouterr().err
+    if refused:
+        assert "alignment 13 (1 prep_sample(s) of the cohort)" in err
+        assert "can be scored for sequence identity" in err
+        assert not args.output.exists()
+    else:
+        assert "alignment 13" not in err
+
+
+def test_an_omitted_cohort_spans_every_alignment_of_the_group_in_every_pool(monkeypatch, tmp_path):
+    """Without --prep-sample-idx the cohort is the named pools' samples completed for
+    any member of the anchor's group: the anchor's own first (to learn the group), then
+    each other member listed over a pool."""
+    rec = _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["cohort_reads"] == [(_POOL_A, 3), (_POOL_B, 13)]
+    assert rec["tickets"] == {3: [1], 13: [2]}
+
+
+def test_a_single_pool_build_is_one_part(monkeypatch, tmp_path):
+    """No output-equivalence verdicts: the group is the alignment alone, so the build is the one it
+    was before parts existed — one cohort read, one ticket, one processing handle."""
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1, 2]
+    assert rec["processing_minted"] == {3: [1, 2]}
+    assert [call[:2] for call in rec["resolve_calls"]] == [("alignment", 3), ("alignment", 3)]
+    assert len([t for t in _FakeFlightClient.instances[0].tickets if t == _ALIGNMENT_TICKET]) == 1
+
+
+def _resolve_answer(definition_idx, group, samples):
+    return {
+        "definition_kind": "alignment",
+        "definition_idx": definition_idx,
+        "group": group,
+        "decisions": DECISIONS,
+        "samples": [
+            {
+                **_UNRESOLVED,
+                "prep_sample_idx": s,
+                "definition_kind": "alignment",
+                "state": "processed",
+                "definition_idx": definition_idx,
+            }
+            for s in samples
+        ],
+    }
+
+
+def test_a_cohort_over_the_resolve_cap_is_resolved_in_chunks(monkeypatch):
+    """Each request carries at most the route's cap; the answers' samples are joined
+    in order, under the one group they all name."""
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    sent: list[list[int]] = []
+
+    def call(method, base_url, token, path, json):
+        sent.append(json["prep_sample_idx"])
+        return _resolve_answer(3, [3, 13], json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    answer = ftc._resolve_definition_group(
+        "http://cp",
+        "t",
+        kind=DefinitionKind.ALIGNMENT,
+        definition_idx=3,
+        prep_sample_idx=[5, 1, 4, 2, 3],
+    )
+    assert sent == [[1, 2], [3, 4], [5]]
+    assert [s.prep_sample_idx for s in answer.samples] == [1, 2, 3, 4, 5]
+    assert answer.group == [3, 13]
+
+
+def test_a_group_that_changes_between_resolve_chunks_is_refused(monkeypatch):
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    groups = iter([[3, 13], [3]])
+
+    def call(method, base_url, token, path, json):
+        return _resolve_answer(3, next(groups), json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    with pytest.raises(RuntimeError, match="changed while its 3 prep_samples were resolved"):
+        ftc._resolve_definition_group(
+            "http://cp",
+            "t",
+            kind=DefinitionKind.ALIGNMENT,
+            definition_idx=3,
+            prep_sample_idx=[1, 2, 3],
+        )
+
+
+def test_the_manifest_records_the_decisions_and_the_build_reads_one_decision_set(
+    monkeypatch, tmp_path
+):
+    """Without --as-of-event the anchor resolves under the current decisions, and its
+    decision set is sent with the DoGet; the manifest records the anchor's block."""
+    rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    assert rec["resolve_as_of"][-1] is None
+    assert set(rec["doget_as_of"]) == {DECISIONS["decision_set"]}
+    assert _manifest(tmp_path)["decisions"] == DECISIONS
+
+
+def test_as_of_event_reaches_every_resolve_and_doget_and_the_manifest(monkeypatch, tmp_path):
+    token = "sha256:" + "8" * 64
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path)
+    args.as_of_event = token
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert set(rec["resolve_as_of"]) == {token}
+    assert set(rec["listing_as_of"]) == {token}
+    assert set(rec["doget_as_of"]) == {DECISIONS["decision_set"]}
+    assert _manifest(tmp_path)["decisions"] == {**DECISIONS, "as_of": True}
+
+
+def test_later_resolve_chunks_are_pinned_to_the_first_chunks_decision_set(monkeypatch):
+    monkeypatch.setattr(ftc, "_RESOLVE_CHUNK", 2)
+    sent: list = []
+
+    def call(method, base_url, token, path, json):
+        sent.append(json.get("as_of_event"))
+        return _resolve_answer(3, [3], json["prep_sample_idx"])
+
+    monkeypatch.setattr(ftc._common, "call", call)
+    ftc._resolve_definition_group(
+        "http://cp", "t", kind=DefinitionKind.ALIGNMENT, definition_idx=3, prep_sample_idx=[1, 2, 3]
+    )
+    assert sent == [None, DECISIONS["decision_set"]]
+
+
+def test_the_manifest_records_its_schema_version(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 0
+    manifest = _manifest(tmp_path)
+    assert manifest["schema_version"] == ftc.MANIFEST_SCHEMA_VERSION == 2
+    assert "parts" in manifest["processing"]
+
+
+def test_the_manifest_has_a_handle_per_part_and_maps_each_sample_to_its_part(monkeypatch, tmp_path):
+    _patched_two_pools(monkeypatch)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    processing = _manifest(tmp_path)["processing"]
+    assert processing["parts"] == [
+        {
+            "export_processing_id": "QP7",
+            "params_hash": canonical_params_hash(_PARAMS).hex(),
+            "aligner": "minimap2",
+        },
+        {
+            "export_processing_id": "QP17",
+            "params_hash": canonical_params_hash(_PARAMS_B).hex(),
+            "aligner": "minimap2",
+        },
+    ]
+    assert processing["sample_part"] == {"QM1": "QP7", "QM2": "QP17"}
+    assert processing["reference"]["name"] == "gg2"
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        (
+            {
+                "state": "incomplete",
+                "reason": "in_progress",
+                "definition_idx": 13,
+                "work_ticket_idx": 55,
+            },
+            "prep_sample 2: incomplete (in_progress), alignment 13, work_ticket 55",
+        ),
+        (
+            {"state": "not_processed", "reason": "no_run"},
+            "prep_sample 2: not_processed (no_run)",
+        ),
+        (
+            {
+                "state": "incomplete",
+                "reason": "upstream_moved",
+                "definition_idx": 3,
+                "upstream_kind": "mask",
+                "upstream_definition_idx": 12,
+            },
+            "prep_sample 2: incomplete (upstream_moved), alignment 3, upstream mask 12",
+        ),
+    ],
+    ids=["incomplete", "not-processed", "upstream-moved"],
+)
+def test_a_sample_not_processed_in_the_group_stops_the_build(
+    monkeypatch, tmp_path, capsys, entry, expected
+):
+    """A cohort named with --prep-sample-idx is refused rather than narrowed, saying
+    which prep_samples and why, before anything streams or is minted."""
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={**_TWO_POOL_RESOLVE, "unprocessed": {("alignment", 3): {2: entry}}},
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "1 prep_sample(s) of the cohort are not processed in the group of alignment 3" in err
+    assert expected in err
+    assert "--prep-sample-idx" in err
+    assert not _FakeFlightClient.instances
+    assert "minted_cohort" not in rec and "processing_cohort" not in rec
+    assert not list(tmp_path.iterdir())
+
+
+_FAILED = {"state": "incomplete", "reason": "failed", "definition_idx": 3, "work_ticket_idx": 55}
+
+
+def test_an_omitted_cohort_leaves_out_unprocessed_samples_and_records_them(
+    monkeypatch, tmp_path, capsys
+):
+    """Without --prep-sample-idx, a prep_sample that is not processed is left out: listed
+    on stderr with its state and reason, and recorded in the manifest by its export_id."""
+    rec = _patched(monkeypatch, resolve={"unprocessed": {("alignment", 3): {2: _FAILED}}})
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["ticket_cohort"] == [1]
+    assert _table_rows(args.output) == [("QM1", "GCF_100", 1.0)]
+    err = capsys.readouterr().err
+    assert "1 of 2 prep_sample(s) are left out" in err
+    assert "prep_sample 2: incomplete (failed), alignment 3, work_ticket 55" in err
+    table = _manifest(tmp_path)["table"]
+    assert table["cohort"] == ["QM1"]
+    assert table["left_out"] == [
+        {
+            "export_id": "QM2",
+            "biosample_accession": None,
+            "biosample_export_entity_id": None,
+            "state": "incomplete",
+            "reason": "failed",
+        }
+    ]
+
+
+def test_an_omitted_cohort_with_nothing_processed_is_refused(monkeypatch, tmp_path, capsys):
+    rec = _patched(
+        monkeypatch,
+        resolve={
+            "unprocessed": {
+                ("alignment", 3): {
+                    1: {"state": "not_processed", "reason": "withdrawn", "definition_idx": 3},
+                    2: _FAILED,
+                }
+            }
+        },
+    )
+    args = _namespace(tmp_path)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "none of the 2 prep_sample(s) of the cohort is processed" in err
+    assert "prep_sample 1: not_processed (withdrawn), alignment 3" in err
+    assert "minted_cohort" not in rec and "processing_cohort" not in rec
+    assert not _FakeFlightClient.instances
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_named_cohort_records_nothing_left_out(monkeypatch, tmp_path):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert _manifest(tmp_path)["table"]["left_out"] == []
+
+
+def test_a_part_over_no_named_pool_is_refused_with_the_flags_to_add(monkeypatch, tmp_path, capsys):
+    """The part's params come from a pool listing; an alignment over none of the named
+    pools cannot be checked, so the build says which pool flags are missing."""
+    _patched_two_pools(monkeypatch)
+    args = _namespace(tmp_path, prep_sample_idx=[1, 2])  # pool (4, 5) only
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "resolve to alignment 13, which is not over any pool named" in err
+    assert not _FakeFlightClient.instances
+
+
+def test_a_part_against_another_reference_is_refused(monkeypatch, tmp_path, capsys):
+    other = {**_PARAMS_B, "reference_idx": 10}
+    _patched_two_pools(
+        monkeypatch,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS)]},
+            _POOL_B: {"alignments": [_listed(13, other)]},
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "ran against reference 10" in capsys.readouterr().err
+    assert not _FakeFlightClient.instances
+
+
+def test_unpaired_pool_flags_are_refused(monkeypatch, tmp_path, capsys):
+    _patched(monkeypatch)
+    args = _namespace(tmp_path, sequencing_run_idx=[4, 6], sequenced_pool_idx=[5])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "paired in the order given" in capsys.readouterr().err
+
+
+def test_parser_pairs_repeated_pool_flags():
+    from qiita_control_plane.cli.user._parser import _build_parser
+
+    args = _build_parser().parse_args(
+        _build_argv(sequencing_run_idx=["4", "6"], sequenced_pool_idx=["5", "8"])
+    )
+    assert ftc._pools(args) == [(4, 5), (6, 8)]
+    single = _build_parser().parse_args(_build_argv())
+    assert ftc._pools(single) == [(4, 5)]
+
+
+# The de novo arm across parts: sample 1's de novo alignment is 4 (mask 2, assembly
+# run 11) and sample 2's is 14 (mask 12, assembly run 21), each read with its own run.
+_TWO_POOL_DENOVO_RESOLVE = {
+    "members": {("alignment", 3): {2: 13}, ("alignment", 4): {2: 14}},
+    "groups": {("alignment", 3): [3, 13], ("alignment", 4): [4, 14]},
+}
+
+
+def test_a_combined_build_across_parts_reads_each_sample_from_its_own_arm(monkeypatch, tmp_path):
+    rec = _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_maps"] == [(1, 11), (2, 21)]
+    assert rec["denovo_lengths"] == [(1, 11), (2, 21)]
+    assert rec["tickets"] == {3: [1], 13: [2], 4: [1], 14: [2]}
+    rows = _table_rows(args.output)
+    assert ("QM1", "qiita-900", 1.0) in rows
+    assert ("QM2", "qiita-901", 1.0) in rows
+    denovo = _manifest(tmp_path)["table"]["denovo"]
+    assert [p["export_processing_id"] for p in denovo["parts"]] == ["QP8", "QP18"]
+    assert denovo["sample_part"] == {"QM1": "QP8", "QM2": "QP18"}
+    assert denovo["applied"] is True
+
+
+@pytest.mark.parametrize(("mask_group", "accepted"), [([2, 12], True), ([2], False)])
+def test_named_arms_on_masks_of_one_group_are_accepted_only_within_it(
+    monkeypatch, tmp_path, capsys, mask_group, accepted
+):
+    """The caller names reference alignment 3 (mask 2) and de novo alignment 14 (mask
+    12). Each prep_sample resolves to a pair on one mask: 1 to 3 and 4 (mask 2), 2 to
+    13 and 14 (mask 12). The named pair is admissible exactly when mask 12 is in mask
+    2's group, which the build reads with a resolve of kind mask."""
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={
+            "members": {("alignment", 3): {2: 13}, ("alignment", 14): {1: 4}},
+            "groups": {
+                ("alignment", 3): [3, 13],
+                ("alignment", 14): [4, 14],
+                ("mask", 2): mask_group,
+            },
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=14)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == (0 if accepted else 1)
+    assert ("mask", 2, [1, 2]) in rec["resolve_calls"]
+    if accepted:
+        assert (rec["tickets"][4], rec["tickets"][14]) == ([1], [2])
+    else:
+        assert "not in the mask group" in capsys.readouterr().err
+        assert not _FakeFlightClient.instances
+
+
+def test_a_prep_samples_two_arms_on_different_masks_are_refused(monkeypatch, tmp_path, capsys):
+    """Prep_sample 2 resolves to reference alignment 13 (mask 12) but de novo alignment 4
+    (mask 2). One snapshot cannot answer that, since both arms' masks are where the
+    prep_sample's mask resolves; two resolves can, when a mask run lands between them.
+    The pair is compared exactly, so the build refuses it, though masks 2 and 12 are
+    one group."""
+    _patched_two_pools(
+        monkeypatch,
+        resolve={
+            "members": {("alignment", 3): {2: 13}},
+            "groups": {("alignment", 3): [3, 13], ("alignment", 4): [4, 14], ("mask", 2): [2, 12]},
+        },
+        denovo_map={(1, 11): _DENOVO_MAP[1], (2, 11): _DENOVO_MAP[2]},
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    assert "both arms must read the same masked pass-set" in capsys.readouterr().err
+    assert not _FakeFlightClient.instances
+
+
+def test_only_assembly_runs_a_prep_sample_reads_are_checked_for_deprecation(
+    monkeypatch, tmp_path, capsys
+):
+    """De novo alignments 4 (assembly run 11) and 14 (run 21) are on mask 2, grouped by
+    derivation, and every prep_sample reads its reference arm from alignment 3. Run 11
+    is deprecated, which a run grouped only by derivation can be. When every
+    prep_sample resolves to 14, nothing reads run 11 and the build goes through though
+    4 is the one named; once a prep_sample resolves to 4, the build refuses."""
+    deprecated = {11}
+
+    def processing(base_url, token, *, processing_idx):
+        status = "deprecated" if processing_idx in deprecated else "active"
+        return {"status": status, "superseded_by": None}
+
+    for members, refused in (({1: 14, 2: 14}, False), ({2: 14}, True)):
+        _patched_two_pools(
+            monkeypatch,
+            resolve={
+                "members": {("alignment", 4): members},
+                "groups": {
+                    ("alignment", 3): [3, 13],
+                    ("alignment", 4): [4, 14],
+                    ("mask", 2): [2, 12],
+                },
+            },
+            denovo_map={(1, 21): _DENOVO_MAP[1], (1, 11): _DENOVO_MAP[1], (2, 21): _DENOVO_MAP[2]},
+            listings={
+                _POOL_A: {"alignments": [_listed(3, _PARAMS), _listed(4, _DENOVO_PARAMS)]},
+                _POOL_B: {
+                    "alignments": [
+                        _listed(13, _PARAMS_B),
+                        _listed(14, {**_DENOVO_PARAMS_B, "mask_idx": 2}),
+                    ]
+                },
+            },
+        )
+        monkeypatch.setattr(ftc, "_fetch_processing", processing)
+        output = tmp_path / f"refused-{refused}.parquet"
+        args = _two_pool_args(
+            tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, output=output
+        )
+        assert ftc._handle_feature_table_build(args, parser=None) == (1 if refused else 0)
+        err = capsys.readouterr().err
+        assert ("assembly run 11" in err) is refused, err
+
+
+def test_an_incomplete_de_novo_sample_stops_the_build(monkeypatch, tmp_path, capsys):
+    """An unfinished de novo run is refused like an unfinished reference one; only a
+    sample with no de novo run at all is reference-only."""
+    _patched_two_pools(
+        monkeypatch,
+        resolve={
+            **_TWO_POOL_DENOVO_RESOLVE,
+            "unprocessed": {
+                ("alignment", 4): {
+                    2: {"state": "incomplete", "reason": "failed", "definition_idx": 14}
+                }
+            },
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "not processed in the group of de novo alignment 4" in err
+    assert "prep_sample 2: incomplete (failed), alignment 14" in err
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"state": "not_processed", "reason": "no_run"},
+        {"state": "not_processed", "reason": "no_data", "definition_idx": 14},
+    ],
+    ids=["no-run", "assembled-nothing"],
+)
+def test_a_sample_with_no_de_novo_run_is_reference_only(monkeypatch, tmp_path, capsys, entry):
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve={
+            **_TWO_POOL_DENOVO_RESOLVE,
+            "unprocessed": {("alignment", 4): {2: entry}},
+        },
+    )
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["denovo_maps"] == [(1, 11)]
+    assert rec["tickets"][4] == [1] and 14 not in rec["tickets"]
+    assert "1 of 2 prep_sample(s) have no de novo arm" in capsys.readouterr().err
+
+
+def test_no_internal_identifier_appears_in_a_multi_part_combined_manifest(monkeypatch, tmp_path):
+    _patched_two_pools(monkeypatch, resolve=_TWO_POOL_DENOVO_RESOLVE)
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    keys: set[str] = set()
+    strings: set[str] = set()
+    _walk(_manifest(tmp_path), keys=keys, strings=strings)
+    assert not [key for key in keys if "idx" in key]
+    assert not [value for value in strings if "idx" in value]
+    assert "params" not in keys and "mask" not in json.dumps(_manifest(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# A deprecated --alignment-idx: refused without --include-deprecated, read alone with it
+# ---------------------------------------------------------------------------
+
+
+def _deprecated_listing(monkeypatch, rec) -> None:
+    body = {
+        "alignments": [
+            {
+                **_ALIGNMENTS_BODY["alignments"][0],
+                "status": "deprecated",
+                "deprecation_reason": "aligner build was wrong",
+            }
+        ]
+    }
+
+    def _alignments(*args, **kwargs):
+        rec["alignments_fetched"] = True
+        return body
+
+    monkeypatch.setattr(ftc, "_fetch_pool_alignments", _alignments)
+
+
+def test_a_deprecated_alignment_is_refused_without_the_flag(monkeypatch, tmp_path, capsys):
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+
+    assert ftc._handle_feature_table_build(_namespace(tmp_path), parser=None) == 1
+    err = capsys.readouterr().err
+    # The same message as the routes' 409 (`deprecated_read`), so both name one flag.
+    assert deprecated_read_refusal("alignment", 3, "aligner build was wrong") in err
+    assert INCLUDE_DEPRECATED_FLAG in err
+    assert rec["resolve_calls"] == []
+
+
+def test_a_deprecated_alignment_is_read_alone_and_marked_with_the_flag(
+    monkeypatch, tmp_path, capsys
+):
+    """No group resolve for the anchor: one part over the cohort the cohort route lists,
+    every request carries the flag, and the manifest marks the part."""
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+
+    args = _namespace(tmp_path, include_deprecated=True)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert rec["resolve_calls"] == []
+    assert rec["ticket_cohort"] == [1, 2]
+    assert rec["processing_minted"] == {3: [1, 2]}
+    assert {flag for _, _, flag in rec["flags"]} == {True}
+    [part] = _manifest(tmp_path)["processing"]["parts"]
+    assert (part["deprecated"], part["deprecation_reason"]) == (True, "aligner build was wrong")
+    assert "alignment 3 is deprecated (aligner build was wrong)" in capsys.readouterr().err
+
+
+def test_the_flag_changes_nothing_for_an_active_alignment(monkeypatch, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    plain_rec = _patched(monkeypatch)
+    assert ftc._handle_feature_table_build(_namespace(tmp_path / "a"), parser=None) == 0
+    plain = _manifest(tmp_path / "a")
+    flagged_rec = _patched(monkeypatch)
+    args = _namespace(tmp_path / "b", include_deprecated=True)
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert [c[:2] for c in flagged_rec["resolve_calls"]] == [
+        c[:2] for c in plain_rec["resolve_calls"]
+    ]
+    assert _manifest(tmp_path / "b")["processing"] == plain["processing"]
+    assert "deprecated" not in _manifest(tmp_path / "b")["processing"]["parts"][0]
+
+
+def test_a_deprecated_denovo_alignment_is_read_alone_with_the_flag(monkeypatch, tmp_path, capsys):
+    """The de novo arm is alignment 4 alone: the prep_samples the cohort route lists
+    completed under it have its arm (here 1), the rest stay reference-only, and its
+    manifest part is marked."""
+    deprecated_4 = {
+        **_listed(4, _DENOVO_PARAMS),
+        "status": "deprecated",
+        "deprecation_reason": "contigs were misassembled",
+    }
+    rec = _patched_two_pools(
+        monkeypatch,
+        resolve=_TWO_POOL_DENOVO_RESOLVE,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), deprecated_4]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        },
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2], (_POOL_A, 4): [1]}
+    flags = []
+
+    def _cohort(
+        b,
+        t,
+        *,
+        sequencing_run_idx,
+        sequenced_pool_idx,
+        alignment_idx,
+        include_deprecated=False,
+        include_deprecated_upstream=False,
+        as_of_event=None,
+    ):
+        flags.append((alignment_idx, include_deprecated))
+        return {
+            "prep_sample_idx": completed.get(
+                ((sequencing_run_idx, sequenced_pool_idx), alignment_idx), []
+            )
+        }
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+    args = _two_pool_args(
+        tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, include_deprecated=True
+    )
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert ("alignment", 4) not in {c[:2] for c in rec["resolve_calls"]}
+    assert (4, True) in flags
+    assert rec["tickets"][4] == [1] and 14 not in rec["tickets"]
+    [part] = _manifest(tmp_path)["table"]["denovo"]["parts"]
+    assert (part["deprecated"], part["deprecation_reason"]) == (True, "contigs were misassembled")
+    assert "alignment 4 is deprecated (contigs were misassembled)" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A deprecated assembly run, and deprecated upstreams
+# ---------------------------------------------------------------------------
+
+
+def test_a_deprecated_denovo_run_is_read_with_the_flag(monkeypatch, tmp_path):
+    """--include-deprecated reads an active de novo alignment's deprecated assembly
+    run: the de novo resolve carries `include_deprecated` alone, which admits a
+    deprecated assembly run and not a deprecated mask
+    (`admitted_deprecated_upstream_kinds`), so a de novo alignment whose mask is also
+    deprecated is resolved `upstream_deprecated` and refused before any read."""
+    rec = _patched_combined(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_processing",
+        lambda *a, **k: {"status": "deprecated", "superseded_by": 3},
+    )
+    args = _namespace(tmp_path, denovo_alignment_idx=4, include_deprecated=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert (4, True, False) in rec["resolve_flags"]
+    assert (3, False, False) in rec["resolve_flags"]
+
+
+def test_the_upstream_flag_reaches_every_request(monkeypatch, tmp_path):
+    rec = _patched(monkeypatch)
+    args = _namespace(tmp_path, include_deprecated_upstream=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    assert {flag for _, flag in rec["resolve_upstream"]} == {True}
+
+
+_UPSTREAM = {
+    "definition_kind": "mask",
+    "definition_idx": 6,
+    "params_hash": "ab" * 32,
+    "deprecation_reason": "host reference was wrong",
+}
+
+
+def test_the_doget_records_and_reports_the_deprecated_upstreams_it_read(monkeypatch, capsys):
+    sent = {}
+
+    def _call(method, base_url, token, path, json=None, **kwargs):
+        sent["json"] = json
+        return {"ticket": "dGlja2V0", "deprecated_upstreams": [_UPSTREAM]}
+
+    monkeypatch.setattr(ftc._common, "call", _call)
+    seen: dict[int, list] = {}
+    for _ in range(2):
+        ftc._create_alignment_doget_ticket(
+            "http://cp",
+            "tok",
+            alignment_idx=3,
+            prep_sample_idx=[1],
+            columns=("prep_sample_idx",),
+            include_deprecated_upstream=True,
+            upstreams_read=seen,
+        )
+    assert sent["json"]["include_deprecated_upstream"] is True
+    assert seen == {3: [_UPSTREAM]}
+    err = capsys.readouterr().err
+    assert err.count("alignment 3 reads mask 6, which is deprecated") == 1
+    assert INCLUDE_DEPRECATED_UPSTREAM_FLAG in err
+
+    part = ftc._Part(3, {"params_hash": "cd" * 32, "params": {"aligner": "minimap2"}}, (1,))
+    record = ftc._manifest_parts(
+        [part], {3: "QP7"}, [{"prep_sample_idx": 1, "export_id": "QM1"}], seen
+    )
+    assert record["parts"][0]["deprecated_upstreams"] == [
+        {"kind": "mask", "params_hash": "ab" * 32, "deprecation_reason": "host reference was wrong"}
+    ]
+    assert "idx" not in json.dumps(record["parts"])
+
+
+def test_a_deprecated_alignments_default_cohort_records_what_it_left_out(
+    monkeypatch, tmp_path, capsys
+):
+    """The cohort route leaves a prep_sample whose mask run is withdrawn out of a
+    deprecated alignment's exact cohort; the build succeeds over the rest and records it
+    in `table.left_out` by its biosample's accession and QB handle, with no `_idx`; an
+    unaccessioned biosample is named on stderr by its QB handle."""
+    rec = _patched(monkeypatch)
+    _deprecated_listing(monkeypatch, rec)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {
+            "prep_sample_idx": [1, 2],
+            "left_out": [
+                {
+                    "prep_sample_idx": 5,
+                    "biosample_accession": "SAMEA5",
+                    "biosample_export_entity_id": "QB5",
+                    "state": "not_processed",
+                    "reason": "upstream_withdrawn",
+                },
+                {
+                    "prep_sample_idx": 6,
+                    "biosample_accession": None,
+                    "biosample_export_entity_id": "QB6",
+                    "state": "incomplete",
+                    "reason": "failed",
+                },
+            ],
+        },
+    )
+    args = _namespace(tmp_path, include_deprecated=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+    assert "left_out_by_accession" not in table
+    assert table["left_out"] == [
+        {
+            "export_id": None,
+            "biosample_accession": None,
+            "biosample_export_entity_id": "QB6",
+            "state": "incomplete",
+            "reason": "failed",
+        },
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA5",
+            "biosample_export_entity_id": "QB5",
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        },
+    ]
+    assert "idx" not in json.dumps(table["left_out"])
+    err = capsys.readouterr().err
+    assert "SAMEA5: not_processed (upstream_withdrawn)" in err
+    assert "QB6: incomplete (failed)" in err and "None:" not in err
+
+
+def test_a_deprecated_denovo_alignment_records_its_failed_and_running_runs(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --include-deprecated on a deprecated de novo alignment, a prep_sample whose
+    run there failed or is running stays reference-only and is recorded under
+    `denovo.left_out` by biosample accession, state and reason."""
+    deprecated_4 = {
+        **_listed(4, _DENOVO_PARAMS),
+        "status": "deprecated",
+        "deprecation_reason": "contigs were misassembled",
+    }
+    _patched_two_pools(
+        monkeypatch,
+        resolve=_TWO_POOL_DENOVO_RESOLVE,
+        listings={
+            _POOL_A: {"alignments": [_listed(3, _PARAMS), deprecated_4]},
+            _POOL_B: {"alignments": [_listed(13, _PARAMS_B), _listed(14, _DENOVO_PARAMS_B)]},
+        },
+    )
+    completed = {(_POOL_A, 3): [1], (_POOL_B, 13): [2], (_POOL_A, 4): [1]}
+    left = {
+        (_POOL_A, 4): [
+            {
+                "prep_sample_idx": 2,
+                "biosample_accession": "SAMEA2",
+                "state": "incomplete",
+                "reason": "failed",
+            },
+            {
+                "prep_sample_idx": 9,
+                "biosample_accession": "SAMEA9",
+                "state": "incomplete",
+                "reason": "in_progress",
+            },
+        ]
+    }
+
+    def _cohort(b, t, *, sequencing_run_idx, sequenced_pool_idx, alignment_idx, **flags):
+        key = ((sequencing_run_idx, sequenced_pool_idx), alignment_idx)
+        return {"prep_sample_idx": completed.get(key, []), "left_out": left.get(key, [])}
+
+    monkeypatch.setattr(ftc, "_fetch_alignment_cohort", _cohort)
+    args = _two_pool_args(
+        tmp_path, prep_sample_idx=[1, 2], denovo_alignment_idx=4, include_deprecated=True
+    )
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    denovo = _manifest(tmp_path)["table"]["denovo"]
+    # Prep_sample 9 is not in the cohort, so it is not recorded.
+    assert denovo["left_out"] == [
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA2",
+            "biosample_export_entity_id": None,
+            "state": ftc.DENOVO_LEFT_OUT_FAILED,
+            "reason": "failed",
+        }
+    ]
+    assert "SAMEA2: failed (failed)" in capsys.readouterr().err
+    assert "idx" not in json.dumps(denovo["left_out"])
+
+
+def test_an_upstream_read_default_cohort_records_what_the_listing_left_out(
+    monkeypatch, tmp_path, capsys
+):
+    """Under --include-deprecated-upstream the cohort route leaves out a prep_sample
+    whose mask run is withdrawn; the build succeeds over the rest and records it in
+    `table.left_out` by its biosample handles, with no `_idx`."""
+    _patched(monkeypatch)
+    monkeypatch.setattr(
+        ftc,
+        "_fetch_alignment_cohort",
+        lambda *a, **k: {
+            "prep_sample_idx": [1, 2],
+            "left_out": [
+                {
+                    "prep_sample_idx": 5,
+                    "biosample_accession": "SAMEA5",
+                    "biosample_export_entity_id": "QB5",
+                    "state": "not_processed",
+                    "reason": "upstream_withdrawn",
+                }
+            ],
+        },
+    )
+    args = _namespace(tmp_path, include_deprecated_upstream=True)
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 0
+    table = _manifest(tmp_path)["table"]
+    assert table["left_out"] == [
+        {
+            "export_id": None,
+            "biosample_accession": "SAMEA5",
+            "biosample_export_entity_id": "QB5",
+            "state": "not_processed",
+            "reason": "upstream_withdrawn",
+        }
+    ]
+    assert "idx" not in json.dumps(table["left_out"])
+    assert "SAMEA5: not_processed (upstream_withdrawn)" in capsys.readouterr().err
+
+
+def test_an_exact_read_names_its_deprecated_upstream_as_read_under_include_deprecated(
+    monkeypatch, capsys
+):
+    """A deprecated alignment read alone reports the deprecated mask under it in the
+    same shape, and the stderr line names --include-deprecated, the flag it was read
+    under."""
+
+    def _call(method, base_url, token, path, json=None, **kwargs):
+        return {"ticket": "dGlja2V0", "deprecated_upstreams": [_UPSTREAM]}
+
+    monkeypatch.setattr(ftc._common, "call", _call)
+    seen: dict[int, list] = {}
+    ftc._create_alignment_doget_ticket(
+        "http://cp",
+        "tok",
+        alignment_idx=3,
+        prep_sample_idx=[1],
+        columns=("prep_sample_idx",),
+        include_deprecated=True,
+        upstreams_read=seen,
+        exact=True,
+    )
+    assert seen == {3: [_UPSTREAM]}
+    err = capsys.readouterr().err
+    assert "alignment 3 reads mask 6, which is deprecated" in err
+    assert err.rstrip().endswith(f"read under {INCLUDE_DEPRECATED_FLAG}")
+    assert INCLUDE_DEPRECATED_UPSTREAM_FLAG not in err

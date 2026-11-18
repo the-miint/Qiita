@@ -10,11 +10,14 @@ from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import global_field_router as biosample_global_field_router
 from .biosample import router as biosample_router
+from .definition_group import router as definition_group_router
+from .definition_settings import router as definition_settings_router
 from .ena_import import router as ena_import_batch_router
 from .exported_feature import router as exported_feature_router
 from .exported_identifier import router as exported_identifier_router
 from .exported_processing import router as exported_processing_router
 from .host_filter_profile import router as host_filter_profile_router
+from .output_equivalence import router as output_equivalence_router
 from .prep_protocol import router as prep_protocol_router
 from .prep_sample import global_field_router as prep_sample_global_field_router
 from .prep_sample import router as prep_sample_router
@@ -73,5 +76,8 @@ api_router.include_router(upload_router)
 api_router.include_router(user_router)
 api_router.include_router(auth_router)
 api_router.include_router(admin_router)
+api_router.include_router(output_equivalence_router)
+api_router.include_router(definition_group_router)
+api_router.include_router(definition_settings_router)
 api_router.include_router(work_ticket_router)
 api_router.include_router(ena_import_batch_router)

@@ -329,6 +329,39 @@ async def delete_principal(pool: asyncpg.Pool, principal_idxs: int | Iterable[in
     await delete_idxs(pool, "principal", named)
 
 
+_EQUIVALENCE_EVENT = "qiita.output_equivalence_event"
+_EQUIVALENCE_EVENT_NO_DELETE = "output_equivalence_event_no_delete"
+
+
+async def delete_output_equivalences(
+    pool: asyncpg.Pool, output_equivalence_idxs: Iterable[int]
+) -> None:
+    """Delete these output equivalences and their history.
+
+    `qiita.output_equivalence_event` refuses DELETE by trigger and RESTRICTs the delete of
+    its output equivalence, so nothing but a test removes one. This disables the trigger for one
+    transaction, as the `auth_event` cleanups do; ALTER TABLE is transactional, so the
+    trigger is back however the transaction ends."""
+    idxs = _as_idx_list(output_equivalence_idxs)
+    if not idxs:
+        return
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            f"ALTER TABLE {_EQUIVALENCE_EVENT} DISABLE TRIGGER {_EQUIVALENCE_EVENT_NO_DELETE}"
+        )
+        await conn.execute(
+            f"DELETE FROM {_EQUIVALENCE_EVENT} WHERE output_equivalence_idx = ANY($1::bigint[])",
+            idxs,
+        )
+        await conn.execute(
+            "DELETE FROM qiita.output_equivalence WHERE output_equivalence_idx = ANY($1::bigint[])",
+            idxs,
+        )
+        await conn.execute(
+            f"ALTER TABLE {_EQUIVALENCE_EVENT} ENABLE TRIGGER {_EQUIVALENCE_EVENT_NO_DELETE}"
+        )
+
+
 async def cleanup_exported_entity_probe(
     pool: asyncpg.Pool,
     *,

@@ -15,8 +15,8 @@ Outputs, in `gene_calls/`:
   - `checkm/<kind>/<bin_id>/genes.faa` and `genes.gff`: the `prodigal_checkm` genes of
     each subject that has any, as Prodigal's CLI writes them for that subject's FASTA
     (contig names and strand as read, not canonical), laid out as CheckM's
-    `bins/<bin_id>/` so it can reuse them instead of calling Prodigal. A subject
-    without genes gets no files, and CheckM calls Prodigal on it as it does today.
+    `bins/<bin_id>/`, where `checkm.sh` copies them so CheckM does not call Prodigal
+    again. A subject without genes gets no files, and CheckM calls Prodigal on it.
     This is a file handed to a later step, not streamed: CheckM reads only files.
 
 **The `prodigal_checkm` rules** are CheckM 1.2.5's `ProdigalRunner.run`

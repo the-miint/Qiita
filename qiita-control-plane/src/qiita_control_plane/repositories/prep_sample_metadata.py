@@ -42,4 +42,6 @@ PREP_SAMPLE_METADATA_SPEC = EntityMetadataSpec(
     metadata_field_contract_trigger="prep_sample_metadata_apply_field_contract",
     visibility_function="qiita.prep_sample_metadata_visibility",
     field_exception_table="qiita.prep_sample_field_exception",
+    exception_on_unique_field_constraint="prep_sample_field_exception_not_on_unique_field",
+    unique_over_exceptions_constraint="prep_sample_study_field_unique_without_exceptions",
 )

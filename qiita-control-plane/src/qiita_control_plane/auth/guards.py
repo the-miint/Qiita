@@ -212,17 +212,25 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     scope_str = str(scope)
 
     def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
-        if isinstance(p, Anonymous):
-            raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
-        if not p.has_scope(scope_str):
-            raise HTTPException(
-                status_code=403,
-                detail=f"missing required scope {scope_str!r}" + _stale_token_hint(p, (scope_str,)),
-                headers=_stale_token_headers(p, (scope_str,)),
-            )
+        check_scope(p, scope_str)
         return p
 
     return _dep
+
+
+def check_scope(p: Principal, scope: str) -> None:
+    """The check that `require_scope` makes, for a route that learns which scope it
+    needs only after reading the row that it acts on. 401s on Anonymous, 403s when the
+    principal's token lacks `scope`, with the same detail and re-login hint."""
+    scope_str = str(scope)
+    if isinstance(p, Anonymous):
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    if not p.has_scope(scope_str):
+        raise HTTPException(
+            status_code=403,
+            detail=f"missing required scope {scope_str!r}" + _stale_token_hint(p, (scope_str,)),
+            headers=_stale_token_headers(p, (scope_str,)),
+        )
 
 
 def require_any_scope(*scopes: str) -> Callable[..., Principal]:

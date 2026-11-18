@@ -5,6 +5,7 @@ endpoints — same input shape, same on-the-wire output.
 """
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import NoReturn
 
@@ -16,18 +17,27 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    DefinitionGroupRefusal,
+    DefinitionKind,
+    DeprecatedUpstream,
+    DeprecationRefusal,
     IdxsListResponse,
+    MaskDefinitionStatus,
     MetadataEntry,
     MetadataFieldWriteResult,
     MissingReasonRef,
     NaturalKeyLookupResponse,
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
+    SampleResolution,
     SampleStudyFieldCreateRequest,
     SampleStudyFieldPatchRequest,
     SampleStudyFieldResponse,
     TerminologyTermRef,
     Tier,
+    admitted_deprecated_upstream_kinds,
+    deprecated_read_refusal,
+    deprecated_upstream_read_refusal,
     field_wire_name,
     unique_in_study_rejection_reason,
 )
@@ -40,6 +50,13 @@ from ..auth.guards import (
     tier_at_least,
 )
 from ..auth.principal import HumanUser, Principal
+from ..decision_set import DecisionSetUnknown, load_decision_set
+from ..definition_similarity import (
+    EquivalenceRefused,
+    Groups,
+    deprecated_upstreams,
+    load_groups,
+)
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
@@ -74,6 +91,7 @@ from ..repositories._sample_helpers import (
     fetch_metadata_checklist_idx_by_name,
     fetch_owner_sample_id_study_field_idxs,
     fetch_study_field,
+    fetch_study_field_has_exceptions,
     fetch_study_field_tier,
     fetch_study_fields_by_display_names,
     parse_text_for_data_type,
@@ -81,8 +99,12 @@ from ..repositories._sample_helpers import (
     widen_study_field_to_text,
     write_sample_metadata,
 )
-from ..repositories.alignment_definition import fetch_alignment_definition_by_idx
+from ..repositories.alignment_definition import (
+    AlignmentHasLiveWork,
+    fetch_alignment_definition_by_idx,
+)
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
 from ..repositories.study_access import CallerMetadataTiers
 
 REFERENCE_NOT_FOUND_DETAIL = "Reference not found"
@@ -156,17 +178,116 @@ GENOME_MAP_HARD_CAP = 250_000
 SAMPLE_STUDIES_HARD_CAP = 500_000
 
 
-def refuse_deprecated_alignment(alignment: asyncpg.Record) -> None:
-    """409 when `alignment` (an `alignment_definition` row) is deprecated: a
-    deprecated config is void for every consumer that names a cohort of it."""
-    if alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"alignment {alignment['alignment_idx']} is deprecated:"
-                f" {alignment['deprecation_reason']}"
-            ),
-        )
+def alignment_exact_read(alignment: asyncpg.Record, *, include_deprecated: bool) -> bool:
+    """`deprecated_read` for an `alignment_definition` row: True when a read naming it
+    reads its own results in exact mode, 409 naming the flag when it is deprecated and
+    `include_deprecated` is not set."""
+    return deprecated_read(
+        kind=DefinitionKind.ALIGNMENT,
+        idx=alignment["alignment_idx"],
+        deprecated=alignment["status"] == AlignmentDefinitionStatus.DEPRECATED.value,
+        deprecation_reason=alignment["deprecation_reason"],
+        include_deprecated=include_deprecated,
+    )
+
+
+def mask_exact_read(mask: asyncpg.Record, *, include_deprecated: bool) -> bool:
+    """`deprecated_read` for a `mask_definition` row: `alignment_exact_read`'s mask
+    twin."""
+    return deprecated_read(
+        kind=DefinitionKind.MASK,
+        idx=mask["mask_idx"],
+        deprecated=mask["status"] == MaskDefinitionStatus.DEPRECATED.value,
+        deprecation_reason=mask["deprecation_reason"],
+        include_deprecated=include_deprecated,
+    )
+
+
+def deprecated_read(
+    *,
+    kind: DefinitionKind,
+    idx: int,
+    deprecated: bool,
+    deprecation_reason: str | None,
+    include_deprecated: bool,
+) -> bool:
+    """Whether a read naming `kind` `idx` reads that definition's own results in exact
+    mode (`definition_resolver.resolve_exact`): only when it is deprecated and the
+    caller set `include_deprecated`. Deprecation stops new processing; it does not
+    forbid reading existing results on purpose, so a deprecated definition named
+    without the flag is a 409 that names the flag. A definition that is not
+    deprecated reads its group whatever the flag."""
+    if not deprecated:
+        return False
+    if include_deprecated:
+        return True
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "detail": deprecated_read_refusal(kind.value, idx, deprecation_reason),
+            "reason": DefinitionGroupRefusal.DEPRECATED.value,
+            "deprecation_reason": deprecation_reason,
+        },
+    )
+
+
+def deprecated_upstream_read(
+    *,
+    kind: DefinitionKind,
+    idx: int,
+    upstreams: list[DeprecatedUpstream],
+    include_deprecated: bool,
+    include_deprecated_upstream: bool,
+) -> frozenset[DefinitionKind]:
+    """The deprecated upstream kinds a read naming active `kind` `idx` reads past
+    (`definition_resolver`, "Deprecated upstreams"): empty when `upstreams` is empty,
+    the flags' `admitted_deprecated_upstream_kinds` when they admit every one, 409
+    naming `include_deprecated_upstream` otherwise."""
+    if not upstreams:
+        return frozenset()
+    admitted = admitted_deprecated_upstream_kinds(
+        include_deprecated=include_deprecated,
+        include_deprecated_upstream=include_deprecated_upstream,
+    )
+    if all(u.definition_kind in admitted for u in upstreams):
+        return admitted
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "detail": deprecated_upstream_read_refusal(kind.value, idx, upstreams),
+            "reason": DefinitionGroupRefusal.DEPRECATED_UPSTREAM.value,
+            "deprecated_upstreams": [u.model_dump(mode="json") for u in upstreams],
+        },
+    )
+
+
+async def refuse_deprecated_mask_read(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, mask_idx: int
+) -> NoReturn:
+    """`deprecated_read`'s 409 for a mask that a mint found deprecated without
+    `include_deprecated` (`MaskDefinitionDeprecated`)."""
+    row = await fetch_mask_definition_by_idx(pool_or_conn, mask_idx)
+    deprecated_read(
+        kind=DefinitionKind.MASK,
+        idx=mask_idx,
+        deprecated=True,
+        deprecation_reason=None if row is None else row["deprecation_reason"],
+        include_deprecated=False,
+    )
+    raise AssertionError("deprecated_read returned for a deprecated mask without the flag")
+
+
+@dataclass(frozen=True)
+class AlignmentCohortRead:
+    """What `authorize_completed_alignment_cohort` admitted: the cohort; `exact`, a
+    deprecated alignment read alone; `admitted_upstream_kinds`, the deprecated
+    upstream kinds an active alignment is read past (`deprecated_upstream_read`, for
+    `resolve_group`); and the deprecated upstreams it reads, for the response."""
+
+    cohort: list[int]
+    exact: bool
+    admitted_upstream_kinds: frozenset[DefinitionKind]
+    deprecated_upstreams: list[DeprecatedUpstream]
 
 
 async def authorize_completed_alignment_cohort(
@@ -176,17 +297,23 @@ async def authorize_completed_alignment_cohort(
     alignment_idx: int,
     prep_sample_idx: list[int],
     nothing_to: str,
-) -> list[int]:
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+) -> AlignmentCohortRead:
     """The gate every route that names a cohort of one alignment runs, and the single
-    copy of the order it runs in. Returns the authorized cohort.
+    copy of the order it runs in. Returns the authorized cohort, whether the read
+    is exact (`alignment_exact_read`: a deprecated alignment under
+    `include_deprecated`), and the deprecated upstreams it reads.
 
     **The order is a disclosure decision, not a style.** Four checks:
 
     1. **The alignment exists** → 404, before anything discloses cohort state.
     2. **Access** → 403, all-or-nothing. A partially-served cohort would answer for some
        of a caller's samples and silently omit the rest.
-    2a. **The alignment is active** → 409. A deprecated config is void for every
-       consumer; after access so its status is told only to a caller who may read it.
+    2a. **The alignment is active, or `include_deprecated` names it** → 409 naming
+       the flag otherwise (`alignment_exact_read`); after access so its status is told
+       only to a caller who may read it. An active alignment whose upstream is
+       deprecated is admitted by `deprecated_upstream_read`, 409 otherwise.
     3. **Completeness** → 422, only once access has passed. Reversed, the 422's sample
        list would tell a caller which samples are in an alignment they have no right to
        read at all. It also subsumes an unknown identifier: a prep_sample that is not
@@ -209,7 +336,19 @@ async def authorize_completed_alignment_cohort(
         pool, caller=caller, prep_sample_idx=prep_sample_idx, min_tier=COHORT_MIN_TIER
     )
 
-    refuse_deprecated_alignment(alignment)
+    exact = alignment_exact_read(alignment, include_deprecated=include_deprecated)
+    upstreams = await deprecated_upstreams(pool, alignment)
+    past = (
+        frozenset()
+        if exact
+        else deprecated_upstream_read(
+            kind=DefinitionKind.ALIGNMENT,
+            idx=alignment_idx,
+            upstreams=upstreams,
+            include_deprecated=include_deprecated,
+            include_deprecated_upstream=include_deprecated_upstream,
+        )
+    )
 
     incomplete = await list_incomplete_alignment_samples(pool, alignment_idx, cohort)
     if incomplete:
@@ -218,7 +357,7 @@ async def authorize_completed_alignment_cohort(
             f" {alignment_idx} (e.g. {first_few(incomplete)})"
         )
         raise HTTPException(status_code=422, detail=f"{detail}{nothing_to}")
-    return cohort
+    return AlignmentCohortRead(cohort, exact, past, upstreams)
 
 
 def first_few(idxs: list[int], limit: int = 5) -> str:
@@ -329,13 +468,6 @@ GENERIC_FK_VIOLATION = "references a row that does not exist"
 # Fallback for a CHECK the wire models should have preempted. Both study-field
 # write surfaces fall back to it, so the wording lives here rather than at each.
 GENERIC_CHECK_VIOLATION = "violates a database constraint on"
-
-# The optimistic-concurrency header pair: every route that emits a version
-# stamp writes ETAG_HEADER, and every PATCH that gates on one reads
-# IF_MATCH_HEADER. A caller round-trips the first into the second, so the two
-# spellings are a contract rather than incidental strings.
-ETAG_HEADER = "ETag"
-IF_MATCH_HEADER = "If-Match"
 
 
 def metadata_entries_from_rows(rows: Mapping[str, MetadataRow]) -> dict[str, MetadataEntry]:
@@ -1298,6 +1430,24 @@ async def patch_and_map_study_field(
                 ),
             )
 
+    # A field that exceptions key on cannot become unique_in_study; the
+    # migration that enforces it says why. The field row is held FOR NO KEY
+    # UPDATE from the read above, which the exception trigger's FOR SHARE waits
+    # behind, so no exception can land between this check and the write. It
+    # depends on no type, so it runs ahead of the widen and its table lock.
+    if (
+        body.unique_in_study
+        and not row["unique_in_study"]
+        and await fetch_study_field_has_exceptions(conn, spec=spec, study_field_idx=study_field_idx)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{noun} field {row['display_name']!r} cannot be made unique within this"
+                " study: field exceptions are set on its values"
+            ),
+        )
+
     # The widen runs ahead of the uniqueness rule below so that rule is judged
     # against the type the field ends at. Anything raised past this point
     # unwinds it with the rest of the caller's transaction.
@@ -1765,6 +1915,33 @@ def raise_transient_retry(detail: str) -> None:
     )
 
 
+def equivalence_refused_http(exc: EquivalenceRefused) -> HTTPException:
+    """409 for a refusal by the definition-similarity rules: the message, the
+    `OutputEquivalenceRefusal` code, and the output equivalences the refusal names."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": str(exc),
+            "reason": exc.reason.value,
+            "output_equivalence_idx": exc.output_equivalence_idx,
+        },
+    )
+
+
+def live_work_http(exc: AlignmentHasLiveWork | MaskHasLiveWork) -> HTTPException:
+    """409 for a deprecation refused while work tickets under the definition are
+    unfinished, shaped as `equivalence_refused_http`'s is: the message, the
+    `DeprecationRefusal` code, and the tickets."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "detail": str(exc),
+            "reason": DeprecationRefusal.LIVE_WORK.value,
+            "work_ticket_idx": exc.work_ticket_idxs,
+        },
+    )
+
+
 def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
     """Translate a lost write race into a 503 retry response.
 
@@ -1871,3 +2048,39 @@ def build_idxs_list_response(
         truncated=truncated,
         caller_system_role=caller_system_role,
     )
+
+
+def sees_resolution_tickets(caller: HumanUser) -> bool:
+    """Whether a route returns `SampleResolution.work_ticket_idx` to this caller: a
+    system_admin only. The ticket a prep_sample waits on may be another principal's
+    block ticket, covering other studies' prep_samples, so it is not the caller's to see
+    even when every prep_sample it names is."""
+    return caller.has_role(SystemRole.SYSTEM_ADMIN)
+
+
+def resolution_body(resolution: SampleResolution, caller: HumanUser) -> dict:
+    """A resolution's JSON body for this caller: without `work_ticket_idx` unless
+    `sees_resolution_tickets`."""
+    exclude = None if sees_resolution_tickets(caller) else {"work_ticket_idx"}
+    return resolution.model_dump(mode="json", exclude=exclude)
+
+
+async def load_groups_as_of(conn: asyncpg.Connection, as_of_event: str | None) -> Groups:
+    """`load_groups` for a route that takes `as_of_event`: 422 when the token names no
+    decision set (`decision_set.DecisionSetUnknown`)."""
+    try:
+        return await load_groups(conn, as_of_event=as_of_event)
+    except DecisionSetUnknown as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def require_known_decision_set(pool: asyncpg.Pool, as_of_event: str | None) -> None:
+    """422 when `as_of_event` names no decision set, for a route whose read may form
+    no group, so an unknown token is refused whichever read runs."""
+    if as_of_event is None:
+        return
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        try:
+            await load_decision_set(conn, as_of_event)
+        except DecisionSetUnknown as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc

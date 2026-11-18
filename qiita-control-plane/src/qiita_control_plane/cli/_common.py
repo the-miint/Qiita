@@ -54,11 +54,15 @@ from qiita_common.auth_constants import (
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
+from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    INCLUDE_DEPRECATED_FLAG,
+    DefinitionKind,
     NaturalKeyLookupResponse,
     PrincipalLookupRequest,
     PrincipalLookupResponse,
     StudyLookupRequest,
+    flags_admitting_deprecated_upstream,
 )
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
@@ -487,19 +491,33 @@ def call_with_status(
     return resp.json(), resp.status_code
 
 
-def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
-    """GET `path` to read its current ETag, then PATCH it with that ETag as
-    the If-Match header and `body` as the update; return the decoded PATCH
-    body.
+def write_with_read_etag(
+    method: str, base_url: str, token: str, path: str, *, json: dict | None = None
+) -> tuple[httpx.Response, httpx.Response]:
+    """GET `path` to read its current ETag, then send `method` to it with that
+    ETag as the If-Match header and `json` as the body; return both responses.
 
-    The server requires If-Match on every PATCH and exposes the matching
-    value as the GET response's ETag header, so reading then writing is the
-    only way to mint a valid If-Match; pairing them here also keeps the
-    lost-update window small.
+    A route that requires If-Match exposes the matching value as its GET's
+    ETag header, so reading then writing is the only way to mint a valid
+    If-Match; pairing them here also keeps the lost-update window small.
     """
-    etag = _request("GET", base_url, token, path).headers["ETag"]
-    resp = _request("PATCH", base_url, token, path, json=body, extra_headers={"If-Match": etag})
-    return resp.json()
+    read = _request("GET", base_url, token, path)
+    written = _request(
+        method,
+        base_url,
+        token,
+        path,
+        json=json,
+        extra_headers={IF_MATCH_HEADER: read.headers[ETAG_HEADER]},
+    )
+    return read, written
+
+
+def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
+    """PATCH `path` with `body` under the ETag that a GET of it returns
+    (`write_with_read_etag`); return the decoded PATCH body."""
+    _read, written = write_with_read_etag("PATCH", base_url, token, path, json=body)
+    return written.json()
 
 
 def whoami(base_url: str, token: str) -> dict:
@@ -917,3 +935,85 @@ def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
     print(f"Logged in. Token saved to {token_file} (mode 0600).", file=sys.stderr)
     print(json.dumps(me, indent=2))
     return 0
+
+
+def print_deprecated_read(kind: str, idx: int, reason: str | None) -> None:
+    """The stderr line for a read of a deprecated definition's own results, made under
+    --include-deprecated."""
+    print(
+        f"warning: {kind} {idx} is deprecated ({reason}); its own results were read"
+        f" under {INCLUDE_DEPRECATED_FLAG}",
+        file=sys.stderr,
+    )
+
+
+def print_deprecated_upstream_read(
+    kind: str, idx: int, upstream: dict, *, exact: bool = False
+) -> None:
+    """The stderr line for a read past a deprecated upstream (a `DeprecatedUpstream`
+    body): of an active definition, naming the flags that admit its kind
+    (`flags_admitting_deprecated_upstream`); or, `exact`, of a deprecated definition
+    read alone under `INCLUDE_DEPRECATED_FLAG`, which reads its upstreams as they are."""
+    flags = (
+        INCLUDE_DEPRECATED_FLAG
+        if exact
+        else " or ".join(
+            flags_admitting_deprecated_upstream(DefinitionKind(upstream["definition_kind"]))
+        )
+    )
+    print(
+        f"warning: {kind} {idx} reads {upstream['definition_kind']}"
+        f" {upstream['definition_idx']}, which is deprecated"
+        f" ({upstream.get('deprecation_reason')}); read under {flags}",
+        file=sys.stderr,
+    )
+
+
+def optional_body_fields(
+    *,
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
+) -> dict[str, bool | str]:
+    """`include_deprecated`, `include_deprecated_upstream` and `as_of_event` as JSON
+    body fields, each sent only when set, so a request without the flags is
+    unchanged."""
+    fields: dict[str, bool | str] = {}
+    if include_deprecated:
+        fields["include_deprecated"] = True
+    if include_deprecated_upstream:
+        fields["include_deprecated_upstream"] = True
+    if as_of_event is not None:
+        fields["as_of_event"] = as_of_event
+    return fields
+
+
+def optional_query_params(
+    *,
+    include_deprecated: bool = False,
+    include_deprecated_upstream: bool = False,
+    as_of_event: str | None = None,
+) -> dict[str, str]:
+    """`optional_body_fields` in query-parameter form."""
+    return {
+        key: "true" if value is True else str(value)
+        for key, value in optional_body_fields(
+            include_deprecated=include_deprecated,
+            include_deprecated_upstream=include_deprecated_upstream,
+            as_of_event=as_of_event,
+        ).items()
+    }
+
+
+def add_as_of_event_argument(parser: argparse.ArgumentParser) -> None:
+    """`--as-of-event TOKEN` on a CLI that resolves definition groups."""
+    parser.add_argument(
+        "--as-of-event",
+        metavar="TOKEN",
+        help=(
+            "Group the definitions under an earlier decision set: the"
+            " `decisions.decision_set` an earlier output recorded (sha256:...). Only the"
+            " output-equivalence verdicts are as of it; runs, gates, tickets and deprecation"
+            " are read as they are now"
+        ),
+    )

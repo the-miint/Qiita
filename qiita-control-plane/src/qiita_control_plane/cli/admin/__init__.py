@@ -37,6 +37,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+from qiita_common.models import INCLUDE_DEPRECATED_FLAG
 
 from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
 from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
@@ -74,6 +75,7 @@ from .backfill_assembly_gene_call import add_assembly_gene_call_parser
 from .backfill_wol_genome_repair import add_wol_genome_repair_parser
 from .check_stored_preflights import add_check_stored_preflights_parser
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
+from .definition import add_definition_parser
 from .fanout import add_fanout_parser
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
@@ -97,6 +99,7 @@ from .masked_export import (
     _retry_seconds_arg,
     _write_masked_sample,
 )
+from .output_equivalence import add_output_equivalence_parser
 from .owner_id import (
     _OWNER_ID_BASE_COLUMNS,
     _OWNER_ID_POOL_COLUMNS,
@@ -209,25 +212,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel = p_ticket_sub.add_parser(
         "cancel",
         help=(
-            "Cancel in-flight work_ticket(s): flip terminal (cancelled) so the CP"
+            "Cancel in-flight or failed work_ticket(s): flip them to cancelled so the CP"
             " stops driving them AND scancel their SLURM job(s), via the CP route"
             " (work_ticket:cancel scope). One ticket or a whole fan-out — no raw"
             " scancel across the compute account. Idempotent; redrive later with"
-            " `qiita ticket run`."
+            " `qiita ticket run`. A failed scancel blocks the redrive until this command,"
+            " run again on the ticket, reaps without error."
         ),
     )
     p_cancel.add_argument(
         "work_ticket_idx",
         nargs="*",
         type=int,
-        help="explicit work_ticket idx(s) to cancel (reaped regardless of state)",
+        help=(
+            "explicit work_ticket idx(s) to cancel: a pending, queued, processing or"
+            " failed one is flipped to cancelled; each is reaped whatever its state"
+        ),
     )
     p_cancel.add_argument(
         "--action-id",
         dest="action_id",
         default=None,
         help=(
-            "cancel all NON-terminal tickets for this action_id (e.g. read-mask);"
+            "cancel all NON-terminal tickets for this action_id (e.g. read-mask; a"
+            " failed ticket is cancelled only by idx);"
             " combine with --sequencing-run-idx / --sequenced-pool-idx to narrow"
         ),
     )
@@ -249,6 +257,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_fanout_parser(sub)
     add_alignment_parser(sub)
+    add_output_equivalence_parser(sub)
+    add_definition_parser(sub)
 
     p_terminology = sub.add_parser("terminology", help="Terminology release operations")
     p_terminology_sub = p_terminology.add_subparsers(dest="terminology_cmd", required=True)
@@ -600,9 +610,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "Export masked sequence data for every prep_sample on a"
             " sequenced_pool (system_admin only). Streams each prep_sample's"
             " masked reads from the data plane and writes them to"
-            " <biosample_accession>.<run>.<pool>.<prep_sample> plus .parquet,"
-            " or .fastq.gz (single-end) / .R1.fastq.gz and .R2.fastq.gz"
-            " (paired)."
+            " <biosample_accession>.<export_id> plus .parquet, or .fastq.gz"
+            " (single-end) / .R1.fastq.gz and .R2.fastq.gz (paired), where"
+            " <export_id> is the prep_sample's public handle under its mask. Exits 1"
+            " when any prep_sample is left out, unless --allow-partial, and when"
+            " none is exported."
         ),
     )
     p_export.add_argument(
@@ -617,7 +629,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=int,
         dest="mask_idx",
-        help="mask_idx identifying which masked reads to export (required).",
+        help=(
+            "mask_idx naming the similarity group of masks to export from (required)."
+            " Each prep_sample is exported from the mask of the group that it resolves"
+            " to; one that is incomplete or not processed there is skipped and listed."
+            " Refused when this mask is deprecated."
+        ),
     )
     p_export.add_argument(
         "--format",
@@ -636,10 +653,50 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="output_dir",
         help=(
             "Directory to write each prep_sample's files into (created, with"
-            " parents, if missing; files are mode 0600). On re-export, an"
+            " parents, if missing; files are mode 0600), plus"
+            " masked-read-export.manifest.json mapping each file to the prep_sample's"
+            " and the mask's public handles. A file that the manifest records under a"
+            " different mask is never overwritten. Otherwise, on re-export, an"
             " existing parquet file is skipped when its count matches the data"
             " plane and overwritten when it differs; an existing fastq target"
-            " is refused."
+            " is refused. A directory holding an export file that the manifest does"
+            " not record is refused; see --adopt-unrecorded."
+        ),
+    )
+    p_export.add_argument(
+        INCLUDE_DEPRECATED_FLAG,
+        action="store_true",
+        dest="include_deprecated",
+        help=(
+            "Export a deprecated --mask-idx's own reads, without its group (refused"
+            " without this flag); each prep_sample must be processed under that mask"
+            " itself. A mask that is not deprecated exports its group either way"
+        ),
+    )
+    _common.add_as_of_event_argument(p_export)
+    p_export.add_argument(
+        "--allow-partial",
+        action="store_true",
+        dest="allow_partial",
+        help=(
+            "Exit 0 when some prep_samples were left out (not processed in the"
+            " group, or refused partway) and the rest were exported. Without it such"
+            " a run exits 1; its files are kept and recorded either way. A run that"
+            " exports nothing exits 1 regardless."
+        ),
+    )
+    p_export.add_argument(
+        "--adopt-unrecorded",
+        action="store_true",
+        dest="adopt_unrecorded",
+        help=(
+            "Accept an output directory holding export files that its manifest does"
+            " not record, such as one written before the manifest or before files"
+            " were named <biosample_accession>.<export_id>. Each such file that this"
+            " run writes is rewritten from the current resolution and recorded; a"
+            " file of the earlier <accession>.<run>.<pool>.<prep_sample> naming is"
+            " removed once its replacement is written and recorded. Unrecorded files"
+            " this run does not write are left in place and listed."
         ),
     )
     p_export.add_argument(

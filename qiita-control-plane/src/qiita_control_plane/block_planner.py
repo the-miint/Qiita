@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import asyncpg
 from qiita_common.actions import BLOCK_MASK_ACTION_ID as _BLOCK_MASK_ACTION_ID
 from qiita_common.api_paths import URL_MASK_DEFINITION_STATUS
+from qiita_common.hashing import canonical_params_hash
 from qiita_common.host_filter_plan import (
     PoolPlanRefusal,
     SampleHostFilter,
@@ -205,6 +206,20 @@ class BlockPlanSampleGainedReads(RuntimeError):
             f"prep_sample {prep_sample_idx} gained stored reads, or had a newer ingest"
             f" submitted, while sequenced_pool {sequenced_pool_idx} was being planned;"
             " plan the pool again"
+        )
+
+
+class BlockPlanMaskEdited(RuntimeError):
+    """A mask this plan minted had its settings edited before the plan's transaction
+    held it, so the plan's tickets would record a mask whose settings are not the
+    ones the plan hashed. The plan rolls back; planning the pool again mints the mask
+    for its own params. The route maps this to 409."""
+
+    def __init__(self, *, mask_idx: int, sequenced_pool_idx: int):
+        self.mask_idx = mask_idx
+        super().__init__(
+            f"mask {mask_idx} had its settings edited while sequenced_pool"
+            f" {sequenced_pool_idx} was being planned; plan the pool again"
         )
 
 
@@ -641,6 +656,8 @@ async def plan_and_submit_blocks(
     # mints one per distinct decision and the partitions fall out naturally.
     mask_by_prep_sample: dict[int, int] = {}
     decision_by_mask: dict[int, SampleHostFilter] = {}
+    # The params hash each mask was minted for, re-checked under the plan's hold.
+    hash_by_mask: dict[int, bytes] = {}
     mask_by_key: dict[tuple[int | None, SampleHostFilter], int] = {}
     async with pool.acquire() as conn:
         for s in [*all_samples, *empty_samples]:
@@ -669,6 +686,7 @@ async def plan_and_submit_blocks(
                 mask_idx = mask_row["mask_idx"]
                 mask_by_key[key] = mask_idx
                 decision_by_mask[mask_idx] = decision
+                hash_by_mask[mask_idx] = canonical_params_hash(params)
             mask_by_prep_sample[s.prep_sample_idx] = mask_idx
 
     # only_missing: drop samples already gated under their resolved mask (a prior
@@ -699,10 +717,16 @@ async def plan_and_submit_blocks(
     block_summaries: list[dict[str, Any]] = []
     partition_summaries: list[dict[str, Any]] = []
     async with pool.acquire() as conn, conn.transaction():
-        # A deprecation landing between the mints above and this transaction would
-        # otherwise see none of the tickets below (`lock_active_mask`).
+        # A deprecation or a settings edit landing between the mints above and this
+        # transaction would otherwise see none of the tickets below
+        # (`lock_active_mask`); one that committed before the hold is caught by the
+        # held row's hash no longer being the one minted.
         for partition_mask_idx in sorted(partitions):
-            await lock_active_mask(conn, partition_mask_idx)
+            held = await lock_active_mask(conn, partition_mask_idx)
+            if held["params_hash"] != hash_by_mask[partition_mask_idx]:
+                raise BlockPlanMaskEdited(
+                    mask_idx=partition_mask_idx, sequenced_pool_idx=sequenced_pool_idx
+                )
         # NB1: serialize the cross-path double-mask race. Take a per-sample advisory
         # lock (mask_idx, prep_sample), held to commit, BEFORE the disallow-without-
         # delete check + create_mask_sample_pending below, so that check→write is
