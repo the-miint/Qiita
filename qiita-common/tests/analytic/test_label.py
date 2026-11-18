@@ -241,15 +241,15 @@ def test_the_default_axis_reproduces_the_ogu_spine_exactly():
     assert f"LEFT JOIN {ft.GENOME_LABEL_TABLE} g" in joined
 
 
-def test_the_feature_label_table_names_a_feature_by_its_sequence_hash():
-    """The one place the published amplicon handle is defined: md5 of the sequence,
-    computed from the per-feature sequence relation — no mint, no DISTINCT (one sequence
-    row per feature already)."""
-    sql = ft.feature_label_table_sql("seq_src")
+def test_the_feature_label_table_reads_the_minted_handle():
+    """The feature-axis twin of `genome_label_table_sql`: the handle is the minted
+    `export_feature_id` read from the mint response, not a computed md5 — no DISTINCT
+    (one row per feature already)."""
+    sql = ft.feature_label_table_sql("mint_src")
     assert "DISTINCT" not in sql
-    assert "md5(sequence) AS feature_id" in sql
+    assert "export_feature_id AS feature_id" in sql
     assert "SELECT feature_idx," in sql
-    assert "FROM seq_src" in sql
+    assert "FROM mint_src" in sql
     assert ft.FEATURE_LABEL_TABLE in sql
 
 

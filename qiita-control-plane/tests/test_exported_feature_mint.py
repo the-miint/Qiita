@@ -25,8 +25,10 @@ from qiita_common.models import GenomeSource
 from qiita_control_plane.repositories.exported_feature import (
     _SOURCE_ID_IS_EXTERNAL_ACCESSION,
     mint_exported_features,
+    mint_observed_features,
 )
 from qiita_control_plane.testing.db_seeds import (
+    seed_bare_feature,
     seed_biosample_with_sequenced_prep_sample,
     seed_genome,
     seed_user_principal,
@@ -123,4 +125,31 @@ async def test_the_source_decides_whether_source_id_is_published(postgres_pool, 
             biosample_idxs=[biosample_idx],
             prep_sample_idxs=[prep_sample_idx],
         )
+        await delete_principal(postgres_pool, [principal_idx])
+
+
+@pytest.mark.db
+async def test_an_observed_feature_mints_a_qf_and_is_idempotent(postgres_pool):
+    """A de-novo feature (an ASV) has no accession, so the observed kind always gets a
+    QF, and a re-mint returns the same published handle."""
+    principal_idx = await seed_user_principal(
+        postgres_pool, prefix="obsfeat-mint", suffix=str(uuid.uuid4())[:8]
+    )
+    feature_idx = await seed_bare_feature(postgres_pool)
+    try:
+        handles = await mint_observed_features(
+            postgres_pool, feature_idx=[feature_idx], created_by_idx=principal_idx
+        )
+        assert set(handles) == {feature_idx}
+        qf = handles[feature_idx]
+        assert qf.startswith("QF") and qf[2:].isdigit()
+        again = await mint_observed_features(
+            postgres_pool, feature_idx=[feature_idx], created_by_idx=principal_idx
+        )
+        assert again == handles  # idempotent: the published handle is stable
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.exported_feature WHERE feature_idx = $1", feature_idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.feature WHERE feature_idx = $1", feature_idx)
         await delete_principal(postgres_pool, [principal_idx])

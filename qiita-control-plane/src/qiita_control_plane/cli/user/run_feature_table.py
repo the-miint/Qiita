@@ -6,10 +6,10 @@ COO `(sample, feature, value)`, and its features, and this writes them as a bund
 The routes are the one implementation of a run table, which the web UI reads too,
 so the two cannot disagree about one.
 
-A run's features are ASVs (counts, named by the md5 of the ASV sequence). The table
-is written straight from its COO rows — BIOM and Parquet both take
+A run's features are ASVs (counts, named by their exported-feature handle, a `QF`).
+The table is written straight from its COO rows — BIOM and Parquet both take
 `(feature_id, sample_id, value)` — so it is never made dense on the way to disk.
-The bundle also carries each ASV's sequence.
+The bundle also carries each feature's sequence and md5, mapped from the handle.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ MANIFEST_NOTE = (
 
 # What each method's feature ids are, for the manifest.
 _FEATURE_ID = {
-    AMPLICON_ACTION_ID: "md5 of the ASV sequence",
+    AMPLICON_ACTION_ID: "exported-feature handle (QF); the sequence companion maps it to md5",
 }
 
 

@@ -985,12 +985,14 @@ class SequencesClearance(NamedTuple):
 
 
 def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
-    """COPY each published feature's md5 and ASV sequence to Parquet — the uniform
-    "a feature id, its sequence" resolver. SEMI JOIN to the published set (not `IN`) and
-    unordered, like `write.taxonomy_copy_sql`: the reader joins on the id."""
+    """COPY the handle -> (sequence, md5) mapping to Parquet: each published feature's
+    `QF`, its ASV sequence, and the reproducible-from-sequence md5. SEMI JOIN to the
+    published set (not `IN`) and unordered, like `write.taxonomy_copy_sql`: the reader
+    joins on the id."""
     del clearance  # Held, not read: holding it is the check.
     return (
-        f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length FROM {FEATURE_RELATION} f"
+        f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length, f.md5"
+        f" FROM {FEATURE_RELATION} f"
         f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = f.feature)"
         f" TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
     )

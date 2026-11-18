@@ -120,6 +120,22 @@ _INSERT_FEATURE = (
     "  ORDER BY f.feature_idx" + _ON_CONFLICT
 )
 
+# The observed-feature kind: a feature with no reference and no accession (an ASV),
+# so the handle is always 'QF<idx>' and there is no accession pass. Idempotent on
+# `exported_feature_live_observed_feature`.
+_INSERT_OBSERVED = (
+    "INSERT INTO qiita.exported_feature (entity_kind, feature_idx, created_by_idx)"
+    " SELECT 'observed_feature', f.feature_idx, $2"
+    "   FROM unnest($1::bigint[]) AS f(feature_idx)"
+    "  ORDER BY f.feature_idx" + _ON_CONFLICT
+)
+
+_SELECT_OBSERVED = (
+    "SELECT feature_idx, export_feature_id FROM qiita.exported_feature"
+    " WHERE NOT retired AND entity_kind = 'observed_feature'"
+    "   AND feature_idx = ANY($1::bigint[])"
+)
+
 
 class IncompleteMintError(RuntimeError):
     """The mint came back short of the entity set it was asked for.
@@ -236,3 +252,21 @@ async def mint_exported_features(
     if unnamed_genomes or unnamed_features:
         raise IncompleteMintError(genome_idx=unnamed_genomes, feature_idx=unnamed_features)
     return rows
+
+
+async def mint_observed_features(
+    pool: asyncpg.Pool, *, feature_idx: list[int], created_by_idx: int
+) -> dict[int, str]:
+    """`feature_idx -> QF handle` for each de-novo feature (an ASV), minting any that
+    lack one. Same idempotence and concurrency contract as `mint_exported_features`,
+    but a single insert: an observed feature has no accession, so no accession pass."""
+    if not feature_idx:
+        return {}
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(_INSERT_OBSERVED, feature_idx, created_by_idx)
+        rows = await conn.fetch(_SELECT_OBSERVED, feature_idx)
+    handles = {row["feature_idx"]: row["export_feature_id"] for row in rows}
+    missing = sorted(set(feature_idx) - handles.keys())
+    if missing:
+        raise IncompleteMintError(genome_idx=[], feature_idx=missing)
+    return handles
