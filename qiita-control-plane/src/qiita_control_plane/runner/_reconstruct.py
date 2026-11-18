@@ -24,6 +24,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.data_plane_errors import (
     is_data_plane_transient,
 )
+from qiita_common.krepp import KREPP_BUILD_RECORD_BASENAME, REFERENCE_INDEX_IDX_BINDING
 from qiita_common.models import (
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
@@ -242,6 +243,8 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
         return {entry.outputs[0]: attempt_workspace / MINT_GENE_FEATURES_OUTPUT_BASENAME}
     if entry.name == LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP:
         return {entry.outputs[0]: attempt_workspace / SUBJECT_GENOME_MAP_OUTPUT_BASENAME}
+    if entry.name == LibraryPrimitive.EXPORT_KREPP_BUILD:
+        return {entry.outputs[0]: attempt_workspace / KREPP_BUILD_RECORD_BASENAME}
     return {}
 
 
@@ -631,6 +634,30 @@ async def _run_action_primitive(
             workspace,
         )
         return {entry.outputs[0]: subject_genome_map_path}
+
+    if entry.name == LibraryPrimitive.EXPORT_KREPP_BUILD:
+        if entry.inputs:
+            raise RuntimeError(f"{entry.name} takes no inputs; got {entry.inputs!r}")
+        record_path = await LIBRARY[LibraryPrimitive.EXPORT_KREPP_BUILD](
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
+            int(bound[REFERENCE_INDEX_IDX_BINDING]),
+            workspace,
+        )
+        return {entry.outputs[0]: record_path}
+
+    if entry.name == LibraryPrimitive.ACTIVATE_KREPP_BUILD:
+        if len(entry.inputs) != 1:
+            raise RuntimeError(
+                f"{entry.name} expects exactly one input (the activation report);"
+                f" got {entry.inputs!r}"
+            )
+        await LIBRARY[LibraryPrimitive.ACTIVATE_KREPP_BUILD](
+            ctx.pool,
+            int(bound[REFERENCE_INDEX_IDX_BINDING]),
+            Path(bound[entry.inputs[0]]),
+        )
+        return {}
 
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])

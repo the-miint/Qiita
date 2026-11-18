@@ -1,0 +1,70 @@
+action_id: reference-index-activate
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Make a registered krepp build the reference's active one, once the cluster admins
+  have copied it to every compute node (docs/runbooks/krepp-index.md). On whichever
+  node SLURM picks, the job checks that node's copy against the registered
+  SHA256SUMS hash and the linked krepp version, then places one 30 kb piece of up to
+  100 backbone tips with it and reports the share whose best edge is the tip's own.
+  The activate step makes the build active, retiring the reference's previous active
+  build, when that share is at least `min_own_edge_share`, and records the result in
+  the build's params.
+
+  `activate: false` runs the checks and writes the report without activating: how the
+  share for a correctly numbered build is first measured, to choose
+  `min_own_edge_share`. The report is the job's output `krepp_activation_report.json`
+  and is also printed to its log.
+
+  The reference itself does not change state, so the action carries no
+  success_status or failure_status.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required: [reference_index_idx, min_own_edge_share]
+  properties:
+    reference_index_idx: {type: integer, minimum: 1}
+    min_own_edge_share: {type: number, minimum: 0, maximum: 1}
+    # Default on via the activate step's `when:`; false runs the checks only.
+    activate: {type: boolean}
+
+steps:
+  # The build's row, for the job (which has no database access): its relative path
+  # and the SHA256SUMS hash a copy must have.
+  - action: export-krepp-build
+    inputs: []
+    outputs: [krepp_build_record]
+
+  - step: krepp_index_activate
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.krepp_index_activate
+    inputs: [krepp_build_record]
+    params: {min_own_edge_share: min_own_edge_share}
+    outputs: [krepp_activation_report]
+    # Not measured on a production build. The job maps the node copy (place_krepp
+    # loads the index once per call) and places up to 100 pieces of 30 kb. The
+    # memory figure measured for w43 r0-15 is 155 GiB peak for 16 placement processes
+    # with the index copied into /dev/shm and charged to the job; this step reads the
+    # copy in place on the node's SSD with one process, which has not been measured.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 160
+      walltime: PT2H
+
+  - action: activate-krepp-build
+    inputs: [krepp_activation_report]
+    when: activate
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 400
+  walltime: PT8H

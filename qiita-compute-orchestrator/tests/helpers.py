@@ -82,3 +82,12 @@ def shard_yaml_baseline_gb(step_name: str) -> int:
 # The backbone of the conftest `krepp_built_index` fixture; the index numbers its edges
 # edge_id = node_index, as Qiita numbers an undecorated tree.
 KREPP_TREE_NEWICK = "((g0:1,g1:1):1,(g2:1,g3:1):1);\n"
+
+
+def krepp_genomes() -> dict[str, str]:
+    """The four genomes the conftest `krepp_built_index` index is built from: tips g0..g3
+    of KREPP_TREE_NEWICK, 20 kb each, random with a fixed seed."""
+    import random
+
+    rng = random.Random(1)
+    return {f"g{i}": "".join(rng.choice("ACGT") for _ in range(20000)) for i in range(4)}

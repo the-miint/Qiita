@@ -2,6 +2,7 @@
 20261117000000_krepp_index_lifecycle.sql adds, `register_index`'s krepp refusals, the
 state changes in `repositories.reference_index`, and the reference-delete gate."""
 
+import json
 import uuid
 
 import asyncpg
@@ -324,3 +325,75 @@ async def test_reference_delete_allowed_once_every_build_is_removed(world):
     a = await _register(world, "a")
     await _remove(world["pool"], a)
     await assert_reference_deletable(world["pool"], world["reference_idx"], force=True)
+
+
+# --- export-krepp-build / activate-krepp-build ------------------------------------
+
+
+def _report(reference_index_idx: int, own: int, minimum: float = 0.9) -> str:
+    from qiita_common.krepp import KreppActivationReport
+
+    return KreppActivationReport(
+        reference_index_idx=reference_index_idx,
+        node="b-cn-01",
+        tips=100,
+        placed=100,
+        own_edge=own,
+        own_edge_share=own / 100,
+        min_own_edge_share=minimum,
+        passed=own / 100 >= minimum,
+    ).model_dump_json()
+
+
+async def test_export_writes_the_build_record(world, tmp_path):
+    from qiita_common.krepp import KreppBuildRecord
+
+    from qiita_control_plane.actions.library import export_krepp_build
+
+    a = await _register(world, "a", "d" * 64)
+    path = await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
+    record = KreppBuildRecord.model_validate_json(path.read_text())
+    assert record.fs_path == f"references/{world['reference_idx']}/krepp/a"
+    assert record.sha256sums_sha256 == "d" * 64
+
+
+async def test_export_refuses_another_reference_and_a_retired_build(world, tmp_path):
+    from qiita_control_plane.actions.library import export_krepp_build
+
+    a = await _register(world, "a")
+    with pytest.raises(ValueError, match="belongs to reference"):
+        await export_krepp_build(world["pool"], world["reference_idx"] + 1000, a, tmp_path)
+    await world["pool"].execute(
+        "UPDATE qiita.reference_index SET state = 'retired' WHERE reference_index_idx = $1", a
+    )
+    with pytest.raises(ValueError, match="retired"):
+        await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
+
+
+async def test_activate_from_a_passing_report_records_it(world, tmp_path):
+    from qiita_control_plane.actions.library import activate_krepp_build_from_report
+
+    a = await _register(world, "a")
+    report = tmp_path / "report.json"
+    report.write_text(_report(a, own=97))
+    await activate_krepp_build_from_report(world["pool"], a, report)
+    row = await world["pool"].fetchrow(
+        "SELECT state, params FROM qiita.reference_index WHERE reference_index_idx = $1", a
+    )
+    assert row["state"] == "active"
+    activation = json.loads(row["params"])["activation"]
+    assert activation["own_edge_share"] == 0.97 and activation["node"] == "b-cn-01"
+
+
+async def test_activate_refuses_a_failing_or_foreign_report(world, tmp_path):
+    from qiita_control_plane.actions.library import activate_krepp_build_from_report
+
+    a = await _register(world, "a")
+    report = tmp_path / "report.json"
+    report.write_text(_report(a, own=3))
+    with pytest.raises(ValueError, match="did not pass"):
+        await activate_krepp_build_from_report(world["pool"], a, report)
+    report.write_text(_report(a + 1, own=97))
+    with pytest.raises(ValueError, match="is for krepp build"):
+        await activate_krepp_build_from_report(world["pool"], a, report)
+    assert await _state(world["pool"], a) == "registered"
