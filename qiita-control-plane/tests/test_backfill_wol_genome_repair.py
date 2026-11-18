@@ -154,7 +154,7 @@ class _World:
 
         A: the sequence links to `G<n>` and `GCA_G<n>`.
         B: `G<n>` exists but does not hold the sequence; a stale WoL ID `G<m>` does,
-           as reference 16's load left it.
+           as an earlier WoL load left it.
         C: no `G<n>` row; only `GCA_G<n>` holds the sequence.
 
         `n` and `parent` go together: a WoL ID is `G` and its parent accession's nine
