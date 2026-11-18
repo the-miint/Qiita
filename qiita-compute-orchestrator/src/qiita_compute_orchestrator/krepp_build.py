@@ -359,15 +359,15 @@ def verify_build(
 
 
 def linked_krepp_version(conn) -> str:
-    """The krepp version miint links, from `miint_versions()`.
-
-    That row is `git describe` output, which equals the `VERSION` string an index
-    records only when miint's krepp pin is a tagged commit (for the untagged pin
-    3120503 it reads `v0.9.1-11-g3120503` while krepp's VERSION says `v0.10.0`).
-    On an untagged pin this therefore refuses a build of the same krepp.
-    duckdb-miint#473 asks miint to report krepp's own VERSION; read that here once
-    it exists."""
-    row = conn.execute("SELECT version FROM miint_versions() WHERE library = 'krepp'").fetchone()
+    """krepp's own version string, as the loaded miint reports it: the `krepp-version`
+    row of `miint_versions()`, the string an index records as `krepp version:`
+    (https://the-miint.github.io/duckdb-miint/utilities/)."""
+    row = conn.execute(
+        "SELECT version FROM miint_versions() WHERE library = 'krepp-version'"
+    ).fetchone()
     if row is None:
-        raise RuntimeError("the loaded miint reports no krepp library (built without krepp?)")
+        raise RuntimeError(
+            "the loaded miint reports no krepp-version row: built without krepp,"
+            " or older than duckdb-miint#475"
+        )
     return row[0]

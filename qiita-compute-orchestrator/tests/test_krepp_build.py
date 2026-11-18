@@ -28,9 +28,11 @@ from qiita_compute_orchestrator.krepp_build import (
     VERIFY_SCRIPT,
     KreppBuildInvalid,
     inventory_index,
+    linked_krepp_version,
     verify_build,
     write_build_files,
 )
+from qiita_compute_orchestrator.miint import open_miint_conn
 
 
 @pytest.fixture
@@ -170,6 +172,17 @@ def test_verify_refuses_a_build_from_another_krepp(build):
     with pytest.raises(KreppBuildInvalid) as exc:
         verify_build(build, sums, linked_krepp_version=built + "-other")
     assert exc.value.check == "krepp-version"
+
+
+def test_linked_version_is_the_one_an_index_records(krepp_built_index):
+    """The version the per-job check compares against is the string the same miint
+    writes into an index it builds."""
+    conn = open_miint_conn()
+    try:
+        linked = linked_krepp_version(conn)
+    finally:
+        conn.close()
+    assert linked == inventory_index(krepp_built_index).settings["krepp version"]
 
 
 def _gnu_sha256sum() -> bool:
