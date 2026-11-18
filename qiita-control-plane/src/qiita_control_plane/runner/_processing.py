@@ -24,14 +24,17 @@ from qiita_common.actions import (
     action_threads_processing_idx,
 )
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.hashing import canonical_params_hash
 
 from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
 )
+from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from ..repositories.processing import ProcessingDeprecated, mint_processing
 from ._base import _log, _workflow_declares_action
 from ._mask import MASK_IDX_BINDING
+from ._record import fail_exhausted_hold, record_minted
 from ._upload import _submission_bad_input
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
@@ -123,6 +126,7 @@ async def _mint_processing_idx(
     action_version: str,
     bound: dict[str, Any],
     assembler_default: str | None = None,
+    work_ticket_idx: int | None = None,
 ) -> dict[str, Any]:
     """Mint (or resolve) the processing_idx for this run's params and bind it.
 
@@ -139,15 +143,29 @@ async def _mint_processing_idx(
     assembler the identity hashed. Without this, an omitted assembler would hash the
     context_schema default while the container fell back to the native job's own
     Inputs default — a silent hash≠reality drift the moment those two defaults
-    diverge."""
+    diverge.
+
+    With `work_ticket_idx`, the same transaction records the processing on the ticket
+    (`work_ticket.processing_idx`), holding the processing row `FOR SHARE` from the
+    mint through that write (the hold: `repositories.definition_hold`), and refuses a
+    ticket that already records another processing (the refusal: `runner._record`)."""
     params = _build_processing_params(
         action_id, action_version, bound, assembler_default=assembler_default
     )
     try:
-        async with pool.acquire() as conn:
-            row = await mint_processing(
+        async with pool.acquire() as conn, conn.transaction():
+            row = await _mint_and_hold(
                 conn, workflow=action_id, version=action_version, params=params
             )
+            if work_ticket_idx is not None:
+                await record_minted(
+                    conn,
+                    work_ticket_idx=work_ticket_idx,
+                    column="processing_idx",
+                    definition_idx=row["processing_idx"],
+                )
+    except MintHoldExhausted as exc:
+        raise fail_exhausted_hold(exc) from exc
     except ProcessingDeprecated as exc:
         # The ticket named a run config that cannot be minted against, which is bad
         # input rather than a fault to retry. Left unhandled it reaches
@@ -159,6 +177,28 @@ async def _mint_processing_idx(
     if params.get("assembler") is not None:
         bindings[ASSEMBLER_BINDING] = params["assembler"]
     return bindings
+
+
+async def _mint_and_hold(
+    conn: asyncpg.Connection, *, workflow: str, version: str, params: dict[str, Any]
+) -> asyncpg.Record:
+    """`mint_processing` under `repositories.definition_hold.mint_and_hold`: the
+    minted row is held `FOR SHARE` for the caller's transaction, re-minted when an
+    edit moved it."""
+
+    async def held_params_hash(row: asyncpg.Record) -> bytes:
+        return await conn.fetchval(
+            "SELECT params_hash FROM qiita.processing WHERE processing_idx = $1 FOR SHARE",
+            row["processing_idx"],
+        )
+
+    return await mint_and_hold(
+        conn,
+        mint=lambda: mint_processing(conn, workflow=workflow, version=version, params=params),
+        held_params_hash=held_params_hash,
+        params_hash=canonical_params_hash(params),
+        what=f"processing for {workflow} {version}",
+    )
 
 
 def _workflow_writes_assembly_gate(steps: list[Any]) -> bool:

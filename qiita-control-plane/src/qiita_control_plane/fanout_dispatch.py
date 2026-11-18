@@ -34,9 +34,10 @@ this pump releases them a capped number at a time:
     nothing. One failing child halts the whole fan-out rather than burning
     through the remaining shards against a sick backend. The operator
     investigates and redrives the failed child(ren) directly (a `/run` redrive
-    dispatches a specific ticket whatever its `dispatch_held`, and clears it); once
-    no failed ticket remains, the next child completion re-starts the pump
-    automatically.
+    dispatches a specific ticket whatever its `dispatch_held`, and clears it), or
+    cancels them (`qiita-admin ticket cancel`); once no failed ticket remains, the
+    next child completion re-starts the pump automatically. A cancel does not pump:
+    when no child is left running, `qiita-admin fanout pump` re-starts it.
 
 Startup reconcile (`dispatch.reconcile_inflight_tickets`) re-dispatches only
 non-held in-flight tickets and then calls the pump for every cohort that still

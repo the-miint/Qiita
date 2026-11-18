@@ -271,7 +271,25 @@ async def test_cohort_of_a_deprecated_alignment_is_409(ctx, seeded):
     await _deprecate(ctx, seeded["align_1"])
     resp = await ctx["user"].get(_cohort_url(seeded, seeded["align_1"]))
     assert resp.status_code == 409, resp.text
-    assert "bad aligner build" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "bad aligner build" in detail["detail"] and "--include-deprecated" in detail["detail"]
+
+
+async def test_cohort_of_a_deprecated_alignment_is_listed_with_the_flag(ctx, seeded):
+    """With `include_deprecated` the deprecated alignment's completed prep_samples are
+    listed as for an active one; the flag changes nothing for an active one."""
+    active = await ctx["user"].get(_cohort_url(seeded, seeded["align_1"]))
+    flagged = await ctx["user"].get(
+        _cohort_url(seeded, seeded["align_1"]), params={"include_deprecated": "true"}
+    )
+    assert flagged.status_code == 200, flagged.text
+    assert flagged.json() == active.json()
+    await _deprecate(ctx, seeded["align_1"])
+    resp = await ctx["user"].get(
+        _cohort_url(seeded, seeded["align_1"]), params={"include_deprecated": "true"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["prep_sample_idx"] == active.json()["prep_sample_idx"] != []
 
 
 async def test_cohort_of_a_deprecated_alignment_the_caller_cannot_read_stays_empty(ctx, seeded):
