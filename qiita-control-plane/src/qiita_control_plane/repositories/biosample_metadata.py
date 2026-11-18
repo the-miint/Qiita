@@ -109,5 +109,7 @@ BIOSAMPLE_METADATA_SPEC = EntityMetadataSpec(
     metadata_field_contract_trigger="biosample_metadata_apply_field_contract",
     visibility_function="qiita.biosample_metadata_visibility",
     field_exception_table="qiita.biosample_field_exception",
+    exception_on_unique_field_constraint="biosample_field_exception_not_on_unique_field",
+    unique_over_exceptions_constraint="biosample_study_field_unique_without_exceptions",
     owner_sample_id_flag_column="is_owner_biosample_id",
 )
