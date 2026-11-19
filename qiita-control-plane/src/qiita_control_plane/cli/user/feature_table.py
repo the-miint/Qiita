@@ -68,7 +68,7 @@ from qiita_common.models import (
     deprecated_read_refusal,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
-from qiita_common.parquet import PARQUET_MEDIA_TYPE
+from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_OPTS_TRANSFER, validate_parquet_path
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 if TYPE_CHECKING:
@@ -78,6 +78,7 @@ from ...feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
 )
+from ...run_feature_table import FEATURE_RELATION
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -954,9 +955,34 @@ class _Companion(NamedTuple):
 # In write order. Each suffix is derived from the caller's name for the reason the
 # identifier map's is, and named for what it holds rather than for the reference it came
 # from: a reference name is not ours to compose into a filename either.
+class SequencesClearance(NamedTuple):
+    """Proof the amplicon sequences relation was built from the features the table
+    names, which is what makes that companion writable."""
+
+    features: int
+
+
+def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
+    """COPY the handle -> (sequence, md5) mapping to Parquet: each published feature's
+    `QF`, its ASV sequence, and the reproducible-from-sequence md5. SEMI JOIN to the
+    published set (not `IN`) and unordered, like `write.taxonomy_copy_sql`: the reader
+    joins on the id."""
+    del clearance
+    return (
+        f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length, f.md5"
+        f" FROM {FEATURE_RELATION} f"
+        f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = f.feature)"
+        f" TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+    )
+
+
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
+    # The amplicon table's (`qiita feature-table runs`). Its taxonomy IS the `taxonomy`
+    # companion above — the lineage answer is already the `feature_id` + ranks sidecar, so
+    # the client stages it under `TAXONOMY_SIDECAR_RELATION` rather than reimplementing it.
+    _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql),
 )
 
 
@@ -1180,11 +1206,11 @@ def _manifest_payload(
 
 
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
-    """The companions these flags ask for, in write order. Spelled out per member rather
-    than read off the namespace, so a renamed flag is a signature change here instead of a
-    silently absent file."""
+    """The flag-gated companions these flags ask for, in write order. `_COMPANIONS` also
+    holds the amplicon `sequences` companion, which is not flag-gated and is written by its
+    own path; `.get(..., False)` leaves it — and any member absent from `asked` — out here."""
     asked = {"taxonomy": taxonomy, "tree": tree}
-    return tuple(companion for companion in _COMPANIONS if asked[companion.name])
+    return tuple(companion for companion in _COMPANIONS if asked.get(companion.name, False))
 
 
 # Written INTO the map as well as printed, because a warning that lives only in a

@@ -74,6 +74,36 @@ def test_check_refuses_an_unnamed_sidecar_row():
         _taxonomy_check(unnamed_rows=1)
 
 
+# --- The feature axis ------------------------------------------------------------------
+# The feature-keyed sidecar: the label joined straight to the taxonomy, no
+# genome-representative reduction.
+
+
+def test_the_feature_sidecar_joins_the_label_straight_to_the_taxonomy():
+    """No reduction: the label joins directly to the per-feature taxonomy on feature_idx,
+    and there is no genome layer (no map, no genome label, no representative pick)."""
+    sql = ft.feature_taxonomy_sidecar_sql()
+    assert f"CREATE VIEW {ft.TAXONOMY_SIDECAR_RELATION} AS" in sql
+    assert "SELECT l.feature_id," in sql
+    assert f"FROM {ft.FEATURE_LABEL_TABLE} l" in sql
+    assert f"LEFT JOIN {ft.TAXONOMY_TABLE} t ON t.feature_idx = l.feature_idx" in sql
+    assert ft.GENOME_LABEL_TABLE not in sql
+    assert ft.MAP_TABLE not in sql
+
+
+def test_the_feature_sidecar_keeps_an_unplaced_feature_with_null_ranks():
+    """LEFT from the label, so a feature the reference does not classify stays present
+    with NULL ranks rather than dropping out of the sidecar."""
+    sql = ft.feature_taxonomy_sidecar_sql()
+    assert sql.count("LEFT JOIN") == 1
+
+
+def test_the_feature_sidecar_restores_the_prefixes():
+    sql = ft.feature_taxonomy_sidecar_sql()
+    assert "'d__' ||" in sql
+    assert "'t__' ||" in sql
+
+
 def test_the_staged_tree_keeps_the_shear_shape_plus_the_join_key():
     """`name` is staged because the shear matches tips BY NAME; `feature_idx` because
     that is what resolves a tip to the genome the table published."""

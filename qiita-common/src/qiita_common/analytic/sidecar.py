@@ -19,6 +19,7 @@ from ..taxonomy import (
 from .label import published_membership_sql
 from .relations import (
     BLOCKED_FEATURE_TABLE,
+    FEATURE_LABEL_TABLE,
     GENOME_LABEL_TABLE,
     PHYLOGENY_TABLE,
     SHEAR_INPUT_RELATION,
@@ -112,10 +113,30 @@ def taxonomy_sidecar_sql() -> str:
     )
 
 
+def feature_taxonomy_sidecar_sql() -> str:
+    """The feature-axis twin of `taxonomy_sidecar_sql`: one row per published feature,
+    carrying its own ranks.
+
+    **No genome-representative reduction** — the whole difference. A feature of this kind IS
+    the taxonomic unit, so its lineage is its own `reference_taxonomy` row; the label joins
+    straight to the taxonomy. LEFT, so a feature the reference does not place stays present
+    with NULL ranks (keeping the sidecar as wide as the table) rather than vanishing.
+    """
+    return (
+        f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
+        f"SELECT l.feature_id, {prefixed_rank_columns_sql(alias='t')} "
+        f"FROM {FEATURE_LABEL_TABLE} l "
+        f"LEFT JOIN {TAXONOMY_TABLE} t ON t.feature_idx = l.feature_idx"
+    )
+
+
 @dataclass(frozen=True)
 class TaxonomyClearance:
-    """Evidence that `check_taxonomy_diagnostics` ran and passed, plus the sidecar's row
-    count so a caller can report the size without counting it again.
+    """Evidence that the sidecar lines up with the table it accompanies, plus its row
+    count so a caller can report the size without counting it again. The alignment is
+    established either by `check_taxonomy_diagnostics` (the genome build, over a raw
+    taxonomy table) or by construction (the serve path scopes the sidecar to the
+    published features, so it is as wide as the table and carries the size alone).
 
     `taxonomy_copy_sql` takes one for the same reason `labelled_relation_sql` takes a
     `LabelClearance`: a sidecar that does not line up with the table it accompanies is
@@ -139,6 +160,20 @@ def taxonomy_diagnostics_sql() -> str:
     )
 
 
+def refuse_repeated_features(repeated_features: int) -> None:
+    """Refuse a taxonomy that holds more than one row for some feature — a malformed
+    reference. Both axes fan a duplicate out silently if unchecked (the genome axis into
+    an arbitrary representative, the feature axis into N answer rows), so both guard here.
+    """
+    if repeated_features:
+        raise ValueError(
+            f"this reference's taxonomy holds more than one row for {repeated_features} "
+            f"feature(s), which ingest writes one-to-one, so the reference is malformed. "
+            f"Two rows for one feature can disagree, and choosing between them silently "
+            f"would publish an arbitrary lineage."
+        )
+
+
 def check_taxonomy_diagnostics(
     *,
     published_rows: int,
@@ -155,17 +190,10 @@ def check_taxonomy_diagnostics(
     to nothing. An unclassified genome is NOT one of these — it is present with NULL
     ranks, which is a different statement and a legitimate one.
     """
-    if repeated_features:
-        # Checked on the STREAMED taxonomy rather than on the sidecar, because the
-        # reduction resolves a repeat to one row and so cannot show it downstream — see
-        # `genome_representative_taxonomy_select_sql`. Two rows for one feature need not
-        # agree, and arbitrating between two lineages is not ours to do quietly.
-        raise ValueError(
-            f"this reference's taxonomy holds more than one row for {repeated_features} "
-            f"feature(s), which ingest writes one-to-one, so the reference is malformed. "
-            f"Two rows for one feature can disagree, and choosing between them silently "
-            f"would publish an arbitrary lineage."
-        )
+    # Checked on the STREAMED taxonomy rather than on the sidecar, because the reduction
+    # resolves a repeat to one row and so cannot show it downstream — see
+    # `genome_representative_taxonomy_select_sql`.
+    refuse_repeated_features(repeated_features)
     if unnamed_rows:
         raise ValueError(
             f"{unnamed_rows} taxonomy rows carry no feature_id, so nothing could join "

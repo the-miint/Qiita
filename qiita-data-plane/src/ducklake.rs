@@ -740,11 +740,13 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// plane recomputes and ships it WHOLESALE via the `sync_reference_exclusion`
 /// DoAction; here it is just a one-column table the views anti-join against.
 ///
-/// `alignment_visible` / `reference_taxonomy_visible` are the ONLY
-/// exclusion-aware read surfaces: each is its base table minus every row whose
-/// `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build side is
-/// a tiny curated list). A blocked genome/feature therefore never reaches an OGU
-/// feature table or a taxonomy lineage, even though it stays in the base table:
+/// `alignment_visible` / `reference_taxonomy_visible` / `amplicon_membership_visible`
+/// are the ONLY exclusion-aware read surfaces: each is its base table minus every
+/// row whose `feature_idx` is blocked (an `ANTI JOIN` — cheap in DuckDB; the build
+/// side is a tiny curated list). An ASV shares the one `feature_idx` space, so a
+/// direct ASV block (or a reference-intersected ASV of a blocked genome) is anti-joined
+/// by the same list. A blocked genome/feature therefore never reaches an OGU or
+/// amplicon feature table or a taxonomy lineage, even though it stays in the base table:
 /// exclusion is read-time only, so no aligner index is rebuilt. Phylogeny is
 /// deliberately NOT viewed here — `reference_phylogeny` is not row-independent
 /// (a node carries parent/child structure; `feature_idx` is on tips only), so a
@@ -763,8 +765,8 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// anti-join predicate IS the enforcement surface, so a definition change must
 /// reconcile on every DP startup rather than silently keep a stale view on an
 /// already-attached catalog. Must run AFTER `ensure_reference_tables` +
-/// `ensure_alignment_tables` (the views reference `reference_taxonomy` +
-/// `alignment`).
+/// `ensure_alignment_tables` + `ensure_amplicon_tables` (the views reference
+/// `reference_taxonomy`, `alignment` and `amplicon_membership`).
 pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- Resolved excluded feature_idx set, mirrored wholesale from the CP
@@ -782,6 +784,11 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         CREATE OR REPLACE VIEW qiita_lake.reference_taxonomy_visible AS
         SELECT t.*
         FROM qiita_lake.reference_taxonomy t
+        ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);
+
+        CREATE OR REPLACE VIEW qiita_lake.amplicon_membership_visible AS
+        SELECT m.*
+        FROM qiita_lake.amplicon_membership m
         ANTI JOIN qiita_lake.reference_exclusion x USING (feature_idx);",
     )?;
     Ok(())
@@ -1116,12 +1123,13 @@ pub fn ensure_gene_call_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 
 /// per-sample ASV feature counts from a deblur run: feature membership plus
 /// abundance, keyed by `processing_idx` (the run) and `feature_idx` (the ASV);
-/// plus the ASV sequences themselves (`amplicon_sequence` +
-/// `amplicon_sequence_chunks`, keyed by feature_idx, mirroring the assembly
-/// tables) so an ASV never has to be recomputed to read back. the derived
-/// closed-reference feature table aggregates membership; it is never itself
-/// stored. membership is replace-keyed on `(prep_sample_idx, processing_idx)`
-/// and the sequence tables on `feature_idx` in
+/// plus the ASV sequences themselves (`amplicon_sequence`, keyed by feature_idx)
+/// so an ASV never has to be recomputed to read back. An ASV is short (a single
+/// 64 KB chunk at most), so its bytes are stored INLINE in `amplicon_sequence`
+/// rather than in a chunk table — unlike the assembly tables, whose genome
+/// contigs are chunked. the derived closed-reference feature table aggregates
+/// membership; it is never itself stored. membership is replace-keyed on
+/// `(prep_sample_idx, processing_idx)` and the sequence table on `feature_idx` in
 /// `flight_service::registration::REPLACE_KEY_TABLES`, so a re-run replaces its own rows.
 pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
@@ -1132,28 +1140,29 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             count BIGINT NOT NULL
         );
 
-        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx.
-        -- Mirrors assembled_sequence: length here, bytes in the chunks table.
+        -- One row per UNIQUE ASV (content-hash deduped), keyed by feature_idx,
+        -- with its bytes stored inline. An ASV is short, so there is no separate
+        -- chunk table (the chunking the reference/assembly tails need for genomes
+        -- is pure overhead here).
         CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence (
             feature_idx BIGINT NOT NULL,
             sequence_hash UUID NOT NULL,
-            sequence_length_bp BIGINT NOT NULL
-        );
-
-        -- The ASV bytes in 64 KB chunks (reassemble with
-        -- string_agg(chunk_data, '' ORDER BY chunk_index)). Mirrors
-        -- assembled_sequence_chunks; loaded multi-file (a <table>/ subdir of parts).
-        CREATE TABLE IF NOT EXISTS qiita_lake.amplicon_sequence_chunks (
-            feature_idx BIGINT NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            chunk_data VARCHAR NOT NULL
+            sequence_length_bp BIGINT NOT NULL,
+            sequence VARCHAR NOT NULL
         );",
     )?;
-    // Pin DuckLake's own rewrites of the chunk table (see CHUNK_ROW_GROUP_SIZE).
-    conn.execute_batch(&format!(
-        "CALL qiita_lake.set_option('parquet_row_group_size', {CHUNK_ROW_GROUP_SIZE}, \
-         table_name => 'amplicon_sequence_chunks');"
-    ))?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a lake that already holds the earlier
+    // three-column `amplicon_sequence` (its bytes lived in the now-removed
+    // `amplicon_sequence_chunks`) untouched, and `ducklake_add_data_files` refuses a
+    // Parquet carrying a column the target lacks ("Column ... exists in file ... but
+    // was not found in table"), so without this every amplicon registration into an
+    // existing lake fails once the loader writes the inline `sequence`. Added nullable
+    // -- the CREATE states NOT NULL for a fresh lake, but a widen cannot retro-fill
+    // existing rows -- and the loader always provides it. Same evolve-at-boot pattern,
+    // and reasons, as ensure_assembly_tables.
+    conn.execute_batch(
+        "ALTER TABLE qiita_lake.amplicon_sequence ADD COLUMN IF NOT EXISTS sequence VARCHAR;",
+    )?;
     Ok(())
 }
 
@@ -1836,6 +1845,7 @@ mod tests {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
         ensure_alignment_tables(&conn).unwrap();
+        ensure_amplicon_tables(&conn).unwrap();
         ensure_exclusion_tables(&conn).expect("first ensure_exclusion_tables");
         ensure_exclusion_tables(&conn).expect("second ensure_exclusion_tables (idempotent)");
 
@@ -1843,6 +1853,7 @@ mod tests {
             "reference_exclusion",
             "alignment_visible",
             "reference_taxonomy_visible",
+            "amplicon_membership_visible",
         ] {
             let mut stmt = conn
                 .prepare(&format!(
@@ -1866,10 +1877,12 @@ mod tests {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
         ensure_alignment_tables(&conn).unwrap();
+        ensure_amplicon_tables(&conn).unwrap();
         ensure_exclusion_tables(&conn).unwrap();
 
         let alignment_idx = next_test_id();
         let reference_idx = next_test_id();
+        let processing_idx = next_test_id();
         let feat_kept = next_test_id();
         let feat_blocked = next_test_id();
 
@@ -1891,6 +1904,12 @@ mod tests {
             column: "feature_idx",
             id: feat_blocked,
         };
+        let _c_amp = Cleanup {
+            conn: &conn,
+            table: "amplicon_membership",
+            column: "processing_idx",
+            id: processing_idx,
+        };
 
         conn.execute_batch(&format!(
             "INSERT INTO qiita_lake.alignment
@@ -1899,6 +1918,10 @@ mod tests {
                       ({alignment_idx}, 1, 2, {feat_blocked});
              INSERT INTO qiita_lake.reference_taxonomy (reference_idx, feature_idx)
                VALUES ({reference_idx}, {feat_kept}), ({reference_idx}, {feat_blocked});
+             INSERT INTO qiita_lake.amplicon_membership
+                 (prep_sample_idx, processing_idx, feature_idx, count)
+               VALUES (1, {processing_idx}, {feat_kept}, 5),
+                      (1, {processing_idx}, {feat_blocked}, 7);
              INSERT INTO qiita_lake.reference_exclusion (feature_idx)
                VALUES ({feat_blocked});"
         ))
@@ -1949,6 +1972,24 @@ mod tests {
             vec![feat_kept],
             "reference_taxonomy_visible excludes the blocked feature"
         );
+
+        let vis_amp: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT feature_idx FROM qiita_lake.amplicon_membership_visible \
+                     WHERE processing_idx = {processing_idx} ORDER BY feature_idx"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            vis_amp,
+            vec![feat_kept],
+            "amplicon_membership_visible excludes the blocked ASV"
+        );
     }
 
     /// The `_visible` views are catalog-stored, not session-local: a fresh ATTACH
@@ -1968,6 +2009,7 @@ mod tests {
             let conn1 = setup_conn();
             ensure_reference_tables(&conn1).unwrap();
             ensure_alignment_tables(&conn1).unwrap();
+            ensure_amplicon_tables(&conn1).unwrap();
             ensure_exclusion_tables(&conn1).unwrap();
             conn1
                 .execute_batch(&format!(
@@ -2030,6 +2072,44 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "amplicon_membership table should exist exactly once");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_amplicon_tables_widens_a_preexisting_sequence_table() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.amplicon_sequence;")
+            .unwrap();
+        // The pre-inline shape, as a lake deployed before ASV bytes moved inline holds
+        // it (the bytes were in amplicon_sequence_chunks, since removed).
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.amplicon_sequence (
+                feature_idx BIGINT NOT NULL,
+                sequence_hash UUID NOT NULL,
+                sequence_length_bp BIGINT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert_eq!(table_schema(&conn, "amplicon_sequence").len(), 3);
+
+        ensure_amplicon_tables(&conn).expect("ensure_amplicon_tables over a narrow table");
+
+        let names: Vec<String> = table_schema(&conn, "amplicon_sequence")
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "feature_idx",
+                "sequence_hash",
+                "sequence_length_bp",
+                "sequence",
+            ],
+            "the inline sequence column must be appended to an existing table so \
+             register-files does not fail on a widened Parquet"
+        );
     }
 
     /// The live rows of `qiita_lake.{table}` held inline in the catalog's Postgres,

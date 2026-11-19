@@ -65,8 +65,8 @@ def taxonomy_copy_sql(path: Path, *, clearance: TaxonomyClearance) -> str:
     tell an empty rank from an absent one without a convention every reader has to be
     told about.
 
-    **Takes a `TaxonomyClearance`**, so it cannot be reached without having run
-    `check_taxonomy_diagnostics`; see that dataclass.
+    **Takes a `TaxonomyClearance`**, so it cannot be reached without a sidecar whose
+    alignment with the table has been established; see that dataclass.
     """
     _ = clearance
     # Quoted, because two of the eight ranks are SQL keywords. The Parquet column names

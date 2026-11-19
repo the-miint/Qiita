@@ -23,6 +23,10 @@ import httpx
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import Field, ValidationError
+from qiita_common.amplicon_constants import (
+    AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
+    AMPLICON_SEQUENCE_TABLE,
+)
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
@@ -46,6 +50,7 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    SERVABLE_REFERENCE_STATUSES,
     DoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
@@ -914,6 +919,13 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # Per-subject assembly quality, signed by the human assembly run mint
         # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
+        # The amplicon feature-table surfaces, served by routes/run_feature_table.py
+        # and scoped to a cohort of (processing_idx, prep_sample_idx). The counts
+        # go through the exclusion-aware VIEW (raw `amplicon_membership` is not
+        # Flight-readable); the sequences resolve the cohort through that view. Both
+        # are excluded from _REFERENCE_DOGET_TABLES below, like `alignment_visible`.
+        AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
+        AMPLICON_SEQUENCE_TABLE,
     }
 )
 
@@ -945,6 +957,9 @@ _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
         ASSEMBLED_SEQUENCE_TABLE,
         ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
         BIN_QUALITY_TABLE,
+        # Served by the feature-table route, cohort-scoped, not reference-scoped.
+        AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
+        AMPLICON_SEQUENCE_TABLE,
     }
 )
 
@@ -994,17 +1009,19 @@ async def create_doget_ticket(
             detail=f"Unknown table {body.table!r}; allowed: {sorted(_REFERENCE_DOGET_TABLES)}",
         )
 
-    _STREAMABLE_STATUSES = (ReferenceStatus.ACTIVE.value, ReferenceStatus.INDEXING.value)
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if status is None:
         raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
-    if status not in _STREAMABLE_STATUSES:
+    if status not in SERVABLE_REFERENCE_STATUSES:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be one of {list(_STREAMABLE_STATUSES)}",
+            detail=(
+                f"Reference status is {status!r}, must be one of "
+                f"{[s.value for s in SERVABLE_REFERENCE_STATUSES]}"
+            ),
         )
 
     filter: dict[str, list[int]] = {"reference_idx": [reference_idx]}

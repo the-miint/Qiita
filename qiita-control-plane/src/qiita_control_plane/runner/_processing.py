@@ -26,6 +26,12 @@ from qiita_common.actions import (
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.hashing import canonical_params_hash
 
+from ..repositories.alignment_definition import list_pool_prep_sample_idxs
+from ..repositories.amplicon import (
+    close_amplicon_samples,
+    create_amplicon_samples_pending,
+    pool_prep_sample_idxs,
+)
 from ..repositories.assembly import (
     create_assembly_sample_pending,
     upsert_assembly_sample_no_data,
@@ -233,6 +239,26 @@ async def _create_assembly_gate_pending(
         )
 
 
+def _workflow_writes_amplicon_gate(steps: list[Any]) -> bool:
+    """True iff some entry is the `finalize-amplicon-sample` action — the signal
+    for the runner's 'pending' write of the pool's qiita.amplicon_sample rows, so
+    a workflow gets that write exactly when it declares the closing one."""
+    return _workflow_declares_action(steps, LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE)
+
+
+async def _create_amplicon_gate_pending(
+    pool: asyncpg.Pool, *, processing_idx: int, sequenced_pool_idx: int
+) -> None:
+    """Materialize this run's amplicon_sample rows at 'pending' for the pool's
+    population (`list_pool_prep_sample_idxs`, the set the pool's other rollups
+    count), right after the processing_idx mint gives the rows their key."""
+    async with pool.acquire() as conn, conn.transaction():
+        population = await list_pool_prep_sample_idxs(conn, sequenced_pool_idx)
+        await create_amplicon_samples_pending(
+            conn, processing_idx=processing_idx, prep_sample_idxs=population
+        )
+
+
 async def _record_assembly_gate_no_data(
     pool: asyncpg.Pool,
     *,
@@ -261,4 +287,25 @@ async def _record_assembly_gate_no_data(
             processing_idx,
             prep_sample_idx,
             standing,
+        )
+
+
+async def _record_amplicon_gate_no_data(
+    pool: asyncpg.Pool, *, processing_idx: int, sequenced_pool_idx: int
+) -> None:
+    """Close this run's amplicon_sample gate at 'no_data' for the whole pool.
+
+    Run from the StepNoData handler: amplicon_deblur raises StepNoData when the pool
+    produced no ASV for any sample, abandoning the remaining entries — including
+    `finalize-amplicon-sample` — so without this write every 'pending' row sits for a
+    run that has ended and will never move again. Nothing counted, so the pool's
+    pending rows all go 'no_data'. Scoped to the pool's raw sequenced_samples rather
+    than `list_pool_prep_sample_idxs`, which drops a sample retired mid-run and would
+    leave its 'pending' row behind."""
+    async with pool.acquire() as conn, conn.transaction():
+        await close_amplicon_samples(
+            conn,
+            processing_idx=processing_idx,
+            prep_sample_idxs=await pool_prep_sample_idxs(conn, sequenced_pool_idx),
+            completed_prep_sample_idxs=[],
         )

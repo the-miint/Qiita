@@ -116,7 +116,7 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
         "exported_feature_one_kind",
         "exported_feature_entity_kind_known",
         "exported_feature_kind_agrees_with_columns",
-        "exported_feature_reference_pairs_with_feature",
+        "exported_feature_reference_iff_feature_kind",
         "exported_feature_published_accession_exists",
         "exported_feature_retirement_consistent",
     }, checks
@@ -132,6 +132,7 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
         "exported_feature_pkey",
         "exported_feature_live_genome",
         "exported_feature_live_reference_feature",
+        "exported_feature_live_observed_feature",
         "exported_feature_export_feature_id_unique",
     }, indexes
 

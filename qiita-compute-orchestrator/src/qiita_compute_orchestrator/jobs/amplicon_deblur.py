@@ -7,28 +7,30 @@ closed-reference) is derived later.
 
 Refinements over the reference implementation (duckdb-miint's amplicon
 `deblur.sql`), whose per-sample ASV output this job is built to reproduce:
-  * primer orient is optional (`orient_primer`, default off);
+  * reads are not oriented on the primer: in the EMP-style preps that this job
+    serves, the primer is not sequenced, so every read already starts at the amplicon;
   * UCHIME chimera detection runs before the MSA;
   * feature identity is the shared canonical hash.
 
 Outputs: manifest (read_id, sequence_hash, sequence_length_bp for mint-features),
-asv_counts (prep_sample_idx, sequence_hash, count), and asv_chunks (a hash-keyed
-chunk directory carrying each ASV's bytes so amplicon_load can store them).
+asv_counts (prep_sample_idx, sequence_hash, count), and asv_sequences (sequence_hash,
+sequence — each ASV's bytes inline, for amplicon_load to store).
 """
 
 from __future__ import annotations
 
+import logging
 import os
-import shutil
+import time
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from qiita_common.backend_failure import StepNoData
-from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
+from qiita_common.chunking import canonical_sequence_hash_expr
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.step_log import listed, summarize
 
 from ..miint import (
-    PARQUET_OPTS_CHUNKED_TRANSFER,
     PARQUET_OPTS_TRANSFER,
     apply_duckdb_settings,
     duckdb_tmp_dir,
@@ -38,10 +40,9 @@ from ..miint import (
 )
 from ..read_source import bind_step_reads
 
-# IUPAC codes a primer may contain; validated before use.
-_IUPAC_DNA = frozenset("ACGTURYSWKMBDHVN")
-
 YAML_STEP_NAME = "denoise"
+
+_LOG = logging.getLogger(__name__)
 
 # reserve headroom for miint's in-process co-consumers (SortMeRNA/MAFFT/deblur
 # link statically and share this process's memory), so DuckDB stays modest.
@@ -56,20 +57,32 @@ class Inputs(BaseModel):
     reads: unset in practice; the pool's reads stream from the data plane.
         bind_step_reads binds the shared read projection.
     sortmerna_ref: SortMeRNA 16S FASTA, materialized by the runner from a reference.
-    primer: forward primer (EMP V4 515F); used only when orient_primer.
-    orient_primer: run the primer orient step. Default off.
     trim: truncation length (150 for the GG2 V4 catalog).
+    orient_primer, primer: bound only by workflow 1.0.0, which offered primer
+        orienting and which the action sync disables once 1.1.0 loads, so no
+        ticket should reach this step with them. They are kept so 1.0.0's params
+        still bind to this module; `primer` is unused, and orienting is refused
+        should a ticket ever ask for it.
     """
 
     reads: Path | None = None
     sortmerna_ref: Path
-    # used only when orient_primer; optional so a submit can omit it.
-    primer: str = "GTGYCAGCMGCCGCGGTAA"
     trim: int
     orient_primer: bool = False
+    primer: str | None = None
     sequenced_pool_idx: int
     sequencing_run_idx: int
     work_ticket_idx: int
+
+    @field_validator("orient_primer")
+    @classmethod
+    def _orienting_removed(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "primer orienting was removed from the amplicon denoise step;"
+                " submit amplicon 1.1.0, which does not offer it"
+            )
+        return value
 
 
 # The relations these blocks feed to miint table functions (derep, alignable,
@@ -129,50 +142,34 @@ SELECT sample_id, read_id, sequence AS sequence1, abundance
 FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_id');
 """
 
-# orient each read to the primer (only when orient_primer). match on upper(read)
-# so mixed-case input still hits the uppercase primer regex.
-_ORIENT_SQL = """
-CREATE OR REPLACE TABLE _inputs_oriented AS
-SELECT sample_id, sequence_index,
-    CASE
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
-           AND regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc')) THEN NULL
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
-        THEN regexp_extract(upper(sequence1), getvariable('rapid_regex_fwd_extract'), 2)
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc'))
-        THEN regexp_extract(sequence_dna_reverse_complement(upper(sequence1)),
-                            getvariable('rapid_regex_fwd_extract'), 2)
-      ELSE upper(sequence1)
-    END AS sequence1
-FROM _inputs;
-"""
 
-
-def _set_session_vars(conn, *, primer: str, trim: int, sortmerna_ref: Path, orient: bool) -> None:
+def _set_session_vars(conn, *, trim: int, sortmerna_ref: Path) -> None:
     conn.execute(f"SET VARIABLE rapid_trim = {int(trim)};")
     # reject unsafe path characters (applies to the FASTA too).
     safe_ref = validate_parquet_path(sortmerna_ref)
     conn.execute(f"SET VARIABLE miint_sortmerna_ref = '{safe_ref}';")
-    if orient:
-        # validate, don't mangle; a bad primer must fail loud.
-        upper = primer.upper()
-        if not upper or set(upper) - _IUPAC_DNA:
-            raise ValueError(f"primer is not valid IUPAC: {primer!r}")
-        conn.execute(f"SET VARIABLE rapid_fwd_primer = '{upper}';")
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd = "
-            "sequence_dna_as_regexp(getvariable('rapid_fwd_primer'));"
-        )
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd_rc = sequence_dna_as_regexp("
-            "sequence_dna_reverse_complement(getvariable('rapid_fwd_primer')));"
-        )
-        # capture the rest of the read after the primer. `.+` (not `[ATGC]+`) so an
-        # ambiguity code or lowercase base does not truncate the captured sequence.
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd_extract = "
-            "'(' || getvariable('rapid_regex_fwd') || ')(.+)';"
-        )
+
+
+def _kept(conn, table: str, stage: str, before: list[int]) -> list[int]:
+    """Log what a stage left in `table` (sample_id, sequence1, abundance), warn on
+    the samples it dropped from `before`, and return the samples it kept."""
+    per_sample = conn.execute(
+        f"SELECT sample_id::BIGINT, sum(abundance)::BIGINT FROM {table} GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    unique = conn.execute(f"SELECT count(DISTINCT sequence1) FROM {table}").fetchone()[0]
+    kept = [sample for sample, _ in per_sample]
+    _LOG.info(
+        "%s: %d unique sequences, %d reads, %d of %d samples",
+        stage,
+        unique,
+        sum(reads for _, reads in per_sample),
+        len(kept),
+        len(before),
+    )
+    dropped = sorted(set(before) - set(kept))
+    if dropped:
+        _LOG.warning("%s dropped %d samples: %s", stage, len(dropped), listed(dropped))
+    return kept
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -186,9 +183,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     counts_out = workspace / "asv_counts.parquet"
     manifest_out = workspace / "manifest.parquet"
-    chunks_dir = workspace / "asv_chunks"
+    sequences_out = workspace / "asv_sequences.parquet"
     memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_DUCKDB_RESERVE_GB
+    )
+    _LOG.info(
+        "pool %d (run %d): trim %d, rRNA reference %s; duckdb %d GB, %d threads",
+        inputs.sequenced_pool_idx,
+        inputs.sequencing_run_idx,
+        inputs.trim,
+        inputs.sortmerna_ref.name,
+        memory_gb,
+        _DUCKDB_THREADS,
     )
 
     with (
@@ -197,13 +203,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         open_miint_conn() as conn,
     ):
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
-        _set_session_vars(
-            conn,
-            primer=inputs.primer,
-            trim=inputs.trim,
-            sortmerna_ref=inputs.sortmerna_ref,
-            orient=inputs.orient_primer,
-        )
+        _set_session_vars(conn, trim=inputs.trim, sortmerna_ref=inputs.sortmerna_ref)
         # stream the pool's reads from the data plane (the runner stages nothing;
         # the stream spills transiently to the job workspace).
         async with bind_step_reads(
@@ -218,26 +218,37 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT prep_sample_idx AS sample_id, sequence_idx AS sequence_index, sequence1 "
                 f"FROM {reads_rel}"
             )
-            if inputs.orient_primer:
-                conn.execute(_ORIENT_SQL)
-                conn.execute(
-                    "CREATE OR REPLACE VIEW _inputs AS SELECT sample_id, sequence_index, sequence1 "
-                    "FROM _inputs_oriented WHERE sequence1 IS NOT NULL"
-                )
-
+            reads_in = conn.execute("SELECT count(*) FROM _inputs").fetchone()[0]
+            samples_in = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT sample_id::BIGINT FROM _inputs ORDER BY 1"
+                ).fetchall()
+            ]
+            _LOG.info("input: %d reads over %d samples", reads_in, len(samples_in))
+            started = time.monotonic()
             conn.execute(_FILTER_SQL)
-            if conn.execute("SELECT count(*) FROM alignable").fetchone()[0] == 0:
+            derep = _kept(conn, "derep", "trim and dereplicate (>=2 copies)", samples_in)
+            alignable = _kept(conn, "alignable", "16S filter (>=2 sequences)", derep)
+            _LOG.info("filtered in %.0fs", time.monotonic() - started)
+            if not alignable:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
                     reason="no prep_sample retained >=2 unique 16S-matching dereplicated sequences",
                 )
+            started = time.monotonic()
             conn.execute(_CHIMERA_SQL)
-            if conn.execute("SELECT count(*) FROM alignable2").fetchone()[0] == 0:
+            nonchimeric = _kept(conn, "alignable2", "chimera filter", alignable)
+            _LOG.info("chimera filter took %.0fs", time.monotonic() - started)
+            if not nonchimeric:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
                     reason="no non-chimeric prep_sample retained >=2 unique sequences",
                 )
+            started = time.monotonic()
             conn.execute(_DENOISE_SQL)
+            denoised = _kept(conn, "deblurred", "align and deblur", nonchimeric)
+            _LOG.info("aligned and deblurred in %.0fs", time.monotonic() - started)
 
             canon = canonical_sequence_hash_expr("sequence1")
             conn.execute(
@@ -246,7 +257,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"       SUM(abundance)::BIGINT AS count "
                 f"FROM deblurred GROUP BY prep_sample_idx, sequence_hash"
             )
-            if conn.execute("SELECT count(*) FROM asv").fetchone()[0] == 0:
+            if not denoised:
                 raise StepNoData(step_name=YAML_STEP_NAME, reason="no ASV survived denoising")
 
             # one representative sequence per canonical hash, so the ASV bytes are
@@ -261,23 +272,35 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             _write_outputs(
-                conn, counts_out=counts_out, manifest_out=manifest_out, chunks_dir=chunks_dir
+                conn, counts_out=counts_out, manifest_out=manifest_out, sequences_out=sequences_out
+            )
+            asvs, reads = conn.execute(
+                "SELECT count(DISTINCT sequence_hash), sum(count)::BIGINT FROM asv"
+            ).fetchone()
+            _LOG.info("wrote %d ASVs, %d reads over %d samples", asvs, reads, len(denoised))
+            summarize(
+                samples_in=len(samples_in),
+                samples=len(denoised),
+                reads_in=reads_in,
+                reads=reads,
+                asvs=asvs,
             )
 
-    return {"asv_counts": counts_out, "manifest": manifest_out, "asv_chunks": chunks_dir}
+    return {"asv_counts": counts_out, "manifest": manifest_out, "asv_sequences": sequences_out}
 
 
-def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, chunks_dir: Path) -> None:
+def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, sequences_out: Path) -> None:
     """publish the three outputs atomically: per-sample counts, the mint-features
-    manifest (read_id, sequence_hash, sequence_length_bp), and a hash-keyed chunk
-    directory carrying each ASV's bytes. write to `.partial`, then rename in."""
+    manifest (read_id, sequence_hash, sequence_length_bp), and `asv_sequences` — one row
+    per ASV, `(sequence_hash, sequence)`, the bytes inline. An ASV is shorter than one
+    chunk, so it is stored whole rather than split and reassembled. write each to
+    `.partial`, then rename in."""
     counts_partial = counts_out.parent / f"{counts_out.name}.partial"
     manifest_partial = manifest_out.parent / f"{manifest_out.name}.partial"
-    chunks_partial = chunks_dir.parent / f"{chunks_dir.name}.partial"
+    sequences_partial = sequences_out.parent / f"{sequences_out.name}.partial"
     safe_counts = validate_parquet_path(counts_partial)
     safe_manifest = validate_parquet_path(manifest_partial)
-    chunks_partial.mkdir(parents=True, exist_ok=True)
-    chunk_part = validate_parquet_path(chunks_partial / "part_00000.parquet")
+    safe_sequences = validate_parquet_path(sequences_partial)
     try:
         conn.execute(
             f"COPY (SELECT prep_sample_idx, sequence_hash, count FROM asv "
@@ -288,16 +311,13 @@ def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, chunks_dir: Pa
             f"FROM asv_seq ORDER BY sequence_hash) TO '{safe_manifest}' ({PARQUET_OPTS_TRANSFER})"
         )
         conn.execute(
-            f"COPY (SELECT sequence_hash, c.chunk_index, c.chunk_data FROM ("
-            f"  SELECT sequence_hash, UNNEST({sequence_split_expr('sequence1')}) AS c FROM asv_seq"
-            f") ORDER BY sequence_hash, c.chunk_index) "
-            f"TO '{chunk_part}' ({PARQUET_OPTS_CHUNKED_TRANSFER})"
+            f"COPY (SELECT sequence_hash, sequence1 AS sequence FROM asv_seq "
+            f"ORDER BY sequence_hash) TO '{safe_sequences}' ({PARQUET_OPTS_TRANSFER})"
         )
         os.replace(counts_partial, counts_out)
         os.replace(manifest_partial, manifest_out)
-        shutil.rmtree(chunks_dir, ignore_errors=True)  # a re-run may leave a dir
-        os.replace(chunks_partial, chunks_dir)
+        os.replace(sequences_partial, sequences_out)
     finally:
         counts_partial.unlink(missing_ok=True)
         manifest_partial.unlink(missing_ok=True)
-        shutil.rmtree(chunks_partial, ignore_errors=True)
+        sequences_partial.unlink(missing_ok=True)

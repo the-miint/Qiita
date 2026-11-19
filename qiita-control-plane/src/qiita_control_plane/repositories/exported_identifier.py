@@ -21,8 +21,8 @@ from .mask_definition import lock_active_mask, lock_mask
 # processing kind has no subtype row at all; it cannot duplicate a row either,
 # since its `prep_sample_idx` is UNIQUE.
 #
-# `{kind_column}` is the processing column of the kind being read: `alignment_idx`
-# or `mask_idx`.
+# `{kind_column}` is the processing column of the kind being read: `alignment_idx`,
+# `mask_idx`, or `processing_idx`.
 _SELECT_LIVE_TEMPLATE = (
     "SELECT ei.prep_sample_idx, ei.export_id,"
     "       bs.biosample_accession, ss.ena_run_accession"
@@ -37,7 +37,7 @@ _SELECT_LIVE_TEMPLATE = (
 )
 # The kind columns, each with its own partial unique index on live rows.
 # Interpolated into SQL, so the set is closed.
-_KIND_COLUMNS = frozenset({"alignment_idx", "mask_idx"})
+_KIND_COLUMNS = frozenset({"alignment_idx", "mask_idx", "processing_idx"})
 
 
 class IncompleteMintError(RuntimeError):
@@ -194,3 +194,25 @@ async def mint_exported_mask_identifiers(
             prep_sample_idxs=cohort,
             created_by_idx=created_by_idx,
         )
+
+
+async def mint_processing_exported_identifiers(
+    conn: asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idxs: list[int],
+    created_by_idx: int,
+) -> list[asyncpg.Record]:
+    """`mint_exported_identifiers` for a `qiita.processing` run (amplicon): ensure a
+    live `export_id` for every `(processing_idx, prep_sample)` pair and return them
+    all ascending. Idempotent and all-or-nothing for the reasons given there.
+
+    Takes a connection rather than a pool so a caller can mint inside its own
+    transaction."""
+    return await _mint_live(
+        conn,
+        column="processing_idx",
+        idx=processing_idx,
+        prep_sample_idxs=prep_sample_idxs,
+        created_by_idx=created_by_idx,
+    )

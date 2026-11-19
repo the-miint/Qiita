@@ -52,6 +52,15 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
   ```
+- `[operator]` **Before the restart, no amplicon ticket may be in flight.** amplicon
+  now passes ASV sequences from `amplicon_deblur` to `amplicon_load` inline
+  (`asv_sequences`) rather than chunked (`asv_chunks`), a change to the shared modules
+  both 1.0.0 and 1.1.0 bind. A ticket past `amplicon_deblur` when the sync lands is
+  refused on resume (its recorded deblur output no longer matches what `amplicon_load`
+  reads) and has to be submitted again. Expect 0; otherwise wait for them to finish.
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'amplicon' AND state IN ('pending','queued','processing')"
+  ```
 - `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
   The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
   workspaces, and the build deployed now does not know to keep them. From this deploy,
@@ -64,10 +73,12 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   first. (#864)
 - `20261113000000_output_equivalence` adds `qiita.output_equivalence` and `qiita.output_equivalence_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. `20261116000002_exported_identifier_prep_sample_delete` makes `qiita.exported_identifier.prep_sample_idx` nullable and ON DELETE SET NULL, adds two nullable description columns and a CHECK that every live row names a prep_sample (every existing row does: the column was NOT NULL), and adds a BEFORE DELETE trigger on `qiita.prep_sample`; no row changes. `20261116000003_work_ticket_reap_pending` adds two nullable columns to `qiita.work_ticket` (`reap_pending_since`, `reap_note`) and a CHECK that they are set together; no row changes. `20261116000004_definition_settings_lock` adds `qiita.definition_settings_edit` (empty), the function `qiita.edit_definition_settings`, and BEFORE UPDATE triggers on `qiita.mask_definition`, `qiita.alignment_definition` and `qiita.processing` that refuse a change to a definition's settings outside that function; no row changes. (#874)
 - `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
+- `[operator]` Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate), `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers), and the `observed_feature` kind on `qiita.exported_feature` (a de-novo ASV's `QF` handle). No out-of-band setup; applies with the standard migrate step.
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` The amplicon workflow gains version 1.1.0 (drops the primer-orient knobs; adds a per-sample completion gate and public sample identifiers). `actions sync` loads it on deploy and supersedes 1.0.0 for new runs; runs already recorded against 1.0.0 keep binding it.
+- `[operator]` 1.1.0 stores ASV sequences inline in the lake's `amplicon_sequence` table. The data plane widens that table on restart (`ALTER TABLE … ADD COLUMN IF NOT EXISTS sequence`), so a redeployed data plane is a precondition for any amplicon `register-files` under 1.1.0 — the standard deploy restart covers it, no manual step. The now-unused `amplicon_sequence_chunks` table is left in the lake with no reader (it holds only 1.0.0 ASV bytes); it can be dropped by hand once no 1.0.0 amplicon run needs reprocessing.
 
 ### 5. Verify
 
