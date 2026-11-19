@@ -84,7 +84,7 @@ from ..repositories._sample_helpers import (
     ValueRewriteOnUniqueFieldError,
     classify_unique_in_study_violation,
     create_study_field_and_read_back,
-    fetch_entity_idx_by_unique_field_value,
+    fetch_entity_idxs_by_unique_field_values,
     fetch_entity_is_linked_to_study,
     fetch_global_metadata,
     fetch_local_metadata,
@@ -767,14 +767,15 @@ async def resolve_study_entity_by_unique_field(
     # parses to itself, so this cannot fail.
     parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
 
-    entity_idx = await fetch_entity_idx_by_unique_field_value(
+    entity_idxs = await fetch_entity_idxs_by_unique_field_values(
         conn,
         spec=spec,
         study_field_idx=field_row.idx,
         data_type=field_row.data_type,
-        value=parsed_value,
+        values=[parsed_value],
         tiers=tiers,
     )
+    entity_idx = entity_idxs.get(parsed_value)
     if entity_idx is None:
         raise HTTPException(
             status_code=404,

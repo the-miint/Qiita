@@ -80,7 +80,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     create_study_field,
     create_study_field_and_read_back,
     fetch_biosample_checklist_requirements,
-    fetch_entity_idx_by_unique_field_value,
+    fetch_entity_idxs_by_unique_field_values,
     fetch_entity_is_linked_to_study,
     fetch_global_fields,
     fetch_global_fields_by_keys,
@@ -107,6 +107,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     insert_owner_biosample_id_metadata,
 )
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.study_access import CallerMetadataTiers
 from qiita_control_plane.testing.db_seeds import (
     NCBI_TAXONOMY_METAGENOME_TERM_ID,
     fetch_seeded_metagenome_term,
@@ -7084,7 +7085,7 @@ async def test_fetch_biosample_checklist_requirements_unknown_checklist(postgres
 
 
 # ---------------------------------------------------------------------------
-# fetch_entity_idx_by_unique_field_value (spec-parameterized over both entities)
+# fetch_entity_idxs_by_unique_field_values (spec-parameterized over both entities)
 # ---------------------------------------------------------------------------
 
 
@@ -7110,38 +7111,18 @@ async def _seed_unique_value(ctx, spec, *, suffix, value):
     return field_idx, entity_idx
 
 
-@pytest.mark.parametrize(
-    "spec",
-    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
-    ids=["biosample", "prep_sample"],
-)
-async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
-    """Tests the case where a unique_in_study field carries the value on one
-    entity: the fetch returns that entity's idx, and a value no entity carries
-    through the field returns None.
-    """
-    field_idx, entity_idx = await _seed_unique_value(ctx, spec, suffix="uniq-hit", value="Sample 1")
-
+async def _fetch_unique(ctx, spec, field_idx, values, tiers=ADMIN_EVERYWHERE):
+    """Run the batched unique-field fetch on its own connection."""
     async with ctx["pool"].acquire() as conn:
-        found = await fetch_entity_idx_by_unique_field_value(
+        found = await fetch_entity_idxs_by_unique_field_values(
             conn,
             spec=spec,
             study_field_idx=field_idx,
             data_type=FieldDataType.TEXT,
-            value="Sample 1",
-            tiers=ADMIN_EVERYWHERE,
+            values=values,
+            tiers=tiers,
         )
-        missed = await fetch_entity_idx_by_unique_field_value(
-            conn,
-            spec=spec,
-            study_field_idx=field_idx,
-            data_type=FieldDataType.TEXT,
-            value="Sample 2",
-            tiers=ADMIN_EVERYWHERE,
-        )
-
-    assert found == entity_idx
-    assert missed is None
+    return found
 
 
 @pytest.mark.parametrize(
@@ -7149,15 +7130,69 @@ async def test_fetch_entity_idx_by_unique_field_value(ctx, spec):
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ctx, spec):
+async def test_fetch_entity_idxs_by_unique_field_values(ctx, spec):
+    """Tests the case where a unique_in_study field carries several of the
+    values on different entities: each hit maps to its own entity's idx, and a
+    value no entity carries through the field is absent from the result.
+    """
+    field_idx, first_entity = await _seed_unique_value(
+        ctx, spec, suffix="uniq-hit", value="Sample 1"
+    )
+    second_entity = await _create_linked_entity_for_spec(ctx, spec)
+    await _write_value(
+        ctx,
+        spec,
+        entity_idx=second_entity,
+        field_idx=field_idx,
+        data_type=FieldDataType.TEXT,
+        value="Sample 2",
+    )
+
+    found = await _fetch_unique(ctx, spec, field_idx, ["Sample 1", "Sample 2", "Sample 3"])
+
+    expected = {"Sample 1": first_entity, "Sample 2": second_entity}
+    assert found == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idxs_by_unique_field_values_hidden_omitted(ctx, spec):
+    """Tests the case where the matching value sits above the caller's tier: it
+    is absent from the result, exactly as a value no entity carries, so the
+    lookup cannot confirm a hidden value; a caller at the field's tier finds it.
+    """
+    field_idx, entity_idx = await _seed_unique_value(
+        ctx, spec, suffix="uniq-hidden", value="Sample 1"
+    )
+    await ctx["pool"].execute(
+        f"UPDATE {spec.study_field_table} SET tier_override = $2::qiita.tier WHERE idx = $1",
+        field_idx,
+        Tier.ADMIN,
+    )
+    member = CallerMetadataTiers(study_tiers={ctx["study_idx"]: Tier.MEMBER}, default=Tier.PUBLIC)
+
+    hidden = await _fetch_unique(ctx, spec, field_idx, ["Sample 1"], tiers=member)
+    shown = await _fetch_unique(ctx, spec, field_idx, ["Sample 1"])
+
+    assert (hidden, shown) == ({}, {"Sample 1": entity_idx})
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_idxs_by_unique_field_values_not_unique_empty(ctx, spec):
     """Tests the case where the field does not declare unique_in_study: every
     metadata row under it carries the flag false, so the query's own
-    unique_in_study term filters them all out and the answer is None rather
+    unique_in_study term filters them all out and the result is empty rather
     than an arbitrary match.
 
-    This is what makes the term load-bearing: without it the same call would
-    return the entity, so a caller that skipped the flag check would act on a
-    value that may repeat.
+    Without the term the same call would return the entity, so a caller that
+    skipped the flag check would act on a value that may repeat.
     """
     field_idx = await _create_plain_field(ctx, spec, suffix="uniq-unflagged")
     entity_idx = await _create_linked_entity_for_spec(ctx, spec)
@@ -7170,17 +7205,9 @@ async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ct
         value="Sample 1",
     )
 
-    async with ctx["pool"].acquire() as conn:
-        found = await fetch_entity_idx_by_unique_field_value(
-            conn,
-            spec=spec,
-            study_field_idx=field_idx,
-            data_type=FieldDataType.TEXT,
-            value="Sample 1",
-            tiers=ADMIN_EVERYWHERE,
-        )
+    found = await _fetch_unique(ctx, spec, field_idx, ["Sample 1"])
 
-    assert found is None
+    assert found == {}
 
 
 @pytest.mark.parametrize(
@@ -7188,7 +7215,7 @@ async def test_fetch_entity_idx_by_unique_field_value_not_unique_returns_none(ct
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, spec):
+async def test_fetch_entity_idxs_by_unique_field_values_scoped_to_its_field(ctx, spec):
     """Tests the case where two unique_in_study fields in the same study carry
     the same value: each resolves only through its own field, so naming the
     field is what scopes the search and no study_idx term is needed.
@@ -7200,26 +7227,10 @@ async def test_fetch_entity_idx_by_unique_field_value_scoped_to_its_field(ctx, s
         ctx, spec, suffix="uniq-scope-b", value="Shared"
     )
 
-    async with ctx["pool"].acquire() as conn:
-        via_first = await fetch_entity_idx_by_unique_field_value(
-            conn,
-            spec=spec,
-            study_field_idx=first_field,
-            data_type=FieldDataType.TEXT,
-            value="Shared",
-            tiers=ADMIN_EVERYWHERE,
-        )
-        via_second = await fetch_entity_idx_by_unique_field_value(
-            conn,
-            spec=spec,
-            study_field_idx=second_field,
-            data_type=FieldDataType.TEXT,
-            value="Shared",
-            tiers=ADMIN_EVERYWHERE,
-        )
+    via_first = await _fetch_unique(ctx, spec, first_field, ["Shared"])
+    via_second = await _fetch_unique(ctx, spec, second_field, ["Shared"])
 
-    assert via_first == first_entity
-    assert via_second == second_entity
+    assert (via_first, via_second) == ({"Shared": first_entity}, {"Shared": second_entity})
 
 
 # ---------------------------------------------------------------------------

@@ -81,7 +81,7 @@ async def insert_biosample(
     )
 
 
-# Columns returned by both fetch_biosample and update_biosample so the
+# Columns returned by both fetch_biosamples_by_idxs and update_biosample so the
 # row -> response shaping has a single source of truth.
 _BIOSAMPLE_RETURNING_COLS = (
     "idx, owner_idx, metadata_checklist_idx,"
@@ -94,24 +94,44 @@ _BIOSAMPLE_RETURNING_COLS = (
 )
 
 
-async def fetch_biosample(
+async def fetch_biosamples_by_idxs(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    biosample_idx: int,
+    biosample_idxs: Sequence[int],
     *,
     lock: RowLock | None = None,
-) -> asyncpg.Record | None:
-    """Return the qiita.biosample row for the given idx, or None on miss.
+) -> dict[int, asyncpg.Record]:
+    """Return `{biosample_idx: row}` for every idx in `biosample_idxs` that has a
+    qiita.biosample row, retired ones included; an absent idx is omitted.
 
     Selects every caller-visible column on the row so the
     row -> response shaping has a single source of truth. Accepts
     either a pool or a connection so the helper composes inside an
     open transaction or stands alone.
 
-    `lock` takes that row lock on the biosample; see row_lock_clause.
+    `lock` takes that row lock on every returned biosample; see row_lock_clause.
     """
-    sql = f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample WHERE idx = $1"
+    # Ordered by idx so that concurrent callers locking overlapping sets take
+    # the rows in the same order.
+    sql = (
+        f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample"
+        " WHERE idx = ANY($1::bigint[]) ORDER BY idx"
+    )
     sql += row_lock_clause(pool_or_conn, lock)
-    return await pool_or_conn.fetchrow(sql, biosample_idx)
+    rows = await pool_or_conn.fetch(sql, list(biosample_idxs))
+    by_idx = {r["idx"]: r for r in rows}
+    return by_idx
+
+
+async def fetch_biosample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idx: int,
+    *,
+    lock: RowLock | None = None,
+) -> asyncpg.Record | None:
+    """`fetch_biosamples_by_idxs` for one idx: its row, or None on miss."""
+    rows = await fetch_biosamples_by_idxs(pool_or_conn, [biosample_idx], lock=lock)
+    row = rows.get(biosample_idx)
+    return row
 
 
 # Columns this repo's PATCH composer is allowed to write. Held as a
@@ -141,7 +161,7 @@ async def update_biosample(
     Thin wrapper around the shared update_row composer that pins the
     table, allowlist, and RETURNING shape for qiita.biosample. See
     update_row for the field-validation and explicit-null semantics;
-    see fetch_biosample for the returned column list.
+    see fetch_biosamples_by_idxs for the returned column list.
     """
     return await update_row(
         conn,
