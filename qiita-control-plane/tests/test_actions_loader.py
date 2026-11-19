@@ -269,9 +269,10 @@ def test_load_actions_loads_on_disk_long_read_assembly_yaml(version):
     container_steps = [s for s in assembly.steps if getattr(s, "container", None)]
     assert len(container_steps) == 4
     # A SIF name names the image, so it moves only with the version that changed the
-    # image: checkm with 1.0.1 (the unbinned residue), assemble with 1.0.2 (the
-    # myloasm provenance dump). binning and dastool are one image for all three.
-    checkm_sif = f"long-read-assembly-checkm-{'1.0.0' if version == '1.0.0' else '1.0.1'}.sif"
+    # image: checkm with each version (1.0.1 the unbinned residue, 1.0.2 the gene_call
+    # step's genes), assemble with 1.0.2 (the myloasm provenance dump). binning and
+    # dastool are one image for all three.
+    checkm_sif = f"long-read-assembly-checkm-{version}.sif"
     assemble_sif = f"long-read-assembly-assemble-{'1.0.2' if version == '1.0.2' else '1.0.0'}.sif"
     assert {s.container for s in container_steps} == {
         assemble_sif,
@@ -1561,13 +1562,10 @@ def test_load_actions_read_mask_persists_syndna_counts_after_the_gate():
     assert names[-2:] == ["finalize-mask-sample", "persist-syndna-read-count"]
 
 
-def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
-    """The mask-model fastq-to-parquet (1.3.0) mints a mask_idx and writes read_mask
-    exactly like read-mask, so it owes the SAME first-class completion gate: its last
-    step is `finalize-mask-sample`, after the read_mask `register-files`. The
-    pre-mask-model versions (1.0.0–1.2.0) never mint a mask_idx and carry no such
-    step; they are not checked here. Keyed by (action_id, version) because several
-    fastq-to-parquet versions coexist on disk."""
+def test_load_actions_fastq_to_parquet_v130_persists_raw_qc_report_last():
+    """1.3.0 owes read-mask's completion gate (`finalize-mask-sample` right after the
+    read_mask `register-files`), then persists the raw QC report alone. Earlier entries
+    keep their index and name so resume matches in-flight tickets."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1579,8 +1577,20 @@ def test_load_actions_fastq_to_parquet_v130_finalizes_gate_last():
         if a.action_id == "fastq-to-parquet" and a.version == "1.3.0"
     )
     names = [s.name for s in ftp_130.steps]
-    assert names[-1] == "finalize-mask-sample"
-    assert names[-2] == "register-files"  # register-files immediately precedes the gate flip
+    assert names == [
+        "fastq",
+        "register-files",
+        "qc_report_raw",
+        "qc",
+        "host_filter",
+        "persist-read-metrics",
+        "register-files",
+        "finalize-mask-sample",
+        "persist-qc-report",
+    ]
+    persist = ftp_130.steps[-1]
+    assert persist.inputs == ["raw_qc_report"]
+    assert persist.outputs == []
 
 
 def test_load_actions_long_read_assembly_finalizes_gate_after_register_files():
