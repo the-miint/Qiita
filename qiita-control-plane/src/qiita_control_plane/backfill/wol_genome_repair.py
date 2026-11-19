@@ -51,7 +51,7 @@ import asyncpg
 import duckdb
 from qiita_common.models.reference import GenomeSource
 
-from ..actions.library import upsert_genomes
+from ..actions.library import _write_genome_associations
 from ..delimited_text import read_headed_tsv
 from ..repositories import RowLock, row_lock_clause
 
@@ -467,6 +467,60 @@ async def _derivations_present(
     return present
 
 
+async def _members_misnamed_after_fold(
+    conn: asyncpg.Connection, reference_idx: int
+) -> list[asyncpg.Record]:
+    """Each member of the reference that, once every GCA_G genome is folded, would not
+    link exactly the genome its header names; with `genomes`, the links it would have.
+
+    The fold replaces a feature's GCA_G link with `G<n>` and drops its links to other
+    WoL IDs; every other link stays. With no GCA_G link left, as after the fold, the
+    prediction is the actual state, so the survey and the postcondition share it."""
+    return await conn.fetch(
+        "WITH member AS ("
+        "  SELECT feature_idx, accession FROM qiita.reference_membership"
+        "   WHERE reference_idx = $1),"
+        " link AS ("
+        "  SELECT fg.feature_idx, g.source, g.source_id"
+        "    FROM member m JOIN qiita.feature_genome fg USING (feature_idx)"
+        "    JOIN qiita.genome g USING (genome_idx)),"
+        " folded AS ("
+        "  SELECT feature_idx, substr(source_id, 5) AS n_id FROM link"
+        "   WHERE source = $2 AND source_id ~ $3),"
+        " after_fold AS ("
+        "  SELECT l.feature_idx, l.source, l.source_id"
+        "    FROM link l LEFT JOIN folded f USING (feature_idx)"
+        "   WHERE NOT (l.source = $2 AND l.source_id ~ $3)"
+        "     AND NOT (f.n_id IS NOT NULL AND l.source = $2 AND l.source_id ~ $4"
+        "              AND l.source_id <> f.n_id)"
+        "  UNION"
+        "  SELECT feature_idx, $2::text, n_id FROM folded)"
+        " SELECT m.feature_idx, m.accession, string_agg("
+        "        a.source || ':' || a.source_id, ', ' ORDER BY a.source_id) AS genomes"
+        "   FROM member m LEFT JOIN after_fold a USING (feature_idx)"
+        "  GROUP BY m.feature_idx, m.accession"
+        " HAVING count(a.source_id) <> 1"
+        "     OR bool_or(a.source <> $2 OR a.source_id <> m.accession)"
+        "  ORDER BY m.feature_idx",
+        reference_idx,
+        _WOL_SOURCE,
+        _anchored(_GCA_G_ID),
+        _anchored(_WOL_ID),
+    )
+
+
+def _misnamed(reference_idx: int, rows: list[asyncpg.Record], *, done: bool) -> str:
+    links = "links" if done else "would link"
+    described = [
+        f"feature {r['feature_idx']} {links} to {r['genomes'] or 'no genome'}, not {r['accession']}"
+        for r in rows
+    ]
+    return (
+        f"reference {reference_idx} feature(s) not linked to exactly the genome its header"
+        f" names{'' if done else ' once folded'}: {_listed(described)}"
+    )
+
+
 async def _survey(
     conn: asyncpg.Connection, reference_idx: int, parents: tuple[Parent, ...]
 ) -> _Survey:
@@ -476,6 +530,8 @@ async def _survey(
     folds, stale = await _links(conn, single, problems)
     await _guards(conn, x_idxs, stale, problems)
     _metadata_matches_reference(reference_idx, headers, parents, problems)
+    if misnamed := await _members_misnamed_after_fold(conn, reference_idx):
+        problems.append(_misnamed(reference_idx, misnamed, done=False))
     present = await _derivations_present(conn, reference_idx, parents, problems)
     labels = await conn.fetch(
         "SELECT ef.idx, ef.genome_idx, ef.export_feature_id, g.source, g.source_id"
@@ -507,21 +563,15 @@ async def _fold(conn: asyncpg.Connection, survey: _Survey) -> list[tuple]:
     """Link each feature to its `G<n>`, drop the stale and `GCA_G` links, delete the
     `GCA_G` rows. Returns the manifest rows: what was deleted, and what was retired."""
     folds = survey.folds
-    create = [f for f in folds if f.w_idx is None]
-    minted = await upsert_genomes(
-        conn, [_WOL_SOURCE] * len(create), [f.n_id for f in create], [None] * len(create)
-    )
-    w_of = {f.x_idx: f.w_idx for f in folds if f.w_idx is not None}
-    w_of.update({f.x_idx: idx for f, idx in zip(create, minted, strict=True)})
-    # Linked by genome_idx rather than through the reference load's
-    # `_write_genome_associations`, which upserts every genome it links: here that would
-    # rewrite all of the reference's `G<n>` rows to mint the few that are missing.
-    await conn.execute(
-        "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
-        " SELECT * FROM unnest($1::bigint[], $2::bigint[])"
-        " ON CONFLICT DO NOTHING",
-        [f.feature_idx for f in folds],
-        [w_of[f.x_idx] for f in folds],
+    # Only a feature that does not already link its `G<n>` needs a write, which mints
+    # `G<n>` where it is missing.
+    needs_link = [f for f in folds if not f.w_linked]
+    await _write_genome_associations(
+        conn,
+        [f.feature_idx for f in needs_link],
+        [_WOL_SOURCE] * len(needs_link),
+        [f.n_id for f in needs_link],
+        [None] * len(needs_link),
     )
 
     manifest: list[tuple] = []
@@ -602,28 +652,8 @@ async def _postcondition_problems(
     )
     if left:
         problems.append(f"{left} GCA_G genome(s) remain")
-    wrong = [
-        f"feature {r['feature_idx']} links to {r['genomes'] or 'no genome'}, not {r['accession']}"
-        for r in await conn.fetch(
-            "SELECT rm.feature_idx, rm.accession, string_agg("
-            "         g.source || ':' || g.source_id, ', ' ORDER BY g.source_id) AS genomes"
-            "  FROM qiita.reference_membership rm"
-            "  LEFT JOIN qiita.feature_genome fg ON fg.feature_idx = rm.feature_idx"
-            "  LEFT JOIN qiita.genome g ON g.genome_idx = fg.genome_idx"
-            " WHERE rm.reference_idx = $1"
-            " GROUP BY rm.feature_idx, rm.accession"
-            " HAVING count(g.genome_idx) <> 1"
-            "     OR bool_or(g.source <> $2 OR g.source_id <> rm.accession)"
-            " ORDER BY rm.feature_idx",
-            reference_idx,
-            _WOL_SOURCE,
-        )
-    ]
-    if wrong:
-        problems.append(
-            f"reference {reference_idx} feature(s) not linked to exactly the genome its"
-            f" header names: {_listed(wrong)}"
-        )
+    if misnamed := await _members_misnamed_after_fold(conn, reference_idx):
+        problems.append(_misnamed(reference_idx, misnamed, done=True))
     missing = [
         r["genome_id"]
         for r in await conn.fetch(

@@ -291,8 +291,8 @@ async def _write_genome_associations(
     All four lists are positionally aligned: row i links feat_idxs[i] to
     (sources[i], source_ids[i]) with originating prep_sample_idxs[i].
 
-    **The reference-load path's writer of qiita.feature_genome.** The assembly path
-    mints genomes through the same `upsert_genomes` but records its edge on
+    **Every qiita.feature_genome link is inserted here.** The assembly path mints
+    genomes through the same `upsert_genomes` but records its edge on
     `assembly_membership.genome_idx` instead. Why the two cannot share this
     junction is stated and pinned in `test_assembly_genome_mint`.
     """

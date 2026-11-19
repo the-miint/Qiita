@@ -44,7 +44,8 @@ from qiita_control_plane.testing.postgres import cancel_unfinished, until_blocke
 pytestmark = pytest.mark.db
 
 _GCA_G_ROWS = (
-    "SELECT count(*) FROM qiita.genome WHERE source = 'genbank' AND source_id ~ '^GCA_G[0-9]{9}$'"
+    "SELECT count(*) FROM qiita.genome"
+    f" WHERE source = '{GenomeSource.GENBANK}' AND source_id ~ '^GCA_G[0-9]{{9}}$'"
 )
 _METADATA_COLUMNS = ("genome_id", "assembly_accession", "source", "in_wol2")
 _MANIFEST_COLUMNS = [
@@ -822,10 +823,11 @@ async def test_refuses_an_existing_derivation_that_disagrees(world):
     await w.pool.execute(
         "INSERT INTO qiita.genome_derivation"
         " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
-        " VALUES ($1, 'refseq', 'GCF_000005825.1', $2, $3)",
+        " VALUES ($1, $4, 'GCF_000005825.1', $2, $3)",
         a["g"],
         DERIVATION_METHOD,
         w.reference_idx,
+        GenomeSource.REFSEQ,
     )
     await _assert_refused(w, "GCF_000005825.1")
 
@@ -1003,18 +1005,44 @@ async def test_a_reference_held_by_a_delete_refuses_after_the_lock_timeout(world
 # --- postconditions: assert in the transaction, roll back ----------------------------
 
 
-async def test_a_failed_postcondition_rolls_everything_back(world):
-    """A reference sequence that also belongs to some other genome would still have two
-    genomes after the fold. Nothing in the preconditions forbids that, so the plan
-    passes; the apply must see it, name the sequence and leave no trace."""
+@pytest.mark.parametrize("left", ["another-genome", "no-genome", "another-wol-id"])
+async def test_refuses_a_member_the_fold_would_leave_linked_otherwise(world, left):
+    """Every member of the reference must end up linked to exactly the genome its header
+    names. The fold touches only features with a GCA_G genome, so a member it does not
+    touch, or one that keeps a link it does not remove, would fail that after the
+    fold; the plan refuses it first, naming the feature."""
     w = world
-    a = await w.rc4_genome("A")
     await w.rc4_genome("C")
-    other = await w.genome(f"GCF_{secrets.randbelow(10**9):09d}.1", source="refseq")
-    await w.link(a["feature_idx"], other)
+    if left == "another-genome":
+        a = await w.rc4_genome("A")
+        feature_idx = a["feature_idx"]
+        other = await w.genome(f"GCF_{secrets.randbelow(10**9):09d}.1", source="refseq")
+        await w.link(feature_idx, other)
+    else:
+        n = w.wol_id()
+        feature_idx = await w.feature()
+        await w.member(feature_idx, n)
+        w.parents[n] = f"GCF_{n[1:]}.1"
+        if left == "another-wol-id":
+            await w.link(feature_idx, await w.genome(w.wol_id()))
+    await _assert_refused(w, rf"feature {feature_idx}\b")
+
+
+async def test_a_failed_postcondition_rolls_everything_back(world, monkeypatch):
+    """The result is asserted inside the transaction, as a backstop for anything the
+    survey did not foresee: here, derivations that were never recorded. The apply names
+    what does not hold and leaves no trace."""
+    w = world
+    await w.rc4_genome("A")
+    await w.rc4_genome("C")
     plan = await _plan(w)
     before = await w.snapshot()
-    with pytest.raises(RepairPostconditionFailed, match=rf"feature {a['feature_idx']}\b"):
+
+    async def _record_nothing(conn, reference_idx, parents):
+        return None
+
+    monkeypatch.setattr(wol_genome_repair, "_record_derivations", _record_nothing)
+    with pytest.raises(RepairPostconditionFailed, match="without their derivation"):
         await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
     assert await w.snapshot() == before
     assert list(w.tmp_path.glob("*manifest*")) == []

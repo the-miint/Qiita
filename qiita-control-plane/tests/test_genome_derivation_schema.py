@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 import pytest
+from qiita_common.models.reference import GenomeSource
 
 from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
 
@@ -38,7 +39,8 @@ async def _seed(conn) -> tuple[int, int]:
         f"derivation-schema-{uuid.uuid4()}",
     )
     genome_idx = await conn.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
+        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
+        GenomeSource.GENBANK,
         f"G{uuid.uuid4().int % 10**9:09d}",
     )
     return reference_idx, genome_idx

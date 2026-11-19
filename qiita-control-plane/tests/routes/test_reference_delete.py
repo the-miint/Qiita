@@ -13,6 +13,7 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
+from qiita_common.models.reference import GenomeSource
 
 from qiita_control_plane.actions.reference import assert_reference_deletable
 from qiita_control_plane.backfill.wol_genome_repair import DERIVATION_METHOD
@@ -24,7 +25,7 @@ pytestmark = pytest.mark.db
 _INSERT_DERIVATION = (
     "INSERT INTO qiita.genome_derivation"
     " (genome_idx, parent_source, parent_source_id, method, asserted_by_reference_idx)"
-    " VALUES ($1, 'refseq', 'GCF_000005825.2', $3, $2)"
+    " VALUES ($1, $4, 'GCF_000005825.2', $3, $2)"
 )
 
 
@@ -571,7 +572,9 @@ async def test_delete_reference_blocked_by_genome_derivation_even_with_force(cli
     the end."""
     ref_idx = await _create_ref(client, f"del-derivation-{uuid.uuid4()}")
     genome_idx = await _derivation_genome(postgres_pool)
-    await postgres_pool.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
+    await postgres_pool.execute(
+        _INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD, GenomeSource.REFSEQ
+    )
     try:
         for params in ({}, {"force": "true"}):
             resp = await client.delete(
@@ -592,7 +595,8 @@ async def test_delete_reference_blocked_by_genome_derivation_even_with_force(cli
 
 async def _derivation_genome(postgres_pool) -> int:
     return await postgres_pool.fetchval(
-        "INSERT INTO qiita.genome (source, source_id) VALUES ('genbank', $1) RETURNING genome_idx",
+        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
+        GenomeSource.GENBANK,
         f"G{uuid.uuid4().int % 10**9:09d}",
     )
 
@@ -602,7 +606,9 @@ async def test_delete_reference_not_blocked_by_another_references_derivation(cli
     asserting = await _create_ref(client, f"del-asserting-{uuid.uuid4()}")
     other = await _create_ref(client, f"del-other-{uuid.uuid4()}")
     genome_idx = await _derivation_genome(postgres_pool)
-    await postgres_pool.execute(_INSERT_DERIVATION, genome_idx, asserting, DERIVATION_METHOD)
+    await postgres_pool.execute(
+        _INSERT_DERIVATION, genome_idx, asserting, DERIVATION_METHOD, GenomeSource.REFSEQ
+    )
     try:
         resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=other))
         assert resp.status_code == 200, resp.text
@@ -624,7 +630,9 @@ async def test_delete_reference_waits_for_an_uncommitted_derivation_and_refuses(
             pending = writer.transaction()
             await pending.start()
             try:
-                await writer.execute(_INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD)
+                await writer.execute(
+                    _INSERT_DERIVATION, genome_idx, ref_idx, DERIVATION_METHOD, GenomeSource.REFSEQ
+                )
                 delete = asyncio.create_task(
                     client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
                 )
