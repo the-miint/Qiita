@@ -3,10 +3,9 @@ against a small index the staged miint builds.
 
 The index is built once per session in a subprocess with a timeout:
 `krepp_index_create` can hang (duckdb-miint#318), and a hang must fail the session's
-fixture rather than the whole run. Building it also pins what krepp writes — seven
-files per partition named `<stem>-m<m>r<r>-no_frac`, and a `key: value` metadata
-text carrying SHARED_METADATA_KEYS — because `inventory_index` succeeding on it is
-that check.
+fixture rather than the whole run. Building it also pins the two things Qiita reads
+of what krepp writes — `metadata-*.txt` texts carrying RECORDED_METADATA_KEYS and
+`tree-*` files — because `inventory_index` succeeding on it is that check.
 """
 
 from __future__ import annotations
@@ -25,8 +24,8 @@ from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
     JEST_NULL,
     MANIFEST,
+    RECORDED_METADATA_KEYS,
     SHA256SUMS,
-    SHARED_METADATA_KEYS,
     VERIFY_SCRIPT,
     KreppBuildInvalid,
     inventory_index,
@@ -56,10 +55,9 @@ def _register(folder: Path) -> tuple[str, dict]:
 
 def test_inventory_reads_what_krepp_writes(krepp_built_index):
     inv = inventory_index(krepp_built_index)
-    assert inv.m == 4
-    assert inv.partitions == (0, 1)
     assert len(inv.files) == 14
-    assert set(inv.settings) == set(SHARED_METADATA_KEYS)
+    assert set(inv.settings) == set(RECORDED_METADATA_KEYS)
+    assert (inv.settings["m"], inv.settings["frac"]) == ("4", "false")
     assert (inv.settings["k"], inv.settings["w"], inv.settings["h"]) == ("19", "25", "9")
     assert inv.settings["krepp version"].startswith("v")
     # krepp writes the backbone tree as Newick carrying the edge numbers it was given.
@@ -71,7 +69,6 @@ def test_registration_is_deterministic(build):
     again, _ = _register(build)
     assert first == again
     assert first == hashlib.sha256((build / SHA256SUMS).read_bytes()).hexdigest()
-    assert manifest["partitions"] == [0, 1]
     listed = [line.split("  ", 1)[1] for line in (build / SHA256SUMS).read_text().splitlines()]
     assert SHA256SUMS not in listed and VERIFY_SCRIPT in listed and MANIFEST in listed
 
@@ -86,8 +83,6 @@ def test_registration_refuses_a_folder_edited_since(build):
 @pytest.mark.parametrize(
     ("edit", "check"),
     [
-        (lambda f: (f / "index" / "reflist-m4r1-no_frac").unlink(), "inventory"),
-        (lambda f: (f / "index" / "notes.txt").write_text("x"), "inventory"),
         (lambda f: (f / "extra.txt").write_text("x"), "inventory"),
         (lambda f: (f / JEST_NULL).unlink(), "inventory"),
     ],
@@ -99,10 +94,26 @@ def test_registration_refuses_a_folder_that_is_not_a_build(build, edit, check):
     assert exc.value.check == check
 
 
-def test_registration_refuses_partitions_that_disagree(build):
+def test_registration_refuses_partitions_that_disagree_on_a_recorded_setting(build):
     txt = build / "index" / "metadata-m4r1-no_frac.txt"
-    txt.write_text(txt.read_text().replace("seed: 0", "seed: 7"))
-    with pytest.raises(KreppBuildInvalid, match=r"differs from r0 on \['seed'\]"):
+    txt.write_text(txt.read_text().replace("w: 25", "w: 31"))
+    with pytest.raises(KreppBuildInvalid, match=r"disagree on 'w': \['25', '31'\]"):
+        _register(build)
+
+
+def test_registration_refuses_an_index_without_metadata_text(build):
+    for txt in (build / "index").glob("metadata-*.txt"):
+        txt.unlink()
+    with pytest.raises(KreppBuildInvalid, match=r"holds no metadata-\*\.txt"):
+        _register(build)
+
+
+def test_registration_refuses_metadata_without_a_recorded_setting(build):
+    txt = build / "index" / "metadata-m4r1-no_frac.txt"
+    txt.write_text(
+        "".join(ln for ln in txt.read_text().splitlines(True) if not ln.startswith("h: "))
+    )
+    with pytest.raises(KreppBuildInvalid, match=r"lacks 'h'"):
         _register(build)
 
 

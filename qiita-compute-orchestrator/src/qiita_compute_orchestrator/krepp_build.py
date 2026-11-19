@@ -10,13 +10,14 @@ Layout::
 
     README.md       for people: what the build is and how to check a copy
     SHA256SUMS      `sha256sum -c` format, every file but itself
-    manifest.json   partitions, the shared index settings, every file's size
+    manifest.json   the recorded index settings, every file's size
     verify.sh       the full check of one copy, run by the cluster admins
-    index/          the krepp files, 7 per partition (`place_krepp`'s index directory)
+    index/          the krepp files as krepp wrote them (`place_krepp`'s index directory)
     jest/           labelled.nwk (the backbone tree with JEST's clade labels), null.txt
 
-The krepp file names and the ``metadata-*.txt`` format are what krepp writes; a test
-pins them against an index built by the staged miint. Everything Qiita writes is a
+Of krepp's files Qiita reads two kinds: the ``metadata-*.txt`` texts (``key: value``
+lines carrying RECORDED_METADATA_KEYS) and the ``tree-*`` files; a test pins both
+against an index built by the staged miint. Everything Qiita writes is a
 function of the folder's content only, so registering the same folder twice yields
 the same ``SHA256SUMS`` and the same hash.
 """
@@ -26,10 +27,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+import duckdb
 
 from .derived_store import KREPP_INDEX_SUBDIR
 
@@ -42,30 +44,9 @@ JEST_LABELLED_TREE = f"{JEST_SUBDIR}/labelled.nwk"
 JEST_NULL = f"{JEST_SUBDIR}/null.txt"
 MANIFEST_FORMAT = 1
 
-# Each partition r of an index with m partitions is these seven files, `<stem>-m<m>r<r>-
-# <frac tag>` plus the text twin of `metadata`.
-_PARTITION_STEMS = ("cmer", "crecord", "inc", "metadata", "reflist", "tree")
-_PARTITION_FILE = re.compile(
-    r"(?P<stem>cmer|crecord|inc|metadata|reflist|tree)-m(?P<m>\d+)r(?P<r>\d+)-"
-    r"(?P<frac>no_frac|frac)(?P<txt>\.txt)?"
-)
-FILES_PER_PARTITION = len(_PARTITION_STEMS) + 1
-
-# The metadata-*.txt keys every partition of one index must agree on. `date`,
-# `nrows` and `total_num_kmers` differ per partition by construction.
-SHARED_METADATA_KEYS = (
-    "krepp version",
-    "seed",
-    "k",
-    "w",
-    "h",
-    "m",
-    "frac",
-    "ppos_v",
-    "npos_v",
-    "sdust-t",
-    "sdust-w",
-)
+# The metadata keys Qiita records for a build (manifest, README, reference_index.params)
+# and checks (krepp version), read from every `metadata-*.txt` in `index/`.
+RECORDED_METADATA_KEYS = ("krepp version", "k", "w", "h", "m", "frac")
 
 _HASH_CHUNK = 8 << 20
 
@@ -87,95 +68,62 @@ class KreppBuildInvalid(ValueError):
 
 @dataclass(frozen=True)
 class Inventory:
-    """What `index/` holds: the partition numbers, the shared settings from the
-    metadata text, and the file names."""
+    """What registration needs from `index/`: the recorded settings, every file, and
+    the tree file a placement uses."""
 
-    m: int
-    partitions: tuple[int, ...]
     settings: dict[str, str]
     files: tuple[str, ...]
     tree_file: str
 
 
-def parse_metadata_text(text: str) -> dict[str, str]:
-    """`key: value` lines (krepp's metadata text) into a dict."""
-    out: dict[str, str] = {}
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        key, sep, value = line.partition(": ")
-        if not sep:
-            raise KreppBuildInvalid("metadata", f"line {line!r} is not `key: value`")
-        out[key] = value.strip()
-    return out
+def _recorded_settings(index_dir: Path) -> dict[str, str]:
+    """RECORDED_METADATA_KEYS from the index's metadata texts, read with DuckDB's
+    read_text as miint's krepp docs show. Each key must be present with one value
+    across the texts, since Qiita records one."""
+    with duckdb.connect() as conn:
+        rows = conn.execute(
+            "SELECT key, list(DISTINCT"
+            "  regexp_extract(content, '(?m)^' || key || ': ([^\\r\\n]*)', 1))"
+            " FROM read_text(?) CROSS JOIN unnest(?::VARCHAR[]) AS t(key)"
+            " GROUP BY key",
+            [str(index_dir / "metadata-*.txt"), list(RECORDED_METADATA_KEYS)],
+        ).fetchall()
+    if not rows:
+        raise KreppBuildInvalid("metadata", f"{index_dir} holds no metadata-*.txt")
+    values = dict(rows)
+    settings: dict[str, str] = {}
+    for key in RECORDED_METADATA_KEYS:
+        found = sorted(values[key])
+        if "" in found:
+            raise KreppBuildInvalid("metadata", f"a metadata text lacks {key!r}")
+        if len(found) != 1:
+            raise KreppBuildInvalid("metadata", f"the metadata texts disagree on {key!r}: {found}")
+        settings[key] = found[0]
+    return settings
 
 
 def inventory_index(index_dir: Path) -> Inventory:
-    """Read `index/`: every file is a krepp partition file, every partition has all
-    seven, all of one `m` and frac tag, and every partition's metadata text agrees on
-    SHARED_METADATA_KEYS. Raises KreppBuildInvalid naming the first problem."""
+    """Read `index/` for what registration records. Whether the files make a complete
+    krepp index is krepp's to say; Qiita reads the settings it records and picks the
+    tree it compares with the reference's, and refuses `tree-*` files that differ,
+    since it compares only one. Raises KreppBuildInvalid."""
     if not index_dir.is_dir():
         raise KreppBuildInvalid("inventory", f"{index_dir} is not a directory")
-    by_partition: dict[int, set[str]] = {}
-    ms: set[int] = set()
-    fracs: set[str] = set()
-    names = sorted(p.name for p in index_dir.iterdir())
-    for name in names:
-        path = index_dir / name
-        match = _PARTITION_FILE.fullmatch(name)
-        if match is None or not path.is_file() or path.is_symlink():
-            raise KreppBuildInvalid(
-                "inventory", f"{KREPP_INDEX_SUBDIR}/{name} is not a krepp partition file"
-            )
-        if match["txt"] and match["stem"] != "metadata":
-            raise KreppBuildInvalid(
-                "inventory", f"{KREPP_INDEX_SUBDIR}/{name}: only metadata has a .txt"
-            )
-        ms.add(int(match["m"]))
-        fracs.add(match["frac"])
-        by_partition.setdefault(int(match["r"]), set()).add(match["stem"] + (match["txt"] or ""))
-    if not by_partition:
-        raise KreppBuildInvalid("inventory", f"{index_dir} holds no krepp partition")
-    if len(ms) != 1 or len(fracs) != 1:
-        raise KreppBuildInvalid(
-            "inventory", f"partitions of more than one index: m {sorted(ms)}, {sorted(fracs)}"
-        )
-    expected = {*_PARTITION_STEMS, "metadata.txt"}
-    for r, stems in sorted(by_partition.items()):
-        if stems != expected:
-            raise KreppBuildInvalid(
-                "inventory", f"partition r{r} is missing {sorted(expected - stems)}"
-            )
-    (m,) = ms
-    (frac,) = fracs
-    partitions = tuple(sorted(by_partition))
-    settings: dict[str, str] | None = None
-    for r in partitions:
-        text = (index_dir / f"metadata-m{m}r{r}-{frac}.txt").read_text()
-        meta = parse_metadata_text(text)
-        missing = [k for k in SHARED_METADATA_KEYS if k not in meta]
-        if missing:
-            raise KreppBuildInvalid("metadata", f"partition r{r} lacks {missing}")
-        shared = {k: meta[k] for k in SHARED_METADATA_KEYS}
-        if settings is None:
-            settings = shared
-        elif shared != settings:
-            differ = sorted(k for k in SHARED_METADATA_KEYS if shared[k] != settings[k])
-            raise KreppBuildInvalid(
-                "metadata", f"partition r{r} differs from r{partitions[0]} on {differ}"
-            )
-    tree_files = [f"tree-m{m}r{r}-{frac}" for r in partitions]
-    first_tree = (index_dir / tree_files[0]).read_bytes()
-    for name in tree_files[1:]:
-        if (index_dir / name).read_bytes() != first_tree:
-            raise KreppBuildInvalid("tree", f"{name} differs from {tree_files[0]}")
-    assert settings is not None
+    names = _all_files(index_dir)
+    if not names:
+        raise KreppBuildInvalid("inventory", f"{index_dir} is empty")
+    settings = _recorded_settings(index_dir)
+    trees = [n for n in names if "/" not in n and n.startswith("tree-")]
+    if not trees:
+        raise KreppBuildInvalid("tree", f"{index_dir} holds no tree-* file")
+    first = (index_dir / trees[0]).read_bytes()
+    for name in trees[1:]:
+        if (index_dir / name).read_bytes() != first:
+            raise KreppBuildInvalid("tree", f"{name} differs from {trees[0]}")
     return Inventory(
-        m=m,
-        partitions=partitions,
         settings=settings,
         files=tuple(f"{KREPP_INDEX_SUBDIR}/{n}" for n in names),
-        tree_file=f"{KREPP_INDEX_SUBDIR}/{tree_files[0]}",
+        tree_file=f"{KREPP_INDEX_SUBDIR}/{trees[0]}",
     )
 
 
@@ -212,7 +160,6 @@ def _all_files(folder: Path) -> list[str]:
 
 def _readme(manifest: dict) -> str:
     s = manifest["settings"]
-    parts = manifest["partitions"]
     return (
         f"# krepp build {manifest['build_label']}\n\n"
         f"A krepp placement index for Qiita reference {manifest['reference_idx']}, registered by\n"
@@ -220,7 +167,6 @@ def _readme(manifest: dict) -> str:
         "the node it is on.\n\n"
         f"- krepp version: {s['krepp version']}\n"
         f"- k {s['k']}, w {s['w']}, h {s['h']}, m {s['m']}, frac {s['frac']}\n"
-        f"- partitions: {len(parts)} ({', '.join(f'r{r}' for r in parts)})\n"
         f"- files: {len(manifest['files'])}, {sum(manifest['files'].values())} bytes\n\n"
         "## Checking a copy\n\n"
         "Run `./verify.sh <sha256>` in the folder, with the SHA256SUMS hash Qiita\n"
@@ -270,8 +216,6 @@ def write_build_files(
         "reference_idx": reference_idx,
         "build_label": build_label,
         "settings": inventory.settings,
-        "m": inventory.m,
-        "partitions": list(inventory.partitions),
         "tree_file": inventory.tree_file,
         "files": {rel: (folder / rel).stat().st_size for rel in content},
     }

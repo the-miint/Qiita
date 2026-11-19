@@ -62,7 +62,7 @@ async def world(postgres_pool):
 
 
 def _params(sums: str) -> dict:
-    return {SHA256SUMS_SHA256_PARAM: sums, "partitions": [0, 1]}
+    return {SHA256SUMS_SHA256_PARAM: sums, "m": 4}
 
 
 async def _register(world, label: str, sums: str = "a" * 64) -> int:

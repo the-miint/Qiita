@@ -10,7 +10,7 @@ reference's active build.
 
 Checks, cheapest first, before any file is hashed:
 
-- the folder is a build (``krepp_build.inventory_index``);
+- its settings and tree can be read (``krepp_build.inventory_index``);
 - it was written by the krepp the staged miint links (``linked_krepp_version``);
 - its tree is the reference's tree as a placement sees it
   (``_phylogeny.tree_difference``): every edge number, parent edge number, branch
@@ -132,8 +132,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             "k": int(settings["k"]),
             "w": int(settings["w"]),
             "h": int(settings["h"]),
-            "m": manifest["m"],
-            "partitions": manifest["partitions"],
+            "m": int(settings["m"]),
             "file_count": len(manifest["files"]),
             "bytes": sum(manifest["files"].values()),
         },

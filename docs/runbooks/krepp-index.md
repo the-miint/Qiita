@@ -24,8 +24,8 @@ same folder overwritten.
 
 ```
 PATH_DERIVED/references/18/krepp/w43_r0-15/
-  index/   the krepp files: 7 per partition (cmer, crecord, inc, metadata,
-           metadata .txt, reflist, tree), all partitions of one index, nothing else
+  index/   the krepp index directory as krepp_index_create wrote it, all partitions
+           of one index, nothing else (registration hashes whatever is there)
   jest/    labelled.nwk (the backbone tree with JEST's clade labels) and null.txt
            (its null distribution)
 ```
