@@ -222,7 +222,8 @@ To import the contents of this file, run
 qiita biosample bulk-create \
     --study-export-id "$STUDY_EXPORT_ID" \
     --tsv-file biosamples.tsv \
-    --owner-biosample-id-field-name sample_id > created.tsv
+    --owner-biosample-id-field-name sample_id \
+    --output created.tsv
 ```
 
 `--owner-biosample-id-field-name` specifies the name of the column holding the
@@ -235,8 +236,9 @@ The example names the study by the `STUDY_EXPORT_ID` kept in step 2. You can nam
 by the `STUDY_IDX` kept there instead, by passing `--study-idx` in place of
 `--study-export-id`.
 
-The command prints a TSV of the biosamples it created, in the file's row order,
-which `> created.tsv` saves:
+The command writes a TSV of the biosamples it created, in the file's row order, to
+the file that `--output` names. That file must not already exist, and it is written
+only when the command succeeds:
 
 ```text
 sample_id	biosample_idx	export_entity_id

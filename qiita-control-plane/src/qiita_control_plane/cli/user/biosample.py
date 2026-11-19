@@ -2,9 +2,7 @@
 
 import argparse
 import json
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import duckdb
@@ -20,12 +18,13 @@ from qiita_common.models import (
     BiosampleImportRequest,
 )
 
-from ...delimited_text import read_headed_tsv, write_tsv
+from ...delimited_text import read_headed_tsv
 from .. import _common
 from ._helpers import _build_body
 
 # The flag the TSV file arrives under, which every error about the file names.
 _TSV_FILE_FLAG = "--tsv-file"
+_OUTPUT_FLAG = "--output"
 _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG = "--owner-biosample-id-field-name"
 # Where DuckDB's read error turns to advice for whoever wrote the reading code.
 _DUCKDB_ADVICE_MARKER = "Possible fixes"
@@ -39,7 +38,6 @@ _REFUSED_OWNER_BIOSAMPLE_ID_COLUMN_NAMES = (
     *_BULK_CREATE_OUTPUT_FIELDS,
     *BIOSAMPLE_ATTRIBUTE_FIELDS,
 )
-_OUTPUT_TSV_NAME = "created.tsv"
 
 
 def _post_biosample(base_url: str, token: str, study_idx: int, body: dict) -> dict:
@@ -134,7 +132,8 @@ def _bulk_create_rows(
 
 def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Create one biosample per row of a TSV file on a study, in one
-    all-or-nothing request, then print each created biosample's identifiers as a TSV."""
+    all-or-nothing request, then write each created biosample's identifiers to
+    the TSV file named by --output."""
     owner_biosample_id_column = args.owner_biosample_id_field_name.strip()
     folded_refused_names = {name.casefold() for name in _REFUSED_OWNER_BIOSAMPLE_ID_COLUMN_NAMES}
     if owner_biosample_id_column.casefold() in folded_refused_names:
@@ -145,7 +144,12 @@ def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.Arg
             " `qiita biosample create` accepts it."
         )
 
-    # Read the file first, so an unreadable file exits before any request.
+    # Check the output path and read the input file first, so an unusable output path
+    # or an unreadable input file stops the command before any biosample is created.
+    try:
+        _common.require_new_output_file(args.output, flag=_OUTPUT_FLAG)
+    except (FileNotFoundError, PermissionError, FileExistsError) as exc:
+        parser.error(str(exc))
     tsv_rows = _read_biosample_tsv(args.tsv_file, owner_biosample_id_column, parser)
 
     def _run(token: str) -> list[tuple[str, ...]]:
@@ -180,15 +184,7 @@ def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.Arg
     def _render(output_rows: list[tuple[str, ...]]) -> None:
         output_columns = (owner_biosample_id_column, *_BULK_CREATE_OUTPUT_FIELDS)
         try:
-            # DuckDB truncates stdout even when it is a file opened for appending,
-            # so the TSV goes to a temporary file that is then copied onto stdout.
-            with tempfile.TemporaryDirectory() as output_dir:
-                output_path = Path(output_dir) / _OUTPUT_TSV_NAME
-                write_tsv(output_path, output_columns, output_rows)
-                sys.stdout.flush()
-                with output_path.open("rb") as output_tsv:
-                    shutil.copyfileobj(output_tsv, sys.stdout.buffer)
-                sys.stdout.flush()
+            _common.write_tsv_output(args.output, output_columns, output_rows)
         except (OSError, duckdb.Error) as exc:
             # The biosamples exist by now, so their identifiers must not be lost.
             created_rows = [dict(zip(output_columns, row, strict=True)) for row in output_rows]

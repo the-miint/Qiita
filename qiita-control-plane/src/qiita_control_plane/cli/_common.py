@@ -1,7 +1,7 @@
-"""Package-private CLI helpers: argument declaration and validation, PAT
-file I/O, authenticated HTTP calls and the runner that wraps a subcommand
-around them, resolution of user-supplied names to the idx values that routes take,
-and the browser login flow.
+"""Package-private CLI helpers: argument declaration and validation, file I/O
+for the PAT and for command output, authenticated HTTP calls and the runner that
+wraps a subcommand around them, resolution of user-supplied names to the idx
+values that routes take, and the browser login flow.
 
 Subcommand-dispatch contract (followed by both qiita-admin and qiita;
 a future third CLI should follow the same shape so the dispatch stays
@@ -32,12 +32,13 @@ import contextlib
 import http.server
 import json
 import os
+import stat
 import sys
 import threading
 import time
 import urllib.parse
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import httpx
@@ -64,6 +65,8 @@ from qiita_common.models import (
     StudyLookupRequest,
     flags_admitting_deprecated_upstream,
 )
+
+from ..delimited_text import write_tsv
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -216,7 +219,7 @@ def validate_base_url(args: argparse.Namespace, parser: argparse.ArgumentParser)
 
 
 # ---------------------------------------------------------------------------
-# Token I/O
+# File I/O
 # ---------------------------------------------------------------------------
 
 
@@ -291,6 +294,53 @@ def commit_partials(
             with contextlib.suppress(FileNotFoundError):
                 final.unlink()
         raise
+
+
+def require_new_output_file(path: Path, *, flag: str) -> None:
+    """Refuse an output `path` whose directory is missing or cannot be written
+    into, or that already exists, naming `flag`, so a command can refuse before it
+    changes anything.
+
+    Raises FileNotFoundError, PermissionError or FileExistsError.
+    """
+    # The directory comes first, through stat(): is_dir() and exists() report False
+    # for a path that cannot be reached, where stat() says why.
+    parent = path.parent
+    try:
+        parent_status = parent.stat()
+    except FileNotFoundError, NotADirectoryError:
+        raise FileNotFoundError(f"{flag} {path}: no such directory to write into") from None
+    except PermissionError:
+        raise PermissionError(f"{flag} {path}: cannot reach {parent}") from None
+    if not stat.S_ISDIR(parent_status.st_mode):
+        raise FileNotFoundError(f"{flag} {path}: no such directory to write into")
+    if not os.access(parent, os.W_OK | os.X_OK):
+        raise PermissionError(f"{flag} {path}: cannot write into {parent}")
+    if path.exists(follow_symlinks=False):
+        raise FileExistsError(f"{flag} {path} already exists; remove it or choose another {flag}")
+
+
+def write_tsv_output(
+    path: Path, columns: tuple[str, ...], rows: Sequence[Sequence[str | None]]
+) -> None:
+    """Write `rows` as the tab-separated table at `path`, headed by `columns`,
+    all at once: the table is written to `<path>.partial` and renamed into place,
+    so a failed write leaves no file at `path` and no partial behind. A file that
+    appears at `path` before the rename is left as it was, and the call raises
+    FileExistsError.
+
+    Raises what `write_tsv` raises, FileExistsError, or OSError from the rename.
+    """
+    # The partial lives in the same directory, so the rename cannot cross filesystems.
+    partial = path.with_name(path.name + ".partial")
+
+    def _write() -> None:
+        write_tsv(partial, columns, rows)
+        # The rename would replace a file that appeared since the caller checked.
+        if path.exists(follow_symlinks=False):
+            raise FileExistsError(f"{path} appeared while the output was written; left as it was")
+
+    commit_partials(_write, [(partial, path)])
 
 
 # ---------------------------------------------------------------------------

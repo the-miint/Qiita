@@ -18,3 +18,7 @@
   `resolved` values become integer-or-string, which a generated client sees on every route
   that returns it, including the deprecated lookups and
   `POST /sequencing-run/lookup-by-instrument-run-id`; those still return integers.
+- **`qiita biosample bulk-create` writes the created biosamples' TSV to a file named by a
+  required `--output` (#N), instead of printing it.** The command refuses an existing file
+  or a missing directory before it creates anything, and writes the file only on success,
+  so a failed run leaves no partial file behind.

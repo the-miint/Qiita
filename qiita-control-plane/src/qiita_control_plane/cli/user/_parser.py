@@ -88,6 +88,7 @@ from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_expor
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import (
     _BULK_CREATE_OUTPUT_FIELDS,
+    _OUTPUT_FLAG,
     _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
     _TSV_FILE_FLAG,
     _handle_biosample_bulk_create,
@@ -700,6 +701,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--owner-idx",
         type=int,
         help="principal_idx of the biosamples' owner; defaults to the caller (resolved via whoami)",
+    )
+    p_biosample_bulk_create.add_argument(
+        _OUTPUT_FLAG,
+        type=Path,
+        required=True,
+        help=(
+            "TSV file to write the created biosamples' identifiers to, one row per biosample"
+            " in the input file's row order; it must not exist, and is written only on success"
+        ),
     )
     _add_global_internal_names_arg(p_biosample_bulk_create, keys="the TSV file's column headers")
     p_biosample_bulk_create.set_defaults(handler=_handle_biosample_bulk_create)
