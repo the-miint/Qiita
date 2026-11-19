@@ -445,9 +445,16 @@ async def _fail_after_held_run_check(
     await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
 
 
-def _nothing_to_download_reason(result: EnaStudyRegistrationResult) -> str | None:
+_ROLLED_BACK = "the import-created study was rolled back"
+
+
+def _nothing_to_download_reason(
+    result: EnaStudyRegistrationResult, *, rolled_back: bool
+) -> str | None:
     """Why a registration left nothing to download, or None when something is."""
     if not result.created_pools:
+        if rolled_back:
+            return f"no run mapped to a downloadable pool; {_ROLLED_BACK}"
         return (
             "study registered but no run mapped to a downloadable pool"
             " (no download tickets created)"
@@ -456,6 +463,8 @@ def _nothing_to_download_reason(result: EnaStudyRegistrationResult) -> str | Non
         reasons = _summarize_run_failures(
             o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
         )
+        if rolled_back:
+            return f"every run failed to register ({reasons}); {_ROLLED_BACK}"
         return f"study registered but every run failed to register ({reasons})"
     return None
 
@@ -580,7 +589,9 @@ async def _process_one_study(
                         caller_idx=principal.principal_idx,
                         tiers=await caller_metadata_tiers(conn, principal),
                     )
-                    if (reason := _nothing_to_download_reason(result)) is not None:
+                    if (
+                        reason := _nothing_to_download_reason(result, rolled_back=True)
+                    ) is not None:
                         raise _FirstImportRegisteredNothing(reason, result)
         except _FirstImportRegisteredNothing as exc:
             async with pool.acquire() as conn:
@@ -661,7 +672,7 @@ async def _process_one_study(
             ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
         )
 
-        if (reason := _nothing_to_download_reason(result)) is not None:
+        if (reason := _nothing_to_download_reason(result, rolled_back=False)) is not None:
             await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=reason)
             return
 

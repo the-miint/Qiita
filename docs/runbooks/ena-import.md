@@ -218,7 +218,9 @@ the item still ends up `excluded`, `unsupported` and/or `failed` — none reache
 `registered`/`skipped_already_present` — the item fails with "every run failed to
 register", grouping those runs by reason (see *Metadata
 harmonization* below); if no platform ever mapped, no pool
-exists and the item instead fails with "no run mapped to a downloadable pool".
+exists and the item instead fails with "no run mapped to a downloadable pool". When the
+import created the study, either reason ends with "the import-created study was rolled
+back"; into an existing study it is prefixed "study registered but" instead.
 
 Resolution only sees public records (see `qiita_common.models.ena`), so these checks
 rarely fire in practice; they enforce the rule rather than assume it.

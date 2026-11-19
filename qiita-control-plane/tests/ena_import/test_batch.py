@@ -1225,7 +1225,7 @@ async def test_process_one_study_zero_pools_reaches_terminal_failed(
     )
     assert item_row["state"] == BatchItemState.FAILED.value
     assert list(item_row["download_work_ticket_idxs"]) == []
-    assert "no run mapped to a downloadable pool" in item_row["failure_reason"]
+    assert item_row["failure_reason"] == _NO_POOL_ROLLED_BACK
     await _assert_no_import_residue(postgres_pool, accession)
     assert (
         await postgres_pool.fetchval(
@@ -1269,6 +1269,10 @@ async def test_fetch_batch_status_missing_ticket_row_stays_downloading(
 # Per-run outcomes surfaced on the status endpoint; all-runs-failed terminal;
 # registered-item re-drive durability + idempotent re-submit.
 # ---------------------------------------------------------------------------
+
+
+_ROLLED_BACK = "the import-created study was rolled back"
+_NO_POOL_ROLLED_BACK = f"no run mapped to a downloadable pool; {_ROLLED_BACK}"
 
 
 async def _drive_one_study(batch_app, postgres_pool, admin_principal, accession):
@@ -1374,6 +1378,7 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     )
     assert item_row["state"] == BatchItemState.FAILED.value
     assert "every run failed to register" in item_row["failure_reason"]
+    assert item_row["failure_reason"].endswith(_ROLLED_BACK)
     assert list(item_row["download_work_ticket_idxs"]) == []
     ticket_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
@@ -1583,6 +1588,7 @@ async def test_process_one_study_mixed_excluded_and_failed_every_run_failed_mess
     )
     assert item_row["state"] == BatchItemState.FAILED.value
     assert "every run failed to register" in item_row["failure_reason"]
+    assert item_row["failure_reason"].endswith(_ROLLED_BACK)
     assert f"SRR-{accession}-suppressed" in item_row["failure_reason"]
     assert f"SRR-{accession}-badharm" in item_row["failure_reason"]
     assert list(item_row["download_work_ticket_idxs"]) == []
