@@ -96,7 +96,7 @@ class _World:
             accession=accession,
         )
 
-    async def genome(self, source_id: str, source: str = "genbank") -> int:
+    async def genome(self, source_id: str, source: str = GenomeSource.GENBANK) -> int:
         self.source_ids.add(source_id)
         return await self.pool.fetchval(
             "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
@@ -207,7 +207,7 @@ class _World:
         )
         return {r["source_id"] for r in rows}
 
-    async def genome_idx(self, source_id: str, source: str = "genbank") -> int | None:
+    async def genome_idx(self, source_id: str, source: str = GenomeSource.GENBANK) -> int | None:
         return await self.pool.fetchval(
             "SELECT genome_idx FROM qiita.genome WHERE source = $1 AND source_id = $2",
             source,
@@ -337,7 +337,7 @@ async def test_execute_folds_every_class_into_g_n(world):
     minted = await w.pool.fetchrow(
         "SELECT source, prep_sample_idx FROM qiita.genome WHERE source_id = $1", c["n"]
     )
-    assert dict(minted) == {"source": "genbank", "prep_sample_idx": None}
+    assert dict(minted) == {"source": GenomeSource.GENBANK, "prep_sample_idx": None}
 
 
 async def test_stale_wol_link_is_removed_and_its_genome_kept(world):
@@ -429,14 +429,14 @@ async def test_execute_records_each_genomes_parent_assembly(world):
     assert rows == {
         a["n"]: {
             "source_id": a["n"],
-            "parent_source": "refseq",
+            "parent_source": GenomeSource.REFSEQ,
             "parent_source_id": "GCF_000005825.2",
             "method": DERIVATION_METHOD,
             "asserted_by_reference_idx": w.reference_idx,
         },
         c["n"]: {
             "source_id": c["n"],
-            "parent_source": "genbank",
+            "parent_source": GenomeSource.GENBANK,
             "parent_source_id": "GCA_000007325.1",
             "method": DERIVATION_METHOD,
             "asserted_by_reference_idx": w.reference_idx,
@@ -654,7 +654,8 @@ async def test_refuses_when_the_reference_header_is_not_g_n(world):
         a["feature_idx"],
         header,
     )
-    # The metadata agrees with the reference, so only the header check can fire.
+    # The metadata agrees with the reference, so only the header checks fire: this one,
+    # which names the GCA_G genome, and the member check.
     metadata = w.metadata([(header, f"GCF_{header[1:]}.1")], name="header.txt")
     await _assert_refused(w, f"GCA_{a['n']}", metadata)
 
@@ -1002,21 +1003,18 @@ async def test_a_reference_held_by_a_delete_refuses_after_the_lock_timeout(world
     )
 
 
-# --- postconditions: assert in the transaction, roll back ----------------------------
-
-
 @pytest.mark.parametrize("left", ["another-genome", "no-genome", "another-wol-id"])
-async def test_refuses_a_member_the_fold_would_leave_linked_otherwise(world, left):
-    """Every member of the reference must end up linked to exactly the genome its header
-    names. The fold touches only features with a GCA_G genome, so a member it does not
-    touch, or one that keeps a link it does not remove, would fail that after the
-    fold; the plan refuses it first, naming the feature."""
+async def test_refuses_a_member_that_the_fold_would_not_link_to_its_header_genome(world, left):
+    """Every member of the reference must end up linked to exactly the genome that its
+    header names. The fold changes only the links of features that have a GCA_G genome,
+    so a member that it does not change, or a link that it does not remove, would break
+    that rule after the fold. The plan refuses such a member first, naming the feature."""
     w = world
     await w.rc4_genome("C")
     if left == "another-genome":
         a = await w.rc4_genome("A")
         feature_idx = a["feature_idx"]
-        other = await w.genome(f"GCF_{secrets.randbelow(10**9):09d}.1", source="refseq")
+        other = await w.genome(f"GCF_{secrets.randbelow(10**9):09d}.1", source=GenomeSource.REFSEQ)
         await w.link(feature_idx, other)
     else:
         n = w.wol_id()
@@ -1028,10 +1026,13 @@ async def test_refuses_a_member_the_fold_would_leave_linked_otherwise(world, lef
     await _assert_refused(w, rf"feature {feature_idx}\b")
 
 
+# --- postconditions: assert in the transaction, roll back ----------------------------
+
+
 async def test_a_failed_postcondition_rolls_everything_back(world, monkeypatch):
-    """The result is asserted inside the transaction, as a backstop for anything the
-    survey did not foresee: here, derivations that were never recorded. The apply names
-    what does not hold and leaves no trace."""
+    """The result is asserted inside the transaction, as a backstop for anything that
+    the survey did not foresee: here, derivations that were never recorded. The apply
+    names what does not hold and leaves no trace."""
     w = world
     await w.rc4_genome("A")
     await w.rc4_genome("C")
@@ -1043,6 +1044,26 @@ async def test_a_failed_postcondition_rolls_everything_back(world, monkeypatch):
 
     monkeypatch.setattr(wol_genome_repair, "_record_derivations", _record_nothing)
     with pytest.raises(RepairPostconditionFailed, match="without their derivation"):
+        await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
+    assert await w.snapshot() == before
+    assert list(w.tmp_path.glob("*manifest*")) == []
+
+
+async def test_a_fold_that_diverges_from_the_survey_rolls_back(world, monkeypatch):
+    """The postcondition reads the members' actual links, so a fold that does other than
+    what the survey predicted is caught: here the links to `G<n>` are never written."""
+    w = world
+    b = await w.rc4_genome("B")
+    plan = await _plan(w)
+    before = await w.snapshot()
+
+    async def _write_nothing(conn, feat_idxs, sources, source_ids, prep_sample_idxs):
+        return None
+
+    monkeypatch.setattr(wol_genome_repair, "_write_genome_associations", _write_nothing)
+    with pytest.raises(
+        RepairPostconditionFailed, match=rf"feature {b['feature_idx']} links to no genome"
+    ):
         await apply_repair(w.pool, plan, manifest_path=w.tmp_path / "manifest.csv")
     assert await w.snapshot() == before
     assert list(w.tmp_path.glob("*manifest*")) == []

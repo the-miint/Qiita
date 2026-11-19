@@ -307,6 +307,7 @@ async def _gca_g_folds(
             f"GCA_G genome(s) whose feature is not a member of reference {reference_idx}:"
             f" {_listed(outside)}"
         )
+    # The member check in `_survey` also refuses these features; this names the GCA_G.
     if misnamed:
         problems.append(
             f"GCA_G genome(s) whose feature has another name in reference {reference_idx}:"
@@ -467,57 +468,64 @@ async def _derivations_present(
     return present
 
 
-async def _members_misnamed_after_fold(
-    conn: asyncpg.Connection, reference_idx: int
+async def _members_mislinked(
+    conn: asyncpg.Connection,
+    reference_idx: int,
+    *,
+    drop: list[tuple[int, int]],
+    add: list[tuple[int, str]],
 ) -> list[asyncpg.Record]:
-    """Each member of the reference that, once every GCA_G genome is folded, would not
-    link exactly the genome its header names; with `genomes`, the links it would have.
+    """Each member of the reference that, after the links in `drop` (feature_idx,
+    genome_idx) are removed and those in `add` (feature_idx, WoL ID) are made, would not
+    link exactly the genome that its header names; `genomes` lists the links that it
+    would have. With nothing to drop or add, that is the current state.
 
-    The fold replaces a feature's GCA_G link with `G<n>` and drops its links to other
-    WoL IDs; every other link stays. With no GCA_G link left, as after the fold, the
-    prediction is the actual state, so the survey and the postcondition share it."""
+    `UNION`, not `UNION ALL`, merges an added `G<n>` link that the feature already has.
+    A member with no accession is left out: `_metadata_matches_reference` refuses it."""
     return await conn.fetch(
         "WITH member AS ("
         "  SELECT feature_idx, accession FROM qiita.reference_membership"
-        "   WHERE reference_idx = $1),"
-        " link AS ("
-        "  SELECT fg.feature_idx, g.source, g.source_id"
-        "    FROM member m JOIN qiita.feature_genome fg USING (feature_idx)"
-        "    JOIN qiita.genome g USING (genome_idx)),"
-        " folded AS ("
-        "  SELECT feature_idx, substr(source_id, 5) AS n_id FROM link"
-        "   WHERE source = $2 AND source_id ~ $3),"
+        "   WHERE reference_idx = $1 AND accession IS NOT NULL),"
+        " dropped AS ("
+        "  SELECT * FROM unnest($2::bigint[], $3::bigint[]) AS d(feature_idx, genome_idx)),"
         " after_fold AS ("
-        "  SELECT l.feature_idx, l.source, l.source_id"
-        "    FROM link l LEFT JOIN folded f USING (feature_idx)"
-        "   WHERE NOT (l.source = $2 AND l.source_id ~ $3)"
-        "     AND NOT (f.n_id IS NOT NULL AND l.source = $2 AND l.source_id ~ $4"
-        "              AND l.source_id <> f.n_id)"
+        "  SELECT fg.feature_idx, g.source, g.source_id"
+        "    FROM member m"
+        "    JOIN qiita.feature_genome fg USING (feature_idx)"
+        "    JOIN qiita.genome g USING (genome_idx)"
+        "   WHERE NOT EXISTS (SELECT 1 FROM dropped d"
+        "                      WHERE d.feature_idx = fg.feature_idx"
+        "                        AND d.genome_idx = fg.genome_idx)"
         "  UNION"
-        "  SELECT feature_idx, $2::text, n_id FROM folded)"
+        "  SELECT * FROM unnest($4::bigint[], $5::text[], $6::text[])"
+        "           AS a(feature_idx, source, source_id))"
         " SELECT m.feature_idx, m.accession, string_agg("
         "        a.source || ':' || a.source_id, ', ' ORDER BY a.source_id) AS genomes"
         "   FROM member m LEFT JOIN after_fold a USING (feature_idx)"
         "  GROUP BY m.feature_idx, m.accession"
         " HAVING count(a.source_id) <> 1"
-        "     OR bool_or(a.source <> $2 OR a.source_id <> m.accession)"
+        "     OR bool_or(a.source <> $7 OR a.source_id <> m.accession)"
         "  ORDER BY m.feature_idx",
         reference_idx,
+        [f for f, _g in drop],
+        [g for _f, g in drop],
+        [f for f, _n in add],
+        [_WOL_SOURCE] * len(add),
+        [n for _f, n in add],
         _WOL_SOURCE,
-        _anchored(_GCA_G_ID),
-        _anchored(_WOL_ID),
     )
 
 
-def _misnamed(reference_idx: int, rows: list[asyncpg.Record], *, done: bool) -> str:
-    links = "links" if done else "would link"
+def _mislinked(reference_idx: int, rows: list[asyncpg.Record], *, folded: bool) -> str:
+    verb = "links" if folded else "would link"
     described = [
-        f"feature {r['feature_idx']} {links} to {r['genomes'] or 'no genome'}, not {r['accession']}"
+        f"feature {r['feature_idx']} {verb} to {r['genomes'] or 'no genome'}, not {r['accession']}"
         for r in rows
     ]
+    which = "not linked" if folded else "that the fold would leave not linked"
     return (
-        f"reference {reference_idx} feature(s) not linked to exactly the genome its header"
-        f" names{'' if done else ' once folded'}: {_listed(described)}"
+        f"reference {reference_idx} feature(s) {which} to exactly the genome that its header"
+        f" names: {_listed(described)}"
     )
 
 
@@ -530,8 +538,13 @@ async def _survey(
     folds, stale = await _links(conn, single, problems)
     await _guards(conn, x_idxs, stale, problems)
     _metadata_matches_reference(reference_idx, headers, parents, problems)
-    if misnamed := await _members_misnamed_after_fold(conn, reference_idx):
-        problems.append(_misnamed(reference_idx, misnamed, done=False))
+    # The fold's own link changes, so that the prediction is of what `_fold` does.
+    drop = [(f.feature_idx, f.x_idx) for f in folds] + [
+        (s.feature_idx, s.genome_idx) for s in stale
+    ]
+    add = [(f.feature_idx, f.n_id) for f in folds]
+    if mislinked := await _members_mislinked(conn, reference_idx, drop=drop, add=add):
+        problems.append(_mislinked(reference_idx, mislinked, folded=False))
     present = await _derivations_present(conn, reference_idx, parents, problems)
     labels = await conn.fetch(
         "SELECT ef.idx, ef.genome_idx, ef.export_feature_id, g.source, g.source_id"
@@ -652,8 +665,8 @@ async def _postcondition_problems(
     )
     if left:
         problems.append(f"{left} GCA_G genome(s) remain")
-    if misnamed := await _members_misnamed_after_fold(conn, reference_idx):
-        problems.append(_misnamed(reference_idx, misnamed, done=True))
+    if mislinked := await _members_mislinked(conn, reference_idx, drop=[], add=[]):
+        problems.append(_mislinked(reference_idx, mislinked, folded=True))
     missing = [
         r["genome_id"]
         for r in await conn.fetch(

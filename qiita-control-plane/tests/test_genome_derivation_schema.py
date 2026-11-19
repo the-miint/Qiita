@@ -95,8 +95,8 @@ async def test_genome_derivation_accepts_genbank_and_refseq_parents(postgres_poo
     async with _rolled_back(postgres_pool) as conn:
         reference_idx, genome_a = await _seed(conn)
         _, genome_b = await _seed(conn)
-        await _insert(conn, genome_a, "genbank", "GCA_000005825.2", reference_idx)
-        await _insert(conn, genome_b, "refseq", "GCF_000005825.12", reference_idx)
+        await _insert(conn, genome_a, GenomeSource.GENBANK, "GCA_000005825.2", reference_idx)
+        await _insert(conn, genome_b, GenomeSource.REFSEQ, "GCF_000005825.12", reference_idx)
         assert (
             await conn.fetchval(
                 "SELECT count(*) FROM qiita.genome_derivation WHERE genome_idx = ANY($1::bigint[])",
@@ -109,15 +109,15 @@ async def test_genome_derivation_accepts_genbank_and_refseq_parents(postgres_poo
 async def test_genome_derivation_one_row_per_genome(postgres_pool):
     async with _rolled_back(postgres_pool) as conn:
         reference_idx, genome_idx = await _seed(conn)
-        await _insert(conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx)
+        await _insert(conn, genome_idx, GenomeSource.GENBANK, "GCA_000005825.2", reference_idx)
         with pytest.raises(asyncpg.UniqueViolationError):
-            await _insert(conn, genome_idx, "refseq", "GCF_000005825.2", reference_idx)
+            await _insert(conn, genome_idx, GenomeSource.REFSEQ, "GCF_000005825.2", reference_idx)
 
 
 async def test_genome_derivation_cascades_with_its_genome(postgres_pool):
     async with _rolled_back(postgres_pool) as conn:
         reference_idx, genome_idx = await _seed(conn)
-        await _insert(conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx)
+        await _insert(conn, genome_idx, GenomeSource.GENBANK, "GCA_000005825.2", reference_idx)
         await conn.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_idx)
         assert (
             await conn.fetchval(
@@ -131,7 +131,7 @@ async def test_genome_derivation_restricts_deleting_its_asserting_reference(post
     """The asserting reference is RESTRICT (the column's COMMENT says why)."""
     async with _rolled_back(postgres_pool) as conn:
         reference_idx, genome_idx = await _seed(conn)
-        await _insert(conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx)
+        await _insert(conn, genome_idx, GenomeSource.GENBANK, "GCA_000005825.2", reference_idx)
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             await conn.execute(
                 "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
@@ -145,23 +145,23 @@ async def test_genome_derivation_rejects_unknown_reference(postgres_pool):
             "SELECT COALESCE(MAX(reference_idx), 0) + 1000000 FROM qiita.reference"
         )
         with pytest.raises(asyncpg.ForeignKeyViolationError):
-            await _insert(conn, genome_idx, "genbank", "GCA_000005825.2", missing)
+            await _insert(conn, genome_idx, GenomeSource.GENBANK, "GCA_000005825.2", missing)
 
 
 @pytest.mark.parametrize(
     ("parent_source", "parent_source_id"),
     [
-        pytest.param("qiita", "GCA_000005825.2", id="qiita-source"),
+        pytest.param(GenomeSource.QIITA, "GCA_000005825.2", id="qiita-source"),
         pytest.param("wol", "GCA_000005825.2", id="wol-source"),
-        pytest.param("genbank", "GCF_000005825.2", id="refseq-id-under-genbank"),
-        pytest.param("refseq", "GCA_000005825.2", id="genbank-id-under-refseq"),
-        pytest.param("genbank", "GCA_000005825", id="no-version"),
-        pytest.param("genbank", "GCA_00000582.2", id="eight-digits"),
-        pytest.param("genbank", "GCA_0000058250.2", id="ten-digits"),
-        pytest.param("genbank", "GCA_000005825.", id="empty-version"),
-        pytest.param("genbank", "G000005825", id="wol-id"),
-        pytest.param("genbank", "GCA_G000005825", id="gca-g-form"),
-        pytest.param("refseq", "GCF_000005825.2 ", id="trailing-space"),
+        pytest.param(GenomeSource.GENBANK, "GCF_000005825.2", id="refseq-id-under-genbank"),
+        pytest.param(GenomeSource.REFSEQ, "GCA_000005825.2", id="genbank-id-under-refseq"),
+        pytest.param(GenomeSource.GENBANK, "GCA_000005825", id="no-version"),
+        pytest.param(GenomeSource.GENBANK, "GCA_00000582.2", id="eight-digits"),
+        pytest.param(GenomeSource.GENBANK, "GCA_0000058250.2", id="ten-digits"),
+        pytest.param(GenomeSource.GENBANK, "GCA_000005825.", id="empty-version"),
+        pytest.param(GenomeSource.GENBANK, "G000005825", id="wol-id"),
+        pytest.param(GenomeSource.GENBANK, "GCA_G000005825", id="gca-g-form"),
+        pytest.param(GenomeSource.REFSEQ, "GCF_000005825.2 ", id="trailing-space"),
     ],
 )
 async def test_genome_derivation_rejects_malformed_parent(
@@ -178,7 +178,12 @@ async def test_genome_derivation_rejects_unknown_method(postgres_pool):
         reference_idx, genome_idx = await _seed(conn)
         with pytest.raises(asyncpg.CheckViolationError):
             await _insert(
-                conn, genome_idx, "genbank", "GCA_000005825.2", reference_idx, method="linearized"
+                conn,
+                genome_idx,
+                GenomeSource.GENBANK,
+                "GCA_000005825.2",
+                reference_idx,
+                method="linearized",
             )
 
 

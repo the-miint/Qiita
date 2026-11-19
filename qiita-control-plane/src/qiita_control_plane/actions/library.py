@@ -239,12 +239,11 @@ async def upsert_genomes(
     RETURNING fires for every row even when the genome already exists, and keeps
     prep_sample_idx current on re-ingest.
 
-    Shared by the two producers of qiita.genome rows — the reference load's
-    `_write_genome_associations` and the assembly mint in
-    `write_assembly_membership` — because the dedupe below is subtle and having it
-    twice is how the two would drift. What is NOT shared is where the resulting
-    edge is written: the reference load writes `qiita.feature_genome`, the assembly
-    path writes `assembly_membership.genome_idx`, and those two must stay apart —
+    Every producer of qiita.genome rows mints them here, because the dedupe below
+    is subtle and having it twice is how two copies would drift. What is NOT shared
+    is where the resulting edge is written: a sequence's link goes to
+    `qiita.feature_genome` (`_write_genome_associations`), an assembly's to
+    `assembly_membership.genome_idx`, and those two must stay apart —
     `test_assembly_genome_mint` states why and pins it.
     """
     if not sources:
@@ -291,9 +290,10 @@ async def _write_genome_associations(
     All four lists are positionally aligned: row i links feat_idxs[i] to
     (sources[i], source_ids[i]) with originating prep_sample_idxs[i].
 
-    **Every qiita.feature_genome link is inserted here.** The assembly path mints
-    genomes through the same `upsert_genomes` but records its edge on
-    `assembly_membership.genome_idx` instead. Why the two cannot share this
+    **Links sequences to their genomes in qiita.feature_genome**, minting the
+    genomes first. The assembly path mints genomes through the same
+    `upsert_genomes` but records its edge on `assembly_membership.genome_idx`
+    instead. Why the two cannot share this
     junction is stated and pinned in `test_assembly_genome_mint`.
     """
     if not feat_idxs:
