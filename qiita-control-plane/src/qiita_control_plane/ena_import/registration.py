@@ -38,6 +38,8 @@ in the download workflow and the batch driver.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from operator import itemgetter
@@ -265,8 +267,19 @@ class EnaStudyRegistrationResult:
     created_pools: list[CreatedPool] = field(default_factory=list)
 
 
+@asynccontextmanager
+async def _connection(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+) -> AsyncIterator[asyncpg.Connection]:
+    if isinstance(pool_or_conn, asyncpg.Pool):
+        async with pool_or_conn.acquire() as conn:
+            yield conn
+    else:
+        yield pool_or_conn
+
+
 async def register_ena_study(
-    pool: asyncpg.Pool,
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     study_idx: int,
     study_header: EnaStudyHeader,
@@ -291,6 +304,9 @@ async def register_ena_study(
 
     tiers is the caller's, and must meet `require_tiers_read_every_value` on
     study_idx: the per-run `library_*` writes check no tier.
+
+    Given a connection, the caller's transaction owns every write, so the
+    transactions below become savepoints and nothing commits before it does.
     """
     require_tiers_read_every_value(tiers, study_idx=study_idx)
     # A run whose sample has no entry here harmonizes against an empty map
@@ -299,7 +315,7 @@ async def register_ena_study(
         sa.sample_accession: sa for sa in sample_attributes
     }
 
-    async with pool.acquire() as conn:
+    async with _connection(pool_or_conn) as conn:
         metadata_checklist_idx = await fetch_metadata_checklist_idx_by_name(
             conn, _ERC000011_CHECKLIST_NAME
         )
@@ -336,8 +352,9 @@ async def register_ena_study(
         # is written -- but only when a run will be written: a pure re-import
         # of already-present runs adds no values and so mints no fields. Ahead
         # of pool resolution too, so a field-shape clash mints nothing at all.
-        # Outside the transaction below: the field rows are per-study
-        # constants that survive a failed attempt (see _ensure_library_fields).
+        # Given a pool, outside the transaction below: the field rows are
+        # per-study constants that survive a failed attempt (see
+        # _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
         implied_host_by_taxon: dict[str, str | None] = {}
         loaded_term_ids: frozenset[str] = frozenset()
@@ -545,8 +562,8 @@ async def _ensure_library_fields(
     unique within the study, or globally linked -- fail the whole study loudly
     before the first run, instead of rolling runs back one by one mid-loop:
     the run's own data is fine, only the slot is wrong, so the run must not
-    pay for it. The field rows are per-study constants and survive a later
-    failure; a retry re-resolves them identically.
+    pay for it. Given a pool-acquired connection, the field rows are per-study
+    constants and survive a later failure; a retry re-resolves them identically.
     """
     field_idxs: dict[str, int] = {}
     async with conn.transaction():

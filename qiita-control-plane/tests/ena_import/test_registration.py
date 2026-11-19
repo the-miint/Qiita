@@ -1812,6 +1812,75 @@ async def test_reimport_is_idempotent_no_duplicates_and_runs_skipped(reg):
     assert count == 1
 
 
+async def test_registration_on_a_caller_connection_rolls_back_with_the_caller(reg):
+    class _Rollback(Exception):
+        pass
+
+    study_accession = unique_ena_accession("PRJNA")
+    header = _study_header(study_accession=study_accession)
+    run = _run(
+        run_accession=unique_accession("SRR"),
+        experiment_accession=unique_accession("SRX"),
+        sample_accession=unique_accession("SAMN"),
+        study_accession=study_accession,
+    )
+    reg["tracker"].study_accessions.append(study_accession)
+
+    with pytest.raises(_Rollback):
+        async with reg["pool"].acquire() as conn, conn.transaction():
+            study_row, _created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=study_accession,
+                ena_study_accession=None,
+                owner_idx=reg["owner_idx"],
+                created_by_idx=reg["caller_idx"],
+                title=header.study_title,
+            )
+            result = await register_ena_study(
+                conn,
+                study_idx=study_row["idx"],
+                study_header=header,
+                ena_runs=[run],
+                sample_attributes=[],
+                owner_idx=reg["owner_idx"],
+                caller_idx=reg["caller_idx"],
+                tiers=ADMIN_EVERYWHERE,
+            )
+            assert result.ena_runs[0].status == EnaRunRegistrationStatus.REGISTERED
+            raise _Rollback
+
+    pool = reg["pool"]
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", study_accession
+        )
+        == 0
+    )
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM qiita.sequenced_sample WHERE ena_run_accession = $1",
+            run.run_accession,
+        )
+        == 0
+    )
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+            f"{study_accession}:%",
+        )
+        == 0
+    )
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM qiita.prep_sample_study_field WHERE display_name = $1"
+            " AND study_idx = $2",
+            ENA_LIBRARY_STRATEGY_FIELD_NAME,
+            study_row["idx"],
+        )
+        == 0
+    )
+
+
 async def test_partial_failure_run_leaves_no_orphan_rows_and_rerun_completes(reg):
     study_accession = unique_ena_accession("PRJNA")
     header = _study_header(study_accession=study_accession)
