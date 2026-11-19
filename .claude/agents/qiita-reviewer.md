@@ -216,7 +216,7 @@ If removing a sentence would not confuse a future reader, it does not belong.
 
 ### R3 — Migration discipline [strong]
 
-- **Timestamps are unique and ordered.** dbmate keys on the leading version; a new migration whose timestamp collides with, or sorts before, one it depends on is skipped silently on a database that already recorded that version, while a fresh-DB test run still passes.
+- **Timestamps are unique and ordered.** dbmate keys on the leading version. A file whose version another file already holds is never run on a database that recorded that version, as the live one has, and `dbmate status` lists it as applied; `tests/test_migration_version.py` fails the unit tier on it. A new migration also sorts after every migration on main: one that sorts before a migration it depends on fails on a fresh database.
 - **An applied migration is not edited** (`CLAUDE.md`, "Database migrations"). Within one unmerged branch, prefer fixing the original `CREATE` over stacking an `ALTER` on a table the same branch creates.
 
 ### R4 — Make the guarded path the explicit one [strong]
