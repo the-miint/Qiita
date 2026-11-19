@@ -10,7 +10,6 @@ one is not, and re-running is idempotent.
 """
 
 import secrets
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -21,6 +20,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_user_principal,
 )
 from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
+from qiita_control_plane.testing.migrations import MIGRATIONS_DIR, migrate_up
 
 pytestmark = pytest.mark.db
 
@@ -28,14 +28,8 @@ pytestmark = pytest.mark.db
 def _backfill_up_sql() -> str:
     """The migration's `migrate:up` body, read from the file so the test tracks the
     real migration rather than a hand-copied duplicate."""
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "db"
-        / "migrations"
-        / "20260724000000_backfill_mask_sample_per_sample.sql"
-    )
-    text = path.read_text()
-    return text.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0].strip()
+    path = MIGRATIONS_DIR / "20260724000000_backfill_mask_sample_per_sample.sql"
+    return migrate_up(path.read_text())
 
 
 @pytest_asyncio.fixture
