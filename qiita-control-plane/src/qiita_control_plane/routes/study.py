@@ -122,25 +122,10 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
 
     return StudyResponse.model_validate(
         {
+            **dict(row),
             "study_idx": row["idx"],
             "export_entity_id": require_export_entity_id(row, kind="study"),
-            "owner_idx": row["owner_idx"],
-            "principal_investigator_idx": row["principal_investigator_idx"],
-            "title": row["title"],
-            "alias": row["alias"],
-            "description": row["description"],
-            "abstract": row["abstract"],
-            "funding": row["funding"],
-            "ena_study_accession": row["ena_study_accession"],
-            "bioproject_accession": row["bioproject_accession"],
-            "notes": row["notes"],
-            "last_submission_at": row["last_submission_at"],
-            "submission_error": row["submission_error"],
             "extra_metadata": extra_metadata,
-            "default_tier": row["default_tier"],
-            "created_by_idx": row["created_by_idx"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
         }
     )
 
@@ -384,15 +369,12 @@ async def get_study(
         # Deleted between the existence guard and here.
         raise HTTPException(status_code=404, detail=f"study {study_idx} not found")
     if view is StudyRecordView.SUMMARY:
-        return StudyRecordSummary(
-            study_idx=row["idx"],
-            export_entity_id=require_export_entity_id(row, kind="study"),
-            title=row["title"],
-            alias=row["alias"],
-            bioproject_accession=row["bioproject_accession"],
-            ena_study_accession=row["ena_study_accession"],
-            default_tier=row["default_tier"],
-            updated_at=row["updated_at"],
+        return StudyRecordSummary.model_validate(
+            {
+                **dict(row),
+                "study_idx": row["idx"],
+                "export_entity_id": require_export_entity_id(row, kind="study"),
+            }
         )
     if view is StudyRecordView.PUBLIC:
         return StudyRecordPublic.model_validate(
