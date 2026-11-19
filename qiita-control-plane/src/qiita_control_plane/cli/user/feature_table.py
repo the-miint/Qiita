@@ -967,7 +967,7 @@ def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -
     `QF`, its ASV sequence, and the reproducible-from-sequence md5. SEMI JOIN to the
     published set (not `IN`) and unordered, like `write.taxonomy_copy_sql`: the reader
     joins on the id."""
-    del clearance  # Held, not read: holding it is the check.
+    del clearance
     return (
         f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length, f.md5"
         f" FROM {FEATURE_RELATION} f"
