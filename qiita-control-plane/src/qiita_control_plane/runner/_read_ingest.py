@@ -14,7 +14,9 @@ from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
 from qiita_common.backend_failure import StepNoData
+from qiita_common.models import ScopeTargetKind
 from qiita_common.parquet import PARQUET_COMPRESSION_INTERMEDIATE, validate_parquet_path
+from qiita_common.qc_metrics import DATA_TYPE_THRESHOLD_KINDS
 from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
 import qiita_control_plane.runner as _runner_pkg
@@ -58,6 +60,7 @@ SAMPLE_MAP_BINDING = BCL_CONVERT_SAMPLE_MAP_KEY
 # `sample_map`. each entry carries its own barcodes_are_rc flag.
 BARCODE_MAP_BINDING = "barcode_map"
 STAGED_READS_BINDING = "reads"
+PREP_PROTOCOL_BINDING = "prep_protocol"
 # A workflow that consumes ready-for-consumption reads (assembly) declares
 # `masked_reads_fastq`; the runner STREAMS the `read_masked` pass-set for a
 # mask_idx from the data plane and writes it as gzip FASTQ (via miint's native
@@ -248,6 +251,11 @@ def _workflow_declares_input(steps: list[Any], name: str) -> bool:
         if name in names:
             return True
     return False
+
+
+def _workflow_declares_param(steps: list[Any], key: str) -> bool:
+    """True iff some entry threads `key` through `params:` (an action_context key)."""
+    return any(key in (getattr(entry, "params", None) or {}) for entry in steps)
 
 
 def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
@@ -687,6 +695,29 @@ async def _prep_sample_is_expected_empty_control(pool: asyncpg.Pool, prep_sample
     if biosample_idx is None:
         return False
     return await is_control_sample(pool, biosample_idx=biosample_idx)
+
+
+async def _resolve_prep_protocol(
+    pool: asyncpg.Pool, scope_target: dict[str, Any]
+) -> dict[str, str]:
+    """Bind `prep_protocol` to the prep_sample's protocol name. Never taken from the client,
+    so a submitted value cannot steer a protocol-keyed verdict. The ticket's RESTRICT FK and
+    `prep_sample.prep_protocol_idx NOT NULL` guarantee the name exists. A protocol with no
+    data-type threshold is refused here, before any export."""
+    if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+        raise _submission_bad_input(
+            f"a workflow that binds prep_protocol must be prep_sample-scoped; "
+            f"got {scope_target['kind']!r}"
+        )
+    name = await pool.fetchval(
+        "SELECT pp.name FROM qiita.prep_sample ps"
+        "  JOIN qiita.prep_protocol pp ON pp.idx = ps.prep_protocol_idx"
+        " WHERE ps.idx = $1",
+        scope_target["prep_sample_idx"],
+    )
+    if name not in DATA_TYPE_THRESHOLD_KINDS:
+        raise _submission_bad_input(f"no data-type threshold for prep_protocol {name!r}")
+    return {PREP_PROTOCOL_BINDING: name}
 
 
 async def _resolve_staged_reads(

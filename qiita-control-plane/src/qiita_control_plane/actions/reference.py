@@ -16,6 +16,7 @@ from qiita_common.models import (
     ReferenceResponse,
     ReferenceStatus,
 )
+from qiita_common.qc_metrics import MARKER_REFERENCE_IDX_KEYS
 
 # Column projection backing every ReferenceResponse. Imported by
 # routes/reference.py too, so the two callers can't drift (they previously
@@ -53,11 +54,13 @@ class ReferenceDeleteBlocked(Exception):
         in_flight: int,
         terminal: int,
         alignment_definitions: int = 0,
+        qc_checks: int = 0,
     ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
+        self.qc_checks = qc_checks
         # Alignment definitions are the force-proof reason and the one the operator
         # most needs to act on, so it is reported first when present. The DuckLake
         # `alignment` rows are keyed on `feature_idx`, which this delete would
@@ -78,11 +81,16 @@ class ReferenceDeleteBlocked(Exception):
                 f"({'/'.join(_WORK_TICKET_IN_FLIGHT_STATES)}) reference it; "
                 "wait for them to finish or cancel them"
             )
-        else:
+        elif terminal:
             reason = (
                 f"{terminal} terminal work ticket(s) "
                 f"({'/'.join(_WORK_TICKET_TERMINAL_STATES)}) reference it; "
                 "re-issue with force=true to delete them too"
+            )
+        else:
+            reason = (
+                f"{qc_checks} QC check(s) record it as a marker reference; "
+                "re-issue with force=true to delete it anyway (the checks are kept)"
             )
         super().__init__(f"Reference {reference_idx} cannot be deleted: {reason}")
 
@@ -103,13 +111,13 @@ async def assert_reference_deletable(
     *,
     force: bool,
 ) -> str:
-    """Existence + work-ticket gating precheck for a reference delete.
+    """Existence + gating precheck for a reference delete.
 
-    Returns the reference's current status on success. Raises
-    ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force) or if any
-    alignment definition aligns against it (always, even with force). Run this
-    *before* any destructive step so a blocked delete touches nothing."""
+    Returns the reference's current status on success. Raises ReferenceNotFound if it
+    doesn't exist, or ReferenceDeleteBlocked if work tickets reference it (by `reference_idx`
+    or an `action_context` marker key: in-flight always, terminal unless force), if a
+    data_type QC check names it (unless force), or if any alignment definition aligns against
+    it (always). Run this *before* any destructive step so a blocked delete touches nothing."""
     status = await conn.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
@@ -122,6 +130,16 @@ async def assert_reference_deletable(
     )
     counts = {r["state"]: r["n"] for r in rows}
     in_flight = sum(counts.get(s, 0) for s in _WORK_TICKET_IN_FLIGHT_STATES)
+    # prep_sample-scoped verify-data-type tickets carry their marker references only in
+    # action_context, so work_ticket.reference_idx is NULL for them.
+    in_flight += await conn.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE state = ANY($2::qiita.work_ticket_state[])"
+        " AND EXISTS (SELECT 1 FROM jsonb_each_text(action_context) c"
+        "  WHERE c.key = ANY($3::text[]) AND c.value = $1::text)",
+        str(reference_idx),
+        list(_WORK_TICKET_IN_FLIGHT_STATES),
+        list(MARKER_REFERENCE_IDX_KEYS.values()),
+    )
     terminal = sum(counts.get(s, 0) for s in _WORK_TICKET_TERMINAL_STATES)
     # Align-block work tickets are block-scoped and leave work_ticket.reference_idx
     # NULL, so the gate above cannot see them — the reference↔alignment link lives
@@ -134,12 +152,20 @@ async def assert_reference_deletable(
         " WHERE (params->>'reference_idx')::bigint = $1",
         reference_idx,
     )
-    if alignment_definitions or in_flight or (terminal and not force):
+    # `metrics` names the marker references a data_type check classified against (jsonb, no FK).
+    qc_checks = await conn.fetchval(
+        "SELECT count(*) FROM qiita.prep_sample_qc_check"
+        " WHERE jsonb_path_exists(metrics, '$.marker_reference_idx.* ? (@ == $idx)',"
+        "  jsonb_build_object('idx', $1::bigint))",
+        reference_idx,
+    )
+    if alignment_definitions or in_flight or ((terminal or qc_checks) and not force):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
             alignment_definitions=alignment_definitions,
+            qc_checks=qc_checks,
         )
     return status
 

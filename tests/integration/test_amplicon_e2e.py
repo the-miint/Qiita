@@ -56,6 +56,8 @@ from conftest import ducklake_connect
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _WORKFLOWS = _REPO_ROOT / "workflows"
 _FIXTURE = Path(__file__).parent.parent / "data" / "amplicon_e2e"
+_MARKER_FIXTURES = _REPO_ROOT / "qiita-compute-orchestrator" / "tests" / "jobs" / "data" / "markers"
+_OTHER_MARKER_CLASSES = ("marker_18s", "marker_23s_28s", "marker_5s_5_8s")
 
 # The four EMP Golay barcodes as they appear in I1 (first 12 nt); each RC is a
 # clean Golay codeword. Stored `barcodes_are_rc=True`: golay_demux RCs the map
@@ -211,6 +213,24 @@ async def synced_amplicon_actions(postgres_pool, tmp_path):
 
 
 @pytest.fixture
+async def synced_verify_data_type_actions(postgres_pool, tmp_path):
+    """Sync the trimmed golay-demux + the real verify-data-type workflow; clean both up."""
+    await _sync_workflow_yaml(
+        postgres_pool, tmp_path / "golay", "golay-demux", _GOLAY_DEMUX_E2E_YAML
+    )
+    await _sync_workflow_yaml(
+        postgres_pool,
+        tmp_path / "vdt",
+        "verify-data-type",
+        (_WORKFLOWS / "verify-data-type" / "1.0.0.yaml").read_text(),
+    )
+    yield
+    for action_id in ("golay-demux", "verify-data-type"):
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE action_id = $1", action_id)
+        await postgres_pool.execute("DELETE FROM qiita.action WHERE action_id = $1", action_id)
+
+
+@pytest.fixture
 async def seeded_pool(postgres_pool, human_admin_session, tmp_path):
     """A sequenced_pool with one prep_sample per barcode and the run pre-flight
     that names them; reverse-FK cleanup."""
@@ -249,9 +269,11 @@ async def seeded_pool(postgres_pool, human_admin_session, tmp_path):
 
     prep_idxs = [p for _, p, _ in samples]
     bio_idxs = [b for b, _, _ in samples]
-    # Work tickets FK the pool; drop them before the pool they scope.
+    # Work tickets FK the pool and the prep_samples; drop them before what they scope.
     await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
+        "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1 OR prep_sample_idx = ANY($2)",
+        pool_idx,
+        prep_idxs,
     )
     await teardown_entity_graph(
         postgres_pool,
@@ -263,23 +285,17 @@ async def seeded_pool(postgres_pool, human_admin_session, tmp_path):
     await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
 
 
-@pytest.fixture
-async def sortmerna_reference(postgres_pool, human_admin_session, data_plane):
-    """An ACTIVE `sequence_reference` whose 200 OTU sequences live in the lake.
-
-    The denoise resolver DoGets `reference_sequence_chunks` (joined to
-    `reference_membership` by feature_idx) and reassembles a FASTA, so both lake
-    tables must carry the real bytes — unlike seed_reference_with_sequences,
-    which seeds Postgres only. `reference_sequences` is not read on this path, so
-    it is left out.
-    """
-    owner = human_admin_session["principal_idx"]
-    sequences = _read_fasta_sequences(_FIXTURE / "sortmerna_16s_ref.fasta.gz")
-
+async def _seed_lake_reference(
+    postgres_pool, data_plane, owner: int, name: str, sequences: list[str]
+) -> tuple[int, list[int]]:
+    """An ACTIVE `sequence_reference` whose sequences live in the lake: the resolver
+    DoGets `reference_sequence_chunks` (joined to `reference_membership` by
+    feature_idx), so both lake tables carry the real bytes. `reference_sequences` is
+    not read on this path, so it is left out."""
     reference_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
         " VALUES ($1, '1.0', 'sequence_reference', 'active', $2) RETURNING reference_idx",
-        f"sortmerna-16s-e2e-{uuid.uuid4()}",
+        name,
         owner,
     )
     feature_idxs: list[int] = []
@@ -305,9 +321,12 @@ async def sortmerna_reference(postgres_pool, human_admin_session, data_plane):
         )
     finally:
         lake.close()
+    return reference_idx, feature_idxs
 
-    yield reference_idx
 
+async def _drop_lake_reference(
+    postgres_pool, data_plane, reference_idx: int, feature_idxs: list[int]
+) -> None:
     lake = ducklake_connect(data_plane["data_path"])
     try:
         lake.execute(
@@ -323,6 +342,42 @@ async def sortmerna_reference(postgres_pool, human_admin_session, data_plane):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
+
+
+@pytest.fixture
+async def sortmerna_reference(postgres_pool, human_admin_session, data_plane):
+    """An ACTIVE `sequence_reference` holding the 200 OTU sequences of the 16S fixture."""
+    reference_idx, feature_idxs = await _seed_lake_reference(
+        postgres_pool,
+        data_plane,
+        human_admin_session["principal_idx"],
+        f"sortmerna-16s-e2e-{uuid.uuid4()}",
+        _read_fasta_sequences(_FIXTURE / "sortmerna_16s_ref.fasta.gz"),
+    )
+    yield reference_idx
+    await _drop_lake_reference(postgres_pool, data_plane, reference_idx, feature_idxs)
+
+
+@pytest.fixture
+async def marker_references(postgres_pool, human_admin_session, data_plane):
+    """One ACTIVE `sequence_reference` per marker class, keyed by class: the 16S
+    fixture and three tiny per-class sets."""
+    sources = {
+        "marker_16s": _FIXTURE / "sortmerna_16s_ref.fasta.gz",
+        **{cls: _MARKER_FIXTURES / f"{cls}.fasta" for cls in _OTHER_MARKER_CLASSES},
+    }
+    seeded = {}
+    for cls, path in sources.items():
+        seeded[cls] = await _seed_lake_reference(
+            postgres_pool,
+            data_plane,
+            human_admin_session["principal_idx"],
+            f"{cls}-e2e-{uuid.uuid4()}",
+            _read_fasta_sequences(path),
+        )
+    yield {cls: idx for cls, (idx, _) in seeded.items()}
+    for idx, feature_idxs in seeded.values():
+        await _drop_lake_reference(postgres_pool, data_plane, idx, feature_idxs)
 
 
 @pytest.fixture
@@ -396,19 +451,35 @@ def _build_convert_dir(dest: Path) -> Path:
     return dest
 
 
-async def _run(postgres_pool, data_plane, *, action_id, pool_idx, owner, action_context) -> int:
-    """Seed a sequenced_pool work_ticket and drive it through the runner."""
+async def _run(
+    postgres_pool,
+    data_plane,
+    *,
+    action_id,
+    owner,
+    action_context,
+    pool_idx=None,
+    prep_sample_idx=None,
+) -> int:
+    """Seed a sequenced_pool (or, with `prep_sample_idx`, prep_sample) work_ticket and
+    drive it through the runner."""
     from qiita_control_plane.runner import run_workflow
 
+    scope_kind, scope_column, scope_idx = (
+        ("prep_sample", "prep_sample_idx", prep_sample_idx)
+        if prep_sample_idx is not None
+        else ("sequenced_pool", "sequenced_pool_idx", pool_idx)
+    )
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("
-        "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, sequenced_pool_idx, action_context"
-        ") VALUES ($1, '1.0.0', $2, 'sequenced_pool', $3, $4::jsonb)"
+        "  action_id, action_version, originator_principal_idx, scope_target_kind,"
+        f"  {scope_column}, action_context"
+        ") VALUES ($1, '1.0.0', $2, $3, $4, $5::jsonb)"
         " RETURNING work_ticket_idx",
         action_id,
         owner,
-        pool_idx,
+        scope_kind,
+        scope_idx,
         json.dumps(action_context),
     )
     await run_workflow(
@@ -421,6 +492,12 @@ async def _run(postgres_pool, data_plane, *, action_id, pool_idx, owner, action_
         upload_staging_root=Path(data_plane["upload_staging_root"]),
     )
     return work_ticket_idx
+
+
+async def _ticket_state(postgres_pool, work_ticket_idx: int) -> str:
+    return await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+    )
 
 
 async def test_golay_demux_then_amplicon(
@@ -531,3 +608,79 @@ async def test_golay_demux_then_amplicon(
     assert {r[0] for r in rows} == set(prep_idxs)
     assert len({r[1] for r in rows}) == 1  # one processing_idx for the whole run
     assert all(r[3] > 0 for r in rows)
+
+
+async def test_golay_demux_then_verify_data_type(
+    postgres_pool,
+    data_plane,
+    synced_verify_data_type_actions,
+    seeded_pool,
+    marker_references,
+    co_cp_bridge,
+    human_admin_session,
+    tmp_path,
+):
+    owner = human_admin_session["principal_idx"]
+    prep_idxs = [p for _, p, _ in seeded_pool["samples"]]
+    barcode_map = [
+        {"prep_sample_idx": prep_idx, "barcode": barcode, "barcodes_are_rc": True}
+        for prep_idx, barcode in zip(prep_idxs, _BARCODES, strict=True)
+    ]
+    golay_ticket = await _run(
+        postgres_pool,
+        data_plane,
+        action_id="golay-demux",
+        pool_idx=seeded_pool["pool_idx"],
+        owner=owner,
+        action_context={
+            "convert_dir": str(_build_convert_dir(tmp_path / "convert")),
+            "barcode_map": barcode_map,
+        },
+    )
+    assert await _ticket_state(postgres_pool, golay_ticket) == "completed"
+
+    prep_sample_idx = prep_idxs[0]
+    await postgres_pool.execute(
+        "UPDATE qiita.prep_sample SET prep_protocol_idx ="
+        " (SELECT idx FROM qiita.prep_protocol WHERE name = 'short_read_amplicon')"
+        " WHERE idx = $1",
+        prep_sample_idx,
+    )
+
+    async def verify(references: dict[str, int]) -> int:
+        return await _run(
+            postgres_pool,
+            data_plane,
+            action_id="verify-data-type",
+            prep_sample_idx=prep_sample_idx,
+            owner=owner,
+            action_context={f"{cls}_reference_idx": idx for cls, idx in references.items()},
+        )
+
+    async def data_type_rows():
+        return await postgres_pool.fetch(
+            "SELECT severity, reason, metrics::text AS metrics, work_ticket_idx"
+            " FROM qiita.prep_sample_qc_check"
+            " WHERE prep_sample_idx = $1 AND \"check\" = 'data_type'",
+            prep_sample_idx,
+        )
+
+    first = await verify(marker_references)
+    assert await _ticket_state(postgres_pool, first) == "completed"
+    (row,) = await data_type_rows()
+    metrics = json.loads(row["metrics"])
+    assert (row["severity"], row["reason"]) == ("info", "insufficient_reads")
+    assert row["work_ticket_idx"] == first
+    assert metrics["n_sampled"] == _READS_PER_SAMPLE
+    assert metrics["dominant_class"] == "marker_16s"
+    assert metrics["marker_reference_idx"] == marker_references
+
+    swapped = marker_references | {
+        "marker_18s": marker_references["marker_23s_28s"],
+        "marker_23s_28s": marker_references["marker_18s"],
+    }
+    second = await verify(swapped)
+    assert await _ticket_state(postgres_pool, second) == "completed"
+    (row,) = await data_type_rows()
+    assert row["work_ticket_idx"] == second
+    assert json.loads(row["metrics"])["marker_reference_idx"] == swapped

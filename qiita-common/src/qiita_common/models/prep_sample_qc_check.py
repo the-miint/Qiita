@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, FiniteFloat
 
@@ -52,6 +53,7 @@ class QcCheckResult(BaseModel):
     reason: str | None = None
     measured_value: FiniteFloat | None = None
     threshold: FiniteFloat | None = None
+    metrics: dict[str, Any] | None = None
 
 
 class PrepSampleQcCheck(BaseModel):
@@ -62,6 +64,7 @@ class PrepSampleQcCheck(BaseModel):
     alignment_idx: int | None
     measured_value: float | None
     threshold: float | None
+    metrics: dict[str, Any] | None
     work_ticket_idx: int
     created_at: datetime
     state: QcCheckState

@@ -103,16 +103,19 @@ from ._processing import (
 )
 from ._read_ingest import (
     BARCODE_MAP_BINDING,
+    PREP_PROTOCOL_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_barcode_map,
+    _resolve_prep_protocol,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _stage_ena_run_roster_binding,
     _stage_shard_roster,
     _workflow_declares_input,
+    _workflow_declares_param,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
 )
@@ -129,10 +132,12 @@ from ._reference import (
     QC_ADAPTER_BINDING,
     SORTMERNA_REF_BINDING,
     _resolve_host_filter_indexes,
+    _resolve_marker_refs,
     _resolve_qc_adapters,
     _resolve_sharded_align_index_bindings,
     _resolve_sortmerna_ref,
     _resolve_syndna_index,
+    _workflow_declares_marker_refs,
     _workflow_needs_adapters,
     _workflow_needs_sharded_align_indexes,
 )
@@ -428,6 +433,20 @@ async def run_workflow(
         if _workflow_declares_input(action.steps, SORTMERNA_REF_BINDING):
             bound.update(
                 await _resolve_sortmerna_ref(
+                    pool,
+                    bound,
+                    data_plane_url=data_plane_url,
+                    signing_key=signing_key,
+                    workspace=workspace,
+                )
+            )
+
+        if _workflow_declares_param(action.steps, PREP_PROTOCOL_BINDING):
+            bound.update(await _resolve_prep_protocol(pool, scope_target))
+
+        if _workflow_declares_marker_refs(action.steps):
+            bound.update(
+                await _resolve_marker_refs(
                     pool,
                     bound,
                     data_plane_url=data_plane_url,

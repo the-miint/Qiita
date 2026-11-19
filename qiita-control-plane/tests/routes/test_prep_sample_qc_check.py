@@ -1,5 +1,6 @@
 """Route tests for GET /qc-check/{prep_sample_idx}."""
 
+import json
 import secrets
 
 import pytest
@@ -46,8 +47,9 @@ async def _add_check(
     await pool.execute(
         "INSERT INTO qiita.prep_sample_qc_check"
         ' (prep_sample_idx, "check", severity, reason, measured_value, threshold,'
-        "  work_ticket_idx, state, invalidated_at, invalidated_by_idx, invalidation_reason)"
-        " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        "  work_ticket_idx, state, invalidated_at, invalidated_by_idx, invalidation_reason,"
+        "  metrics)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)",
         prep_sample_idx,
         check,
         severity,
@@ -59,6 +61,7 @@ async def _add_check(
         kw.get("invalidated_at"),
         kw.get("invalidated_by_idx"),
         kw.get("invalidation_reason"),
+        json.dumps(kw["metrics"]) if "metrics" in kw else None,
     )
 
 
@@ -212,6 +215,21 @@ async def test_viewer_reads_rows_and_verdict(ctx):
     assert classifier["state"] == QcCheckState.INVALIDATED
     assert classifier["invalidation_reason"] == "replaced"
     assert "invalidated_by_idx" not in classifier
+
+
+async def test_metrics_is_an_object_on_one_row_and_null_on_another(ctx):
+    ps_idx, ticket_idx, study_idx = await ctx["make_prep_sample"]()
+    await _as_viewer(ctx, study_idx)
+    pool = ctx["pool"]
+    metrics = {"n_sampled": 5, "nested": {"a": 1}}
+    await _add_check(pool, ticket_idx, ps_idx, QcCheck.DATA_TYPE, QcSeverity.INFO, metrics=metrics)
+    await _add_check(pool, ticket_idx, ps_idx, QcCheck.COMPOSITION, QcSeverity.INFO)
+
+    body = (await ctx["user"].get(_url(ps_idx))).json()
+
+    by_check = {c["check"]: c for c in body["checks"]}
+    assert by_check[QcCheck.DATA_TYPE]["metrics"] == metrics
+    assert by_check[QcCheck.COMPOSITION]["metrics"] is None
 
 
 async def test_viewer_on_prep_sample_with_no_rows_gets_empty(ctx):

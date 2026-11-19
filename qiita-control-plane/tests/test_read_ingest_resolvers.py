@@ -23,6 +23,7 @@ import duckdb
 import pytest
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
+from qiita_common.models import WorkTicketFailureStage
 
 from qiita_control_plane.auth import tickets
 from qiita_control_plane.auth.tickets import run_signed_flight_call, token_expiry
@@ -44,6 +45,7 @@ from qiita_control_plane.runner import (
     STAGED_READS_BINDING,
     _resolve_barcode_map,
     _resolve_sample_map,
+    _resolve_sortmerna_ref,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _stage_ena_run_roster,
@@ -57,6 +59,12 @@ from qiita_control_plane.runner._read_ingest import (
     _barcode_roster_mismatches,
     _copy_masked_to_fastq,
     _preflight_barcode_roster,
+    _resolve_prep_protocol,
+    _workflow_declares_param,
+)
+from qiita_control_plane.runner._reference import (
+    _resolve_marker_refs,
+    _workflow_declares_marker_refs,
 )
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
@@ -1183,6 +1191,187 @@ def test_write_reference_fasta_empty_raises(tmp_path):
 
     with connect_with_miint() as con, pytest.raises(ValueError, match="no sequences"):
         _write_reference_fasta([], tmp_path / "ref.fasta", con)
+
+
+# --- SortMeRNA reference resolvers ---------------------------------------------
+
+_MARKER_KEYS = {
+    "marker_16s": "marker_16s_reference_idx",
+    "marker_18s": "marker_18s_reference_idx",
+    "marker_23s_28s": "marker_23s_28s_reference_idx",
+    "marker_5s_5_8s": "marker_5s_5_8s_reference_idx",
+}
+_MARKER_CONTEXT = {key: 10 + i for i, key in enumerate(_MARKER_KEYS.values())}
+_DO_GET_CHUNKS = "qiita_control_plane.runner._do_get_reference_sequence_chunks"
+_SIGN_TICKET = "qiita_control_plane.runner._reference.sign_ticket"
+
+
+class _ReferencePool:
+    """`fetchrow` answers from a reference_idx -> (kind, status) map."""
+
+    def __init__(self, rows: dict[int, tuple[str, str]]):
+        self._rows = rows
+
+    async def fetchrow(self, _query, reference_idx):
+        row = self._rows.get(reference_idx)
+        return None if row is None else {"kind": row[0], "status": row[1]}
+
+
+def _active_pool(*idxs: int) -> _ReferencePool:
+    return _ReferencePool({i: ("sequence_reference", "active") for i in idxs})
+
+
+def _chunks_by_reference(monkeypatch) -> list[int]:
+    fetched: list[int] = []
+
+    def _fake(_url, reference_idx):
+        fetched.append(reference_idx)
+        return [(reference_idx, 0, "ACGT" * reference_idx)]
+
+    monkeypatch.setattr(_DO_GET_CHUNKS, _fake)
+    monkeypatch.setattr(_SIGN_TICKET, lambda **kw: kw["filter"]["reference_idx"][0])
+    return fetched
+
+
+def _marker_refs(pool, context, tmp_path):
+    return asyncio.run(_resolve_marker_refs(pool, context, **_staged_kwargs(tmp_path)))
+
+
+def test_resolve_marker_refs_binds_one_fasta_per_class(tmp_path, monkeypatch):
+    fetched = _chunks_by_reference(monkeypatch)
+    pool = _active_pool(*_MARKER_CONTEXT.values())
+    bound = _marker_refs(pool, _MARKER_CONTEXT, tmp_path)
+    assert set(bound) == {f"{c}_ref" for c in _MARKER_KEYS}
+    for cls, key in _MARKER_KEYS.items():
+        idx = _MARKER_CONTEXT[key]
+        assert bound[f"{cls}_ref"].read_text() == f">{idx}\n{'ACGT' * idx}\n"
+    assert sorted(fetched) == sorted(_MARKER_CONTEXT.values())
+
+
+@pytest.mark.parametrize("cls", list(_MARKER_KEYS))
+def test_resolve_marker_refs_names_the_class_missing_its_key(tmp_path, monkeypatch, cls):
+    _chunks_by_reference(monkeypatch)
+    context = {k: v for k, v in _MARKER_CONTEXT.items() if k != _MARKER_KEYS[cls]}
+    with pytest.raises(BackendFailure) as exc:
+        _marker_refs(_active_pool(*_MARKER_CONTEXT.values()), context, tmp_path)
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert _MARKER_KEYS[cls] in exc.value.reason
+
+
+@pytest.mark.parametrize(
+    ("row", "match"),
+    [
+        (None, "does not exist"),
+        (("sequence_reference", "loading"), "not active"),
+        (("rype_index", "active"), "not a sequence_reference"),
+    ],
+)
+def test_resolve_marker_refs_rejects_an_unusable_reference_naming_its_class(
+    tmp_path, monkeypatch, row, match
+):
+    _chunks_by_reference(monkeypatch)
+    rows = {i: ("sequence_reference", "active") for i in _MARKER_CONTEXT.values()}
+    bad = _MARKER_CONTEXT["marker_18s_reference_idx"]
+    if row is None:
+        del rows[bad]
+    else:
+        rows[bad] = row
+    with pytest.raises(BackendFailure) as exc:
+        _marker_refs(_ReferencePool(rows), _MARKER_CONTEXT, tmp_path)
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert exc.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert "marker_18s" in exc.value.reason
+    assert match in exc.value.reason
+
+
+def test_resolve_marker_refs_rejects_one_reference_under_two_classes(tmp_path, monkeypatch):
+    _chunks_by_reference(monkeypatch)
+    context = _MARKER_CONTEXT | {
+        "marker_18s_reference_idx": _MARKER_CONTEXT["marker_16s_reference_idx"]
+    }
+    with pytest.raises(BackendFailure) as exc:
+        _marker_refs(_active_pool(*context.values()), context, tmp_path)
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "marker_16s" in exc.value.reason and "marker_18s" in exc.value.reason
+
+
+def test_resolve_marker_refs_data_plane_failure_is_a_submission_failure(tmp_path, monkeypatch):
+    def _boom(_url, _ticket):
+        raise RuntimeError("Flight: connection refused")
+
+    _chunks_by_reference(monkeypatch)
+    monkeypatch.setattr(_DO_GET_CHUNKS, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        _marker_refs(_active_pool(*_MARKER_CONTEXT.values()), _MARKER_CONTEXT, tmp_path)
+    assert exc.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert "marker_" in exc.value.reason and "data plane" in exc.value.reason
+
+
+def test_resolve_sortmerna_ref_keeps_its_binding_and_missing_key_message(tmp_path, monkeypatch):
+    _chunks_by_reference(monkeypatch)
+    bound = asyncio.run(
+        _resolve_sortmerna_ref(
+            _active_pool(3), {"sortmerna_reference_idx": 3}, **_staged_kwargs(tmp_path)
+        )
+    )
+    assert bound == {"sortmerna_ref": tmp_path / "ticket" / "804" / "sortmerna_ref.fasta"}
+    assert bound["sortmerna_ref"].read_text() == ">3\nACGTACGTACGT\n"
+    with pytest.raises(BackendFailure, match="amplicon requires sortmerna_reference_idx"):
+        asyncio.run(_resolve_sortmerna_ref(_active_pool(3), {}, **_staged_kwargs(tmp_path)))
+
+
+def test_resolve_sortmerna_ref_wrong_kind_message_is_unchanged(tmp_path):
+    pool = _ReferencePool({3: ("rype_index", "active")})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_sortmerna_ref(pool, {"sortmerna_reference_idx": 3}, **_staged_kwargs(tmp_path))
+        )
+    assert exc.value.reason == "reference 3 is not a sequence_reference"
+
+
+def test_workflow_declares_marker_refs_gate():
+    assert _workflow_declares_marker_refs([_step(inputs=["reads", "marker_5s_5_8s_ref"])])
+    assert not _workflow_declares_marker_refs([_step(inputs=["reads", "sortmerna_ref"])])
+
+
+# --- prep_protocol binding -------------------------------------------------------
+
+
+class _ProtocolPool:
+    def __init__(self, name: str):
+        self._name = name
+
+    async def fetchval(self, _query, _prep_sample_idx):
+        return self._name
+
+
+def test_resolve_prep_protocol_binds_the_name_of_the_samples_protocol():
+    scope = {"kind": "prep_sample", "prep_sample_idx": 5}
+    bound = asyncio.run(_resolve_prep_protocol(_ProtocolPool("short_read_amplicon"), scope))
+    assert bound == {"prep_protocol": "short_read_amplicon"}
+
+
+def test_resolve_prep_protocol_refuses_a_protocol_with_no_data_type_threshold():
+    scope = {"kind": "prep_sample", "prep_sample_idx": 5}
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_resolve_prep_protocol(_ProtocolPool("made_up_protocol"), scope))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "made_up_protocol" in exc.value.reason
+
+
+@pytest.mark.parametrize("kind", ["sequenced_pool", "block", "reference"])
+def test_resolve_prep_protocol_refuses_a_non_prep_sample_scope(kind):
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(_resolve_prep_protocol(_ProtocolPool("x"), {"kind": kind}))
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "prep_sample" in exc.value.reason
+
+
+def test_workflow_declares_param_gate():
+    steps = [SimpleNamespace(params={"prep_protocol": "prep_protocol"}), SimpleNamespace(params={})]
+    assert _workflow_declares_param(steps, "prep_protocol")
+    assert not _workflow_declares_param(steps, "other")
+    assert not _workflow_declares_param([_step()], "prep_protocol")
 
 
 # =============================================================================

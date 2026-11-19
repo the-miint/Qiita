@@ -1677,3 +1677,32 @@ def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
     versions = [a.version for a in load_actions(tmp_path)]
 
     assert versions == ["1.9.0", "1.10.0"], versions
+
+
+def test_load_actions_verify_data_type_is_a_native_prep_sample_producer_of_qc_checks():
+    """`verify-data-type` samples a prep_sample's raw reads, so it is admin-only, takes
+    one reference per marker class, and ends in `persist-qc-checks` with no gate to
+    count the row under."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.actions.library import QcProducer
+    from qiita_control_plane.runner._reconstruct import _workflow_qc_producer
+
+    repo_root = Path(__file__).resolve().parents[2]
+    action = {a.action_id: a for a in load_actions(repo_root / "workflows")}["verify-data-type"]
+
+    assert action.target_kind == ScopeTargetKind.PREP_SAMPLE
+    assert [str(k) for k in action.target_processing_kinds] == ["sequenced"]
+    assert set(action.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+    assert set(action.context_schema["required"]) == {
+        "marker_16s_reference_idx",
+        "marker_18s_reference_idx",
+        "marker_23s_28s_reference_idx",
+        "marker_5s_5_8s_reference_idx",
+    }
+    assert [s.name for s in action.steps] == ["verify_data_type", "persist-qc-checks"]
+    assert _workflow_qc_producer(action.steps) == QcProducer.NONE

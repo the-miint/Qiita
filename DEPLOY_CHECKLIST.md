@@ -64,14 +64,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   first. (#864)
 - `20261113000000_output_equivalence` adds `qiita.output_equivalence` and `qiita.output_equivalence_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. `20261116000002_exported_identifier_prep_sample_delete` makes `qiita.exported_identifier.prep_sample_idx` nullable and ON DELETE SET NULL, adds two nullable description columns and a CHECK that every live row names a prep_sample (every existing row does: the column was NOT NULL), and adds a BEFORE DELETE trigger on `qiita.prep_sample`; no row changes. `20261116000003_work_ticket_reap_pending` adds two nullable columns to `qiita.work_ticket` (`reap_pending_since`, `reap_note`) and a CHECK that they are set together; no row changes. `20261116000004_definition_settings_lock` adds `qiita.definition_settings_edit` (empty), the function `qiita.edit_definition_settings`, and BEFORE UPDATE triggers on `qiita.mask_definition`, `qiita.alignment_definition` and `qiita.processing` that refuse a change to a definition's settings outside that function; no row changes. (#874)
 - `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
+- `20261118000100_prep_sample_qc_check_metrics` adds the nullable `prep_sample_qc_check.metrics`
+  column with a JSON-object CHECK. `dbmate` applies it; there is nothing to backfill. (#912)
 
 ### 4. Deploy
 
-_None yet._
+- The new `verify-data-type` 1.0.0 workflow reaches `qiita.action` through `qiita-admin actions
+  sync` in `activate.sh`. It is native-only, so no SIF is built. (#912)
 
 ### 5. Verify
 
 - `[operator]` (#874) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin output-equivalence list` exits 0 and prints `0 output equivalence(s)` on stderr (the output-equivalence routes are mounted and the new table is readable).
+- `verify-data-type` is registered and enabled (expect one row, `1.0.0`, `t`):
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT version, enabled FROM qiita.action WHERE action_id = 'verify-data-type'"
+  ```
+  (#912)
 
 ### 6. After the deploy verifies green
 
@@ -145,6 +153,10 @@ _None yet._
   ROLLBACK;
   SQL
   ```
+- `[operator]` **Load the four rRNA marker references `verify-data-type` classifies against**, and
+  keep their `reference_idx` values for the submit context. Files, versions and commands are in
+  [`docs/runbooks/verify-data-type.md`](docs/runbooks/verify-data-type.md). The deploy does not
+  depend on this; no ticket is chained to the workflow. (#912)
 - `[admin]` **Add gene calls to the long-read-assembly runs finished before this deploy**
   (1.0.0, 1.0.1 and 1.0.2; the dry run counts them). Each run gets one
   `assembly-gene-call-recover` ticket, which reads the `assemble`, `bin_refine`, `checkm`,

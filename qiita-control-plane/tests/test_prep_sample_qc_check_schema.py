@@ -242,6 +242,25 @@ async def test_snake_case_reason_accepted(seeded):
     await _add(seeded, QcCheck.DATA_TYPE, QcSeverity.FAIL, reason="data_type_mismatch")
 
 
+@pytest.mark.parametrize("metrics", [None, "{}", '{"n_sampled": 5}'])
+async def test_metrics_accepts_null_and_an_object(seeded, metrics):
+    idx = await _add(seeded, QcCheck.DATA_TYPE, QcSeverity.INFO)
+    await seeded["pool"].execute(
+        "UPDATE qiita.prep_sample_qc_check SET metrics = $2::jsonb WHERE idx = $1", idx, metrics
+    )
+
+
+@pytest.mark.parametrize("metrics", ["[1]", "3", '"x"', "null"])
+async def test_metrics_rejects_a_non_object(seeded, metrics):
+    idx = await _add(seeded, QcCheck.DATA_TYPE, QcSeverity.INFO)
+    with pytest.raises(asyncpg.CheckViolationError, match="metrics_is_object"):
+        await seeded["pool"].execute(
+            "UPDATE qiita.prep_sample_qc_check SET metrics = $2::jsonb WHERE idx = $1",
+            idx,
+            metrics,
+        )
+
+
 async def test_both_producers_rejected(seeded):
     mask_idx, alignment_idx = await _seed_mask(seeded), await _seed_alignment(seeded)
     with pytest.raises(asyncpg.CheckViolationError):

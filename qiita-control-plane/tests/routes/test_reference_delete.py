@@ -10,10 +10,17 @@ import json
 import uuid
 
 import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 
-from qiita_control_plane.testing.db_teardown import teardown_entity_graph
+from qiita_control_plane.testing.db_seeds import (
+    delete_action_if_created,
+    seed_action_if_absent,
+    seed_biosample_with_sequenced_prep_sample,
+    seed_user_principal,
+)
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
 
 pytestmark = pytest.mark.db
 
@@ -720,3 +727,112 @@ async def test_delete_reference_data_plane_failure_returns_502(client, postgres_
         )
         == 1
     )
+
+
+_VERIFY_ACTION_ID = "ref-delete-verify-data-type"
+
+
+@pytest_asyncio.fixture
+async def verify_ticket(postgres_pool):
+    """A prep_sample-scoped ticket, `work_ticket.reference_idx` NULL, plus a way to set its
+    state/context and to record a data_type check against it."""
+    pool = postgres_pool
+    principal_idx = await seed_user_principal(pool, prefix="refdel", suffix=uuid.uuid4().hex[:8])
+    version = f"v-{uuid.uuid4()}"
+    created = await seed_action_if_absent(
+        pool, action_id=_VERIFY_ACTION_ID, version=version, target_kind="prep_sample"
+    )
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=principal_idx
+    )
+
+    async def ticket(state, context):
+        return await pool.fetchval(
+            "INSERT INTO qiita.work_ticket (action_id, action_version,"
+            " originator_principal_idx, scope_target_kind, prep_sample_idx, action_context, state)"
+            " VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb, $6::qiita.work_ticket_state)"
+            " RETURNING work_ticket_idx",
+            _VERIFY_ACTION_ID,
+            version,
+            principal_idx,
+            prep_sample_idx,
+            json.dumps(context),
+            state,
+        )
+
+    async def check(work_ticket_idx, metrics):
+        await pool.execute(
+            'INSERT INTO qiita.prep_sample_qc_check (prep_sample_idx, "check", severity,'
+            " work_ticket_idx, metrics) VALUES ($1, 'data_type', 'info', $2, $3::jsonb)",
+            prep_sample_idx,
+            work_ticket_idx,
+            json.dumps(metrics),
+        )
+
+    yield ticket, check
+    await pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        _VERIFY_ACTION_ID,
+        version,
+    )
+    await teardown_entity_graph(
+        pool, study_idxs=[], biosample_idxs=[biosample_idx], prep_sample_idxs=[prep_sample_idx]
+    )
+    if created:
+        await delete_action_if_created(
+            pool, action_id=_VERIFY_ACTION_ID, version=version, created=True
+        )
+    await delete_principal(pool, principal_idx)
+
+
+async def test_delete_reference_blocked_by_inflight_marker_ticket_even_with_force(
+    client, postgres_pool, verify_ticket
+):
+    ticket, _ = verify_ticket
+    ref_idx = await _create_ref(client, f"del-marker-flight-{uuid.uuid4()}")
+    await ticket("processing", {"marker_18s_reference_idx": ref_idx})
+
+    for params in ({}, {"force": "true"}):
+        resp = await client.delete(
+            URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params=params
+        )
+        assert resp.status_code == 409, resp.text
+        assert "in-flight" in resp.json()["detail"]
+
+
+async def test_delete_reference_ignores_a_terminal_marker_ticket_and_other_references(
+    client, verify_ticket
+):
+    ticket, _ = verify_ticket
+    ref_idx = await _create_ref(client, f"del-marker-done-{uuid.uuid4()}")
+    await ticket("completed", {"marker_18s_reference_idx": ref_idx})
+    await ticket("processing", {"marker_18s_reference_idx": ref_idx + 1000000})
+
+    resp = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+    assert resp.status_code == 200, resp.text
+
+
+async def test_delete_reference_named_in_qc_check_metrics_requires_force(
+    client, postgres_pool, verify_ticket
+):
+    ticket, check = verify_ticket
+    ref_idx = await _create_ref(client, f"del-marker-metrics-{uuid.uuid4()}")
+    await check(
+        await ticket("completed", {}),
+        {"marker_reference_idx": {"marker_16s": 1, "marker_18s": ref_idx}},
+    )
+
+    blocked = await client.delete(URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx))
+    assert blocked.status_code == 409, blocked.text
+    assert "QC check" in blocked.json()["detail"]
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", ref_idx
+        )
+        == 1
+    )
+
+    forced = await client.delete(
+        URL_REFERENCE_BY_IDX.format(reference_idx=ref_idx), params={"force": "true"}
+    )
+    assert forced.status_code == 200, forced.text

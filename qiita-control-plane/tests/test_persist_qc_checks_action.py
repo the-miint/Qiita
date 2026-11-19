@@ -35,6 +35,24 @@ pytestmark = pytest.mark.db
 
 _ACTION_ID = "persist-qc-checks-test"
 
+_METRICS = {
+    "n_sampled": 2000,
+    "fractions": {
+        "marker_16s": 0.5,
+        "marker_18s": 0.25,
+        "marker_23s_28s": 0.0,
+        "marker_5s_5_8s": 0.0,
+        "unclassified": 0.25,
+    },
+    "dominant_class": "marker_16s",
+    "marker_reference_idx": {
+        "marker_16s": 1,
+        "marker_18s": 2,
+        "marker_23s_28s": 3,
+        "marker_5s_5_8s": 4,
+    },
+}
+
 
 @pytest_asyncio.fixture
 async def seeded(postgres_pool):
@@ -130,6 +148,8 @@ async def _ticket(s, *, mask_idx: int | None = None, alignment_idx: int | None =
 
 
 def _entry(s, check=QcCheck.DATA_TYPE, severity=QcSeverity.INFO, **extra) -> dict:
+    if check == QcCheck.DATA_TYPE:
+        extra = {"metrics": _METRICS} | extra
     return {
         "prep_sample_idx": s["prep_sample_idx"],
         "check": str(check),
@@ -432,3 +452,58 @@ async def test_missing_expected_producer_column_rejected(seeded, tmp_path):
         await _persist(
             seeded, tmp_path, await _ticket(seeded), [_entry(seeded)], QcProducer.ALIGNMENT
         )
+
+
+async def test_valid_metrics_are_stored_in_canonical_form(seeded, tmp_path):
+    await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded, metrics=_METRICS)])
+    (row,) = await _rows(seeded)
+    assert row["metrics"] == _METRICS
+
+
+async def test_check_without_a_model_stores_null_metrics(seeded, tmp_path):
+    entry = _entry(seeded, QcCheck.COMPOSITION)
+    await _persist(seeded, tmp_path, await _ticket(seeded), [entry])
+    (row,) = await _rows(seeded)
+    assert row["metrics"] is None
+
+
+async def test_check_with_a_model_but_no_metrics_rejected_and_nothing_written(seeded, tmp_path):
+    entry = _entry(seeded)
+    del entry["metrics"]
+    with pytest.raises(ValueError, match="data_type: metrics are required"):
+        await _persist(seeded, tmp_path, await _ticket(seeded), [entry])
+    assert await _count(seeded) == 0
+
+
+async def test_rerun_replaces_metrics(seeded, tmp_path):
+    await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded, metrics=_METRICS)])
+    changed = _METRICS | {"n_sampled": 7}
+    await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded, metrics=changed)])
+    (row,) = await _rows(seeded)
+    assert row["metrics"]["n_sampled"] == 7
+
+
+async def test_metrics_on_a_check_without_a_model_rejected_and_row_untouched(seeded, tmp_path):
+    await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded, metrics=_METRICS)])
+    entry = _entry(seeded, QcCheck.COMPOSITION, metrics={"k": 1})
+    with pytest.raises(ValueError, match="composition"):
+        await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded), entry])
+    (row,) = await _rows(seeded)
+    assert row["metrics"] == _METRICS
+
+
+async def test_metrics_failing_the_model_rejected_and_nothing_written(seeded, tmp_path):
+    bad = _METRICS | {"n_sampled": 0}
+    with pytest.raises(ValueError, match="n_sampled"):
+        await _persist(seeded, tmp_path, await _ticket(seeded), [_entry(seeded, metrics=bad)])
+    assert await _count(seeded) == 0
+
+
+async def test_one_bad_metrics_entry_voids_the_good_entries(seeded, tmp_path):
+    entries = [
+        _entry(seeded, QcCheck.DATA_TYPE, metrics=_METRICS),
+        _entry(seeded, QcCheck.COMPOSITION, metrics={"k": 1}),
+    ]
+    with pytest.raises(ValueError, match="composition"):
+        await _persist(seeded, tmp_path, await _ticket(seeded), entries)
+    assert await _count(seeded) == 0
