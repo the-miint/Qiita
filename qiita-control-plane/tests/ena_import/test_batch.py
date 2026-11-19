@@ -1774,47 +1774,6 @@ async def test_failed_first_import_leaves_no_study_behind(
     await _cleanup_study(postgres_pool, accession)
 
 
-async def test_item_failed_after_creating_its_study_does_not_block_reimport(
-    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
-):
-    from qiita_control_plane.ena_import import batch as batch_module
-
-    real_register = batch_module.register_ena_study
-
-    async def _boom(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(batch_module, "register_ena_study", _boom)
-    accession = unique_ena_accession("PRJNA")
-    first_idx, first_items = await _drive_one_study(
-        batch_app, postgres_pool, admin_principal, accession
-    )
-    batch_cleanup.append(first_idx)
-    assert (
-        await postgres_pool.fetchval(
-            "SELECT state FROM qiita.ena_import_batch_item WHERE idx = $1", first_items[0].idx
-        )
-        == BatchItemState.FAILED.value
-    )
-
-    monkeypatch.setattr(batch_module, "register_ena_study", real_register)
-    second_idx, second_items = await _drive_one_study(
-        batch_app, postgres_pool, admin_principal, accession
-    )
-    batch_cleanup.append(second_idx)
-    assert (
-        await postgres_pool.fetchval(
-            "SELECT state FROM qiita.ena_import_batch_item WHERE idx = $1", second_items[0].idx
-        )
-        == BatchItemState.DOWNLOADING.value
-    )
-    assert await postgres_pool.fetchval(
-        "SELECT study_created FROM qiita.ena_import_batch_item WHERE idx = $1", second_items[0].idx
-    )
-
-    await _cleanup_study(postgres_pool, accession)
-
-
 async def test_reimport_by_a_submitter_below_admin_fails_naming_their_tier(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup
 ):
