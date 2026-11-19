@@ -1891,17 +1891,18 @@ def test_natural_key_lookup_response_refuses_non_positive_idx(idx):
 
 def test_biosample_study_lookup_request_names_malformed_idxs():
     """Tests the case where values under key idx include ones that are not
-    positive whole numbers, or are too long for an idx: the refusal names each
-    such value and only those, so the longest allowed idx is not named."""
+    positive whole numbers, have a leading zero, or are too long for an idx: the
+    refusal names each such value and only those, so the longest allowed idx is
+    not named."""
     longest = "9" * 18
     too_long = "1" + "0" * 18
     with pytest.raises(ValidationError) as exc_info:
         BiosampleStudyLookupRequest.model_validate(
-            {"key": "idx", "values": ["812", longest, "0", "abc", "-1", too_long]}
+            {"key": "idx", "values": ["812", longest, "0", "01", "abc", "-1", too_long]}
         )
     messages = [error["msg"] for error in exc_info.value.errors()]
     expected = [
-        f"Value error, idx values must match {LOOKUP_IDX_PATTERN}: ['0', 'abc', '-1', '{too_long}']"
+        f"Value error, idx values must match {LOOKUP_IDX_PATTERN}: ['0', '01', 'abc', '-1', '{too_long}']"  # noqa: E501
     ]
     assert messages == expected
 

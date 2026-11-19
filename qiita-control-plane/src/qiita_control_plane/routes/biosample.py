@@ -26,6 +26,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+    PATH_BIOSAMPLE_LOOKUP_BY_STUDY,
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
     PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
@@ -53,6 +54,8 @@ from qiita_common.models import (
     BiosampleStudyFieldCreateRequest,
     BiosampleStudyFieldResponse,
     BiosampleStudyLinkResponse,
+    BiosampleStudyLookupKey,
+    BiosampleStudyLookupRequest,
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
@@ -156,6 +159,7 @@ from ._helpers import (
     require_etag_match,
     require_if_match,
     resolve_and_write_study_scoped_metadata,
+    resolve_biosample_idxs_by_kind,
     resolve_metadata_checklist_idx,
     resolve_natural_keys,
     resolve_study_entity_by_unique_field,
@@ -873,6 +877,80 @@ async def lookup_biosample_in_study_by_unique_field(
                 value=body.unique_field_value,
             ),
         )
+
+
+async def _fetch_linked_biosample_idxs_by_kind(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    key: BiosampleStudyLookupKey,
+    unique_field_display_name: str | None,
+    tiers: CallerMetadataTiers,
+    values: list[str],
+) -> dict[str, int]:
+    """Resolve values of the identifier kind named by `key` to the idxs of live
+    biosamples with a live link to study_idx, keyed by each value as sent.
+
+    A value that names no such biosample is absent.
+    """
+    # Resolve every value to an idx, whatever its retirement or study membership
+    idx_by_value = await resolve_biosample_idxs_by_kind(
+        conn,
+        study_idx=study_idx,
+        key=key,
+        values=values,
+        unique_field_display_name=unique_field_display_name,
+        tiers=tiers,
+    )
+
+    # Keep only the idxs that are live and have a live link to the study
+    candidate_idxs = list(set(idx_by_value.values()))
+    linked_idxs = await fetch_biosample_idxs_for_study(
+        conn, study_idx=study_idx, limit=len(candidate_idxs), among_idxs=candidate_idxs
+    )
+    linked = set(linked_idxs)
+    linked_idx_by_value = {value: idx for value, idx in idx_by_value.items() if idx in linked}
+    return linked_idx_by_value
+
+
+@router.post(PATH_BIOSAMPLE_LOOKUP_BY_STUDY)
+async def lookup_biosample_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: BiosampleStudyLookupRequest,
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> NaturalKeyLookupResponse:
+    """Resolve a list of values of the identifier kind named by `body.key` to
+    the identifier named by `body.return_key` of each biosample in the study.
+
+    Access is that of the study-scoped biosample reads. A value is `missing`
+    when it names no biosample, a biosample not linked to the study, a retired
+    biosample, a retired link, or a unique-field value above the caller's tier;
+    the response does not say which.
+    """
+    # One snapshot, so the resolution, the live-link filter and the export ids agree
+    async with snapshot() as conn:
+        tiers = await caller_metadata_tiers(conn, user)
+        fetcher = partial(
+            _fetch_linked_biosample_idxs_by_kind,
+            conn,
+            study_idx=study_idx,
+            key=body.key,
+            unique_field_display_name=body.unique_field_display_name,
+            tiers=tiers,
+        )
+        lookup_response = await resolve_natural_keys(
+            values=body.values,
+            fetcher=fetcher,
+            return_key=body.return_key,
+            export_ids_from=(conn, EntityKind.BIOSAMPLE),
+        )
+    return lookup_response
 
 
 @router.get(PATH_BIOSAMPLE_BY_STUDY_AND_IDX)

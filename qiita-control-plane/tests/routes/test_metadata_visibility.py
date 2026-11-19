@@ -23,6 +23,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
     URL_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD,
+    URL_BIOSAMPLE_LOOKUP_BY_STUDY,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
     URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY,
     URL_SEQUENCED_SAMPLE_BY_IDX,
@@ -403,6 +404,29 @@ async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
 
     assert shown.status_code == 200, shown.text
     assert shown.json()["biosample_idx"] == corpus.entity_idx
+
+
+async def test_study_lookup_hidden_value_is_missing(ctx):
+    """Tests the case where a viewer looks up biosamples in a study by an
+    owner-biosample-id they cannot see: the value is missing, as one that no
+    biosample carries, while the bypass role's lookup resolves it."""
+    study_idx = await _seed_study_for_case(ctx, "viewer")
+    corpus = await _seed_biosample_corpus(ctx, study_idx)
+    url = URL_BIOSAMPLE_LOOKUP_BY_STUDY.format(study_idx=study_idx)
+    body = {
+        "key": "unique_field",
+        "unique_field_display_name": corpus.owner_id_field,
+        "values": [corpus.owner_id_value],
+        "return_key": "idx",
+    }
+
+    hidden = await ctx["user"].post(url, json=body)
+    shown = await ctx["wet"].post(url, json=body)
+
+    assert hidden.status_code == 200, hidden.text
+    assert hidden.json() == {"resolved": {}, "missing": [corpus.owner_id_value]}
+    assert shown.status_code == 200, shown.text
+    assert shown.json() == {"resolved": {corpus.owner_id_value: corpus.entity_idx}, "missing": []}
 
 
 async def test_global_value_from_another_study_is_checked_there(ctx):

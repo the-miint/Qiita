@@ -22,6 +22,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP,
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+    URL_BIOSAMPLE_LOOKUP_BY_STUDY,
     URL_BIOSAMPLE_METADATA_BY_STUDY,
     URL_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     URL_BIOSAMPLE_RESOLVE_ROSTER,
@@ -34,6 +35,7 @@ from qiita_common.models import (
     BiosampleStudyLinkResponse,
     BiosampleStudyLookupKey,
     FieldDataType,
+    LookupReturnKey,
     Tier,
 )
 
@@ -101,6 +103,7 @@ pytestmark = pytest.mark.db
 
 _SEED_PREFIX = "bs-route"
 _ELIGIBILITY_DETAIL = "owner is not eligible to own biosamples"
+_ABSENT_BIOSAMPLE_IDX = "999999999999"
 # One display_name for every access-matrix study. display_name is unique per
 # study, so reusing it across them costs nothing and lets the matrix's request
 # builder name the field without threading it through the driver.
@@ -5189,16 +5192,15 @@ async def test_resolve_unique_field_values_bad_field_422(ctx, field_state):
     assert caught.value.status_code == 422
 
 
-@pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
-async def test_resolve_biosample_idxs_by_kind(ctx, key):
-    """Tests the case where the one biosample a value names is retired and,
-    except under unique_field, outside the study: it still resolves, since the
-    caller decides which biosamples count. A value naming nothing is absent,
-    except under idx, where every value maps to itself as a number."""
-    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix=f"rbk-{key}")
+async def _seed_biosample_named_by_kind(ctx, *, key, study_idx, display_name):
+    """Seed one wet-owned biosample that a value of identifier kind `key` names.
+
+    Returns (value, unknown, biosample_idx), `unknown` being a value of that
+    kind that names nothing. Only under unique_field is the biosample linked to
+    study_idx; the value is written to that study's field `display_name`.
+    """
     wet_idx = ctx["wet_session"]["principal_idx"]
     unknown = unique_accession("RBK-MISS")
-    field_name = None
     if key == "matrix_tube_id":
         value = unique_matrix_tube_id()
         unknown = unique_matrix_tube_id()
@@ -5207,7 +5209,6 @@ async def test_resolve_biosample_idxs_by_kind(ctx, key):
         )
     elif key == "unique_field":
         value = "S-1"
-        field_name = display_name
         biosample_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
         written = await _patch_biosample_metadata(
             ctx["wet"], study_idx, biosample_idx, {display_name: value}
@@ -5228,8 +5229,24 @@ async def test_resolve_biosample_idxs_by_kind(ctx, key):
             "idx": str(biosample_idx),
         }[key]
         if key == "idx":
-            unknown = "999999999999"
-    await retire_biosample(ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=wet_idx)
+            unknown = _ABSENT_BIOSAMPLE_IDX
+    return value, unknown, biosample_idx
+
+
+@pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
+async def test_resolve_biosample_idxs_by_kind(ctx, key):
+    """Tests the case where the one biosample a value names is retired and,
+    except under unique_field, outside the study: it still resolves, since the
+    caller decides which biosamples count. A value naming nothing is absent,
+    except under idx, where every value maps to itself as a number."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix=f"rbk-{key}")
+    value, unknown, biosample_idx = await _seed_biosample_named_by_kind(
+        ctx, key=key, study_idx=study_idx, display_name=display_name
+    )
+    await retire_biosample(
+        ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=ctx["wet_session"]["principal_idx"]
+    )
+    field_name = display_name if key == "unique_field" else None
 
     async with ctx["pool"].acquire() as conn:
         resolved = await route_helpers.resolve_biosample_idxs_by_kind(
@@ -5482,6 +5499,132 @@ async def test_lookup_biosample_in_study_by_unique_field_authz(ctx, case, no_bio
         send=_send,
         success_status=200,
         required_scope="biosample:read",
+    )
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/biosample/lookup
+# ===========================================================================
+
+
+async def _lookup_in_study(client, study_idx, body):
+    """POST the study-scoped biosample lookup with the given body."""
+    return await client.post(URL_BIOSAMPLE_LOOKUP_BY_STUDY.format(study_idx=study_idx), json=body)
+
+
+@pytest.mark.parametrize("return_key", get_args(LookupReturnKey))
+@pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
+async def test_lookup_biosample_in_study(ctx, key, return_key):
+    """Tests the case where a value of each identifier kind names a live
+    biosample linked to the study: it resolves to the identifier the request
+    chose, and a value naming nothing is missing."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(
+        ctx, suffix=f"lbs-{key}-{return_key}"
+    )
+    value, unknown, biosample_idx = await _seed_biosample_named_by_kind(
+        ctx, key=key, study_idx=study_idx, display_name=display_name
+    )
+    body = {"key": key, "values": [value, unknown], "return_key": return_key}
+    if key == "unique_field":
+        body["unique_field_display_name"] = display_name
+    else:
+        await seed_biosample_to_study_link(
+            ctx["pool"],
+            biosample_idx=biosample_idx,
+            study_idx=study_idx,
+            created_by_idx=ctx["wet_session"]["principal_idx"],
+        )
+    identifier = biosample_idx
+    if return_key == "export_entity_id":
+        identifier = await fetch_export_entity_id(
+            ctx["pool"], kind="biosample", entity_idx=biosample_idx
+        )
+
+    resp = await _lookup_in_study(ctx["wet"], study_idx, body)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {value: identifier}, "missing": [unknown]}
+
+
+async def test_lookup_biosample_in_study_missing(ctx):
+    """Tests the case where values name a biosample not linked to the study, a
+    retired biosample, one whose link is retired, and an idx no biosample has,
+    one of them sent twice: each is missing, listed once in input order, and
+    only the live, linked biosample resolves."""
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="lbs-missing")
+    live, retired, retired_link = [
+        await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx) for _ in range(3)
+    ]
+    unlinked = await seed_biosample(ctx["pool"], owner_idx=wet_idx, created_by_idx=wet_idx)
+    ctx["created"]["biosample"].append(unlinked)
+    await retire_biosample(ctx["pool"], biosample_idx=retired, retired_by_idx=wet_idx)
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=retired_link, study_idx=study_idx, retired_by_idx=wet_idx
+    )
+    values = [str(idx) for idx in (live, unlinked, retired, retired_link)]
+    values += [_ABSENT_BIOSAMPLE_IDX, str(unlinked)]
+
+    resp = await _lookup_in_study(
+        ctx["wet"], study_idx, {"key": "idx", "values": values, "return_key": "idx"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "resolved": {str(live): live},
+        "missing": [str(unlinked), str(retired), str(retired_link), _ABSENT_BIOSAMPLE_IDX],
+    }
+    assert resp.json() == expected
+
+
+@pytest.mark.parametrize("case", UNIQUE_FIELD_RESOLUTION_CASES)
+async def test_lookup_biosample_in_study_unique_field_resolution(ctx, case):
+    """Tests the case where each shared resolution case reaches the study
+    lookup: a field the single lookups refuse is refused the same way, and a
+    value they answer 404 for is missing."""
+    setup, single_status, expected_detail = _UNIQUE_FIELD_RESOLUTION[case]
+    study_idx, display_name, value = await setup(ctx, case)
+    body = {"key": "unique_field", "unique_field_display_name": display_name, "values": [value]}
+
+    resp = await _lookup_in_study(ctx["wet"], study_idx, body)
+
+    if single_status == 404:
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"resolved": {}, "missing": [value]}
+    else:
+        assert resp.status_code == single_status, resp.text
+        assert expected_detail in resp.json()["detail"], resp.text
+
+
+async def test_lookup_biosample_in_study_bad_body_422(ctx):
+    """Tests the case where the body fails the request model, by naming
+    unique_field without a field: the route refuses it."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="lbs-422"
+    )
+
+    resp = await _lookup_in_study(ctx["wet"], study_idx, {"key": "unique_field", "values": ["S-1"]})
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_READ_AUTHZ_CASES)
+async def test_lookup_biosample_in_study_authz(ctx, case, no_biosample_read_client):
+    """Tests the case where each row of the study-scoped sample read matrix
+    calls the study lookup: the route enforces the same bar as the reads."""
+
+    async def _send(client, study_idx, sample_idx):
+        body = {"key": "idx", "values": [str(sample_idx)]}
+        return await _lookup_in_study(client, study_idx, body)
+
+    await assert_study_scoped_sample_read_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_read_client,
+        seed_sample=_seed_authz_sample,
+        send=_send,
+        success_status=200,
+        required_scope=Scope.BIOSAMPLE_READ,
     )
 
 

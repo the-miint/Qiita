@@ -1,3 +1,13 @@
+### Added
+
+- **`POST /study/{study_idx}/biosample/lookup` resolves many biosample identifiers within one
+  study (#N).** The body names one identifier kind: `export_entity_id`, `idx`,
+  `biosample_accession`, `ena_sample_accession`, `matrix_tube_id`, or `unique_field` with the
+  study field's display name. Each value maps to the identifier that `return_key` chooses.
+  A value naming no live biosample linked to the study, or a unique-field value that the
+  caller's tier cannot read, is listed in `missing`. Access is that of the study-scoped
+  biosample reads.
+
 ### Changed
 
 - **`POST /study/lookup` and `POST /biosample/lookup` return each value's
