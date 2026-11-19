@@ -8,10 +8,10 @@ from qiita_compute_orchestrator.derived_store import krepp_build_relpath, node_r
 
 
 def test_build_relpath_and_node_path():
-    rel = krepp_build_relpath(18, "w43_r0-15")
-    assert rel == "references/18/krepp/w43_r0-15"
+    rel = krepp_build_relpath(18, "w43_r0-25")
+    assert rel == "references/18/krepp/w43_r0-25"
     assert node_relative_path("/scratch/qiita-miint", rel) == Path(
-        "/scratch/qiita-miint/references/18/krepp/w43_r0-15"
+        "/scratch/qiita-miint/references/18/krepp/w43_r0-25"
     )
 
 

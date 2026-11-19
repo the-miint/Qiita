@@ -4,7 +4,7 @@ For the operator who brings a krepp index built outside Qiita into service on a
 reference, and for the cluster admins who copy it to the compute nodes. What the
 states mean and what each check covers: [reference-data](../architecture/reference-data.md#krepp-placement-index-builds).
 
-Throughout, reference `18` and build label `w43_r0-15` are the example. A build label is
+Throughout, reference `18` and build label `w43_r0-25` are the example. A build label is
 one path segment (letters, digits, `.`, `_`, `-`); a rebuild gets a new label, never the
 same folder overwritten.
 
@@ -23,7 +23,7 @@ same folder overwritten.
 ## 1. Place the build at its master path
 
 ```
-PATH_DERIVED/references/18/krepp/w43_r0-15/
+PATH_DERIVED/references/18/krepp/w43_r0-25/
   index/   the krepp index directory as krepp_index_create wrote it, all partitions
            of one index, nothing else (registration hashes whatever is there)
   jest/    labelled.nwk (the backbone tree with JEST's clade labels) and null.txt
@@ -38,7 +38,7 @@ four files there), and the cluster admins' copy must be able to read everything.
 ```
 qiita ticket submit --action-id reference-index-register --action-version 1.0.0 \
   --scope-target-json '{"kind": "reference", "reference_idx": 18}' \
-  --context-json '{"build_label": "w43_r0-15"}'
+  --context-json '{"build_label": "w43_r0-25"}'
 ```
 
 The job checks the folder, the krepp version and the trees, then hashes every file and
@@ -50,7 +50,7 @@ the hash to give the cluster admins.
 ## 3. Copy to every node (cluster admins)
 
 Copy the whole folder, as it is after registration, to
-`PATH_NODE_LOCAL/references/18/krepp/w43_r0-15/` on every compute node, then on each
+`PATH_NODE_LOCAL/references/18/krepp/w43_r0-25/` on every compute node, then on each
 node run, in that folder:
 
 ```
