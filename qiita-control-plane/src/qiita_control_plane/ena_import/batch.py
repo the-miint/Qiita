@@ -449,11 +449,11 @@ _ROLLED_BACK = "the import-created study was rolled back"
 
 
 def _nothing_to_download_reason(
-    result: EnaStudyRegistrationResult, *, rolled_back: bool
+    result: EnaStudyRegistrationResult, *, study_created: bool
 ) -> str | None:
     """Why a registration left nothing to download, or None when something is."""
     if not result.created_pools:
-        if rolled_back:
+        if study_created:
             return f"no run mapped to a downloadable pool; {_ROLLED_BACK}"
         return (
             "study registered but no run mapped to a downloadable pool"
@@ -463,7 +463,7 @@ def _nothing_to_download_reason(
         reasons = _summarize_run_failures(
             o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
         )
-        if rolled_back:
+        if study_created:
             return f"every run failed to register ({reasons}); {_ROLLED_BACK}"
         return f"study registered but every run failed to register ({reasons})"
     return None
@@ -589,7 +589,7 @@ async def _process_one_study(
                         tiers=await caller_metadata_tiers(conn, principal),
                     )
                     if (
-                        reason := _nothing_to_download_reason(result, rolled_back=True)
+                        reason := _nothing_to_download_reason(result, study_created=True)
                     ) is not None:
                         raise _FirstImportRegisteredNothing(reason, result)
         except _FirstImportRegisteredNothing as exc:
@@ -671,7 +671,7 @@ async def _process_one_study(
             ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
         )
 
-        if (reason := _nothing_to_download_reason(result, rolled_back=False)) is not None:
+        if (reason := _nothing_to_download_reason(result, study_created=False)) is not None:
             await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=reason)
             return
 

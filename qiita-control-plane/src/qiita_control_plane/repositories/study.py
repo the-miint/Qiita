@@ -341,7 +341,7 @@ _STUDY_ACCESSION_UNIQUE_CONSTRAINTS = frozenset(
 STUDY_ACCESSION_LOCK_CLASS = 0x0574_0001
 
 
-# Outlasts a creating import's open registration transaction (~27ms per run).
+# Outlasts a creating import's open registration transaction; see POOL_LOCK_WAIT_TIMEOUT_S.
 STUDY_LOCK_WAIT_TIMEOUT_S = 90.0
 
 

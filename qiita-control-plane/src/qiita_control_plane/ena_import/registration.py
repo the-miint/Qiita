@@ -352,7 +352,7 @@ async def register_ena_study(
         # is written -- but only when a run will be written: a pure re-import
         # of already-present runs adds no values and so mints no fields. Ahead
         # of pool resolution too, so a field-shape clash mints nothing at all.
-        # On a pool connection (no caller transaction) the field rows commit on
+        # Given a pool (no caller transaction) the field rows commit on
         # their own and survive a failed attempt (see _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
         implied_host_by_taxon: dict[str, str | None] = {}
