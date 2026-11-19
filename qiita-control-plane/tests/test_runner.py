@@ -2631,6 +2631,73 @@ async def test_run_action_primitive_refuses_a_wrongly_scoped_ticket(
     assert str(exc.value) == f"{name} requires a {required}-scoped ticket; got {wrong!r}"
 
 
+@pytest.mark.parametrize(
+    ("inputs", "expect_filtered"),
+    [(["raw_qc_report"], False), (["raw_qc_report", "filtered_qc_report"], True)],
+)
+async def test_run_action_primitive_persist_qc_report_binds_what_the_step_declares(
+    monkeypatch, tmp_path, inputs, expect_filtered
+):
+    """A step declaring only `raw_qc_report` persists the raw report alone (filtered
+    stored as NULL); a 1.2.0-shaped step still passes both."""
+    import json as _json
+
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_persist(pool, prep_sample_idx, raw, filtered=None):
+        recorded.update(prep_sample_idx=prep_sample_idx, raw=raw, filtered=filtered)
+        return 1
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.PERSIST_QC_REPORT, fake_persist)
+    bound = {}
+    for name in inputs:
+        path = tmp_path / f"{name}.json"
+        path.write_text(_json.dumps({"point": name}))
+        bound[name] = str(path)
+
+    entry = WorkflowAction(kind="action", name="persist-qc-report", inputs=inputs, outputs=[])
+    await _run_action_primitive(
+        run_context(
+            pool=None,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=9,
+        ),
+        entry,
+        bound,
+        tmp_path,
+    )
+    assert recorded["prep_sample_idx"] == 5
+    assert recorded["raw"] == {"point": "raw_qc_report"}
+    assert recorded["filtered"] == ({"point": "filtered_qc_report"} if expect_filtered else None)
+
+
+async def test_run_action_primitive_persist_qc_report_rejects_filtered_alone(tmp_path):
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(
+        kind="action", name="persist-qc-report", inputs=["filtered_qc_report"], outputs=[]
+    )
+    with pytest.raises(RuntimeError, match="expects inputs"):
+        await _run_action_primitive(
+            run_context(
+                pool=None,
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 5},
+                work_ticket_idx=9,
+            ),
+            entry,
+            {"filtered_qc_report": str(tmp_path / "f.json")},
+            tmp_path,
+        )
+
+
 async def test_run_action_primitive_persist_qc_checks_dispatches(monkeypatch, tmp_path):
     """The persist-qc-checks arm passes the ticket idx, the scope target's prep_sample_idx
     and the `qc_checks` binding's path."""
@@ -5801,6 +5868,67 @@ async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
     assert by_index[0].state is StepProgressState.COMPLETED
     assert by_index[1].state is StepProgressState.COMPLETED
     assert by_index[2].state is StepProgressState.COMPLETED
+
+
+async def test_resume_runs_an_entry_appended_after_the_recorded_ones(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """Rows recorded under the 3-entry list resume into a list with a fourth entry
+    appended: no StepProgressMismatch, the recorded entries are fast-forwarded and
+    only the appended one runs."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    for index, name in ((0, "compute"), (2, "finish")):
+        await _seed_submitted_step(
+            postgres_pool,
+            multi_step_ticket,
+            step_name=name,
+            slurm_job_id=952 + index,
+            step_index=index,
+        )
+        await step_progress.record_running(
+            postgres_pool, work_ticket_idx=multi_step_ticket, step_index=index, attempt=0
+        )
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=1,
+        attempt=0,
+        step_name="mint-features",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    for index in (0, 1, 2):
+        await step_progress.record_completed(
+            postgres_pool, work_ticket_idx=multi_step_ticket, step_index=index, attempt=0
+        )
+    appended = {
+        "kind": "action",
+        "name": "write-membership",
+        "inputs": ["manifest", "feature_map"],
+        "outputs": [],
+    }
+    await postgres_pool.execute(
+        "UPDATE qiita.action SET steps = $1::jsonb WHERE (action_id, version) ="
+        " (SELECT action_id, action_version FROM qiita.work_ticket WHERE work_ticket_idx = $2)",
+        json.dumps([*_MULTI_STEP_WORKFLOW, appended]),
+        multi_step_ticket,
+    )
+
+    backend = FakeSlurmBackendClient(
+        status_script=[],
+        result_script=[{"manifest": "manifest.parquet"}, {"result": "result.parquet"}],
+    )
+    await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", multi_step_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 0
+    assert [c[0] for c in library_spy.calls] == ["write-membership"]
+    rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
+    assert {r.step_index: r.state for r in rows} == dict.fromkeys(
+        range(4), StepProgressState.COMPLETED
+    )
 
 
 async def test_resume_fails_a_ticket_whose_completed_entry_moved(

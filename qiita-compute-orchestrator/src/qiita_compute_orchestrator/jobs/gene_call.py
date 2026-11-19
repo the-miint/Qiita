@@ -35,6 +35,7 @@ them.
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
@@ -58,6 +59,8 @@ from ..miint import (
 )
 from ._assembly import READ_FASTX_MAX_BATCH_BYTES
 from .assembly_hash import _file_meta
+
+_LOG = logging.getLogger(__name__)
 
 YAML_STEP_NAME = "gene_call"
 
@@ -422,10 +425,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # A partial output is never left where the next step would read it.
         shutil.rmtree(out, ignore_errors=True)
         raise
-    print(
-        f"gene_call: {n_subjects} subject(s), {n_checkm} with prodigal_checkm genes, "
-        f"prep_sample_idx={inputs.prep_sample_idx}",
-        flush=True,
+    # The step narrative goes to stderr; stdout carries only the launcher's one receipt
+    # line (`jobs.__main__`, the step-log contract).
+    _LOG.info(
+        "gene_call: %s subject(s), %s with prodigal_checkm genes, prep_sample_idx=%s",
+        n_subjects,
+        n_checkm,
+        inputs.prep_sample_idx,
     )
     # `gene_manifest` is the gene file again, under the name mint-gene-features takes:
     # its `sequence_hash` column is what that action mints.

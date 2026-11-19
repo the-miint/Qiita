@@ -874,16 +874,16 @@ async def _run_action_primitive(
         return {}
 
     if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
-        # Persist the two fastqc-equivalent QC reports onto this prep_sample's
-        # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
-        # sidecar (the qc_report_raw / qc_report_filtered step outputs); we read
-        # each verbatim and hand the parsed dicts to the primitive. Inputs are
-        # resolved by their fixed binding names — not positionally — so a YAML
-        # reorder can't silently swap raw/filtered.
-        if set(entry.inputs) != {"raw_qc_report", "filtered_qc_report"}:
+        # Inputs are resolved by their fixed binding names, not positionally, so a
+        # YAML reorder can't swap raw/filtered. The raw report is required; the
+        # filtered one is optional (the mask-model workflows have none).
+        if set(entry.inputs) not in (
+            {"raw_qc_report"},
+            {"raw_qc_report", "filtered_qc_report"},
+        ):
             raise RuntimeError(
                 f"{entry.name} expects inputs "
-                "[raw_qc_report, filtered_qc_report]; "
+                "[raw_qc_report] or [raw_qc_report, filtered_qc_report]; "
                 f"got {entry.inputs!r}"
             )
 
@@ -894,7 +894,7 @@ async def _run_action_primitive(
             ctx.pool,
             ctx.scope_target["prep_sample_idx"],
             _report("raw_qc_report"),
-            _report("filtered_qc_report"),
+            _report("filtered_qc_report") if "filtered_qc_report" in entry.inputs else None,
         )
         return {}
 
