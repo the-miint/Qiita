@@ -44,8 +44,9 @@ JEST_LABELLED_TREE = f"{JEST_SUBDIR}/labelled.nwk"
 JEST_NULL = f"{JEST_SUBDIR}/null.txt"
 MANIFEST_FORMAT = 1
 
-# The metadata keys Qiita records for a build (manifest, README, reference_index.params)
-# and checks (krepp version), read from every `metadata-*.txt` in `index/`.
+# The metadata keys Qiita reads from every `metadata-*.txt` in `index/`: all are
+# recorded in the manifest and README, all but `frac` in reference_index.params, and
+# `krepp version` is checked against the linked krepp.
 RECORDED_METADATA_KEYS = ("krepp version", "k", "w", "h", "m", "frac")
 
 _HASH_CHUNK = 8 << 20
@@ -82,23 +83,25 @@ def _recorded_settings(index_dir: Path) -> dict[str, str]:
     across the texts, since Qiita records one."""
     with duckdb.connect() as conn:
         rows = conn.execute(
-            "SELECT key, list(DISTINCT"
-            "  regexp_extract(content, '(?m)^' || key || ': ([^\\r\\n]*)', 1))"
-            " FROM read_text(?) CROSS JOIN unnest(?::VARCHAR[]) AS t(key)"
-            " GROUP BY key",
+            "SELECT key, regexp_extract(content, '(?m)^' || key || ': ([^\\r\\n]*)', 1),"
+            " parse_filename(filename)"
+            " FROM read_text(?) CROSS JOIN unnest(?::VARCHAR[]) AS t(key)",
             [str(index_dir / "metadata-*.txt"), list(RECORDED_METADATA_KEYS)],
         ).fetchall()
     if not rows:
         raise KreppBuildInvalid("metadata", f"{index_dir} holds no metadata-*.txt")
-    values = dict(rows)
+    by_key: dict[str, dict[str, list[str]]] = {}
+    for key, value, name in rows:
+        by_key.setdefault(key, {}).setdefault(value, []).append(name)
     settings: dict[str, str] = {}
     for key in RECORDED_METADATA_KEYS:
-        found = sorted(values[key])
+        found = by_key[key]
         if "" in found:
-            raise KreppBuildInvalid("metadata", f"a metadata text lacks {key!r}")
+            raise KreppBuildInvalid("metadata", f"{sorted(found[''])} lack {key!r}")
         if len(found) != 1:
-            raise KreppBuildInvalid("metadata", f"the metadata texts disagree on {key!r}: {found}")
-        settings[key] = found[0]
+            detail = "; ".join(f"{v!r} in {sorted(n)}" for v, n in sorted(found.items()))
+            raise KreppBuildInvalid("metadata", f"the metadata texts disagree on {key!r}: {detail}")
+        (settings[key],) = found
     return settings
 
 
@@ -145,7 +148,9 @@ def _hash_all(folder: Path, relpaths: list[str], threads: int) -> dict[str, str]
 def _all_files(folder: Path) -> list[str]:
     """Every file under `folder`, relative. A directory os.walk cannot list raises
     KreppBuildInvalid (`unreadable`); os.walk alone skips it, which would drop its
-    files from both the stray-file check and SHA256SUMS."""
+    files from both the stray-file check and SHA256SUMS. A symlink raises (`link`):
+    a copied link can point back at the shared filesystem or dangle on a node, and
+    os.walk does not descend into a linked directory."""
 
     def _unreadable(exc: OSError) -> None:
         raise KreppBuildInvalid("unreadable", f"{exc.filename}: {exc.strerror}") from exc
@@ -153,6 +158,10 @@ def _all_files(folder: Path) -> list[str]:
     out = []
     for root, dirs, files in os.walk(folder, onerror=_unreadable):
         dirs.sort()
+        links = [n for n in (*dirs, *files) if os.path.islink(os.path.join(root, n))]
+        if links:
+            rel = sorted((Path(root) / n).relative_to(folder).as_posix() for n in links)
+            raise KreppBuildInvalid("link", f"symlinks are not part of a build: {rel}")
         for name in sorted(files):
             out.append((Path(root) / name).relative_to(folder).as_posix())
     return sorted(out)

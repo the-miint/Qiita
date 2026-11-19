@@ -24,6 +24,7 @@ from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
     JEST_NULL,
     MANIFEST,
+    README,
     RECORDED_METADATA_KEYS,
     SHA256SUMS,
     VERIFY_SCRIPT,
@@ -85,6 +86,8 @@ def test_registration_refuses_a_folder_edited_since(build):
     [
         (lambda f: (f / "extra.txt").write_text("x"), "inventory"),
         (lambda f: (f / JEST_NULL).unlink(), "inventory"),
+        (lambda f: (f / "index" / "extra").symlink_to(f / JEST_NULL), "link"),
+        (lambda f: (f / "index" / "sub").symlink_to(f / "jest"), "link"),
     ],
 )
 def test_registration_refuses_a_folder_that_is_not_a_build(build, edit, check):
@@ -97,7 +100,10 @@ def test_registration_refuses_a_folder_that_is_not_a_build(build, edit, check):
 def test_registration_refuses_partitions_that_disagree_on_a_recorded_setting(build):
     txt = build / "index" / "metadata-m4r1-no_frac.txt"
     txt.write_text(txt.read_text().replace("w: 25", "w: 31"))
-    with pytest.raises(KreppBuildInvalid, match=r"disagree on 'w': \['25', '31'\]"):
+    with pytest.raises(
+        KreppBuildInvalid,
+        match=r"disagree on 'w': '25' in \['metadata-m4r0-no_frac.txt'\]; '31' in \['metadata-m4r1",
+    ):
         _register(build)
 
 
@@ -113,7 +119,7 @@ def test_registration_refuses_metadata_without_a_recorded_setting(build):
     txt.write_text(
         "".join(ln for ln in txt.read_text().splitlines(True) if not ln.startswith("h: "))
     )
-    with pytest.raises(KreppBuildInvalid, match=r"lacks 'h'"):
+    with pytest.raises(KreppBuildInvalid, match=r"\['metadata-m4r1-no_frac.txt'\] lack 'h'"):
         _register(build)
 
 
@@ -141,6 +147,7 @@ def test_verify_accepts_the_registered_copy(build):
         (lambda f: (f / "index" / "cmer-m4r0-no_frac").write_bytes(b"x"), "size"),
         (lambda f: _same_size_edit(f / "index" / "metadata-m4r0-no_frac.txt"), "hash"),
         (lambda f: _same_size_edit(f / MANIFEST), "manifest"),
+        (lambda f: (f / "index" / "extra").symlink_to(f / README), "link"),
     ],
 )
 def test_verify_refuses_a_changed_copy(build, edit, check):
