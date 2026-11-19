@@ -1,6 +1,6 @@
 """DB test for the migration that makes every ENA-imported study public.
 
-The migration (db/migrations/20261118000000_ena_imported_studies_public.sql) sets
+The migration (db/migrations/20261119000000_ena_imported_studies_public.sql) sets
 `default_tier = 'public'` on each study that an ENA import created
 (`qiita.ena_import_batch_item.study_created`). It refuses to apply, naming the
 studies, while one of them holds a sample that did not come from ENA: a
@@ -26,6 +26,7 @@ from qiita_control_plane.repositories.ena_import_batch import (
 )
 from qiita_control_plane.testing.db_seeds import (
     retire_biosample_to_study_link,
+    retire_prep_sample_to_study_link,
     seed_biosample,
     seed_biosample_to_study_link,
     seed_prep_sample_to_study_link,
@@ -44,7 +45,7 @@ from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
-_MIGRATION = MIGRATIONS_DIR / "20261118000000_ena_imported_studies_public.sql"
+_MIGRATION = MIGRATIONS_DIR / "20261119000000_ena_imported_studies_public.sql"
 
 
 @pytest_asyncio.fixture
@@ -119,9 +120,10 @@ async def _seed_biosample_in(mig, *, study_idx: int, with_ena_accession: bool) -
 
 async def _seed_sequenced_sample_in(
     mig, *, study_idx: int, biosample_idx: int, with_ena_accession: bool
-) -> None:
-    """A sequenced_sample in `study_idx`, on `biosample_idx`. With an ENA
-    accession it carries the run accession that an import writes."""
+) -> int:
+    """A sequenced_sample in `study_idx`, on `biosample_idx`, returning its
+    prep_sample_idx. With an ENA accession it carries the run accession that an
+    import writes."""
     pool, owner = mig["pool"], mig["principal_idx"]
     prep_sample_idx = await seed_sequenced_prep_sample(
         pool, biosample_idx=biosample_idx, owner_idx=owner
@@ -144,6 +146,7 @@ async def _seed_sequenced_sample_in(
             sequenced_sample_idx,
             unique_ena_accession("ERR"),
         )
+    return prep_sample_idx
 
 
 async def _in_isolation(conn: asyncpg.Connection, mig) -> None:
@@ -192,18 +195,28 @@ async def test_up_accepts_samples_that_came_from_ena(mig):
     assert await _up_then_tiers(mig) == (Tier.PUBLIC, Tier.MEMBER)
 
 
-async def test_up_ignores_a_sample_retired_from_the_study(mig):
-    """A biosample whose link to the import-created study is retired is no
-    longer in it, so it does not block the study."""
+@pytest.mark.parametrize("retired", ["biosample", "sequenced_sample"])
+async def test_up_ignores_a_sample_retired_from_the_study(mig, retired):
+    """A biosample or prep_sample whose link to the import-created study is
+    retired is no longer in it, so it does not block the study."""
+    study_idx, by_idx = mig["created_idx"], mig["principal_idx"]
     biosample_idx = await _seed_biosample_in(
-        mig, study_idx=mig["created_idx"], with_ena_accession=False
+        mig, study_idx=study_idx, with_ena_accession=retired != "biosample"
     )
-    await retire_biosample_to_study_link(
-        mig["pool"],
-        biosample_idx=biosample_idx,
-        study_idx=mig["created_idx"],
-        retired_by_idx=mig["principal_idx"],
-    )
+    if retired == "biosample":
+        await retire_biosample_to_study_link(
+            mig["pool"], biosample_idx=biosample_idx, study_idx=study_idx, retired_by_idx=by_idx
+        )
+    else:
+        prep_sample_idx = await _seed_sequenced_sample_in(
+            mig, study_idx=study_idx, biosample_idx=biosample_idx, with_ena_accession=False
+        )
+        await retire_prep_sample_to_study_link(
+            mig["pool"],
+            prep_sample_idx=prep_sample_idx,
+            study_idx=study_idx,
+            retired_by_idx=by_idx,
+        )
     assert await _up_then_tiers(mig) == (Tier.PUBLIC, Tier.MEMBER)
 
 

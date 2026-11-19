@@ -1,11 +1,12 @@
-"""Reading the migration files as a source of truth, without a database.
+"""Reading the migration files as a source of truth.
 
-Several tests assert that Python and the schema agree (enum parity, the in-flight
-index predicates) by *replaying the SQL* rather than querying Postgres, so the
-check runs in the no-infrastructure tier. They all need the same two primitives,
-and they must agree on them — two scanners with different ideas of where a
-migration's `up` half ends is the silent-inconsistency shape, and the answer only
-shows up as a false green.
+Several tests read the SQL itself. Some assert that Python and the schema agree
+(enum parity, the in-flight index predicates) by *replaying the SQL* rather than
+querying Postgres, so the check runs in the no-infrastructure tier; others apply
+one migration's `up` or `down` half to the test database. They all split a
+migration the same way, and they must agree on it — two scanners with different
+ideas of where a migration's `up` half ends is the silent-inconsistency shape,
+and the answer only shows up as a false green.
 
 `migrate_up()` is the load-bearing one, and it matches the marker **anchored to the
 start of a line**, as dbmate itself does. Two weaker forms are tempting and both

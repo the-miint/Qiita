@@ -18,10 +18,10 @@
 -- or a sequenced_sample in it with no ena_run_accession (likewise). A sample
 -- whose link to the study is retired is no longer in it, and is not counted.
 --
--- Two kinds of content that a person may have added after the import are
--- published without a check, by decision: the study's alias, description,
--- abstract and funding, and local fields added with no tier_override. The
--- deploy checklist lists both before this migration runs.
+-- The migration does not check two kinds of content that a person may have
+-- added after the import, and publishes them: the study's alias, description,
+-- abstract and funding, and local fields added with no tier_override. Whether
+-- they may be public is the study owner's call, which no column records.
 DO $$
 DECLARE
     offending TEXT;

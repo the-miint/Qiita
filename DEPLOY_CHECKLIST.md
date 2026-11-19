@@ -57,20 +57,22 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   workspaces, and the build deployed now does not know to keep them. From this deploy,
   reclaim skips every ticket that backfill can still recover or is recovering. (#888)
 - `[operator]` **Before `make migrate`, read what the bucket-3 migration will publish.** It
-  makes every study an ENA import created public.
+  makes every study an ENA import created public, and does not check 2 or 3 below: read them,
+  and before the deploy raise with each study's owner any that should not be public.
   1. The studies that still hold a biosample or sequenced_sample with no ENA accession.
      The migration refuses while any do, so expect no rows; otherwise stop the deploy and
      raise each study with its owner (no route moves samples out of a study).
   2. The studies whose alias, description, abstract or funding a person added (an import
-     writes none of them), and
-  3. their local fields with no `tier_override` that someone other than the importer added.
-     The migration publishes 2 and 3 by decision: read them, and raise any that should
-     not be public before the deploy.
+     writes none of them). The owner edits these with `PATCH /api/v1/study/{study_idx}`.
+  3. The local fields with no `tier_override`, on the studies an import created, that no
+     import wrote: ones not created by an import's submitter while that import of the study
+     ran. The owner keeps one off the public tier by setting its `tier_override` with
+     `PATCH /api/v1/study/{study_idx}/<kind>/{idx}`, from the row.
   4. How many studies become public. (#feat/default-tier-review)
   ```bash
   psql "$DATABASE_URL" -tAc "WITH imported AS (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) SELECT bts.study_idx, 'biosample', count(*) FROM qiita.biosample_to_study bts JOIN qiita.biosample b ON b.idx = bts.biosample_idx WHERE NOT bts.retired AND b.ena_sample_accession IS NULL AND bts.study_idx IN (SELECT study_idx FROM imported) GROUP BY 1 UNION ALL SELECT pts.study_idx, 'sequenced_sample', count(*) FROM qiita.prep_sample_to_study pts JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx WHERE NOT pts.retired AND ss.ena_run_accession IS NULL AND pts.study_idx IN (SELECT study_idx FROM imported) GROUP BY 1"
   psql "$DATABASE_URL" -tAc "SELECT idx, title FROM qiita.study WHERE idx IN (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) AND num_nonnulls(alias, description, abstract, funding) > 0"
-  psql "$DATABASE_URL" -tAc "WITH imported AS (SELECT i.study_idx, b.submitted_by_principal_idx FROM qiita.ena_import_batch_item i JOIN qiita.ena_import_batch b ON b.idx = i.batch_idx WHERE i.study_created) SELECT sf.study_idx, 'biosample', sf.display_name FROM qiita.biosample_study_field sf JOIN imported im ON im.study_idx = sf.study_idx WHERE sf.biosample_global_field_idx IS NULL AND sf.tier_override IS NULL AND sf.created_by_idx <> im.submitted_by_principal_idx UNION ALL SELECT sf.study_idx, 'prep_sample', sf.display_name FROM qiita.prep_sample_study_field sf JOIN imported im ON im.study_idx = sf.study_idx WHERE sf.prep_sample_global_field_idx IS NULL AND sf.tier_override IS NULL AND sf.created_by_idx <> im.submitted_by_principal_idx ORDER BY 1, 2, 3"
+  psql "$DATABASE_URL" -tAc "WITH imported AS (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created), import_run AS (SELECT i.study_idx, b.submitted_by_principal_idx AS by_idx, i.created_at AS from_at, i.updated_at AS to_at FROM qiita.ena_import_batch_item i JOIN qiita.ena_import_batch b ON b.idx = i.batch_idx WHERE i.study_idx IN (SELECT study_idx FROM imported)), field AS (SELECT study_idx, 'biosample-field' AS kind, idx, display_name, created_by_idx, created_at FROM qiita.biosample_study_field WHERE biosample_global_field_idx IS NULL AND tier_override IS NULL UNION ALL SELECT study_idx, 'prep-sample-field', idx, display_name, created_by_idx, created_at FROM qiita.prep_sample_study_field WHERE prep_sample_global_field_idx IS NULL AND tier_override IS NULL) SELECT f.study_idx, f.kind, f.idx, f.display_name FROM field f WHERE f.study_idx IN (SELECT study_idx FROM imported) AND NOT EXISTS (SELECT 1 FROM import_run r WHERE r.study_idx = f.study_idx AND r.by_idx = f.created_by_idx AND f.created_at BETWEEN r.from_at AND r.to_at) ORDER BY 1, 2, 4"
   psql "$DATABASE_URL" -tAc "SELECT count(DISTINCT study_idx) FROM qiita.ena_import_batch_item WHERE study_created"
   ```
 
@@ -81,7 +83,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   first. (#864)
 - `20261113000000_output_equivalence` adds `qiita.output_equivalence` and `qiita.output_equivalence_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. `20261116000002_exported_identifier_prep_sample_delete` makes `qiita.exported_identifier.prep_sample_idx` nullable and ON DELETE SET NULL, adds two nullable description columns and a CHECK that every live row names a prep_sample (every existing row does: the column was NOT NULL), and adds a BEFORE DELETE trigger on `qiita.prep_sample`; no row changes. `20261116000003_work_ticket_reap_pending` adds two nullable columns to `qiita.work_ticket` (`reap_pending_since`, `reap_note`) and a CHECK that they are set together; no row changes. `20261116000004_definition_settings_lock` adds `qiita.definition_settings_edit` (empty), the function `qiita.edit_definition_settings`, and BEFORE UPDATE triggers on `qiita.mask_definition`, `qiita.alignment_definition` and `qiita.processing` that refuse a change to a definition's settings outside that function; no row changes. (#874)
 - `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
-- `[operator]` (#feat/default-tier-review) `make migrate` applies `20261118000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
+- `[operator]` (#feat/default-tier-review) `make migrate` applies `20261119000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 
@@ -106,7 +108,7 @@ _None yet._
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
   cd ~/qiita-miint/qiita-control-plane
-  sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261118000000_ena_imported_studies_public.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+  sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261119000000_ena_imported_studies_public.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.study WHERE idx IN (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) AND default_tier <> 'public'"
   ```
 - `[operator]` **Find the failed tickets that still hide a completed gate, check each, and cancel

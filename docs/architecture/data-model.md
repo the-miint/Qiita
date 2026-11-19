@@ -255,7 +255,7 @@ that default unless its migration names another tier.
 
 | Global fields | Tier | Why |
 |---|---|---|
-| collection date; geographic location (country and/or sea, latitude, longitude) | `public` | ENA publishes them with every biosample that carries them, as legacy Qiita and redbiom did, and they are what people search for biosamples by. A study can increase the tier of single values with field exceptions, but not of a global field as a whole: a study-local field linked to a global field carries no `tier_override` (see **Field tier** above). Keeping a study non-public keeps these values from callers with no grant on it, though not from a caller who reads the same biosample through another study. Values that must not be published are coarsened before they are submitted. |
+| collection date; geographic location (country and/or sea, latitude, longitude) | `public` | ENA publishes them with every biosample that carries them, as legacy Qiita and redbiom did, and they are what people search for biosamples by. A study can increase the tier of single values with field exceptions, but not of a global field as a whole: a study-local field linked to a global field carries no `tier_override` (see **Field tier** above). Keeping a study non-public keeps these values from callers with no grant on it, though not from a caller who reads the same biosample through another study. Nothing in Qiita coarsens a value: one that must not be published has to be coarsened by its submitter before it reaches Qiita or ENA. |
 | broad-scale environmental context, local environmental context, environmental medium, and their verbatim twins (`env_broad_scale`, `env_local_scale`, `env_medium`) | `public` | They describe the biosample's environment, not a person, and people search for biosamples by them. |
 | taxon id, host taxon id, depth, qiita sample type | `public` | They name the organism, its host species (such as human, never an individual), and the biosample's depth and kind, and people search for biosamples by them. |
 | prep_sample title, design description | `public` | ENA publishes them with the experiment. |
@@ -267,7 +267,7 @@ that default unless its migration names another tier.
   its record. No route changes it after the study is created.
 - Every study that an ENA import created is `public`, since ENA already
   publishes its data (`repositories.study.get_or_create_study_by_ena_accessions`;
-  `20261118000000_ena_imported_studies_public.sql` set the ones created before
+  `20261119000000_ena_imported_studies_public.sql` set the ones created before
   it). A study that an import only matched by accession keeps its tier.
 - On a `public` study, a purely-local field with no `tier_override` is public
   too, because its field tier falls through to the study's default; only the

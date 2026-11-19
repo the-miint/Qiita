@@ -487,15 +487,13 @@ def study_record_view(
     PUBLIC: no grant on a public-default study, which only that default
     admits the caller to. None: no grant on a study that is not public.
     """
-    if caller.has_role_at_least(bypass_role) or row.owner_idx == caller.principal_idx:
+    if caller.has_role_at_least(bypass_role):
         return StudyRecordView.FULL
-    if row.access_tier is not None:
-        if tier_at_least(row.access_tier, row.default_tier):
-            return StudyRecordView.FULL
-        return StudyRecordView.SUMMARY
-    if row.default_tier is Tier.PUBLIC:
-        return StudyRecordView.PUBLIC
-    return None
+    if row.access_tier is None and row.owner_idx != caller.principal_idx:
+        return StudyRecordView.PUBLIC if row.default_tier is Tier.PUBLIC else None
+    if _access_row_allows(row, caller=caller, min_tier=row.default_tier):
+        return StudyRecordView.FULL
+    return StudyRecordView.SUMMARY
 
 
 def caller_effective_tier(row: CallerStudyAccessRow, *, caller: Principal) -> Tier:

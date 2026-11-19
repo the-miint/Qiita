@@ -180,11 +180,10 @@ class StudySummary(BaseModel):
 
 class StudyPublicSummary(BaseModel):
     """One row of GET /api/v1/study for a study that only its public default
-    admits the caller to, holding what the public view of the record holds
-    (docs/architecture/data-model.md, "What a tier reads of a study's own
-    record"): `export_entity_id` is its handle. `default_tier`, `caller_tier`
-    and `access_via` are always `public` here, and are kept so that every row
-    reads the same way.
+    admits the caller to: the fields of a `StudySummary` row without
+    `study_idx` and `updated_at`, with `export_entity_id` as its handle.
+    `default_tier`, `caller_tier` and `access_via` are always `public` here, and
+    are kept so that every row reads the same way.
 
     Its fields are listed here rather than shared with `StudySummary` through a
     base class, so that a field added for callers with a grant cannot reach it.

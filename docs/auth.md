@@ -377,7 +377,8 @@ reaches it — an owner counts as `admin`; above `public` it also drops public
 studies they hold no grant on and role-only reads), `after_study_idx` (the
 previous page's `next_after_study_idx`) and `limit` (≤ 500). Each row carries the
 caller's `caller_tier`, `access_via` (`owner` / `grant` / `public` / `role`) and
-`record_view`; a row whose `record_view` is `public` carries no `study_idx`. A page can come back shorter than `limit` with a cursor when many
+`record_view`; a row whose `record_view` is `public` carries no `study_idx` or
+`updated_at`. A page can come back shorter than `limit` with a cursor when many
 candidates were filtered out; follow the cursor.
 
 ### Study access (`qiita.study_access`)
