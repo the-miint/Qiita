@@ -160,6 +160,9 @@ has a live download job, and once the sequenced_sample's reads have a `sequence_
 (the download reuses them rather than fetching the new run); retire its prep_sample and
 add the corrected run to a new `sequenced_pool` the same way.
 
+A study that an import creates is `public`, so every signed-in user can list it and
+read its public view; `docs/architecture/data-model.md` ("Default tiers") says why.
+
 An import will only add to a study **an import created**. A study Qiita created
 natively and later deposited to ENA carries a `bioproject_accession` too, so
 importing that accession would otherwise merge ENA-derived samples into curated

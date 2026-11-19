@@ -248,8 +248,6 @@ What such a caller may touch:
 
 ### Default tiers
 
-Each default below is a deliberate choice, and this is where it is stated.
-
 **Global fields.** Every global field is `public`, the column default of both
 global-field tables (`20260501000007_biosample_field.sql`,
 `20260501000010_prep_protocol_prep_sample_field.sql`). A new global field takes
@@ -257,28 +255,26 @@ that default unless its migration names another tier.
 
 | Global fields | Tier | Why |
 |---|---|---|
-| collection date; geographic location (country and/or sea, latitude, longitude) | `public` | ENA requires them of every sample and publishes them, as legacy Qiita and redbiom did, and discovery searches on them. A study that cannot publish its locations or dates stays non-public, coarsens the values at submission, or hides single values with field exceptions. No study can raise a global field's tier for its own values (see **Field tier** above). |
-| broad-scale environmental context, local environmental context, environmental medium, and their verbatim twins (`env_broad_scale`, `env_local_scale`, `env_medium`) | `public` | They describe the sample's environment, not a person, and discovery searches on them. |
-| taxon id, host taxon id, depth, qiita sample type | `public` | As above. |
+| collection date; geographic location (country and/or sea, latitude, longitude) | `public` | ENA publishes them with every biosample that carries them, as legacy Qiita and redbiom did, and they are what people search for biosamples by. A study can increase the tier of single values with field exceptions, but not of a global field as a whole: a study-local field linked to a global field carries no `tier_override` (see **Field tier** above). Keeping a study non-public keeps these values from callers with no grant on it, though not from a caller who reads the same biosample through another study. Values that must not be published are coarsened before they are submitted. |
+| broad-scale environmental context, local environmental context, environmental medium, and their verbatim twins (`env_broad_scale`, `env_local_scale`, `env_medium`) | `public` | They describe the biosample's environment, not a person, and people search for biosamples by them. |
+| taxon id, host taxon id, depth, qiita sample type | `public` | They name the organism, its host species (such as human, never an individual), and the biosample's depth and kind, and people search for biosamples by them. |
 | prep_sample title, design description | `public` | ENA publishes them with the experiment. |
 
 **Studies.**
 
-- `qiita.study.default_tier` defaults to `member`: a study is readable by its
-  owner and the people it is shared with until it is created public. It is set
-  only when the study is created.
-- A study that an ENA import creates is `public`, since ENA already publishes
-  its data (`repositories.study.get_or_create_study_by_ena_accessions`). A study
-  that the import only matched by accession keeps its tier.
-  `20261118000000_ena_imported_studies_public.sql` brought the studies that
-  imports created before then to `public`. It refuses to apply while one holds
-  a biosample or a sequenced_sample that did not come from ENA.
+- `qiita.study.default_tier` defaults to `member`: unless a study was created
+  public, only its owner, the people it is shared with, and wet_lab_admin+ read
+  its record. No route changes it after the study is created.
+- Every study that an ENA import created is `public`, since ENA already
+  publishes its data (`repositories.study.get_or_create_study_by_ena_accessions`;
+  `20261118000000_ena_imported_studies_public.sql` set the ones created before
+  it). A study that an import only matched by accession keeps its tier.
 - On a `public` study, a purely-local field with no `tier_override` is public
   too, because its field tier falls through to the study's default; only the
-  owner-biosample-id floor still applies. Making a study public therefore
-  publishes its untiered local fields. On an ENA-imported study those include
-  the `ena library *` fields and the unmapped ENA attributes, which ENA
-  publishes already.
+  owner-biosample-id floor and field exceptions still apply. Making a study
+  public therefore publishes its untiered local fields. On an ENA-imported
+  study those include the `ena library *` fields and the unmapped ENA
+  attributes, which ENA publishes already.
 
 ### What a tier reads of a study's own record
 
@@ -296,15 +292,16 @@ study's record has three views:
 |---|---|---|
 | **full** | wet_lab_admin+ by role; the owner; a grant at or above the study's `default_tier` | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
 | **summary** | any other grant: a tier below `default_tier` | `study_idx`, `export_entity_id`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
-| **public** | no grant on a `public`-default study, which only its default admits the caller to | `export_entity_id`, title, alias, description, abstract, funding, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
+| **public** | no grant on a `public`-default study, which only its default admits the caller to | `export_entity_id`, title, alias, description, abstract, funding, `bioproject_accession`, `ena_study_accession`, `default_tier` |
 
 Anyone else gets nothing (403). The summary is what lets someone a study was
 shared with find it and recognise it, without the fields its tier does not
 reach. The public view is what a reader outside the study sees of a public
 study: what describes it, without its internal idxs, notes, extra metadata or
-submission state. Its `GET /api/v1/study` row carries no `study_idx` either;
-`export_entity_id` is the handle. Two routes still return a `study_idx` to such
-a caller: the listing's cursor, `next_after_study_idx`, and
+submission state. It also leaves out `updated_at`, which moves when a field it
+leaves out changes. Its `GET /api/v1/study` row carries neither `study_idx` nor
+`updated_at`; `export_entity_id` is the handle. Two places still return a
+`study_idx` to such a caller: the listing's cursor, `next_after_study_idx`, and
 `POST /api/v1/study/lookup`.
 
 Search follows the same line: a summary reader's `q` matches only the summary

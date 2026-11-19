@@ -3,11 +3,11 @@
 - **A study that only its public default lets a caller read now shows them a public view (#feat/default-tier-review).**
   - A caller with no grant on a `public`-default study, who is not its owner and has no
     wet-lab admin role, gets `view: "public"` from `GET /api/v1/study/{study_idx}`. That view
-    carries the QS id (`export_entity_id`), title, alias, description, abstract, funding,
-    accessions, `default_tier` and `updated_at`. It leaves out the notes, `extra_metadata`, the
-    submission state, `created_at`, and the owner, PI and creator idxs, and it has no `ETag`.
-  - In `GET /api/v1/study`, that study's row has `record_view: "public"` and no `study_idx`, and
-    `q` finds it only by words in the public view's fields.
+    carries the `export_entity_id`, title, alias, description, abstract, funding, the two
+    accessions and `default_tier`. It leaves out `study_idx` and the owner, PI and creator idxs,
+    the notes, `extra_metadata`, the submission state and both timestamps, and it has no `ETag`.
+  - In `GET /api/v1/study`, that study's row has `record_view: "public"` and neither `study_idx`
+    nor `updated_at`, and `q` finds it only by words in the public view's fields.
   - The owner, anyone with a grant at or above the study's `default_tier`, and wet-lab admins
     still read the full record.
 - **Studies that an ENA import creates are public (#feat/default-tier-review).**
