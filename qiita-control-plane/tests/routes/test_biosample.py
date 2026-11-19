@@ -2991,10 +2991,10 @@ async def test_lookup_by_accession_rejects_invalid_accession_field_422(ctx):
 # ---------------------------------------------------------------------------
 # Mirrors the accession variant; the auth surface, dedup/missing semantics,
 # and retired-row exclusion are shared with lookup_biosample_by_accession
-# via resolve_idxs_by_natural_key in routes/_helpers.py. The tests below
-# cover the per-key wire surface (route exists, format validator fires on
-# bad input). The shared behavior (auth tiers, dedup, retired-row
-# exclusion) is exercised once on the accession surface above.
+# via resolve_natural_keys in routes/_helpers.py. The tests below cover the
+# per-key wire surface (route exists, format validator fires on bad input).
+# The shared behavior (auth tiers, dedup, retired-row exclusion) is exercised
+# once on the accession surface above.
 
 
 async def _seed_biosample_with_matrix_tube_id(ctx, *, matrix_tube_id: str, owner_idx: int) -> int:
@@ -3058,7 +3058,8 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
 # deprecated lookup routes' tests ends when those routes are removed
 async def test_lookup_biosample_resolves_by_export_entity_id(ctx):
     """Tests the case where the body keys on export_entity_id: a biosample's
-    minted id resolves to its idx and an unknown id lands in `missing`."""
+    minted id resolves to that same id (the default return_key), and an unknown
+    id lands in `missing`."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     biosample_idx = await _seed_biosample_with_accession(
         ctx, accession=unique_accession("LOOKUP-EXP"), owner_idx=owner_idx
@@ -3073,12 +3074,29 @@ async def test_lookup_biosample_resolves_by_export_entity_id(ctx):
         json={"key": "export_entity_id", "values": [export_id, unknown_id]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"resolved": {export_id: biosample_idx}, "missing": [unknown_id]}
+    assert resp.json() == {"resolved": {export_id: export_id}, "missing": [unknown_id]}
+
+
+# same-pattern-ok: per-entity twin of the POST /study/lookup tests
+async def test_lookup_biosample_returns_idx_when_asked(ctx):
+    """Tests the case where the body sets return_key to idx: a seeded accession
+    resolves to the biosample's idx instead of its export_entity_id."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    acc = unique_accession("LOOKUP-IDX")
+    biosample_idx = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP,
+        json={"key": "biosample_accession", "values": [acc], "return_key": "idx"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {acc: biosample_idx}, "missing": []}
 
 
 async def test_lookup_biosample_resolves_by_matrix_tube_id_excluding_retired(ctx):
     """Tests the case where the body keys on matrix_tube_id: a live biosample's
-    tube resolves, and a retired biosample's tube lands in `missing`."""
+    tube resolves to its export_entity_id, and a retired biosample's tube lands
+    in `missing`."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     live_tube = unique_matrix_tube_id()
     retired_tube = unique_matrix_tube_id()
@@ -3095,7 +3113,10 @@ async def test_lookup_biosample_resolves_by_matrix_tube_id_excluding_retired(ctx
         json={"key": "matrix_tube_id", "values": [live_tube, retired_tube]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"resolved": {live_tube: live_idx}, "missing": [retired_tube]}
+    live_export_id = await fetch_export_entity_id(
+        ctx["pool"], kind="biosample", entity_idx=live_idx
+    )
+    assert resp.json() == {"resolved": {live_tube: live_export_id}, "missing": [retired_tube]}
 
 
 # same-pattern-ok: per-entity twin of the POST /study/lookup tests; the overlap with the
@@ -3107,14 +3128,15 @@ async def test_lookup_biosample_resolves_by_matrix_tube_id_excluding_retired(ctx
         {"key": "owner_idx", "values": ["SAMN00000001"]},
         {"key": "biosample_accession", "values": []},
         {"key": "matrix_tube_id", "values": ["abc"]},
+        {"key": "biosample_accession", "values": ["SAMN00000001"], "return_key": "biosample_idx"},
     ],
-    ids=["key-absent", "key-invalid", "values-empty", "tube-malformed"],
+    ids=["key-absent", "key-invalid", "values-empty", "tube-malformed", "return-key-invalid"],
 )
 async def test_lookup_biosample_rejects_bad_body_422(ctx, body):
     """Tests the case where the body omits `key`, names a key outside
-    BiosampleLookupKey, carries no values, or carries a malformed tube id under
-    matrix_tube_id: the request model rejects it with 422 before any DB work
-    runs."""
+    BiosampleLookupKey, carries no values, carries a malformed tube id under
+    matrix_tube_id, or names a return_key outside LookupReturnKey: the request
+    model rejects it with 422 before any DB work runs."""
     resp = await ctx["wet"].post(URL_BIOSAMPLE_LOOKUP, json=body)
     assert resp.status_code == 422
 

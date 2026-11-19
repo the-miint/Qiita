@@ -59,6 +59,10 @@ PrepSampleCohort = Annotated[
 # Upper bound on the values one natural-key lookup request may resolve.
 MAX_NATURAL_KEY_LOOKUP_VALUES = 10_000
 
+# The identifier that a lookup returns for each resolved value. The route fixes the
+# entity, so this names only the kind of identifier.
+LookupReturnKey = Literal["export_entity_id", "idx"]
+
 
 def _strip_text(value: Any) -> Any:
     """Strip outer whitespace from text, passing anything else through so the
@@ -474,12 +478,28 @@ class PatchRequestModel(BaseModel):
         return self
 
 
-class NaturalKeyLookupResponse(BaseModel):
-    """`resolved` maps each found natural-key value to its idx. `missing` lists
-    the values that did not resolve, in input order (deduped).
+class NaturalKeyLookupRequest(BaseModel):
+    """A lookup of many values in one round trip; each subclass adds the `key`
+    naming what the values are.
+
+    `return_key` names the identifier that each resolved value maps to: the entity's
+    `export_entity_id` by default, or its idx.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
+    return_key: LookupReturnKey = "export_entity_id"
+
+
+class NaturalKeyLookupResponse(BaseModel):
+    """`resolved` maps each found natural-key value, once, to the identifier
+    that the route returns for it: an `export_entity_id` (a string) or an idx
+    (an int). The order of `resolved` is not defined.
+    `missing` lists the values that did not resolve, once each, in input order.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)] | str]
     missing: list[str]

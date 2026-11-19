@@ -1,11 +1,18 @@
 """Reads of `qiita.exported_entity`."""
 
-from collections.abc import Mapping
-from typing import Any, Literal, get_args
+from collections.abc import Mapping, Sequence
+from enum import StrEnum
+from typing import Any
 
 import asyncpg
 
-EntityKind = Literal["study", "biosample"]
+
+class EntityKind(StrEnum):
+    """The kinds of entity that hold an export_entity_id."""
+
+    STUDY = "study"
+    BIOSAMPLE = "biosample"
+
 
 # Every caller-visible column, both kinds in one pass. Study entries come first
 # ascending, then biosample entries ascending: `study_idx IS NULL` is false on a
@@ -42,7 +49,7 @@ def entity_idx_column(kind: EntityKind) -> str:
     `kind` is also the entity's table name; both reach SQL text, so a value outside
     EntityKind is refused.
     """
-    if kind not in get_args(EntityKind):
+    if kind not in tuple(EntityKind):
         raise ValueError(f"invalid entity kind: {kind!r}")
     column = f"{kind}_idx"
     return column
@@ -97,15 +104,38 @@ async def fetch_exported_entities(
 
     Raises `MissingExportedEntityError` rather than returning a short list.
     """
-    requested = {"study": study_idx, "biosample": biosample_idx}
+    requested = {EntityKind.STUDY: study_idx, EntityKind.BIOSAMPLE: biosample_idx}
     rows = await pool.fetch(_SELECT, study_idx, biosample_idx)
 
     # Per kind, so a gap names the entities it is actually about. A row of the
     # other kind carries NULL in this kind's column, so it matches nothing here.
-    for kind in get_args(EntityKind):
+    for kind in EntityKind:
         column = entity_idx_column(kind)
         returned = {row[column] for row in rows}
         missing = sorted(idx for idx in set(requested[kind]) if idx not in returned)
         if missing:
             raise MissingExportedEntityError(missing, kind=kind)
     return rows
+
+
+async def fetch_export_entity_ids_by_idx(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    kind: EntityKind,
+    idxs: Sequence[int],
+) -> dict[int, str]:
+    """Return `{idx: export_entity_id}` for every `kind` entity in `idxs`.
+
+    Raises `MissingExportedEntityError`, as `fetch_exported_entities` does,
+    rather than leaving an idx out.
+    """
+    # Refuse a kind outside EntityKind before the query runs
+    column = entity_idx_column(kind)
+    unique_idxs = sorted(set(idxs))
+    rows = await fetch_exported_entities(
+        pool,
+        study_idx=unique_idxs if kind == EntityKind.STUDY else [],
+        biosample_idx=unique_idxs if kind == EntityKind.BIOSAMPLE else [],
+    )
+    export_id_by_idx = {row[column]: row["export_entity_id"] for row in rows}
+    return export_id_by_idx

@@ -42,6 +42,7 @@ from qiita_control_plane.routes._helpers import (
     parse_kv_detail,
     raise_for_transient_write_race,
     raise_http_for_sample_metadata_write_error,
+    resolve_natural_keys,
 )
 from qiita_control_plane.testing.db_seeds import fetch_seeded_metagenome_term
 
@@ -462,6 +463,22 @@ async def test_detail_for_slot_occupied_by_typed_value_local_path(conn, entity_k
     assert f"field {_DISPLAY_NAME!r}" in detail
     assert f"{entity_kind}_study_field_idx={_STUDY_FIELD_IDX}" in detail
     assert "global_field_idx" not in detail
+
+
+# ---------------------------------------------------------------------------
+# resolve_natural_keys
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_natural_keys_export_ids_need_a_source():
+    """Tests the case where export ids are asked for with no connection and
+    kind to read them from: the helper raises rather than returning idxs."""
+
+    async def _fetch(*, values: list[str]) -> dict[str, int]:
+        return dict.fromkeys(values, 1)
+
+    with pytest.raises(ValueError, match="export_ids_from"):
+        await resolve_natural_keys(values=["a"], fetcher=_fetch, return_key="export_entity_id")
 
 
 # ---------------------------------------------------------------------------

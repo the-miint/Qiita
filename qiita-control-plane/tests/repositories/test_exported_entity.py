@@ -3,10 +3,12 @@
 import pytest
 
 from qiita_control_plane.repositories.exported_entity import (
+    EntityKind,
     MissingExportedEntityError,
     entity_idx_column,
     export_entity_id_lookup,
     export_entity_id_select,
+    fetch_export_entity_ids_by_idx,
     fetch_exported_entities,
     require_export_entity_id,
 )
@@ -126,6 +128,39 @@ async def test_fetch_exported_entities_raise_missing(postgres_pool, probe, kind)
     actual = {"missing": caught.value.missing, "kind": caught.value.kind}
     expected = {"missing": [_ABSENT_IDX], "kind": kind}
     assert actual == expected
+
+
+@pytest.mark.parametrize("kind", list(EntityKind))
+async def test_fetch_export_entity_ids_by_idx(postgres_pool, probe, kind):
+    """Tests the case where the idxs name entities of one kind, one of them
+    twice: each idx maps to its own export_entity_id, once."""
+    idxs = probe["study_idxs"] if kind == "study" else [probe["biosample_idx"]]
+
+    actual = await fetch_export_entity_ids_by_idx(postgres_pool, kind=kind, idxs=[*idxs, idxs[0]])
+
+    expected = {
+        idx: await fetch_export_entity_id(postgres_pool, kind=kind, entity_idx=idx) for idx in idxs
+    }
+    assert actual == expected
+
+
+@pytest.mark.parametrize("kind", list(EntityKind))
+async def test_fetch_export_entity_ids_by_idx_raise_missing(postgres_pool, kind):
+    """Tests the case where an idx names no entity of `kind`: the fetch raises,
+    naming that idx and kind, rather than leaving the idx out."""
+    with pytest.raises(MissingExportedEntityError) as caught:
+        await fetch_export_entity_ids_by_idx(postgres_pool, kind=kind, idxs=[_ABSENT_IDX])
+
+    actual = {"missing": caught.value.missing, "kind": caught.value.kind}
+    expected = {"missing": [_ABSENT_IDX], "kind": kind}
+    assert actual == expected
+
+
+async def test_fetch_export_entity_ids_by_idx_empty(postgres_pool):
+    """Tests the case where no idxs are given: the result is empty."""
+    actual = await fetch_export_entity_ids_by_idx(postgres_pool, kind="study", idxs=[])
+
+    assert actual == {}
 
 
 def test_require_export_entity_id():

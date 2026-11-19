@@ -1,5 +1,6 @@
 """Tests for shared Pydantic models."""
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -20,15 +21,25 @@ from qiita_common.models import (
     StudyLookupRequest,
     TerminologyManifestFile,
 )
-from qiita_common.models._base import MAX_NATURAL_KEY_LOOKUP_VALUES
+from qiita_common.models._base import MAX_NATURAL_KEY_LOOKUP_VALUES, NaturalKeyLookupResponse
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 # Each natural-key lookup request model, as (model, its fixed body fields, its
 # list field, and a builder for the i-th distinct valid value).
 _LOOKUP_REQUEST_CAP_CASES = [
-    (StudyLookupRequest, {"key": "bioproject_accession"}, "values", lambda i: f"PRJ{i}"),
-    (BiosampleLookupRequest, {"key": "matrix_tube_id"}, "values", lambda i: f"{i:010d}"),
+    (
+        StudyLookupRequest,
+        {"key": "bioproject_accession", "return_key": "export_entity_id"},
+        "values",
+        lambda i: f"PRJ{i}",
+    ),
+    (
+        BiosampleLookupRequest,
+        {"key": "matrix_tube_id", "return_key": "export_entity_id"},
+        "values",
+        lambda i: f"{i:010d}",
+    ),
     (
         StudyLookupByAccessionRequest,
         {"accession_field": "bioproject_accession"},
@@ -1807,6 +1818,65 @@ def test_max_natural_key_lookup_values_bounds_lookup_requests(
     over_cap_body = {**fixed_fields, list_field: [*at_cap, make_value(len(at_cap))]}
     with pytest.raises(ValidationError):
         model.model_validate(over_cap_body)
+
+
+@pytest.mark.parametrize(
+    ("model", "key"),
+    [(StudyLookupRequest, "bioproject_accession"), (BiosampleLookupRequest, "biosample_accession")],
+    ids=["study", "biosample"],
+)
+def test_natural_key_lookup_request_return_key_defaults_to_export_entity_id(model, key):
+    """Tests the case where a lookup request names no return_key: it asks for
+    the export_entity_id, and an explicit idx is kept as sent."""
+    defaulted = model.model_validate({"key": key, "values": ["X1"]})
+    explicit = model.model_validate({"key": key, "values": ["X1"], "return_key": "idx"})
+
+    expected = (
+        {"key": key, "values": ["X1"], "return_key": "export_entity_id"},
+        {"key": key, "values": ["X1"], "return_key": "idx"},
+    )
+    assert (defaulted.model_dump(), explicit.model_dump()) == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "key", "return_key"),
+    [
+        (StudyLookupRequest, "bioproject_accession", "study_idx"),
+        (BiosampleLookupRequest, "biosample_accession", "biosample_idx"),
+    ],
+    ids=["study", "biosample"],
+)
+def test_natural_key_lookup_request_refuses_entity_named_return_key(model, key, return_key):
+    """Tests the case where return_key names the entity's own idx column rather
+    than the shared `idx`: the request is refused, since the route already fixes
+    the entity."""
+    with pytest.raises(ValidationError):
+        model.model_validate({"key": key, "values": ["X1"], "return_key": return_key})
+
+
+@pytest.mark.parametrize("from_json", [False, True], ids=["python", "json"])
+def test_natural_key_lookup_response_keeps_each_value_type(from_json):
+    """Tests the case where `resolved` carries an idx, an export_entity_id, and an
+    export_entity_id made only of digits: each keeps the type it was sent with,
+    so a numeric-looking string is not read as an idx."""
+    body = {"resolved": {"a": 7, "b": "QB1", "c": "5"}, "missing": []}
+
+    response = (
+        NaturalKeyLookupResponse.model_validate_json(json.dumps(body))
+        if from_json
+        else NaturalKeyLookupResponse.model_validate(body)
+    )
+
+    types = {value: type(identifier) for value, identifier in response.resolved.items()}
+    assert (response.model_dump(), types) == (body, {"a": int, "b": str, "c": str})
+
+
+@pytest.mark.parametrize("idx", [0, -1], ids=["zero", "negative"])
+def test_natural_key_lookup_response_refuses_non_positive_idx(idx):
+    """Tests the case where `resolved` carries an int that is not a valid idx:
+    it is refused rather than accepted as some other identifier."""
+    with pytest.raises(ValidationError):
+        NaturalKeyLookupResponse.model_validate({"resolved": {"a": idx}, "missing": []})
 
 
 def test_biosample_lookup_request_names_malformed_tube_ids():

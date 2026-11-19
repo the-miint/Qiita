@@ -591,7 +591,9 @@ def resolve_study_idx(
     if not args.study_export_id.strip():
         parser.error(f"{STUDY_EXPORT_ID_FLAG}: must not be blank")
     # The request strips the id, so the response is keyed on the stripped form.
-    lookup_request = StudyLookupRequest(key="export_entity_id", values=[args.study_export_id])
+    lookup_request = StudyLookupRequest(
+        key="export_entity_id", values=[args.study_export_id], return_key="idx"
+    )
     export_id = lookup_request.values[0]
     lookup = lookup_natural_keys(
         base_url, token, f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP}", lookup_request

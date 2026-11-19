@@ -1042,7 +1042,7 @@ def test_biosample_link_by_study_export_id(monkeypatch, capsys):
         (
             "POST",
             f"https://q.example.test{URL_STUDY_LOOKUP}",
-            {"key": "export_entity_id", "values": ["QS7"]},
+            {"key": "export_entity_id", "values": ["QS7"], "return_key": "idx"},
         ),
         ("POST", f"https://q.example.test{link_url}", None),
     ]

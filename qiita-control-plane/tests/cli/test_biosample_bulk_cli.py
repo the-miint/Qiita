@@ -230,7 +230,11 @@ def test__handle_biosample_bulk_create_by_study_export_id(monkeypatch, tmp_path,
 
     calls = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
     expected_calls = [
-        ("POST", _BASE + URL_STUDY_LOOKUP, {"key": "export_entity_id", "values": ["QS7"]}),
+        (
+            "POST",
+            _BASE + URL_STUDY_LOOKUP,
+            {"key": "export_entity_id", "values": ["QS7"], "return_key": "idx"},
+        ),
         ("GET", _BASE + URL_AUTH_WHOAMI, None),
         ("POST", _BASE + _BULK_URL, {"rows": _expected_rows(42)}),
     ]

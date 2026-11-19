@@ -54,7 +54,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories.exported_entity import require_export_entity_id
+from ..repositories.exported_entity import EntityKind, require_export_entity_id
 from ..repositories.study import (
     create_study,
     fetch_study,
@@ -69,7 +69,7 @@ from ._helpers import (
     raise_for_unique_violation,
     require_etag_match,
     require_if_match,
-    resolve_idxs_by_natural_key,
+    resolve_natural_keys,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
@@ -476,21 +476,26 @@ async def lookup_study(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> NaturalKeyLookupResponse:
-    """Resolve a list of values of the natural key named by `body.key` to
-    study_idx.
+    """Resolve a list of values of the natural key named by `body.key` to each
+    study's identifier named by `body.return_key`.
 
-    Auth: HumanUser with Scope.STUDY_READ. The response is only the
-    (value, idx) mapping — no study columns — so resolution does not itself
+    Auth: HumanUser with Scope.STUDY_READ. The response is only the mapping
+    from value to identifier — no study columns — so resolution does not itself
     disclose row contents; reading a row still requires the per-row access
     policy on GET /study/{idx}.
     """
     # `user` is resolved only to require a human caller; no per-caller filter
     # runs here (see auth docstring).
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
-        values=body.values,
-        fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.key),
-    )
+    # One read-only snapshot, so the export ids read the same rows that the lookup read
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
+            # handler twin of lookup_biosample; differs only in fetcher and kind
+            values=body.values,
+            fetcher=partial(fetch_study_idxs_by_natural_key, conn, key=body.key),
+            export_ids_from=(conn, EntityKind.STUDY),
+            return_key=body.return_key,
+        )
     return lookup_response
 
 
@@ -505,8 +510,9 @@ async def lookup_study_by_accession(
     on the accession column named by `body.accession_field` (default
     bioproject_accession)."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.accession_field),
+        return_key="idx",
     )
     return lookup_response

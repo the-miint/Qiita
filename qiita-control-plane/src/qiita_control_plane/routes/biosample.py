@@ -120,7 +120,11 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
-from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
+from ..repositories.exported_entity import (
+    EntityKind,
+    fetch_exported_entities,
+    require_export_entity_id,
+)
 from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._field_exception import (
@@ -152,8 +156,8 @@ from ._helpers import (
     require_etag_match,
     require_if_match,
     resolve_and_write_study_scoped_metadata,
-    resolve_idxs_by_natural_key,
     resolve_metadata_checklist_idx,
+    resolve_natural_keys,
     resolve_study_entity_by_unique_field,
 )
 
@@ -1476,13 +1480,13 @@ async def lookup_biosample(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> NaturalKeyLookupResponse:
-    """Resolve a list of values of the natural key named by `body.key` to
-    biosample_idx.
+    """Resolve a list of values of the natural key named by `body.key` to each
+    biosample's identifier named by `body.return_key`.
 
     Auth: HumanUser with Scope.BIOSAMPLE_READ. No per-row access predicate
-    runs — the response carries only the (value, idx) mapping with no
-    biosample columns, so a caller who sees the idx still cannot read the
-    row without satisfying GET /biosample/{idx}'s tier+access checks.
+    runs — the response carries only the mapping from value to identifier,
+    with no biosample columns, so a caller still cannot read the row without
+    satisfying GET /biosample/{idx}'s tier+access checks.
 
     Retired biosamples are excluded from `resolved` (and therefore listed
     in `missing`).
@@ -1490,10 +1494,15 @@ async def lookup_biosample(
     # `user` is resolved only to require a human caller; no per-caller filter
     # runs here (see auth docstring).
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
-        values=body.values,
-        fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.key),
-    )
+    # One read-only snapshot, so the export ids read the same rows that the lookup read
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
+            # handler twin of lookup_study; differs only in fetcher and kind
+            values=body.values,
+            fetcher=partial(fetch_biosample_idxs_by_natural_key, conn, key=body.key),
+            export_ids_from=(conn, EntityKind.BIOSAMPLE),
+            return_key=body.return_key,
+        )
     return lookup_response
 
 
@@ -1508,9 +1517,10 @@ async def lookup_biosample_by_accession(
     keyed on the accession column named by `body.accession_field` (default
     biosample_accession)."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.accession_field),
+        return_key="idx",
     )
     return lookup_response
 
@@ -1524,9 +1534,10 @@ async def lookup_biosample_by_matrix_tube_id(
 ) -> NaturalKeyLookupResponse:
     """Deprecated in favor of POST /biosample/lookup with key matrix_tube_id."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.matrix_tube_ids,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key="matrix_tube_id"),
+        return_key="idx",
     )
     return lookup_response
 

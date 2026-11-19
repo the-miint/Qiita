@@ -196,7 +196,7 @@ from ._helpers import (
     deprecated_upstream_read,
     load_groups_as_of,
     require_known_decision_set,
-    resolve_idxs_by_natural_key,
+    resolve_natural_keys,
 )
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
@@ -1551,8 +1551,9 @@ async def lookup_run_by_instrument_run_id(
     # user is read only to keep the dependency chain explicit — no
     # per-caller filter runs here (see auth docstring).
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.instrument_run_ids,
         fetcher=partial(fetch_sequencing_run_idxs_by_instrument_run_id, pool),
+        return_key="idx",
     )
     return lookup_response

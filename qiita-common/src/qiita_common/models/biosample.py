@@ -24,6 +24,7 @@ from qiita_common.models._base import (
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
+    NaturalKeyLookupRequest,
     NaturalKeyLookupResponse,
     NonBlankName,
     NonBlankText,
@@ -660,17 +661,13 @@ BiosampleLookupKey = Literal[
 ]
 
 
-# same-pattern-ok: per-entity key set; parallels StudyLookupRequest
-class BiosampleLookupRequest(BaseModel):
-    """Resolves a list of values of the natural key named by `key` to
-    biosample_idxs in one round trip. Under `matrix_tube_id`, every value must
-    match MATRIX_TUBE_ID_PATTERN.
+class BiosampleLookupRequest(NaturalKeyLookupRequest):
+    """Resolves a list of values of the biosample natural key named by `key`,
+    each to the biosample identifier that `return_key` names. Under
+    `matrix_tube_id`, every value must match MATRIX_TUBE_ID_PATTERN.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     key: BiosampleLookupKey
-    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
 
     @model_validator(mode="after")
     def _check_matrix_tube_ids(self) -> BiosampleLookupRequest:
@@ -720,15 +717,12 @@ StudyAccessionField = Literal["ena_study_accession", "bioproject_accession"]
 StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
 
 
-class StudyLookupRequest(BaseModel):
-    """Resolves a list of values of the natural key named by `key` to
-    study_idxs in one round trip.
+class StudyLookupRequest(NaturalKeyLookupRequest):
+    """Resolves a list of values of the study natural key named by `key`, each
+    to the study identifier that `return_key` names.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     key: StudyLookupKey
-    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
 
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest

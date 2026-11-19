@@ -22,6 +22,7 @@ from qiita_common.models import (
     DeprecatedUpstream,
     DeprecationRefusal,
     IdxsListResponse,
+    LookupReturnKey,
     MaskDefinitionStatus,
     MetadataEntry,
     MetadataFieldWriteResult,
@@ -104,6 +105,7 @@ from ..repositories.alignment_definition import (
     fetch_alignment_definition_by_idx,
 )
 from ..repositories.block import list_incomplete_alignment_samples
+from ..repositories.exported_entity import EntityKind, fetch_export_entity_ids_by_idx
 from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
 from ..repositories.study_access import CallerMetadataTiers
 
@@ -1959,17 +1961,24 @@ def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
     )
 
 
-async def resolve_idxs_by_natural_key(
+async def resolve_natural_keys(
     *,
     values: list[str],
     fetcher: Callable[..., Awaitable[dict[str, int]]],
+    return_key: LookupReturnKey,
+    export_ids_from: tuple[asyncpg.Pool | asyncpg.Connection, EntityKind] | None = None,
 ) -> NaturalKeyLookupResponse:
     """Dedup `values` in input order and resolve survivors via
     `fetcher(values=...)`.
 
-    The caller supplies `fetcher` already bound to its pool and any per-key
-    SQL details so this helper stays table-agnostic. `missing` is the
-    input-order deduped list of values that did not resolve.
+    The caller supplies `fetcher` already bound to its pool or connection and
+    any per-key SQL details so this helper stays table-agnostic. `missing` is
+    the input-order deduped list of values that did not resolve.
+
+    `return_key` names what each resolved value maps to. Under
+    `export_entity_id`, `export_ids_from` must give a pool or connection and the
+    kind of entity that `fetcher` returns idxs of, and each idx is replaced by
+    that entity's `export_entity_id`.
     """
     # Dedup while preserving input order so `missing` is deterministic.
     dedup_ordered: list[str] = []
@@ -1980,8 +1989,20 @@ async def resolve_idxs_by_natural_key(
         seen.add(v)
         dedup_ordered.append(v)
 
-    resolved = await fetcher(values=dedup_ordered)
-    missing = [v for v in dedup_ordered if v not in resolved]
+    resolved_idxs = await fetcher(values=dedup_ordered)
+    missing = [v for v in dedup_ordered if v not in resolved_idxs]
+
+    # Swap each idx for its export_entity_id in one read of the resolved idxs
+    resolved: dict[str, int | str] = dict(resolved_idxs)
+    if return_key == "export_entity_id":
+        if export_ids_from is None:
+            raise ValueError("return_key export_entity_id needs export_ids_from")
+        conn, kind = export_ids_from
+        export_id_by_idx = await fetch_export_entity_ids_by_idx(
+            conn, kind=kind, idxs=list(resolved_idxs.values())
+        )
+        resolved = {value: export_id_by_idx[idx] for value, idx in resolved_idxs.items()}
+
     lookup_response = NaturalKeyLookupResponse(resolved=resolved, missing=missing)
     return lookup_response
 
