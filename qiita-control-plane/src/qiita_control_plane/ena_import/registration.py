@@ -352,9 +352,8 @@ async def register_ena_study(
         # is written -- but only when a run will be written: a pure re-import
         # of already-present runs adds no values and so mints no fields. Ahead
         # of pool resolution too, so a field-shape clash mints nothing at all.
-        # Given a pool, outside the transaction below: the field rows are
-        # per-study constants that survive a failed attempt (see
-        # _ensure_library_fields).
+        # On a pool connection (no caller transaction) the field rows commit on
+        # their own and survive a failed attempt (see _ensure_library_fields).
         library_field_idxs: dict[str, int] = {}
         implied_host_by_taxon: dict[str, str | None] = {}
         loaded_term_ids: frozenset[str] = frozenset()
@@ -562,8 +561,8 @@ async def _ensure_library_fields(
     unique within the study, or globally linked -- fail the whole study loudly
     before the first run, instead of rolling runs back one by one mid-loop:
     the run's own data is fine, only the slot is wrong, so the run must not
-    pay for it. Given a pool-acquired connection, the field rows are per-study
-    constants and survive a later failure; a retry re-resolves them identically.
+    pay for it. If the caller's connection holds no transaction the field rows
+    commit here and survive a later failure; inside one they roll back with it.
     """
     field_idxs: dict[str, int] = {}
     async with conn.transaction():
