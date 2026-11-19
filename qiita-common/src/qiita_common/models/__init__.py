@@ -35,6 +35,7 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models._base import (
+    MAX_COHORT_PREP_SAMPLE_IDX,
     AccessionText,
     BlockScopeTarget,
     ComputeTarget,
@@ -229,6 +230,7 @@ from qiita_common.models.prep_sample_qc_check import (
     QcVerdict,
 )
 from qiita_common.models.processing import (
+    AmpliconSampleState,
     AssemblyExportRosterResponse,
     AssemblySampleState,
     AssemblySampleStatusUpdate,
@@ -509,6 +511,7 @@ __all__ = [
     "date",
     "field_validator",
     "model_validator",
+    "MAX_COHORT_PREP_SAMPLE_IDX",
     "MAX_NAME_LENGTH",
     "MAX_TABLE_NAME_LENGTH",
     "MAX_VERSION_LENGTH",
@@ -898,6 +901,7 @@ __all__ = [
     "MaskStateSource",
     # Processing-run identity and its lifecycle (the assembly twin of the mask
     # lifecycle names above).
+    "AmpliconSampleState",
     "AssemblyExportRosterResponse",
     "AssemblySampleState",
     "AssemblySampleStatusUpdate",
