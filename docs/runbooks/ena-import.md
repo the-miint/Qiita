@@ -168,6 +168,23 @@ anything is written. Deleting a batch (which cascades its items) discards the re
 that the import created the study, so a later re-import of that accession is refused
 as well.
 
+An item that creates its study registers it in the same transaction, so when its
+registration fails, or every run fails or none maps to a pool, nothing is committed: the
+study, its owner grant and its pools are gone, and the item is `failed` with no
+`study_idx`. Re-importing creates the study afresh, under a new idx and `QS` handle. The
+rolled-back ones leave gaps in both numberings. Concurrent imports of one accession take
+turns: the second waits for the first to commit or roll back. Studies left empty by a
+failed first import before this change stay until a re-import succeeds into them. List
+them with:
+
+```sql
+SELECT s.idx, s.bioproject_accession, i.idx AS item_idx
+FROM qiita.study s
+JOIN qiita.ena_import_batch_item i ON i.study_idx = s.idx AND i.study_created
+WHERE NOT EXISTS (SELECT 1 FROM qiita.biosample_to_study WHERE study_idx = s.idx)
+  AND NOT EXISTS (SELECT 1 FROM qiita.prep_sample_to_study WHERE study_idx = s.idx);
+```
+
 A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
 is reused, and is still subject to the import-created guard above. If the pair
 identifies two different studies, or contradicts the accession the one study it
