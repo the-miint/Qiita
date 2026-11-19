@@ -1315,6 +1315,34 @@ async def test_fetch_biosample_idxs_for_study_respects_limit(ctx):
     assert result == [bs_idxs[2], bs_idxs[1]]
 
 
+async def test_fetch_biosample_idxs_for_study_among_idxs(ctx):
+    """Tests the case where among_idxs names a live linked biosample, a retired
+    biosample with a live link, a biosample whose link is retired, and one
+    never linked: only the live linked one comes back."""
+    live_idx = await _create_biosample_with_link(ctx)
+    retired_bs_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample(
+        ctx["pool"], biosample_idx=retired_bs_idx, retired_by_idx=ctx["principal_idx"]
+    )
+    retired_link_idx = await _create_biosample_with_link(ctx)
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=retired_link_idx,
+        study_idx=ctx["study_idx"],
+        retired_by_idx=ctx["principal_idx"],
+    )
+    unlinked_idx = await _create_biosample(ctx)
+    # A second live linked biosample, left out of among_idxs
+    await _create_biosample_with_link(ctx)
+    among = [live_idx, retired_bs_idx, retired_link_idx, unlinked_idx]
+
+    result = await fetch_biosample_idxs_for_study(
+        ctx["pool"], study_idx=ctx["study_idx"], limit=len(among), among_idxs=among
+    )
+
+    assert result == [live_idx]
+
+
 # ---------------------------------------------------------------------------
 # fetch_study_idxs_by_biosample_idx / fetch_active_study_idxs_by_biosample_idx
 # ---------------------------------------------------------------------------
@@ -2124,6 +2152,28 @@ async def test_fetch_biosample_idxs_by_natural_key_export_entity_id_excludes_ret
         ctx["pool"], key="export_entity_id", values=[bs_handle]
     )
     assert result == {}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_include_retired(ctx):
+    """Tests the case where the biosample a value names is retired: with
+    include_retired it resolves, and by default it does not."""
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("LK-INC-RET"),
+        ena_acc=unique_accession("LK-INC-RET-ENA"),
+    )
+    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
+
+    included = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle], include_retired=True
+    )
+    default = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="export_entity_id", values=[bs_handle]
+    )
+
+    assert (included, default) == ({bs_handle: bs_idx}, {})
 
 
 async def test_fetch_biosample_idxs_by_natural_key_empty_values_short_circuits(ctx):

@@ -10,6 +10,7 @@ from typing import get_args
 import asyncpg
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_BIOSAMPLE_BULK_BY_STUDY,
@@ -31,6 +32,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import (
     BiosampleAccessionField,
     BiosampleStudyLinkResponse,
+    BiosampleStudyLookupKey,
     FieldDataType,
     Tier,
 )
@@ -56,6 +58,7 @@ from qiita_control_plane.testing.db_teardown import (
     delete_principal,
     teardown_entity_graph,
 )
+from qiita_control_plane.testing.tiers import ADMIN_EVERYWHERE
 from qiita_control_plane.testing.unique_names import (
     unique_accession,
     unique_field_name,
@@ -5127,6 +5130,121 @@ async def test_patch_biosample_metadata_unique_field_resend_200(ctx):
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["results"][display_name]["outcome"] == "unchanged"
+
+
+# ---------------------------------------------------------------------------
+# resolve_unique_field_values / resolve_biosample_idxs_by_kind (route helpers)
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_unique_field_values(ctx):
+    """Tests the case where several values of a unique field are resolved at
+    once: each carried value maps to its biosample, keyed as sent, and a value
+    no biosample carries is absent."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="ufv-hit")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    first_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    second_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    for biosample_idx, value in ((first_idx, "S-1"), (second_idx, "S-2")):
+        written = await _patch_biosample_metadata(
+            ctx["wet"], study_idx, biosample_idx, {display_name: value}
+        )
+        assert written.status_code == 200, written.text
+
+    async with ctx["pool"].acquire() as conn:
+        resolved = await route_helpers.resolve_unique_field_values(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=display_name,
+            values=["S-1", "S-2", "S-3"],
+            noun="biosample",
+            tiers=ADMIN_EVERYWHERE,
+        )
+
+    assert resolved == {"S-1": first_idx, "S-2": second_idx}
+
+
+@pytest.mark.parametrize("field_state", ["absent", "not-unique"])
+async def test_resolve_unique_field_values_bad_field_422(ctx, field_state):
+    """Tests the case where the named field does not exist on the study, or
+    exists without declaring unique_in_study: either is refused with 422."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(
+        ctx, suffix=f"ufv-{field_state}", unique_in_study=field_state != "not-unique"
+    )
+    named = unique_field_name("Missing") if field_state == "absent" else display_name
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(HTTPException) as caught:
+            await route_helpers.resolve_unique_field_values(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=study_idx,
+                display_name=named,
+                values=["S-1"],
+                noun="biosample",
+                tiers=ADMIN_EVERYWHERE,
+            )
+
+    assert caught.value.status_code == 422
+
+
+@pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
+async def test_resolve_biosample_idxs_by_kind(ctx, key):
+    """Tests the case where the one biosample a value names is retired and,
+    except under unique_field, outside the study: it still resolves, since the
+    caller decides which biosamples count. A value naming nothing is absent,
+    except under idx, where every value maps to itself as a number."""
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix=f"rbk-{key}")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    unknown = unique_accession("RBK-MISS")
+    field_name = None
+    if key == "matrix_tube_id":
+        value = unique_matrix_tube_id()
+        unknown = unique_matrix_tube_id()
+        biosample_idx = await _seed_biosample_with_matrix_tube_id(
+            ctx, matrix_tube_id=value, owner_idx=wet_idx
+        )
+    elif key == "unique_field":
+        value = "S-1"
+        field_name = display_name
+        biosample_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+        written = await _patch_biosample_metadata(
+            ctx["wet"], study_idx, biosample_idx, {display_name: value}
+        )
+        assert written.status_code == 200, written.text
+    else:
+        accession = unique_accession("RBK")
+        field = "ena_sample_accession" if key == "ena_sample_accession" else "biosample_accession"
+        biosample_idx = await _seed_biosample_with_accession(
+            ctx, accession=accession, owner_idx=wet_idx, field=field
+        )
+        value = {
+            "biosample_accession": accession,
+            "ena_sample_accession": accession,
+            "export_entity_id": await fetch_export_entity_id(
+                ctx["pool"], kind="biosample", entity_idx=biosample_idx
+            ),
+            "idx": str(biosample_idx),
+        }[key]
+        if key == "idx":
+            unknown = "999999999999"
+    await retire_biosample(ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=wet_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        resolved = await route_helpers.resolve_biosample_idxs_by_kind(
+            conn,
+            study_idx=study_idx,
+            key=key,
+            values=[value, unknown],
+            unique_field_display_name=field_name,
+            tiers=ADMIN_EVERYWHERE,
+        )
+
+    expected = {value: biosample_idx}
+    if key == "idx":
+        expected[unknown] = int(unknown)
+    assert resolved == expected
 
 
 async def test_lookup_biosample_in_study_by_unique_field(ctx):

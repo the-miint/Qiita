@@ -22,6 +22,10 @@ from qiita_common.models import (
     TerminologyManifestFile,
 )
 from qiita_common.models._base import MAX_NATURAL_KEY_LOOKUP_VALUES, NaturalKeyLookupResponse
+from qiita_common.models.biosample import (
+    LOOKUP_IDX_PATTERN,
+    BiosampleStudyLookupRequest,
+)
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
@@ -39,6 +43,12 @@ _LOOKUP_REQUEST_CAP_CASES = [
         {"key": "matrix_tube_id", "return_key": "export_entity_id"},
         "values",
         lambda i: f"{i:010d}",
+    ),
+    (
+        BiosampleStudyLookupRequest,
+        {"key": "idx", "return_key": "export_entity_id", "unique_field_display_name": None},
+        "values",
+        lambda i: f"{i + 1}",
     ),
     (
         StudyLookupByAccessionRequest,
@@ -1877,6 +1887,52 @@ def test_natural_key_lookup_response_refuses_non_positive_idx(idx):
     it is refused rather than accepted as some other identifier."""
     with pytest.raises(ValidationError):
         NaturalKeyLookupResponse.model_validate({"resolved": {"a": idx}, "missing": []})
+
+
+def test_biosample_study_lookup_request_names_malformed_idxs():
+    """Tests the case where values under key idx include ones that are not
+    positive whole numbers, or are too long for an idx: the refusal names each
+    such value and only those, so the longest allowed idx is not named."""
+    longest = "9" * 18
+    too_long = "1" + "0" * 18
+    with pytest.raises(ValidationError) as exc_info:
+        BiosampleStudyLookupRequest.model_validate(
+            {"key": "idx", "values": ["812", longest, "0", "abc", "-1", too_long]}
+        )
+    messages = [error["msg"] for error in exc_info.value.errors()]
+    expected = [
+        f"Value error, idx values must match {LOOKUP_IDX_PATTERN}: ['0', 'abc', '-1', '{too_long}']"
+    ]
+    assert messages == expected
+
+
+def test_biosample_study_lookup_request_checks_tube_ids_too():
+    """Tests the case where the study-scoped request keys on matrix_tube_id: the
+    tube-id rule applies to it as to the system-wide lookup."""
+    with pytest.raises(ValidationError):
+        BiosampleStudyLookupRequest.model_validate({"key": "matrix_tube_id", "values": ["abc"]})
+
+
+@pytest.mark.parametrize(
+    ("body", "accepted"),
+    [
+        ({"key": "unique_field", "unique_field_display_name": "sample_id"}, True),
+        ({"key": "unique_field"}, False),
+        ({"key": "biosample_accession", "unique_field_display_name": "sample_id"}, False),
+    ],
+    ids=["unique-field-named", "unique-field-unnamed", "other-key-named"],
+)
+def test_biosample_study_lookup_request_unique_field_display_name(body, accepted):
+    """Tests the case where unique_field_display_name is given or left out:
+    the unique_field kind needs it, and every other kind refuses it."""
+    full_body = {**body, "values": ["S-1"]}
+    try:
+        BiosampleStudyLookupRequest.model_validate(full_body)
+        outcome = True
+    except ValidationError:
+        outcome = False
+
+    assert outcome is accepted
 
 
 def test_biosample_lookup_request_names_malformed_tube_ids():

@@ -286,14 +286,15 @@ async def fetch_biosample_idxs_for_study(
     *,
     study_idx: int,
     limit: int,
+    among_idxs: Sequence[int] | None = None,
 ) -> list[int]:
     """Return up to `limit` biosample idxs linked to study_idx, newest-linked first.
 
-    Excludes retired links and retired biosamples. Callers that need
-    to detect truncation pass `limit = cap + 1`; if the returned list
-    has length > cap, the underlying set exceeded the cap. Accepts
-    either a pool or a connection so the helper composes inside an
-    open transaction or stands alone.
+    With `among_idxs`, only those idxs are considered. Excludes retired links
+    and retired biosamples. Callers that need to detect truncation pass
+    `limit = cap + 1`; if the returned list has length > cap, the underlying
+    set exceeded the cap. Accepts either a pool or a connection so the helper
+    composes inside an open transaction or stands alone.
     """
     # The retired-link predicate is index-covered; the join filters
     # out separately-retired biosamples.
@@ -304,10 +305,12 @@ async def fetch_biosample_idxs_for_study(
         " WHERE bts.study_idx = $1"
         "   AND bts.retired = false"
         "   AND b.retired = false"
+        "   AND ($3::bigint[] IS NULL OR bts.biosample_idx = ANY($3::bigint[]))"
         " ORDER BY bts.created_at DESC, bts.biosample_idx DESC"
         " LIMIT $2",
         study_idx,
         limit,
+        None if among_idxs is None else list(among_idxs),
     )
     return [r["biosample_idx"] for r in rows]
 
@@ -327,15 +330,15 @@ async def fetch_biosample_idxs_by_natural_key(
     *,
     key: BiosampleLookupKey,
     values: list[str],
+    include_retired: bool = False,
 ) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
     # retired rows; study has neither
     """Return `{value: biosample_idx}` for every value in `values` that
-    resolves to a non-retired qiita.biosample row via the natural key named by
-    `key`.
+    resolves to a qiita.biosample row via the natural key named by `key`.
 
-    Values absent from the table or carried only by retired rows are
-    omitted from the returned map, so a caller can detect misses by
-    set-difference against the input `values`.
+    Values absent from the table are omitted from the returned map, so a caller
+    can detect misses by set-difference against the input `values`. So are
+    values carried only by retired rows, unless `include_retired` is set.
     """
     if key not in _BIOSAMPLE_LOOKUP_SQL:
         raise ValueError(f"invalid biosample lookup key: {key!r}")
@@ -345,8 +348,9 @@ async def fetch_biosample_idxs_by_natural_key(
     rows = await pool_or_conn.fetch(
         f"SELECT biosample.idx, {column_sql} AS lookup_value FROM qiita.biosample{join_sql}"
         f" WHERE {column_sql} = ANY($1::text[])"
-        "   AND biosample.retired = false",
+        "   AND (biosample.retired = false OR $2)",
         values,
+        include_retired,
     )
     resolved = {r["lookup_value"]: r["idx"] for r in rows}
     return resolved

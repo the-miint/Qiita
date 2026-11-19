@@ -6,7 +6,8 @@ endpoints — same input shape, same on-the-wire output.
 
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import NoReturn
 
 import asyncpg
@@ -17,6 +18,7 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    BiosampleStudyLookupKey,
     DefinitionGroupRefusal,
     DefinitionKind,
     DeprecatedUpstream,
@@ -104,6 +106,8 @@ from ..repositories.alignment_definition import (
     AlignmentHasLiveWork,
     fetch_alignment_definition_by_idx,
 )
+from ..repositories.biosample import fetch_biosample_idxs_by_natural_key
+from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.exported_entity import EntityKind, fetch_export_entity_ids_by_idx
 from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
@@ -743,6 +747,45 @@ async def resolve_study_entity_by_unique_field(
     still resolves; the caller applies its own gate afterwards and decides what
     retirement means for the operation it is performing.
     """
+    entity_idxs = await resolve_unique_field_values(
+        conn,
+        spec=spec,
+        study_idx=study_idx,
+        display_name=display_name,
+        values=[value],
+        noun=noun,
+        tiers=tiers,
+    )
+    entity_idx = entity_idxs.get(value)
+    if entity_idx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=detail_for_unique_field_miss(
+                noun=noun, study_idx=study_idx, display_name=display_name, value=value
+            ),
+        )
+    return entity_idx
+
+
+async def resolve_unique_field_values(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    values: list[str],
+    noun: str,
+    tiers: CallerMetadataTiers,
+) -> dict[str, int]:
+    """Resolve values of one of the study's fields to the entities that carry
+    them, keyed by each value as sent.
+
+    display_name names one of the study's fields, which must declare
+    unique_in_study; one that does not is refused (422), as is a name the
+    study does not use. A value no entity carries, and one whose match is
+    hidden from `tiers`, are both absent from the result. Retirement is not
+    consulted; the caller decides what it means for its operation.
+    """
     field_rows = await fetch_study_fields_by_display_names(
         conn, spec=spec, study_idx=study_idx, display_names=[display_name]
     )
@@ -764,28 +807,70 @@ async def resolve_study_entity_by_unique_field(
             ),
         )
 
-    # Parse against the field's type so the value handed to the query below is
-    # in the form the column stores. A unique_in_study field is text, which
-    # parses to itself, so this cannot fail.
-    parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
+    # Parse against the field's type so each value handed to the query below is
+    # in the form the column stores. The API lets only a text field declare
+    # unique_in_study, and text parses to itself; a wider type, which the
+    # schema allows, would let one unparseable value fail the whole request.
+    # Two values sent may parse alike.
+    sent_by_parsed: dict[str | Decimal | date | bool, list[str]] = {}
+    for value in values:
+        parsed = parse_text_for_data_type(display_name, field_row.data_type, value)
+        sent_by_parsed[parsed] = [*sent_by_parsed.get(parsed, []), value]
 
     entity_idxs = await fetch_entity_idxs_by_unique_field_values(
         conn,
         spec=spec,
         study_field_idx=field_row.idx,
         data_type=field_row.data_type,
-        values=[parsed_value],
+        values=list(sent_by_parsed),
         tiers=tiers,
     )
-    entity_idx = entity_idxs.get(parsed_value)
-    if entity_idx is None:
-        raise HTTPException(
-            status_code=404,
-            detail=detail_for_unique_field_miss(
-                noun=noun, study_idx=study_idx, display_name=display_name, value=value
-            ),
+
+    # Key each match by the value or values as sent
+    resolved = {
+        sent: entity_idx
+        for parsed, entity_idx in entity_idxs.items()
+        for sent in sent_by_parsed[parsed]
+    }
+    return resolved
+
+
+async def resolve_biosample_idxs_by_kind(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    key: BiosampleStudyLookupKey,
+    values: list[str],
+    unique_field_display_name: str | None,
+    tiers: CallerMetadataTiers,
+) -> dict[str, int]:
+    """Resolve values of the identifier kind named by `key` to biosample idxs,
+    keyed by each value as sent.
+
+    Retired biosamples and biosamples outside study_idx still resolve; the
+    caller decides which of them count. Under `unique_field`, the values are
+    those of the study's field named by unique_field_display_name. Under `idx`,
+    each value maps to itself as a number, whether or not a biosample has it.
+    """
+    if key == "unique_field":
+        if unique_field_display_name is None:
+            raise ValueError("key unique_field needs unique_field_display_name")
+        resolved = await resolve_unique_field_values(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=unique_field_display_name,
+            values=values,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            tiers=tiers,
         )
-    return entity_idx
+    elif key == "idx":
+        resolved = {value: int(value) for value in values}
+    else:
+        resolved = await fetch_biosample_idxs_by_natural_key(
+            conn, key=key, values=values, include_retired=True
+        )
+    return resolved
 
 
 # Sample-family metadata-write exceptions carrying one shared HTTP mapping.

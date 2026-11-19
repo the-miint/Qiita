@@ -312,6 +312,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_BIOSAMPLE_BULK_BY_STUDY",
     ),
     (
+        "URL_BIOSAMPLE_LOOKUP_BY_STUDY",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_LOOKUP_BY_STUDY",
+    ),
+    (
         "URL_BIOSAMPLE_LIST_BY_STUDY",
         "PATH_STUDY_PREFIX",
         "PATH_BIOSAMPLE_LIST_BY_STUDY",
