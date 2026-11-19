@@ -149,6 +149,36 @@ async def test_get_qc_report_merges_samples(ctx, seeded_pool):
     assert body["merged"]["filtered"]["read_pairs"] == 9 + 27
 
 
+async def test_get_qc_report_returns_raw_only_sample(ctx, seeded_pool):
+    """A prep_sample persisted by a workflow with no filtered report still returns its raw one."""
+    db = ctx["pool"]
+    owner = ctx["wet_session"]["principal_idx"]
+    bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
+    await db.execute(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx,"
+        "   raw_qc_report)"
+        " VALUES ($1, $2, $3, $4, $5::jsonb)",
+        ps_idx,
+        seeded_pool["pool_idx"],
+        "qc-item-raw-only",
+        owner,
+        json.dumps(_report("raw", 5, _mate(5, 500, 25.0))),
+    )
+    try:
+        resp = await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+        assert resp.status_code == 200, resp.text
+        sample = next(
+            s for s in resp.json()["samples"] if s["sequenced_pool_item_id"] == "qc-item-raw-only"
+        )
+        assert sample["raw_qc_report"]["read_pairs"] == 5
+        assert sample["filtered_qc_report"] is None
+    finally:
+        await teardown_entity_graph(
+            db, study_idxs=[], biosample_idxs=[bs_idx], prep_sample_idxs=[ps_idx]
+        )
+
+
 async def test_get_qc_report_empty_pool(ctx, seeded_pool):
     """A pool whose samples carry no QC reports yields merged None at both
     points and an empty samples list — seed a fresh pool with no reports."""
