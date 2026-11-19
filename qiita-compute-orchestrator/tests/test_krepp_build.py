@@ -246,6 +246,22 @@ def test_verify_script(build):
     result = run()
     assert result.returncode != 0 and "not in SHA256SUMS: index/stray" in result.stderr
     (build / "index" / "stray").unlink()
+    (build / "index" / "extra").symlink_to("../README.md")
+    result = run()
+    assert (
+        result.returncode != 0 and "symlinks are not part of a build: index/extra" in result.stderr
+    )
+    (build / "index" / "extra").unlink()
+    tree = build / "index" / "tree-m4r0-no_frac"
+    outside = build.parent / "tree-copy"
+    shutil.copy(tree, outside)
+    tree.unlink()
+    tree.symlink_to(outside)
+    result = run()
+    assert result.returncode != 0 and "index/tree-m4r0-no_frac" in result.stderr
+    tree.unlink()
+    shutil.copy(outside, tree)
+    assert run().returncode == 0
     _same_size_edit(build / JEST_NULL)
     assert run().returncode != 0
     assert json.loads((build / MANIFEST).read_text())["build_label"] == build.name

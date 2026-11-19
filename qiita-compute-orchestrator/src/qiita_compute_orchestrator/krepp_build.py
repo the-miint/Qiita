@@ -180,7 +180,7 @@ def _readme(manifest: dict) -> str:
         "## Checking a copy\n\n"
         "Run `./verify.sh <sha256>` in the folder, with the SHA256SUMS hash Qiita\n"
         "recorded for this build. It checks that SHA256SUMS is that file, that every\n"
-        "file listed in it has its hash, and that no other file is present.\n"
+        "file listed in it has its hash, and that no other file or symlink is present.\n"
     )
 
 
@@ -192,6 +192,9 @@ cd "$(dirname "$0")"
 want="${1:?usage: verify.sh <sha256 of SHA256SUMS>}"
 got=$(sha256sum SHA256SUMS | cut -d' ' -f1)
 [ "$got" = "$want" ] || { echo "verify.sh: SHA256SUMS is $got, expected $want" >&2; exit 1; }
+# A link would pass the hash check through its target and be missed by find -type f.
+links=$(find . -type l | sed 's|^[.]/||')
+[ -z "$links" ] || { echo "verify.sh: symlinks are not part of a build: $links" >&2; exit 1; }
 sha256sum --check --quiet --strict SHA256SUMS
 # sha256sum --check ignores files it is not told about; refuse them here.
 listed=$(mktemp)
@@ -272,7 +275,8 @@ def verify_build(
     linked_krepp_version: str | None,
 ) -> dict:
     """The per-job check of one copy, cheap enough to run before every placement:
-    SHA256SUMS is the registered one; the folder holds exactly the files it lists;
+    SHA256SUMS is the registered one; the folder holds exactly the files it lists
+    and no symlink;
     every size matches the manifest; the small files (manifest, README, verify.sh,
     every metadata text and the tree) match their hashes; and the build's krepp
     version is the one miint links, when the caller passes it. The large index files
