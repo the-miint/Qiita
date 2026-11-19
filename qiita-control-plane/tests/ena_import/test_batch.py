@@ -45,6 +45,7 @@ from qiita_control_plane.ena_import.batch import (
     schedule_ena_import_batch,
 )
 from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
+from qiita_control_plane.repositories import study as study_module
 from qiita_control_plane.repositories.ena_import_batch import (
     fetch_partial_download_counts,
     fetch_runs_needing_download,
@@ -2008,6 +2009,35 @@ async def _wait_for_a_study_lock_waiter(postgres_pool) -> None:
             return
         await asyncio.sleep(0.05)
     raise AssertionError("no import is waiting on the study lock")
+
+
+async def test_study_lock_wait_gives_up_naming_the_accession(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    monkeypatch.setattr(study_module, "STUDY_LOCK_WAIT_TIMEOUT_S", 0.3)
+    accession = unique_ena_accession("PRJNA")
+    batch_idx, items = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.append(batch_idx)
+
+    async with postgres_pool.acquire() as holder, holder.transaction():
+        await holder.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))", STUDY_ACCESSION_LOCK_CLASS, accession
+        )
+        await schedule_ena_import_batch(batch_app, items=items, principal=admin_principal)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx FROM qiita.ena_import_batch_item WHERE idx = $1", items[0].idx
+    )
+    reason = await postgres_pool.fetchval(
+        "SELECT failure_reason FROM qiita.ena_import_batch_item WHERE idx = $1", items[0].idx
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert row["study_idx"] is None
+    assert accession in reason
+    assert "another import" in reason
+    await _assert_no_import_residue(postgres_pool, accession)
 
 
 @pytest.mark.parametrize("first_import_fails", [True, False])

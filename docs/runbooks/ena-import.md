@@ -173,9 +173,10 @@ registration fails, or every run fails or none maps to a pool, nothing is commit
 study, its owner grant and its pools are gone, and the item is `failed` with no
 `study_idx`. Re-importing creates the study afresh, under a new idx and `QS` handle. The
 rolled-back ones leave gaps in both numberings. Concurrent imports of one accession take
-turns: the second waits for the first to commit or roll back. Studies left empty by a
-failed first import before this change stay until a re-import succeeds into them. List
-them with:
+turns: the second waits for the first to commit or roll back, and gives up after 90 s,
+failing its item with `another import holds <accession>; gave up waiting 90s for it`. An
+import-created study with no `biosample` or `prep_sample` links stays until a re-import
+succeeds into it. List them with:
 
 ```sql
 SELECT s.idx, s.bioproject_accession, i.idx AS item_idx

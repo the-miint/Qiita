@@ -15,7 +15,6 @@ from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyLookupKey, Tie
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from .exported_entity import export_entity_id_lookup, export_entity_id_select
-from .sequencing_run import POOL_LOCK_WAIT_TIMEOUT_S
 from .study_access import insert_study_access
 
 _STUDY_RETURNING_COLS = (
@@ -342,24 +341,29 @@ _STUDY_ACCESSION_UNIQUE_CONSTRAINTS = frozenset(
 STUDY_ACCESSION_LOCK_CLASS = 0x0574_0001
 
 
-async def lock_study_accession(
-    conn: asyncpg.Connection, *, bioproject_accession: str, timeout: float | None = None
-) -> None:
-    """Take the per-accession study-creation advisory lock (held to transaction commit).
+# Outlasts a creating import's open registration transaction (~27ms per run).
+STUDY_LOCK_WAIT_TIMEOUT_S = 90.0
 
-    An import that creates a study keeps its transaction open through
-    registration, so a concurrent import of the accession waits here and then
-    finds the committed study, or creates its own if the first rolled back.
-    Always taken before the sequencing_run lock. Waits at most `timeout`
-    seconds, defaulting to `POOL_LOCK_WAIT_TIMEOUT_S`.
+
+async def lock_study_accession(conn: asyncpg.Connection, *, bioproject_accession: str) -> None:
+    """Take the per-accession study-creation advisory lock, held to transaction commit.
+
+    Raises TimeoutError naming the accession after `STUDY_LOCK_WAIT_TIMEOUT_S`.
+    Always taken before the sequencing_run lock.
     """
     require_transaction(conn)
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-        STUDY_ACCESSION_LOCK_CLASS,
-        bioproject_accession,
-        timeout=POOL_LOCK_WAIT_TIMEOUT_S if timeout is None else timeout,
-    )
+    try:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            STUDY_ACCESSION_LOCK_CLASS,
+            bioproject_accession,
+            timeout=STUDY_LOCK_WAIT_TIMEOUT_S,
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"another import holds {bioproject_accession}; gave up waiting"
+            f" {STUDY_LOCK_WAIT_TIMEOUT_S:g}s for it"
+        ) from exc
 
 
 async def get_or_create_study_by_ena_accessions(
