@@ -48,9 +48,10 @@ from qiita_control_plane.ena_import.registration import EnaRunRegistrationStatus
 from qiita_control_plane.repositories.ena_import_batch import (
     fetch_partial_download_counts,
     fetch_runs_needing_download,
+    update_ena_import_batch_item_study_created,
 )
 from qiita_control_plane.repositories.sequence_range import mint_sequence_range
-from qiita_control_plane.repositories.study import create_study
+from qiita_control_plane.repositories.study import STUDY_ACCESSION_LOCK_CLASS, create_study
 from qiita_control_plane.runner._read_ingest import ENA_RUN_MAP_BINDING, _stage_ena_run_roster
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
@@ -268,6 +269,23 @@ async def _cleanup_study(postgres_pool, study_accession: str) -> None:
     )
     await teardown_ena_study_graph(
         postgres_pool, study_idxs=study_idxs, run_accessions=[study_accession]
+    )
+
+
+async def _assert_no_import_residue(postgres_pool, accession: str) -> None:
+    """A rolled-back first import leaves neither the study nor its pools behind."""
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+        )
+        == 0
+    )
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.sequencing_run WHERE instrument_run_id LIKE $1",
+            f"{accession}:%",
+        )
+        == 0
     )
 
 
@@ -1208,6 +1226,13 @@ async def test_process_one_study_zero_pools_reaches_terminal_failed(
     assert item_row["state"] == BatchItemState.FAILED.value
     assert list(item_row["download_work_ticket_idxs"]) == []
     assert "no run mapped to a downloadable pool" in item_row["failure_reason"]
+    await _assert_no_import_residue(postgres_pool, accession)
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT study_idx FROM qiita.ena_import_batch_item WHERE batch_idx = $1", batch_idx
+        )
+        is None
+    )
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -1362,6 +1387,13 @@ async def test_process_one_study_all_runs_failed_reaches_terminal_failed(
     failed_run = status.items[0].ena_runs[0]
     assert failed_run.status == EnaRunRegistrationStatus.UNSUPPORTED.value
     assert failed_run.failure_reason is not None
+    await _assert_no_import_residue(postgres_pool, accession)
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT study_idx FROM qiita.ena_import_batch_item WHERE batch_idx = $1", batch_idx
+        )
+        is None
+    )
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -1640,12 +1672,11 @@ async def test_reconcile_registered_item_reuses_already_submitted_ticket(
     await _cleanup_study(postgres_pool, accession)
 
 
-async def test_interrupted_item_keeps_the_record_of_the_study_it_created(
+async def test_item_cancelled_while_creating_its_study_leaves_no_study_and_redrives(
     batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
 ):
-    """An item cancelled after committing its study (e.g. by the shutdown drain)
-    must still be recorded as that study's creator, or its re-drive -- and every
-    later import of the accession -- is refused as a native study."""
+    """An item cancelled (e.g. by the shutdown drain) before its study commits
+    leaves nothing behind, and its re-drive creates the study afresh."""
     from qiita_control_plane.ena_import import batch as batch_module
 
     real_register = batch_module.register_ena_study
@@ -1668,17 +1699,71 @@ async def test_interrupted_item_keeps_the_record_of_the_study_it_created(
         items[0].idx,
     )
     assert row["state"] == BatchItemState.RESOLVING.value
-    assert row["study_idx"] is not None
-    assert row["study_created"] is True
+    assert row["study_idx"] is None
+    assert row["study_created"] is False
+    await _assert_no_import_residue(postgres_pool, accession)
 
     monkeypatch.setattr(batch_module, "register_ena_study", real_register)
     assert await reconcile_inflight_batches(batch_app) == 1
     await asyncio.gather(*list(batch_app.state.running_ena_import_batches))
 
-    state = await postgres_pool.fetchval(
-        "SELECT state FROM qiita.ena_import_batch_item WHERE idx = $1", items[0].idx
+    row = await postgres_pool.fetchrow(
+        "SELECT state, study_created FROM qiita.ena_import_batch_item WHERE idx = $1",
+        items[0].idx,
     )
-    assert state == BatchItemState.DOWNLOADING.value
+    assert row["state"] == BatchItemState.DOWNLOADING.value
+    assert row["study_created"] is True
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_failed_first_import_leaves_no_study_behind(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    from qiita_control_plane.ena_import import batch as batch_module
+
+    real_register = batch_module.register_ena_study
+    attempted_study_idxs = []
+
+    async def _boom(*_args, **kwargs):
+        attempted_study_idxs.append(kwargs["study_idx"])
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(batch_module, "register_ena_study", _boom)
+    accession = unique_ena_accession("PRJNA")
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, study_idx, study_created FROM qiita.ena_import_batch_item WHERE idx = $1",
+        first_items[0].idx,
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert row["study_idx"] is None
+    assert row["study_created"] is False
+    await _assert_no_import_residue(postgres_pool, accession)
+    (study_idx,) = attempted_study_idxs
+    for table in ("exported_entity", "study_access"):
+        assert (
+            await postgres_pool.fetchval(
+                f"SELECT count(*) FROM qiita.{table} WHERE study_idx = $1", study_idx
+            )
+            == 0
+        )
+
+    monkeypatch.setattr(batch_module, "register_ena_study", real_register)
+    second_idx, second_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(second_idx)
+    row = await postgres_pool.fetchrow(
+        "SELECT state, study_created FROM qiita.ena_import_batch_item WHERE idx = $1",
+        second_items[0].idx,
+    )
+    assert row["state"] == BatchItemState.DOWNLOADING.value
+    assert row["study_created"] is True
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -1716,6 +1801,9 @@ async def test_item_failed_after_creating_its_study_does_not_block_reimport(
             "SELECT state FROM qiita.ena_import_batch_item WHERE idx = $1", second_items[0].idx
         )
         == BatchItemState.DOWNLOADING.value
+    )
+    assert await postgres_pool.fetchval(
+        "SELECT study_created FROM qiita.ena_import_batch_item WHERE idx = $1", second_items[0].idx
     )
 
     await _cleanup_study(postgres_pool, accession)
@@ -1902,6 +1990,129 @@ async def test_import_allows_a_study_an_earlier_batch_created(
     # Only the batch that actually created the study records it.
     assert first["study_created"] is True
     assert second["study_created"] is False
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def test_failed_reimport_keeps_the_study_an_earlier_batch_created(
+    batch_app, postgres_pool, admin_principal, download_ena_study_action, batch_cleanup, monkeypatch
+):
+    from qiita_control_plane.ena_import import batch as batch_module
+
+    accession = unique_ena_accession("PRJNA")
+    first_idx, first_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(first_idx)
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(batch_module, "register_ena_study", _boom)
+    second_idx, second_items = await _drive_one_study(
+        batch_app, postgres_pool, admin_principal, accession
+    )
+    batch_cleanup.append(second_idx)
+
+    first_study = await postgres_pool.fetchval(
+        "SELECT study_idx FROM qiita.ena_import_batch_item WHERE idx = $1", first_items[0].idx
+    )
+    row = await postgres_pool.fetchrow(
+        "SELECT state, study_created FROM qiita.ena_import_batch_item WHERE idx = $1",
+        second_items[0].idx,
+    )
+    assert row["state"] == BatchItemState.FAILED.value
+    assert row["study_created"] is False
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT idx FROM qiita.study WHERE bioproject_accession = $1", accession
+        )
+        == first_study
+    )
+
+    await _cleanup_study(postgres_pool, accession)
+
+
+async def _wait_for_a_study_lock_waiter(postgres_pool) -> None:
+    for _ in range(200):
+        if await postgres_pool.fetchval(
+            "SELECT count(*) FROM pg_locks"
+            " WHERE locktype = 'advisory' AND classid = $1 AND NOT granted",
+            STUDY_ACCESSION_LOCK_CLASS,
+        ):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("no import is waiting on the study lock")
+
+
+@pytest.mark.parametrize("first_import_fails", [True, False])
+async def test_concurrent_first_imports_of_one_accession_serialize_on_the_study(
+    batch_app,
+    postgres_pool,
+    admin_principal,
+    download_ena_study_action,
+    batch_cleanup,
+    monkeypatch,
+    first_import_fails,
+):
+    from qiita_control_plane.ena_import import batch as batch_module
+
+    real_register = batch_module.register_ena_study
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def _gated(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return await real_register(*args, **kwargs)
+        entered.set()
+        await release.wait()
+        if first_import_fails:
+            raise RuntimeError("boom")
+        return await real_register(*args, **kwargs)
+
+    monkeypatch.setattr(batch_module, "register_ena_study", _gated)
+    accession = unique_ena_accession("PRJNA")
+    batch_a, items_a = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_b, items_b = await create_ena_import_batch(
+        postgres_pool, accessions=[accession], principal=admin_principal
+    )
+    batch_cleanup.extend([batch_a, batch_b])
+
+    task_a = schedule_ena_import_batch(batch_app, items=items_a, principal=admin_principal)
+    await entered.wait()
+    task_b = schedule_ena_import_batch(batch_app, items=items_b, principal=admin_principal)
+    await _wait_for_a_study_lock_waiter(postgres_pool)
+    release.set()
+    await asyncio.gather(task_a, task_b)
+
+    rows = {
+        r["idx"]: r
+        for r in await postgres_pool.fetch(
+            "SELECT idx, state, study_idx, study_created FROM qiita.ena_import_batch_item"
+            " WHERE idx = ANY($1::bigint[])",
+            [items_a[0].idx, items_b[0].idx],
+        )
+    }
+    a, b = rows[items_a[0].idx], rows[items_b[0].idx]
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.study WHERE bioproject_accession = $1", accession
+        )
+        == 1
+    )
+    assert b["state"] == BatchItemState.DOWNLOADING.value
+    if first_import_fails:
+        assert a["state"] == BatchItemState.FAILED.value
+        assert b["study_created"] is True
+    else:
+        assert a["state"] == BatchItemState.DOWNLOADING.value
+        assert a["study_created"] is True
+        assert b["study_created"] is False
+        assert a["study_idx"] == b["study_idx"]
 
     await _cleanup_study(postgres_pool, accession)
 
@@ -3595,6 +3806,24 @@ async def test_run_list_and_whole_study_import_of_one_study_strand_no_run(
         return await real_register(pool, **kwargs)
 
     monkeypatch.setattr(batch_module, "register_ena_study", _gated_register)
+
+    # The study exists first: an item that creates it registers alone, so only
+    # imports into an existing study register concurrently.
+    seed_idx, seed_items = await create_ena_import_batch(
+        postgres_pool, accessions=[study], principal=admin_principal
+    )
+    batch_cleanup.append(seed_idx)
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        seeded = await create_study(
+            conn,
+            owner_idx=admin_principal.principal_idx,
+            created_by_idx=admin_principal.principal_idx,
+            title=study,
+            bioproject_accession=study,
+        )
+        await update_ena_import_batch_item_study_created(
+            conn, item_idx=seed_items[0].idx, study_idx=seeded["idx"]
+        )
 
     whole_idx, whole_items = await create_ena_import_batch(
         postgres_pool, accessions=[study], principal=admin_principal

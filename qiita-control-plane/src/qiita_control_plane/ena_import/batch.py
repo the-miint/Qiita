@@ -77,6 +77,7 @@ from ..repositories.sequenced_sample import (
 from ..repositories.study import (
     fetch_study_idx_by_either_ena_accession,
     get_or_create_study_by_ena_accessions,
+    lock_study_accession,
 )
 from .availability import EnaAvailabilityClient
 from .miint_resolver import MiintEnaResolver, call_with_ena_retry
@@ -84,6 +85,7 @@ from .registration import (
     RESUBMITTABLE_DOWNLOAD_TICKET_STATES,
     EnaRunRegistrationOutcome,
     EnaRunRegistrationStatus,
+    EnaStudyRegistrationResult,
     exception_reason,
     fetch_download_pool_states,
     fetch_pool_download_ticket,
@@ -443,6 +445,30 @@ async def _fail_after_held_run_check(
     await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=failure_reason)
 
 
+def _nothing_to_download_reason(result: EnaStudyRegistrationResult) -> str | None:
+    """Why a registration left nothing to download, or None when something is."""
+    if not result.created_pools:
+        return (
+            "study registered but no run mapped to a downloadable pool"
+            " (no download tickets created)"
+        )
+    if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
+        reasons = _summarize_run_failures(
+            o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
+        )
+        return f"study registered but every run failed to register ({reasons})"
+    return None
+
+
+class _FirstImportRegisteredNothing(Exception):
+    """Raised inside the creating transaction so the study it made rolls back."""
+
+    def __init__(self, reason: str, result: EnaStudyRegistrationResult) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.result = result
+
+
 async def _process_one_study(
     app: FastAPI,
     pool: asyncpg.Pool,
@@ -522,83 +548,112 @@ async def _process_one_study(
                 sorted({run.sample_accession for run in ena_runs}),
             )
 
-        # Resolve the study BEFORE registering anything, so an import into a
-        # study we did not create fails with nothing written.
-        async with pool.acquire() as conn, conn.transaction():
-            study_row, study_created = await get_or_create_study_by_ena_accessions(
-                conn,
-                bioproject_accession=study_header.study_accession,
-                ena_study_accession=study_header.secondary_study_accession,
-                owner_idx=principal.principal_idx,
-                created_by_idx=principal.principal_idx,
-                # study.title is NOT NULL but ENA's study_title is optional; a
-                # title is cosmetic, not identity, so fall back to the accession.
-                title=study_header.study_title or study_header.study_accession,
-            )
-            if study_created:
-                await update_ena_import_batch_item_study_created(
-                    conn, item_idx=item.idx, study_idx=study_row["idx"]
+        # A creating item registers in the same transaction, so a failure leaves no
+        # study. Until it commits, nothing may write this item's row through the
+        # pool: the study_created stamp holds the row lock.
+        result = None
+        try:
+            async with pool.acquire() as conn, conn.transaction():
+                await lock_study_accession(conn, bioproject_accession=study_header.study_accession)
+                study_row, study_created = await get_or_create_study_by_ena_accessions(
+                    conn,
+                    bioproject_accession=study_header.study_accession,
+                    ena_study_accession=study_header.secondary_study_accession,
+                    owner_idx=principal.principal_idx,
+                    created_by_idx=principal.principal_idx,
+                    # study.title is NOT NULL but ENA's study_title is optional; a
+                    # title is cosmetic, not identity, so fall back to the accession.
+                    title=study_header.study_title or study_header.study_accession,
                 )
-        study_idx = study_row["idx"]
-        if not study_created and not await _study_created_by_an_import(pool, study_idx):
-            await _set_item_state(
-                pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=(
-                    f"{item.ena_study_accession} maps to existing study {study_idx}, which was"
-                    " not created by an ENA import; importing into it would merge ENA samples"
-                    " into a natively-created study"
-                ),
-            )
+                study_idx = study_row["idx"]
+                if study_created:
+                    await update_ena_import_batch_item_study_created(
+                        conn, item_idx=item.idx, study_idx=study_idx
+                    )
+                    result = await register_ena_study(
+                        conn,
+                        study_idx=study_idx,
+                        study_header=study_header,
+                        ena_runs=ena_runs,
+                        sample_attributes=sample_attributes,
+                        owner_idx=principal.principal_idx,
+                        caller_idx=principal.principal_idx,
+                        tiers=await caller_metadata_tiers(conn, principal),
+                    )
+                    if (reason := _nothing_to_download_reason(result)) is not None:
+                        raise _FirstImportRegisteredNothing(reason, result)
+        except _FirstImportRegisteredNothing as exc:
+            async with pool.acquire() as conn:
+                await update_ena_import_batch_item_run_outcomes(
+                    conn,
+                    item_idx=item.idx,
+                    study_idx=None,
+                    ena_run_outcomes=_ena_run_outcomes(exc.result.ena_runs),
+                )
+            await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=exc.reason)
             return
 
-        # The role that admitted the submission may have been revoked since,
-        # most often before a re-drive at startup. A submitter who no longer
-        # holds admin on the study is refused here, with a reason that an
-        # operator can read, before anything is written.
-        tiers = await caller_metadata_tiers(pool, principal)
-        held = tiers.tier_on(study_idx)
-        if not tier_at_least(held, Tier.ADMIN):
-            await _set_item_state(
-                pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=(
-                    f"the submitter holds {held.value!r} on study {study_idx}; an ENA import"
-                    f" needs {Tier.ADMIN.value!r} there or the {METADATA_BYPASS_ROLE.value}"
-                    " role"
-                ),
-            )
-            return
+        flagged: list[EnaRunRegistrationOutcome] = []
+        if result is None:
+            if not await _study_created_by_an_import(pool, study_idx):
+                await _set_item_state(
+                    pool,
+                    item.idx,
+                    BatchItemState.FAILED,
+                    failure_reason=(
+                        f"{item.ena_study_accession} maps to existing study {study_idx}, which"
+                        " was not created by an ENA import; importing into it would merge ENA"
+                        " samples into a natively-created study"
+                    ),
+                )
+                return
 
-        # A re-import: runs this study already holds that the Portal's fresh
-        # response above no longer names are candidates for the ENA
-        # availability flag; a held run the Portal DOES still return has any
-        # existing flag cleared. Runs before register_ena_study so a Browser
-        # API failure here fails the item before anything new is written --
-        # held runs are rows Qiita already has, so this does not depend on
-        # register_ena_study having run. Disjoint from register_ena_study's
-        # outcomes below (which only cover runs the Portal returned), so the
-        # two lists concatenate with no overlap. A run-list item's runs all resolved
-        # public, so it only clears flags.
-        flagged = await _reconcile_and_record(
-            pool,
-            item,
-            study_idx=study_idx,
-            portal_run_accessions=public_run_accessions,
-            only_runs=None if requested is None else public_run_accessions,
-        )
-        result = await register_ena_study(
-            pool,
-            study_idx=study_idx,
-            study_header=study_header,
-            ena_runs=ena_runs,
-            sample_attributes=sample_attributes,
-            owner_idx=principal.principal_idx,
-            caller_idx=principal.principal_idx,
-            tiers=tiers,
-        )
+            # The role that admitted the submission may have been revoked since,
+            # most often before a re-drive at startup. A submitter who no longer
+            # holds admin on the study is refused here, with a reason that an
+            # operator can read, before anything is written.
+            tiers = await caller_metadata_tiers(pool, principal)
+            held = tiers.tier_on(study_idx)
+            if not tier_at_least(held, Tier.ADMIN):
+                await _set_item_state(
+                    pool,
+                    item.idx,
+                    BatchItemState.FAILED,
+                    failure_reason=(
+                        f"the submitter holds {held.value!r} on study {study_idx}; an ENA import"
+                        f" needs {Tier.ADMIN.value!r} there or the {METADATA_BYPASS_ROLE.value}"
+                        " role"
+                    ),
+                )
+                return
+
+            # A re-import: runs this study already holds that the Portal's fresh
+            # response above no longer names are candidates for the ENA
+            # availability flag; a held run the Portal DOES still return has any
+            # existing flag cleared. Runs before register_ena_study so a Browser
+            # API failure here fails the item before anything new is written --
+            # held runs are rows Qiita already has, so this does not depend on
+            # register_ena_study having run. Disjoint from register_ena_study's
+            # outcomes below (which only cover runs the Portal returned), so the
+            # two lists concatenate with no overlap. A run-list item's runs all resolved
+            # public, so it only clears flags.
+            flagged = await _reconcile_and_record(
+                pool,
+                item,
+                study_idx=study_idx,
+                portal_run_accessions=public_run_accessions,
+                only_runs=None if requested is None else public_run_accessions,
+            )
+            result = await register_ena_study(
+                pool,
+                study_idx=study_idx,
+                study_header=study_header,
+                ena_runs=ena_runs,
+                sample_attributes=sample_attributes,
+                owner_idx=principal.principal_idx,
+                caller_idx=principal.principal_idx,
+                tiers=tiers,
+            )
         await _set_item_registered(
             pool,
             item.idx,
@@ -606,38 +661,8 @@ async def _process_one_study(
             ena_run_outcomes=_ena_run_outcomes(flagged) + _ena_run_outcomes(result.ena_runs),
         )
 
-        if not result.created_pools:
-            # Registration succeeded (study + biosamples), but no run mapped to a
-            # downloadable pool -- e.g. every run hit an unmappable platform. There
-            # is nothing to download, so the item must reach a terminal state rather
-            # than sit in `downloading` forever with an empty ticket list.
-            await _set_item_state(
-                pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=(
-                    "study registered but no run mapped to a downloadable pool"
-                    " (no download tickets created)"
-                ),
-            )
-            return
-
-        if not any(o.status in _SUCCESSFUL_RUN_REGISTRATION_STATUSES for o in result.ena_runs):
-            # Pools exist (a platform mapped), but every run then failed, was
-            # unsupported or was excluded (non-public) inside register_ena_study,
-            # so the pools hold no sequenced_sample rows. Submitting downloads
-            # against them would report success over an all-failed study.
-            # Terminal `failed`; the per-run reasons are already persisted on
-            # `ena_run_outcomes`.
-            reasons = _summarize_run_failures(
-                o for o in result.ena_runs if o.status not in _SUCCESSFUL_RUN_REGISTRATION_STATUSES
-            )
-            await _set_item_state(
-                pool,
-                item.idx,
-                BatchItemState.FAILED,
-                failure_reason=f"study registered but every run failed to register ({reasons})",
-            )
+        if (reason := _nothing_to_download_reason(result)) is not None:
+            await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=reason)
             return
 
         # Local import (narrow, deliberately unusual direction): reuse the exact
