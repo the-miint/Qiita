@@ -3,8 +3,8 @@
 - **krepp placement index builds can be registered onto a reference, checked on a node,
   activated and removed (#TBD).** A build made outside Qiita is placed at
   `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/`. The
-  `reference-index-register` workflow checks it (a krepp build, written by the krepp the
-  staged miint links, over the reference's own tree and edge numbers), writes
+  `reference-index-register` workflow checks it (written by the krepp the staged miint
+  links, over the reference's own tree and edge numbers, no symlinks), writes
   `README.md`, `manifest.json`, `verify.sh` and `SHA256SUMS` into it and records it
   `registered`. After the cluster admins copy it to every compute node, the
   `reference-index-activate` workflow checks a node's copy, places pieces of up to 100
