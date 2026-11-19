@@ -463,6 +463,24 @@ async def test_taxonomy_404s_for_an_unknown_reference(role_keyed_clients, amplic
     assert resp.status_code == 404, resp.text
 
 
+async def test_taxonomy_404s_for_a_known_name_with_an_unknown_version(
+    role_keyed_clients, amplicon_run, taxonomy_reference
+):
+    # The resolver matches (name, version), not name alone: the seeded reference's name
+    # with a version it does not carry is still a 404, so a release the server does not
+    # hold is told plainly rather than silently resolved to another release.
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_TAXONOMY,
+        json=_body(
+            [amplicon_run["processing_idx"]],
+            prep_sample_idx=[amplicon_run["ps_a"]],
+            reference_name=taxonomy_reference["name"],
+            reference_version="9999.9",
+        ),
+    )
+    assert resp.status_code == 404, resp.text
+
+
 async def test_taxonomy_409s_for_a_reference_that_is_not_servable(
     role_keyed_clients, amplicon_run, taxonomy_reference
 ):
