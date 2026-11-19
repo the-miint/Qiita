@@ -560,7 +560,6 @@ async def _process_one_study(
         # A creating item registers in the same transaction, so a failure leaves no
         # study. Until it commits, nothing may write this item's row through the
         # pool: the study_created stamp holds the row lock.
-        result = None
         try:
             async with pool.acquire() as conn, conn.transaction():
                 await lock_study_accession(conn, bioproject_accession=study_header.study_accession)
@@ -605,7 +604,7 @@ async def _process_one_study(
             return
 
         flagged: list[EnaRunRegistrationOutcome] = []
-        if result is None:
+        if not study_created:
             if not await _study_created_by_an_import(pool, study_idx):
                 await _set_item_state(
                     pool,
