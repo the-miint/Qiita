@@ -450,9 +450,9 @@ def _warn_anomaly(
     """Emit a loud WARNING (never a raise) with the count and first five rows of
     `sql`, when it returns any.
 
-    For anomalies that real corpora carry and that the load must survive. An
-    unconfigured WARNING reaches stderr via Python's last-resort handler and
-    lands in the SLURM job log, the loudest channel this architecture offers
+    For anomalies that real corpora carry and that the load must survive. The
+    WARNING goes through the launcher's step-log handler to the step's stderr
+    narrative (the SLURM job log), the loudest channel this architecture offers
     today."""
     n, first = _anomaly(conn, sql, params)
     if n:

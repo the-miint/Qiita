@@ -199,9 +199,12 @@ async def run_native_job(
     BAD_INPUT; the backend hands it to the runner, which transitions the
     ticket to NO_DATA.
 
-    Other exception types from `execute` propagate so they surface in
-    the orchestrator's logs with full traceback rather than being
-    silently classified. Every pyarrow and Flight exception that
+    Other exception types from `execute` propagate rather than being
+    mapped to a `BackendFailure` here: the launcher (`jobs.__main__`)
+    catches them, writes a failure receipt carrying the exception (the
+    traceback goes to the stderr narrative), and leaves the final kind to
+    the backend's state-based classification.
+    Every pyarrow and Flight exception that
     `is_data_plane_transient` does not recognise propagates for the same reason, which is
     what the pyarrow arm's placement above the builtin arms buys: an
     `ArrowInvalid` is a `ValueError` and an `ArrowNotImplementedError` is a

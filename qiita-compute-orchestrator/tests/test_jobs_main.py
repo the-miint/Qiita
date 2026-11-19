@@ -14,16 +14,21 @@ behavior per test.
 from __future__ import annotations
 
 import json
+import logging
 import stat
 import sys
 import types
 from pathlib import Path
 
+import duckdb
 import pytest
 from pydantic import BaseModel
+from qiita_common.log_tail import contains_oom_signature
+from qiita_common.step_log import summarize
 
 from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
 from qiita_compute_orchestrator.jobs.__main__ import _flatten_params, main
+from qiita_compute_orchestrator.slurm.launcher_failure import parse_launcher_failure
 
 
 class _Inputs(BaseModel):
@@ -38,6 +43,25 @@ def _install_stub(monkeypatch, *, short_name: str, execute_fn) -> None:
     mod.Inputs = _Inputs
     mod.execute = execute_fn
     monkeypatch.setitem(sys.modules, full, mod)
+
+
+@pytest.fixture(autouse=True)
+def _restore_root_logging():
+    """`main()` calls `logging.basicConfig(force=True)`, which rebinds the root
+    logger's handlers to whatever stderr is live when it runs — under pytest, the
+    test's captured stream — and quiets httpx/httpcore, and restores none of it. A
+    later test that logs would then write to a closed stream (`ValueError: I/O
+    operation on closed file`). Snapshot the logging state and put it back."""
+    root = logging.root
+    handlers, level = root.handlers[:], root.level
+    noisy = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    try:
+        yield
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+        for name, lvl in noisy.items():
+            logging.getLogger(name).setLevel(lvl)
 
 
 @pytest.fixture
@@ -65,6 +89,14 @@ def _write_params(input_path: Path, *, fastq_path: str, reference_idx: int, work
             output_path=str(input_path.parent / "output"),
         ).model_dump_json()
     )
+
+
+def _outcome(captured) -> dict:
+    """The outcome line: the last line of stderr, among the step's log lines, and
+    the whole of stdout, as the step's receipt."""
+    line = captured.err.strip().splitlines()[-1]
+    assert captured.out.strip() == line
+    return json.loads(line)
 
 
 def test_main_writes_manifest_and_chmods_on_success(monkeypatch, io_dirs):
@@ -114,6 +146,32 @@ def test_main_writes_manifest_and_chmods_on_success(monkeypatch, io_dirs):
     for p in (output_path / "manifest.parquet", output_path / "manifest.json"):
         mode = stat.S_IMODE(p.stat().st_mode)
         assert mode == 0o440, f"{p.name}: expected 0o440, got {mode:#o}"
+
+
+def test_main_logs_the_step_and_prints_its_receipt(monkeypatch, io_dirs, capsys):
+    """A successful job's log lines carry its step name on stderr, and stdout is
+    one receipt line holding what it summarized."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        logging.getLogger("qiita_compute_orchestrator.jobs.receipt").info("counted 3 things")
+        summarize(things=3)
+        out = workspace / "manifest.parquet"
+        out.write_bytes(b"P")
+        return {"manifest": out}
+
+    _install_stub(monkeypatch, short_name="receipt", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=7, work_ticket_idx=99)
+
+    assert main(["--job", "receipt"]) == 0
+    captured = capsys.readouterr()
+    step = "fastq"
+    assert f"INFO {step}: counted 3 things" in captured.err
+    assert json.loads(captured.out) == {
+        "kind": "completed",
+        "step_name": step,
+        "summary": {"things": 3},
+    }
 
 
 def test_main_handles_directory_output(monkeypatch, io_dirs):
@@ -236,8 +294,7 @@ def test_main_returns_1_on_reserved_key_collision(reserved_key, monkeypatch, io_
     rc = main(["--job", "collision"])
     assert rc == 1
 
-    captured = capsys.readouterr()
-    err = json.loads(captured.err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     # Stderr carries the YAML step name from params.json, not the module path.
     assert err["step_name"] == "fastq"
@@ -274,7 +331,7 @@ def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, c
 
     rc = main(["--job", "post_fail"])
     assert rc == 1
-    err = json.loads(capsys.readouterr().err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     # YAML step name from params.json, not the module path.
     assert err["step_name"] == "fastq"
@@ -304,7 +361,7 @@ def test_main_rejects_out_of_tree_output(monkeypatch, io_dirs, capsys):
 
     rc = main(["--job", "escapes"])
     assert rc == 1
-    err = json.loads(capsys.readouterr().err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "contract_violation"
     assert err["step_name"] == "fastq"
     assert "post-success manifest write failed" in err["reason"]
@@ -334,11 +391,98 @@ def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     rc = main(["--job", "skeleton"])
     assert rc == 1
 
-    captured = capsys.readouterr()
-    err = json.loads(captured.err)
+    err = _outcome(capsys.readouterr())
     assert err["kind"] == "unknown_permanent"
     # YAML step name from params.json, not the module path; module path
     # stays in the reason text for operator-side debugging.
     assert err["step_name"] == "fastq"
     assert "qiita_compute_orchestrator.jobs.skeleton" in err["reason"]
     assert "not implemented" in err["reason"]
+
+
+def test_main_writes_a_no_data_receipt(monkeypatch, io_dirs, capsys):
+    """A `StepNoData` from execute() ends the step non-zero with a `no_data` receipt
+    — not a failure — on stdout and as the last stderr line. run_native_job re-raises
+    StepNoData unchanged; main() turns it into the no-data outcome the backend parses
+    before its failure parse."""
+    from qiita_common.backend_failure import StepNoData
+
+    from qiita_compute_orchestrator.slurm.launcher_failure import NO_DATA_MARKER_KIND
+
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        raise StepNoData(step_name="fastq", reason="FASTQ well carried no records")
+
+    _install_stub(monkeypatch, short_name="nodata", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    rc = main(["--job", "nodata"])
+    assert rc == 1
+    out = _outcome(capsys.readouterr())
+    assert out["kind"] == NO_DATA_MARKER_KIND
+    assert out["step_name"] == "fastq"
+    assert out["reason"] == "FASTQ well carried no records"
+    # A no-data outcome has no summary — it is not a success.
+    assert "summary" not in out
+
+
+def test_main_writes_a_receipt_for_an_unhandled_exception(monkeypatch, io_dirs, capsys, tmp_path):
+    """An exception run_native_job does not classify (it maps the ones it knows to
+    BackendFailure and lets the rest propagate) still ends the step with a receipt on
+    stdout — a typed permanent failure carrying the exception — rather than an empty
+    stdout. It writes no outcome line to stderr, so `parse_launcher_failure` finds
+    nothing and the backend's state-based classification governs the kind."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        raise RuntimeError("something unexpected blew up")
+
+    _install_stub(monkeypatch, short_name="boom", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    rc = main(["--job", "boom"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    receipt = json.loads(captured.out.strip())
+    assert receipt["kind"] == "unknown_permanent"
+    assert receipt["step_name"] == "fastq"
+    assert "RuntimeError" in receipt["reason"]
+    assert "something unexpected blew up" in receipt["reason"]
+    # The traceback is in the narrative, but there is no launcher outcome line to parse.
+    assert "RuntimeError" in captured.err
+    stderr_file = tmp_path / "stderr"
+    stderr_file.write_text(captured.err)
+    assert parse_launcher_failure(stderr_file) is None
+
+
+def test_an_unhandled_oom_leaves_classification_to_the_backend(
+    monkeypatch, io_dirs, capsys, tmp_path
+):
+    """An in-process DuckDB OOM surfaces as an unclassified exception whose message
+    carries an OOM signature. The catch-all must not stamp an `unknown_permanent` line on
+    stderr: `parse_launcher_failure` returns None, so `result_step` runs its state-based
+    path, sees the OOM signature in the stderr tail (`contains_oom_signature`), and
+    upgrades to the retriable OOM_KILLED (its own tests cover that upgrade). A stderr line
+    here would make the OOM permanent."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        # The real exception run_native_job does not map (it is not a ValueError), with
+        # the message DuckDB actually raises.
+        raise duckdb.OutOfMemoryException(
+            "Out of Memory Error: could not allocate block of size 256.0 KiB"
+        )
+
+    _install_stub(monkeypatch, short_name="oom", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    assert main(["--job", "oom"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip())["kind"] == "unknown_permanent"
+    stderr_file = tmp_path / "stderr"
+    stderr_file.write_text(captured.err)
+    # No launcher line to pre-empt the backend, and the OOM signature the backend keys on
+    # is present in the narrative for it to find.
+    assert parse_launcher_failure(stderr_file) is None
+    assert contains_oom_signature(captured.err)

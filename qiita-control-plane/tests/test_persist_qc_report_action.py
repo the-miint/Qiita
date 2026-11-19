@@ -1,10 +1,9 @@
 """DB tests for the persist-qc-report library primitive.
 
-`persist_qc_report` writes the two fastqc-equivalent QC reports (raw / filtered
-qc_report.json) onto the 1:1 sequenced_sample for a prep_sample as JSONB. It is
-the in-process action fastq-to-parquet/1.2.0 runs after persist-read-metrics,
-consuming the qc_report.json sidecars from the qc_report_raw / qc_report_filtered
-steps.
+`persist_qc_report` writes the raw fastqc-equivalent QC report, and the filtered one
+when bound, onto the 1:1 sequenced_sample for a prep_sample as JSONB. It is the
+in-process action fastq-to-parquet runs after persist-read-metrics, consuming the
+qc_report.json sidecars from the qc_report_raw (and qc_report_filtered) steps.
 
 Each test seeds its own principal -> biosample -> prep_sample chain (and, where
 needed, the sequenced_sample subtype), so the file runs against the shared
@@ -142,3 +141,24 @@ async def test_persist_fails_fast_without_sequenced_sample(chain):
         await persist_qc_report(
             chain["pool"], chain["prep_sample_idx"], _RAW_REPORT, _FILTERED_REPORT
         )
+
+
+async def test_raw_only_persist_clears_filtered_report(chain):
+    """A raw-only persist stores NULL filtered even over an existing value, so the
+    row never pairs a fresh raw report with a stale filtered one."""
+    ss_idx = await chain["seed_subtype"]()
+    await persist_qc_report(chain["pool"], chain["prep_sample_idx"], _RAW_REPORT, _FILTERED_REPORT)
+    newer_raw = {**_RAW_REPORT, "read_pairs": 7}
+    returned = await persist_qc_report(chain["pool"], chain["prep_sample_idx"], newer_raw)
+    assert returned == ss_idx
+    raw, filtered = await _reports(chain["pool"], ss_idx)
+    assert raw == newer_raw
+    assert filtered is None
+
+
+async def test_raw_only_persist_on_fresh_row_leaves_filtered_null(chain):
+    ss_idx = await chain["seed_subtype"]()
+    await persist_qc_report(chain["pool"], chain["prep_sample_idx"], _RAW_REPORT)
+    raw, filtered = await _reports(chain["pool"], ss_idx)
+    assert raw == _RAW_REPORT
+    assert filtered is None
