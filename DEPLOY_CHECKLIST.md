@@ -52,6 +52,15 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
   ```
+- `[operator]` **Before the restart, no amplicon ticket may be in flight.** amplicon
+  now passes ASV sequences from `amplicon_deblur` to `amplicon_load` inline
+  (`asv_sequences`) rather than chunked (`asv_chunks`), a change to the shared modules
+  both 1.0.0 and 1.1.0 bind. A ticket past `amplicon_deblur` when the sync lands is
+  refused on resume (its recorded deblur output no longer matches what `amplicon_load`
+  reads) and has to be submitted again. Expect 0; otherwise wait for them to finish.
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'amplicon' AND state IN ('pending','queued','processing')"
+  ```
 - `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
   The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
   workspaces, and the build deployed now does not know to keep them. From this deploy,
