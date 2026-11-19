@@ -194,7 +194,7 @@ async def test_post_study_full_body_round_trips(ctx):
         bioproject_accession="PRJNA000001",
         notes="notes-1",
         extra_metadata=extra,
-        default_tier="viewer",
+        default_tier=Tier.VIEWER,
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -644,7 +644,7 @@ async def test_get_study_returns_same_shape_as_post(ctx):
         ena_study_accession="ERP000001",
         notes="notes-1",
         extra_metadata=extra,
-        default_tier="viewer",
+        default_tier=Tier.VIEWER,
     )
     assert create_resp.status_code == 201, create_resp.text
     posted = create_resp.json()
@@ -710,7 +710,7 @@ async def test_get_study_without_grant_403(ctx):
         ctx,
         title=_unique_title("get-403"),
         owner_idx=other_owner,
-        default_tier="member",
+        default_tier=Tier.MEMBER,
     )
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
@@ -723,11 +723,11 @@ async def test_get_study_without_grant_403(ctx):
 @pytest.mark.parametrize(
     ("default_tier", "grant", "status", "view"),
     [
-        ("member", Tier.VIEWER, 200, StudyRecordView.SUMMARY),
-        ("admin", Tier.VIEWER, 200, StudyRecordView.SUMMARY),
-        ("admin", Tier.MEMBER, 200, StudyRecordView.SUMMARY),
-        ("member", Tier.MEMBER, 200, StudyRecordView.FULL),
-        ("member", None, 403, None),
+        (Tier.MEMBER, Tier.VIEWER, 200, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.VIEWER, 200, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.MEMBER, 200, StudyRecordView.SUMMARY),
+        (Tier.MEMBER, Tier.MEMBER, 200, StudyRecordView.FULL),
+        (Tier.MEMBER, None, 403, None),
         (Tier.PUBLIC, None, 200, StudyRecordView.PUBLIC),
         (Tier.PUBLIC, Tier.VIEWER, 200, StudyRecordView.FULL),
     ],
@@ -1537,7 +1537,7 @@ async def _seed_list_fixture(ctx) -> tuple[str, dict[str, int]]:
     other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"list-{token}")
     ctx["created"]["user_principals"].append(other)
     idxs: dict[str, int] = {}
-    for name, tier in (("private", "member"), ("shared", "member"), ("public", "public")):
+    for name, tier in (("private", Tier.MEMBER), ("shared", Tier.MEMBER), ("public", Tier.PUBLIC)):
         resp = await _post_study(
             ctx["wet"], ctx, title=f"{token} {name}", owner_idx=other, default_tier=tier
         )
@@ -1633,15 +1633,15 @@ async def test_list_studies_wet_lab_admin_sees_every_study(ctx):
 async def test_list_studies_min_tier_filters_on_the_callers_own_tier(ctx):
     token, idxs = await _seed_list_fixture(ctx)
     viewer = {
-        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="viewer"))["studies"]
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier=Tier.VIEWER))["studies"]
     }
     assert viewer == {idxs["shared"], idxs["own"]}
     member = {
-        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="member"))["studies"]
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier=Tier.MEMBER))["studies"]
     }
     assert member == {idxs["own"]}
     # Applies to a role-bypass caller too: the wet_lab_admin holds no grant here.
-    assert (await _list(ctx["wet"], q=token, min_tier="viewer"))["studies"] == []
+    assert (await _list(ctx["wet"], q=token, min_tier=Tier.VIEWER))["studies"] == []
 
 
 async def test_list_studies_search_matches_title_words(ctx):
@@ -1687,12 +1687,12 @@ async def test_list_studies_min_tier_pages_are_not_padded_with_dropped_rows(ctx)
     and the shared one is not a candidate, so page two is the shared study —
     not an empty page carrying a cursor."""
     token, idxs = await _seed_list_fixture(ctx)
-    first = await _list(ctx["user"], q=token, min_tier="viewer", limit=1)
+    first = await _list(ctx["user"], q=token, min_tier=Tier.VIEWER, limit=1)
     assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
     second = await _list(
         ctx["user"],
         q=token,
-        min_tier="viewer",
+        min_tier=Tier.VIEWER,
         limit=1,
         after_study_idx=first["next_after_study_idx"],
     )
@@ -1705,12 +1705,12 @@ async def test_list_studies_reads_past_dropped_candidates_to_the_end(ctx):
     study reads past it and reports the end, rather than returning an empty
     page with a cursor."""
     token, idxs = await _seed_list_fixture(ctx)
-    first = await _list(ctx["user"], q=token, min_tier="member", limit=1)
+    first = await _list(ctx["user"], q=token, min_tier=Tier.MEMBER, limit=1)
     assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
     second = await _list(
         ctx["user"],
         q=token,
-        min_tier="member",
+        min_tier=Tier.MEMBER,
         limit=1,
         after_study_idx=first["next_after_study_idx"],
     )
@@ -1733,7 +1733,7 @@ async def test_list_studies_explicit_public_min_tier_matches_no_filter(ctx):
     token, _ = await _seed_list_fixture(ctx)
     for client in (ctx["user"], ctx["wet"]):
         plain = await _list(client, q=token)
-        public = await _list(client, q=token, min_tier="public")
+        public = await _list(client, q=token, min_tier=Tier.PUBLIC)
         assert public == plain
 
 
@@ -1799,7 +1799,7 @@ async def test_list_studies_stops_after_the_fill_round_cap_and_resumes(ctx):
         await shared(f"viewer{i}", Tier.VIEWER) for i in range(_MAX_LIST_FILL_ROUNDS + 1)
     ]
 
-    params = {"q": token, "min_tier": "member", "limit": 1}
+    params = {"q": token, "min_tier": Tier.MEMBER, "limit": 1}
     first = await _list(ctx["user"], **params)
     # Rounds spent on the newest viewer studies: nothing kept, cursor at the last one read.
     assert first == {
@@ -1893,7 +1893,7 @@ async def test_list_studies_owner_without_an_access_row_is_admin(ctx):
     await ctx["pool"].execute(
         "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2", idx, me
     )
-    for min_tier in (None, "viewer", "admin"):
+    for min_tier in (None, Tier.VIEWER, Tier.ADMIN):
         params = {"q": token} | ({"min_tier": min_tier} if min_tier else {})
         rows = (await _list(ctx["user"], **params))["studies"]
         assert [(r["study_idx"], r["caller_tier"], r["access_via"]) for r in rows] == [
@@ -1927,7 +1927,7 @@ async def test_list_studies_pages_past_a_dropped_row_mid_page(ctx):
         if grant == Tier.MEMBER:
             member_idxs.append(idx)
     seen: list[int] = []
-    params: dict = {"q": token, "limit": 3, "min_tier": "member"}
+    params: dict = {"q": token, "limit": 3, "min_tier": Tier.MEMBER}
     for _ in range(10):
         body = await _list(ctx["user"], **params)
         seen += [r["study_idx"] for r in body["studies"]]
