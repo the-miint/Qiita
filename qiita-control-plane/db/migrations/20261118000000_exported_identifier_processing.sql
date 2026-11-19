@@ -70,6 +70,23 @@ COMMENT ON COLUMN qiita.exported_identifier.processing_idx IS
     'an alignment- or mask-kind row. Exactly one of alignment_idx / mask_idx / '
     'processing_idx is set on a live row.';
 
+COMMENT ON FUNCTION qiita.retire_detached_exported_identifier() IS
+    'Retires an exported_identifier whose processing FK (alignment_idx, mask_idx or '
+    'processing_idx) or prep_sample_idx was just nulled by an ON DELETE SET NULL. '
+    'Required for that FK action to satisfy the one_processing and live_names_prep_sample '
+    'CHECKs — without it deleting an alignment_definition, mask_definition, processing or '
+    'prep_sample row that a live identifier names fails.';
+
+COMMENT ON TABLE qiita.exported_identifier IS
+    'Public handle (export_id, ''QM<idx>'') for one processed sample — a '
+    'prep_sample plus its processing: (alignment_idx, prep_sample_idx), '
+    '(mask_idx, prep_sample_idx) or (processing_idx, prep_sample_idx). Exists because no '
+    'accession identifies a processed sample: a biosample accession cannot say WHICH '
+    'sequencing of it, and an ENA run accession is NULL until submission. Never deleted, '
+    'only retired, so a published citation keeps resolving. Extended by ADD COLUMN per '
+    'new processing type — which must update the one_processing CHECK AND add its own '
+    'partial unique index.';
+
 -- migrate:down
 
 -- Restore the trigger and CHECK to their pre-processing state (alignment + mask +
@@ -105,6 +122,22 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+COMMENT ON FUNCTION qiita.retire_detached_exported_identifier() IS
+    'Retires an exported_identifier whose processing FK (alignment_idx or mask_idx) '
+    'or prep_sample_idx was just nulled by an ON DELETE SET NULL. Required for that '
+    'FK action to satisfy the one_processing and live_names_prep_sample CHECKs — '
+    'without it deleting an alignment_definition, mask_definition or prep_sample row '
+    'that a live identifier names fails.';
+
+COMMENT ON TABLE qiita.exported_identifier IS
+    'Public handle (export_id, ''QM<idx>'') for one processed sample — a '
+    'prep_sample plus its processing: (alignment_idx, prep_sample_idx) or '
+    '(mask_idx, prep_sample_idx). Exists because no accession identifies a processed '
+    'sample: a biosample accession cannot say WHICH sequencing of it, and an ENA run '
+    'accession is NULL until submission. Never deleted, only retired, so a published '
+    'citation keeps resolving. Extended by ADD COLUMN per new processing type — which '
+    'must update the one_processing CHECK AND add its own partial unique index.';
 
 DROP INDEX IF EXISTS qiita.exported_identifier_live_processing_sample;
 -- The processing-kind identifier (alignment_idx and mask_idx NULL, processing_idx
