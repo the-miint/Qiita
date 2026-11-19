@@ -2785,6 +2785,19 @@ def test_idle_wait_stops_the_deploy_when_the_catalog_query_fails(tmp_path: Path)
     assert "set QIITA_DP_IDLE_WAIT_S=0 to restart without waiting" in proc.stderr
 
 
+def _holds_open(pid: int, path: Path) -> bool:
+    """Whether process `pid` has `path` open. An fd listed under /proc/<pid>/fd can be
+    closed before it is read (the child is still starting), so a vanished one is
+    skipped."""
+    for fd in Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            if os.readlink(fd) == str(path):
+                return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc (Linux)")
 @pytest.mark.parametrize(
     ("name", "busy"), [("upload.parquet.partial", True), ("upload.parquet", False)]
@@ -2799,9 +2812,8 @@ def test_idle_wait_counts_an_open_partial_upload(tmp_path: Path, name: str, busy
         stdin=subprocess.PIPE,
     )
     try:
-        fd_dir = Path(f"/proc/{holder.pid}/fd")
         for _ in range(100):
-            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+            if _holds_open(holder.pid, held):
                 break
             time.sleep(0.05)
         proc, _calls = _run_idle_wait(
@@ -2826,9 +2838,8 @@ def test_idle_wait_counts_a_partial_upload_on_any_local_instance(tmp_path: Path)
         stdin=subprocess.PIPE,
     )
     try:
-        fd_dir = Path(f"/proc/{holder.pid}/fd")
         for _ in range(100):
-            if any(os.readlink(fd) == str(held) for fd in fd_dir.iterdir()):
+            if _holds_open(holder.pid, held):
                 break
             time.sleep(0.05)
         proc, _calls = _run_idle_wait(
