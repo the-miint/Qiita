@@ -487,13 +487,15 @@ def study_record_view(
     PUBLIC: no grant on a public-default study, which only that default
     admits the caller to. None: no grant on a study that is not public.
     """
-    if caller.has_role_at_least(bypass_role):
+    if caller.has_role_at_least(bypass_role) or row.owner_idx == caller.principal_idx:
         return StudyRecordView.FULL
-    if row.access_tier is None and row.owner_idx != caller.principal_idx:
-        return StudyRecordView.PUBLIC if row.default_tier is Tier.PUBLIC else None
-    if _access_row_allows(row, caller=caller, min_tier=row.default_tier):
-        return StudyRecordView.FULL
-    return StudyRecordView.SUMMARY
+    if row.access_tier is not None:
+        if tier_at_least(row.access_tier, row.default_tier):
+            return StudyRecordView.FULL
+        return StudyRecordView.SUMMARY
+    if row.default_tier is Tier.PUBLIC:
+        return StudyRecordView.PUBLIC
+    return None
 
 
 def caller_effective_tier(row: CallerStudyAccessRow, *, caller: Principal) -> Tier:
@@ -946,8 +948,8 @@ def require_study_access(
     `min_tier`. Routes that must surface 404 on a missing study for
     bypass-role callers should compose `require_study_exists` alongside
     this guard (see `list_biosample_idxs_in_study`). Reading the study's own
-    record is not gated here: it has two levels, decided by
-    `study_record_view`.
+    record is not gated here: `study_record_view` decides which view of it a
+    caller reads.
 
     `bypass_role` defaults to `SYSTEM_ADMIN` (existing behavior). Pass
     `WET_LAB_ADMIN` for routes whose policy admits any wet_lab_admin

@@ -159,10 +159,9 @@ class StudySummary(BaseModel):
 
     `caller_tier` is the caller's own tier on the study: `admin` for its
     owner, else their qiita.study_access row, or `public` when they hold none.
-    `access_via`
-    says why they can read it, which `caller_tier` alone cannot: a
-    wet_lab_admin with no grant and a stranger on a public study both have
-    `caller_tier` public.
+    `access_via` says why they can read it, which `caller_tier` alone cannot:
+    a wet_lab_admin with no grant has `caller_tier` public, as the reader of a
+    `StudyPublicSummary` row does.
     """
 
     study_idx: Annotated[int, Field(gt=0)]
@@ -181,8 +180,15 @@ class StudySummary(BaseModel):
 
 class StudyPublicSummary(BaseModel):
     """One row of GET /api/v1/study for a study that only its public default
-    admits the caller to. It carries no study_idx, as the record's public view
-    (`StudyRecordPublic`) does not: `export_entity_id` is the handle."""
+    admits the caller to, holding what the public view of the record holds
+    (docs/architecture/data-model.md, "What a tier reads of a study's own
+    record"): `export_entity_id` is its handle. `default_tier`, `caller_tier`
+    and `access_via` are always `public` here, and are kept so that every row
+    reads the same way.
+
+    Its fields are listed here rather than shared with `StudySummary` through a
+    base class, so that a field added for callers with a grant cannot reach it.
+    """
 
     export_entity_id: str
     title: str
@@ -193,7 +199,6 @@ class StudyPublicSummary(BaseModel):
     caller_tier: Tier
     access_via: StudyAccessVia
     record_view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
-    updated_at: AwareDatetime
 
 
 class StudySummaryListResponse(BaseModel):
@@ -228,9 +233,14 @@ class StudyRecordSummary(BaseModel):
 
 class StudyRecordPublic(BaseModel):
     """GET /api/v1/study/{study_idx} for a caller whom only the study's public
-    default admits: no grant, not the owner, no bypass role. It describes the
-    study and leaves out its internal idxs, notes, extra metadata and
-    submission state; the full record is `StudyResponse`."""
+    default admits: no grant, not the owner, no bypass role. Which fields it
+    holds is defined in docs/architecture/data-model.md ("What a tier reads of
+    a study's own record"); the full record is `StudyResponse`.
+
+    Its fields are listed here rather than shared with the other views through
+    a base class, so that a field added for callers with a grant cannot reach
+    it.
+    """
 
     view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
     export_entity_id: str
@@ -242,7 +252,6 @@ class StudyRecordPublic(BaseModel):
     bioproject_accession: str | None
     ena_study_accession: str | None
     default_tier: Tier
-    updated_at: AwareDatetime
 
 
 def _reject_public_tier(tier: Tier) -> Tier:

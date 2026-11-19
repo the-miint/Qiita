@@ -6,23 +6,28 @@
 --
 -- An ENA import now creates its studies public
 -- (`repositories.study.get_or_create_study_by_ena_accessions`;
--- docs/architecture/data-model.md, "Default tiers", says why). This brings the
--- studies that imports created before it to the same tier. A study that an
--- import only matched by accession is not one it created
+-- docs/architecture/data-model.md, "Default tiers", says why). This migration
+-- brings the studies that imports created before this deploy to the same tier.
+-- A study that an import only matched by accession is not one it created
 -- (`qiita.ena_import_batch_item.study_created`), and keeps its tier.
 --
--- Making a study public publishes everything in it, so the migration refuses
--- while an import-created study holds data that did not come from ENA: a
--- biosample linked to it with no ena_sample_accession (the import writes one on
--- every biosample it creates), or a sequenced_sample in it with no
--- ena_run_accession (likewise). Only active links count: a sample retired from
--- the study is no longer in it.
+-- Making a study public publishes its public view and its local fields with no
+-- tier_override. So the migration refuses while an import-created study holds
+-- a sample that did not come from ENA: a biosample linked to it with no
+-- ena_sample_accession (the import writes one on every biosample it creates),
+-- or a sequenced_sample in it with no ena_run_accession (likewise). A sample
+-- whose link to the study is retired is no longer in it, and is not counted.
+--
+-- Two kinds of content that a person may have added after the import are
+-- published without a check, by decision: the study's alias, description,
+-- abstract and funding, and local fields added with no tier_override. The
+-- deploy checklist lists both before this migration runs.
 DO $$
 DECLARE
     offending TEXT;
 BEGIN
     WITH imported AS (
-        SELECT DISTINCT study_idx FROM qiita.ena_import_batch_item WHERE study_created
+        SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created
     ), not_from_ena AS (
         SELECT bts.study_idx
           FROM qiita.biosample_to_study bts
@@ -42,9 +47,9 @@ BEGIN
       FROM not_from_ena;
     IF offending IS NOT NULL THEN
         RAISE EXCEPTION 'ENA-imported studies % hold data that did not come from ENA', offending
-          USING HINT = 'Making these studies public would publish that data. Decide each study'
-                       ' with its owner, for example by moving the samples that did not come'
-                       ' from ENA into a study of their own, then apply again.';
+          USING HINT = 'Making these studies public would publish their biosamples or'
+                       ' sequenced_samples that did not come from ENA. Stop the deploy and'
+                       ' raise each study with its owner; no route moves samples out of a study.';
     END IF;
 END
 $$;
@@ -55,8 +60,8 @@ UPDATE qiita.study
 
 -- migrate:down
 
--- Every study an import created was `member` before the up step: default_tier
--- cannot be changed after creation, and imports created their studies at
+-- Every study an import created was `member` before the up step: no route
+-- changes default_tier after creation, and imports created their studies at
 -- `member` until this deploy.
 UPDATE qiita.study
    SET default_tier = 'member'

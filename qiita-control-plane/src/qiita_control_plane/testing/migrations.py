@@ -64,6 +64,16 @@ def migrate_up(sql: str) -> str:
     return _DOWN_MARKER.split(sql, maxsplit=1)[0]
 
 
+def migrate_down(sql: str) -> str:
+    """The `migrate:down` half of a dbmate migration: everything after the
+    `-- migrate:down` line, matched as `migrate_up` matches it. Raises when the
+    file has no such line, rather than returning an empty rollback."""
+    parts = _DOWN_MARKER.split(sql, maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("migration has no '-- migrate:down' line")
+    return parts[1]
+
+
 def strip_sql_comments(sql: str, *, source: str = "<sql>") -> str:
     """Remove `--` line comments, refusing to corrupt a string literal.
 

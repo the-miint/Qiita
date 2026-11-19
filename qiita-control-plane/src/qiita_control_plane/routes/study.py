@@ -236,22 +236,31 @@ def _list_row(
     view: StudyRecordView,
     principal: Principal,
 ) -> StudySummary | StudyPublicSummary:
-    """One GET /study row for `view`. A public-view row leaves out study_idx,
-    as `StudyRecordPublic` does."""
-    common = {
+    """One GET /study row, in the model for `view`."""
+    fields = {
+        **dict(row),
         "export_entity_id": require_export_entity_id(row, kind="study"),
-        "title": row["title"],
-        "alias": row["alias"],
-        "bioproject_accession": row["bioproject_accession"],
-        "ena_study_accession": row["ena_study_accession"],
-        "default_tier": access.default_tier,
         "caller_tier": caller_effective_tier(access, caller=principal),
         "access_via": study_access_via(access, caller=principal),
-        "updated_at": row["updated_at"],
     }
     if view is StudyRecordView.PUBLIC:
-        return StudyPublicSummary(**common)
-    return StudySummary(study_idx=row["idx"], record_view=view, **common)
+        return StudyPublicSummary.model_validate(fields)
+    return StudySummary.model_validate({**fields, "study_idx": row["idx"], "record_view": view})
+
+
+def _matches_within_view(row: asyncpg.Record, view: StudyRecordView) -> bool:
+    """Whether the listing's `q` matched in a field that `view` shows. A summary
+    or public-view reader is held to that view's fields: a match only in a
+    field they cannot read would disclose it."""
+    if view is StudyRecordView.FULL:
+        # fetch_study_list_candidates admits a row only on a match in some field
+        # of the full record.
+        return True
+    if view is StudyRecordView.SUMMARY:
+        return row["summary_match"]
+    if view is StudyRecordView.PUBLIC:
+        return row["public_match"]
+    raise RuntimeError(f"no search rule for study record view {view!r}")
 
 
 @router.get(PATH_STUDY_ROOT)
@@ -284,8 +293,7 @@ async def list_studies(
     """The studies the caller may read, highest study_idx first: the same set
     GET /study/{idx} answers (owned, shared with them at any tier, or
     public-default; every study for wet_lab_admin+). Each row says which view
-    of the record that answer is; a row in the public view carries no
-    study_idx, as that view does not."""
+    of the record that answer is (`StudyPublicSummary` for the public view)."""
     # A min_tier above public asks about the caller's own grants, so a role
     # bypass and ungranted public studies cannot contribute rows.
     relationship_only = min_tier is not None and min_tier is not Tier.PUBLIC
@@ -319,11 +327,7 @@ async def list_studies(
                 access, caller=principal, tier=min_tier
             ):
                 continue
-            # A summary or public-view reader is held to that view's fields:
-            # matching words only in a field they cannot read would disclose it.
-            if q is not None and view is StudyRecordView.SUMMARY and not row["summary_match"]:
-                continue
-            if q is not None and view is StudyRecordView.PUBLIC and not row["public_match"]:
+            if q is not None and not _matches_within_view(row, view):
                 continue
             studies.append(_list_row(row, access=access, view=view, principal=principal))
             if len(studies) == limit:
@@ -391,20 +395,13 @@ async def get_study(
             updated_at=row["updated_at"],
         )
     if view is StudyRecordView.PUBLIC:
-        return StudyRecordPublic(
-            export_entity_id=require_export_entity_id(row, kind="study"),
-            title=row["title"],
-            alias=row["alias"],
-            description=row["description"],
-            abstract=row["abstract"],
-            funding=row["funding"],
-            bioproject_accession=row["bioproject_accession"],
-            ena_study_accession=row["ena_study_accession"],
-            default_tier=row["default_tier"],
-            updated_at=row["updated_at"],
+        return StudyRecordPublic.model_validate(
+            {**dict(row), "export_entity_id": require_export_entity_id(row, kind="study")}
         )
-    response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
-    return _study_response_from_row(row)
+    if view is StudyRecordView.FULL:
+        response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
+        return _study_response_from_row(row)
+    raise RuntimeError(f"no response for study record view {view!r}")
 
 
 @router.patch(PATH_STUDY_BY_IDX)

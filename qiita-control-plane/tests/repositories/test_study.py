@@ -812,8 +812,8 @@ async def test_get_or_create_study_by_ena_accessions_reuses_on_hit(postgres_pool
 
 
 async def test_get_or_create_study_by_ena_accessions_creates_the_study_public(postgres_pool):
-    """ENA already publishes an imported study's data, so the study an import
-    creates is public."""
+    """The study an import creates is public (docs/architecture/data-model.md,
+    "Default tiers")."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()

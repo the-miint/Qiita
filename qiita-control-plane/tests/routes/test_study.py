@@ -728,16 +728,15 @@ async def test_get_study_without_grant_403(ctx):
         ("admin", Tier.MEMBER, 200, StudyRecordView.SUMMARY),
         ("member", Tier.MEMBER, 200, StudyRecordView.FULL),
         ("member", None, 403, None),
-        ("public", None, 200, StudyRecordView.PUBLIC),
-        ("public", Tier.VIEWER, 200, StudyRecordView.FULL),
+        (Tier.PUBLIC, None, 200, StudyRecordView.PUBLIC),
+        (Tier.PUBLIC, Tier.VIEWER, 200, StudyRecordView.FULL),
     ],
 )
 async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant, status, view):
     """The full record at or above the study's default_tier; below it, a grant
     reads only the summary, which carries none of the record's private fields.
-    A caller whom only a public default admits reads the public view: what
-    describes the study, without its internal idxs, notes, extra metadata or
-    submission state."""
+    A caller whom only a public default admits reads the public view, with the
+    fields that docs/architecture/data-model.md lists for it."""
     other_owner = await seed_user_principal(
         ctx["pool"], prefix=_SEED_PREFIX, suffix=f"view-{secrets.token_hex(3)}"
     )
@@ -799,7 +798,6 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "bioproject_accession",
             "ena_study_accession",
             "default_tier",
-            "updated_at",
         }
         assert (body["description"], body["abstract"], body["funding"]) == (
             "a description",
@@ -1590,9 +1588,19 @@ async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     # A viewer grant on a member-default study reads only its summary.
     assert rows[qs["shared"]]["record_view"] == StudyRecordView.SUMMARY
     # Only the public default admits them to the public study: its public view,
-    # whose row carries no study_idx.
+    # whose row carries no study_idx and no updated_at.
+    assert set(rows[qs["public"]]) == {
+        "export_entity_id",
+        "title",
+        "alias",
+        "bioproject_accession",
+        "ena_study_accession",
+        "default_tier",
+        "caller_tier",
+        "access_via",
+        "record_view",
+    }
     assert rows[qs["public"]]["record_view"] == StudyRecordView.PUBLIC
-    assert "study_idx" not in rows[qs["public"]]
     assert rows[qs["own"]]["record_view"] == StudyRecordView.FULL
     assert rows[qs["shared"]]["study_idx"] == idxs["shared"]
     assert rows[qs["own"]]["study_idx"] == idxs["own"]
@@ -1856,7 +1864,7 @@ async def test_list_studies_public_reader_cannot_search_fields_the_public_view_l
         ctx,
         title=f"{token} open",
         owner_idx=other,
-        default_tier="public",
+        default_tier=Tier.PUBLIC,
         notes=f"internal {secret}",
         abstract=f"about {described}",
     )
