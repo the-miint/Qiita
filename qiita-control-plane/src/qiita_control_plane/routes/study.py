@@ -233,21 +233,6 @@ def _list_row(
     return StudySummary.model_validate({**fields, "study_idx": row["idx"], "record_view": view})
 
 
-def _matches_within_view(row: asyncpg.Record, view: StudyRecordView) -> bool:
-    """Whether the listing's `q` matched in a field that `view` shows. A summary
-    or public-view reader is held to that view's fields: a match only in a
-    field they cannot read would disclose it."""
-    if view is StudyRecordView.FULL:
-        # fetch_study_list_candidates admits a row only on a match in some field
-        # of the full record.
-        return True
-    if view is StudyRecordView.SUMMARY:
-        return row["summary_match"]
-    if view is StudyRecordView.PUBLIC:
-        return row["public_match"]
-    raise RuntimeError(f"no search rule for study record view {view!r}")
-
-
 @router.get(PATH_STUDY_ROOT)
 async def list_studies(
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -282,7 +267,7 @@ async def list_studies(
     # A min_tier above public asks about the caller's own grants, so a role
     # bypass and ungranted public studies cannot contribute rows.
     relationship_only = min_tier is not None and min_tier is not Tier.PUBLIC
-    bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN) and not relationship_only
+    role_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
     studies: list[StudySummary | StudyPublicSummary] = []
     cursor = after_study_idx
     more = True
@@ -290,7 +275,8 @@ async def list_studies(
         rows = await fetch_study_list_candidates(
             pool,
             principal_idx=principal.principal_idx,
-            all_studies=bypass,
+            all_studies=role_bypass and not relationship_only,
+            role_reads_full_record=role_bypass,
             include_ungranted_public=not relationship_only,
             query=q,
             after_study_idx=cursor,
@@ -306,13 +292,22 @@ async def list_studies(
                 default_tier=Tier(row["default_tier"]),
             )
             view = study_record_view(access, caller=principal)
+            match_view = (
+                StudyRecordView(row["match_view"]) if row["match_view"] is not None else None
+            )
+            if match_view != view:
+                # The query matched `q` against another view's fields than the
+                # one this caller reads, so its ladder and study_record_view's
+                # have drifted apart.
+                raise RuntimeError(
+                    f"study {row['idx']}: the list query searched the {match_view} view,"
+                    f" but study_record_view gives {view}"
+                )
             if view is None:
                 continue
             if min_tier is not None and not caller_tier_reaches(
                 access, caller=principal, tier=min_tier
             ):
-                continue
-            if q is not None and not _matches_within_view(row, view):
                 continue
             studies.append(_list_row(row, access=access, view=view, principal=principal))
             if len(studies) == limit:

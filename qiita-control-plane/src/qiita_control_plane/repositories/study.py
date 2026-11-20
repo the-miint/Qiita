@@ -11,7 +11,7 @@ to wrap the call in a transaction.
 import json
 
 import asyncpg
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyLookupKey, Tier
+from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyLookupKey, StudyRecordView, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from .exported_entity import export_entity_id_lookup, export_entity_id_select
@@ -494,6 +494,7 @@ async def fetch_study_list_candidates(
     *,
     principal_idx: int,
     all_studies: bool,
+    role_reads_full_record: bool,
     include_ungranted_public: bool,
     query: str | None,
     after_study_idx: int | None,
@@ -513,13 +514,18 @@ async def fetch_study_list_candidates(
     grant on can never satisfy — without it, public studies would fill pages
     only to be dropped.
 
-    `query` is a websearch-syntax full-text query. A row matches on the full
-    record's `search_vector`, on the public view's fields, or on the summary
-    fields (title, alias, accessions; `search_vector` does not cover the
-    accessions). `summary_match` and `public_match` say whether the summary or
-    the public view alone matched, so a caller who may read only one of them
-    is held to it. All use the 'english' configuration, so words are stemmed
-    and matched whole.
+    `query` is a websearch-syntax full-text query, matched only against the
+    fields of the view the caller reads of each study: the full record's
+    `search_vector` plus the accessions, which it does not cover, for the full
+    view; the summary fields for the summary view; the public view's fields for
+    the public view. The match must be made here, not by the caller: the caller
+    pages past every row this returns, so a row that matched only on a field its
+    view hides would move the cursor, and a cursor would tell the caller that a
+    hidden field holds the words. Each row's `match_view` is the view the query
+    matched against, worked out from the same inputs as `study_record_view`
+    (`role_reads_full_record` is the caller's role bypass there); the caller
+    checks that the two agree. All three use the 'english' configuration, so
+    words are stemmed and matched whole.
 
     Keyset paging on idx (`after_study_idx`) never re-reads a skipped row, but
     a page scans down from the highest idx until it has `limit` candidates or
@@ -530,21 +536,27 @@ async def fetch_study_list_candidates(
     return await pool_or_conn.fetch(
         "SELECT study.idx, study.title, study.alias, study.bioproject_accession,"
         "       study.ena_study_accession, study.default_tier, study.owner_idx,"
-        "       study.updated_at, sa.access_tier,"
-        f"      {export_entity_id_select('study')},"
-        f"      ($3::text IS NOT NULL AND {_STUDY_SUMMARY_TSVECTOR}"
-        "        @@ websearch_to_tsquery('english', $3)) AS summary_match,"
-        f"      ($3::text IS NOT NULL AND {_STUDY_PUBLIC_TSVECTOR}"
-        "        @@ websearch_to_tsquery('english', $3)) AS public_match"
+        "       study.updated_at, sa.access_tier, v.match_view,"
+        f"      {export_entity_id_select('study')}"
         " FROM qiita.study"
         " LEFT JOIN qiita.study_access sa"
         "   ON sa.study_idx = study.idx AND sa.principal_idx = $1"
+        " CROSS JOIN LATERAL (SELECT CASE"
+        "   WHEN $8 OR study.owner_idx = $1 OR sa.access_tier >= study.default_tier"
+        "     THEN $9::text"
+        "   WHEN sa.access_tier IS NOT NULL THEN $10::text"
+        "   WHEN study.default_tier = $7::qiita.tier THEN $11::text"
+        " END AS match_view) v"
         " WHERE ($2 OR study.owner_idx = $1 OR sa.access_tier IS NOT NULL"
         "        OR ($6 AND study.default_tier = $7::qiita.tier))"
-        "   AND ($3::text IS NULL"
-        "        OR study.search_vector @@ websearch_to_tsquery('english', $3)"
-        f"       OR {_STUDY_PUBLIC_TSVECTOR} @@ websearch_to_tsquery('english', $3)"
-        f"       OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3))"
+        "   AND ($3::text IS NULL OR CASE v.match_view"
+        "        WHEN $9 THEN study.search_vector @@ websearch_to_tsquery('english', $3)"
+        f"            OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3)"
+        f"       WHEN $10 THEN {_STUDY_SUMMARY_TSVECTOR}"
+        "            @@ websearch_to_tsquery('english', $3)"
+        f"       WHEN $11 THEN {_STUDY_PUBLIC_TSVECTOR}"
+        "            @@ websearch_to_tsquery('english', $3)"
+        "        END)"
         "   AND ($4::bigint IS NULL OR study.idx < $4)"
         " ORDER BY study.idx DESC"
         " LIMIT $5",
@@ -555,4 +567,8 @@ async def fetch_study_list_candidates(
         limit,
         include_ungranted_public,
         Tier.PUBLIC,
+        role_reads_full_record,
+        StudyRecordView.FULL,
+        StudyRecordView.SUMMARY,
+        StudyRecordView.PUBLIC,
     )

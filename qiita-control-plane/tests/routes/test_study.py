@@ -1883,6 +1883,64 @@ async def test_list_studies_public_reader_cannot_search_fields_the_public_view_l
         assert [r["study_idx"] for r in full] == [idx], word
 
 
+@pytest.mark.parametrize("view", [StudyRecordView.PUBLIC, StudyRecordView.SUMMARY])
+async def test_list_studies_cursor_does_not_reveal_matches_on_hidden_fields(ctx, view):
+    """Enough studies that match `q` only in their notes to spend every fill
+    round, read through a view that leaves the notes out: the page is empty and
+    has no cursor. A cursor would say that studies matched on the hidden notes,
+    and name one of them."""
+    from qiita_control_plane.routes.study import _MAX_LIST_FILL_ROUNDS
+
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"cur-{token}")
+    ctx["created"]["user_principals"].append(other)
+    for n in range(_MAX_LIST_FILL_ROUNDS):
+        created = await _post_study(
+            ctx["wet"],
+            ctx,
+            title=f"{token} hidden {n}",
+            owner_idx=other,
+            default_tier=Tier.PUBLIC if view is StudyRecordView.PUBLIC else Tier.MEMBER,
+            notes=f"internal {secret}",
+        )
+        assert created.status_code == 201, created.text
+        if view is StudyRecordView.SUMMARY:
+            await _grant_study_access(
+                ctx,
+                study_idx=created.json()["study_idx"],
+                principal_idx=ctx["user_session"]["principal_idx"],
+                tier=Tier.VIEWER,
+                granted_by_idx=other,
+            )
+
+    assert await _list(ctx["user"], q=secret, limit=1) == {
+        "studies": [],
+        "next_after_study_idx": None,
+    }
+
+
+async def test_list_studies_role_reader_searches_the_full_record_under_min_tier(ctx):
+    """A wet_lab_admin reads every study's full record, also when `min_tier`
+    limits the listing to their own grants: a study they hold only a viewer
+    grant on is found by a word in its notes."""
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"role-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"], ctx, title=f"{token} granted", owner_idx=other, notes=f"internal {secret}"
+    )
+    idx = created.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=idx,
+        principal_idx=ctx["wet_session"]["principal_idx"],
+        tier=Tier.VIEWER,
+        granted_by_idx=other,
+    )
+    rows = (await _list(ctx["wet"], q=secret, min_tier=Tier.VIEWER))["studies"]
+    assert [(r["study_idx"], r["record_view"]) for r in rows] == [(idx, StudyRecordView.FULL)]
+
+
 async def test_list_studies_owner_without_an_access_row_is_admin(ctx):
     """An owner whose own study_access row was deleted is still listed, as
     admin, passes every min_tier, and still reads the full record."""

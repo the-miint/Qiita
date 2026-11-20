@@ -305,8 +305,10 @@ leaves out changes. Its `GET /api/v1/study` row carries neither `study_idx` nor
 `POST /api/v1/study/lookup`.
 
 Search follows the same line: a summary reader's `q` matches only the summary
-fields, and a public-view reader's only the public view's fields, so a match
-cannot disclose a word in a field they cannot read.
+fields, and a public-view reader's only the public view's fields. The listing
+query applies that match itself, so a study that matches only in a field the
+caller cannot read is never paged over, and neither a row nor the listing's
+cursor discloses the word.
 
 ## Raw Data Fingerprint
 
