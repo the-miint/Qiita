@@ -496,6 +496,70 @@ fn open_attaches_one_connection_and_the_rest_on_demand() {
     assert_eq!(one, 1);
 }
 
+/// A pool member's catalog backend stays open while the member sits idle
+/// (`KEEP_CATALOG_BACKEND`). Two halves, because a short wait cannot tell the
+/// setting from the 60 s default: the member's catalog pool reports no idle limit
+/// (which fails if the setting is not applied, or applied after the ATTACH), and
+/// over a 6 s wait its backend stays open while a control ATTACH with a 2 s limit
+/// is closed (which fails if `0` stops meaning no limit).
+/// `__ducklake_metadata_<alias>` is the name DuckLake gives the catalog database
+/// it attaches.
+#[test]
+#[cfg(feature = "integration")]
+#[serial_test::serial]
+fn a_members_catalog_backend_outlives_an_idle_timeout() {
+    use crate::ducklake::{connect_ducklake, tag_catalog_connstr};
+    let base = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let observed = crate::test_catalog::CatalogSessions::new();
+    let port = observed.port;
+    let sessions = |pool_size: usize| observed.count(pool_size);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = LakePool::open(
+        tag_catalog_connstr(&base, port, 1).unwrap(),
+        data_path.clone(),
+        PoolSettings::for_tests(1, tmp.path().to_path_buf()),
+    )
+    .expect("open a pool against the test catalog");
+    {
+        let member = pool.checkout().expect("the attached connection");
+        let idle_timeout: u64 = member
+            .query_row(
+                "SELECT idle_timeout_millis \
+                 FROM postgres_configure_pool(catalog_name='__ducklake_metadata_qiita_lake')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read the catalog attach's pool settings");
+        assert_eq!(
+            idle_timeout, 0,
+            "no idle limit on the member's catalog backend"
+        );
+    }
+
+    let control = Connection::open_in_memory().unwrap();
+    control
+        .execute_batch("LOAD postgres; SET pg_pool_idle_timeout_millis=2000;")
+        .unwrap();
+    connect_ducklake(
+        &control,
+        &tag_catalog_connstr(&base, port, 2).unwrap(),
+        &data_path,
+    )
+    .unwrap();
+    assert!(sessions(2) >= 1, "the control's backend, before the wait");
+    assert!(sessions(1) >= 1, "the member's backend, before the wait");
+
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    assert_eq!(
+        sessions(2),
+        0,
+        "the control's backend was closed for idleness"
+    );
+    assert!(sessions(1) >= 1, "the member's backend is still open");
+}
+
 #[test]
 fn a_lake_write_runs_ordered_on_one_thread_and_the_baseline_comes_back() {
     let tmp = tempfile::tempdir().unwrap();

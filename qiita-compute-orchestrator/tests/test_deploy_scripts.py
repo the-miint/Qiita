@@ -600,6 +600,21 @@ def test_render_fills_every_placeholder(tmp_path: Path) -> None:
     assert f"listen 127.0.0.1:{_lb_port()};" in text
 
 
+def test_render_routes_reflection_on_the_loopback_listener_only(tmp_path: Path) -> None:
+    """verify.sh's health/data-plane-lb row runs grpcurl without a proto, which calls
+    reflection first; the loopback listener routes it to the upstream, the 443 edge
+    does not."""
+    result, dest = _render(tmp_path)
+    assert result.returncode == 0, result.stderr
+    text = dest.read_text()
+    loopback_at = text.index(f"listen 127.0.0.1:{_lb_port()};")
+    edge, loopback = text[:loopback_at], text[loopback_at:]
+    for version in ("v1", "v1alpha"):
+        location = f"location /grpc.reflection.{version}.ServerReflection/ {{\n"
+        assert location + "        grpc_pass grpc://qiita_data_plane;" in loopback, version
+        assert location not in edge, version
+
+
 def test_render_places_local_members_at_the_bind_host_then_peers(tmp_path: Path) -> None:
     """Local instances at the bind host, then peers verbatim, read back through the
     same parser verify.sh uses."""
@@ -1043,6 +1058,7 @@ def test_instance_memory_fits_fails_without_mem_total(tmp_path: Path, body: str 
 
 
 _CONFIG_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "config.rs"
+_LAKE_LOCKS_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "lake_locks.rs"
 
 
 def test_default_pool_size_matches_the_data_plane() -> None:
@@ -1054,6 +1070,19 @@ def test_default_pool_size_matches_the_data_plane() -> None:
     )
     assert match, f"DEFAULT_POOL_SIZE not found in {_CONFIG_RS}"
     result = _run_common('printf %s "$QIITA_DATA_PLANE_DEFAULT_POOL_SIZE"')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == match.group(1)
+
+
+def test_lock_sessions_match_the_data_plane() -> None:
+    """The lock sessions the deploy adds to each pool are the data plane's."""
+    match = re.search(
+        r"^pub\(crate\) const LOCK_SESSIONS: usize = (\d+);$",
+        _LAKE_LOCKS_RS.read_text(),
+        re.MULTILINE,
+    )
+    assert match, f"LOCK_SESSIONS not found in {_LAKE_LOCKS_RS}"
+    result = _run_common('printf %s "$QIITA_DATA_PLANE_LOCK_SESSIONS"')
     assert result.returncode == 0, result.stderr
     assert result.stdout == match.group(1)
 
@@ -2840,14 +2869,16 @@ def test_data_plane_unit_stop_timeout_covers_the_idle_wait() -> None:
 _DUCKLAKE_RS = _REPO_ROOT / "qiita-data-plane" / "src" / "ducklake.rs"
 
 
-def _budget(settings: str, rows: str) -> tuple[list[str], list[str]]:
-    """Run qiita_catalog_connection_budget on a settings row and backend rows, as
-    psql prints them. Returns the pass/fail rows and the detail lines under them."""
+def _budget(settings: str, rows: str, local: str = "50051:8") -> tuple[list[str], list[str]]:
+    """Run qiita_catalog_connection_budget on a settings row, this host's instances
+    (`local`, as `<port>:<pool>` pairs) and backend rows, as psql prints them.
+    Returns the pass/fail rows and the detail lines under them."""
     result = _run_common(
-        'n_pass=0 n_fail=0; qiita_catalog_connection_budget "$1" <<<"$2"; '
+        'n_pass=0 n_fail=0; qiita_catalog_connection_budget "$1" "$3" <<<"$2"; '
         'echo "counts $n_pass $n_fail"',
         settings,
         rows,
+        local,
     )
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
@@ -2877,7 +2908,7 @@ def test_budget_counts_each_instance_once_at_its_pool_size() -> None:
             "10.0.0.9|2|dp|",
         ]
     )
-    (row,), details = _budget("100|3|0|t|dp", rows)
+    (row,), details = _budget("100|3|0|t|dp|10.0.0.5", rows, local="50051:8 50052:8")
     assert _passed(row), row
     assert "5 data-plane instance(s), pools 28 + 5 other client backend(s) = 33 of 97" in row
     assert details == [
@@ -2896,14 +2927,14 @@ def test_budget_fails_past_max_connections_less_the_reserved(other: int, passes:
     """20 − 3 superuser-reserved − 2 reserved leaves 15: pools 10 plus 5 others fit,
     plus 6 do not."""
     rows = f"10.0.0.5|1|dp|qiita-data-plane:50051:pool=10\n10.0.0.9|{other}|admin|psql"
-    (row,), _ = _budget("20|3|2|t|dp", rows)
+    (row,), _ = _budget("20|3|2|t|dp|10.0.0.5", rows, local="50051:10")
     assert _passed(row) is passes, row
     assert f"= {10 + other} of 15 (max_connections 20" in row
 
 
 def test_budget_fails_without_pg_read_all_stats() -> None:
     (row,), details = _budget(
-        "100|3|0|f|lake_rw", "10.0.0.5|1|lake_rw|qiita-data-plane:50051:pool=8"
+        "100|3|0|f|lake_rw|10.0.0.5", "10.0.0.5|1|lake_rw|qiita-data-plane:50051:pool=8"
     )
     assert not _passed(row), row
     assert "GRANT pg_read_all_stats TO lake_rw;" in row
@@ -2911,7 +2942,7 @@ def test_budget_fails_without_pg_read_all_stats() -> None:
 
 
 def test_budget_fails_on_a_data_plane_session_without_a_client_address() -> None:
-    (row,), _ = _budget("100|3|0|t|lake_rw", "|1|lake_rw|qiita-data-plane:50051:pool=8")
+    (row,), _ = _budget("100|3|0|t|lake_rw|10.0.0.5", "|1|lake_rw|qiita-data-plane:50051:pool=8")
     assert not _passed(row), row
     assert "grant pg_read_all_stats to role 'lake_rw'" in row
 
@@ -2920,19 +2951,64 @@ def test_budget_fails_on_a_data_plane_session_without_a_client_address() -> None
     "name", ["qiita-data-plane:50051", "qiita-data-plane:x:pool=8", "qiita-data-plane:50051:pool="]
 )
 def test_budget_fails_on_a_name_it_cannot_read(name: str) -> None:
-    (row,), _ = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    (row,), _ = _budget("100|3|0|t|dp|10.0.0.5", f"10.0.0.5|1|dp|{name}")
     assert not _passed(row), row
     assert f"application_name '{name}'" in row
 
 
-def test_budget_fails_when_no_instance_is_connected() -> None:
-    (row,), details = _budget("100|3|0|t|dp", "10.0.0.9|2|admin|psql")
+def test_budget_counts_a_local_instance_with_no_session_at_its_configured_pool() -> None:
+    """An idle instance of this host with no backend open still counts, once, at
+    its configured pool; one with a session counts from the session's name."""
+    rows = "10.0.0.5|1|dp|qiita-data-plane:50051:pool=10\n10.0.0.9|2|admin|psql"
+    (row,), details = _budget("100|3|0|t|dp|10.0.0.5", rows, local="50051:10 50052:10")
+    assert _passed(row), row
+    assert "2 data-plane instance(s), pools 20 + 2 other client backend(s) = 22 of 97" in row
+    assert details == [
+        "10.0.0.5:50051 pool=10",
+        "10.0.0.5:50052 pool=10 (no session under its name)",
+        "other: 10.0.0.9 user=admin application_name=psql x2",
+    ]
+
+
+def test_budget_passes_with_no_data_plane_session_at_all() -> None:
+    (row,), details = _budget("100|3|0|t|dp|local", "10.0.0.9|2|admin|psql", local="50051:10")
+    assert _passed(row), row
+    assert "1 data-plane instance(s), pools 10 + 2 other client backend(s) = 12 of 97" in row
+    assert details == [
+        "local:50051 pool=10 (no session under its name)",
+        "other: 10.0.0.9 user=admin application_name=psql x2",
+    ]
+
+
+def test_budget_tells_a_local_instance_from_a_peer_on_the_same_port() -> None:
+    """A session on this host's port from another address is a peer, counted beside
+    this host's instance; a local session on a port outside this host's list
+    counts from its name. The IPv6 address of this host is bracketed."""
+    rows = "\n".join(
+        [
+            "10.0.0.6|1|dp|qiita-data-plane:50051:pool=10",
+            "::1|1|dp|qiita-data-plane:50059:pool=4",
+        ]
+    )
+    (row,), details = _budget("100|3|0|t|dp|::1", rows, local="50051:10")
+    assert _passed(row), row
+    assert "3 data-plane instance(s), pools 24 + 0 other" in row
+    assert details == [
+        "10.0.0.6:50051 pool=10",
+        "[::1]:50059 pool=4",
+        "[::1]:50051 pool=10 (no session under its name)",
+    ]
+
+
+@pytest.mark.parametrize("local", ["", "50051", "50051:x", "50051:8,50052:8"])
+def test_budget_fails_on_local_instances_it_cannot_read(local: str) -> None:
+    (row,), _ = _budget("100|3|0|t|dp|10.0.0.5", "", local=local)
     assert not _passed(row), row
-    assert "no catalog session is named" in row
-    assert details == ["other: 10.0.0.9 user=admin application_name=psql x2"]
 
 
-@pytest.mark.parametrize("settings", ["", "100|3||t|dp", "lots|3|0|t|dp"])
+@pytest.mark.parametrize(
+    "settings", ["", "100|3||t|dp|10.0.0.5", "lots|3|0|t|dp|10.0.0.5", "100|3|0|t|dp"]
+)
 def test_budget_fails_on_a_settings_row_it_cannot_read(settings: str) -> None:
     (row,), _ = _budget(settings, "10.0.0.5|1|dp|qiita-data-plane:50051:pool=8")
     assert not _passed(row), row
@@ -2948,17 +3024,18 @@ def test_budget_reads_the_name_the_data_plane_writes() -> None:
     )
     assert match, f"catalog_application_name not found in {_DUCKLAKE_RS}"
     name = match.group(1).replace("{port}", "50057").replace("{pool_size}", "13")
-    (row,), details = _budget("100|3|0|t|dp", f"10.0.0.5|1|dp|{name}")
+    (row,), details = _budget("100|3|0|t|dp|10.0.0.5", f"10.0.0.5|1|dp|{name}", local="50057:13")
     assert _passed(row), row
     assert details == ["10.0.0.5:50057 pool=13"]
 
 
 def _run_budget_check(
-    tmp_path: Path, *, fail_on: str = ""
+    tmp_path: Path, *, fail_on: str = "", topology: str = ""
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     """Run qiita_check_catalog_connection_budget with `psql` stubbed: it answers the
     settings query and the backends query with one row each, records its argv and
-    PGPASSFILE, and exits 2 when its argv contains `fail_on`."""
+    PGPASSFILE, and exits 2 when its argv contains `fail_on`. The env file, also
+    DP_ENV, carries the connection string and `topology`."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     calls = tmp_path / "psql-calls"
@@ -2969,14 +3046,14 @@ def _run_budget_check(
         f'if [ -n "{fail_on}" ]; then case "$argv" in *"{fail_on}"*)\n'
         '  echo "psql: boom" >&2; exit 2 ;; esac; fi\n'
         'case "$argv" in\n'
-        "  *max_connections*) echo '100|3|0|t|lake_rw' ;;\n"
-        "  *) echo '10.0.0.5|2|lake_rw|qiita-data-plane:50051:pool=8' ;;\n"
+        "  *max_connections*) echo '100|3|0|t|lake_rw|10.0.0.5' ;;\n"
+        "  *) echo '10.0.0.5|2|lake_rw|qiita-data-plane:50051:pool=10' ;;\n"
         "esac\n"
     )
     (bin_dir / "psql").chmod(0o755)
     env_path = tmp_path / "data-plane.env"
     env_path.write_text(
-        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n"
+        "DUCKLAKE_CATALOG_CONNSTR='dbname=lake host=db user=lake_rw password=s3cr3t'\n" + topology
     )
     proc = subprocess.run(
         [
@@ -2985,7 +3062,11 @@ def _run_budget_check(
             f'set -euo pipefail; source "{_COMMON}"; n_pass=0 n_fail=0; '
             f'qiita_check_catalog_connection_budget "{env_path}"; echo "counts $n_pass $n_fail"',
         ],
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        env={
+            **{k: v for k, v in os.environ.items() if k not in _TOPOLOGY_VARS},
+            "DP_ENV": str(env_path),
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        },
         capture_output=True,
         text=True,
         timeout=60,
@@ -2998,7 +3079,7 @@ def test_budget_check_queries_the_catalog_with_the_password_off_argv(tmp_path: P
     proc, calls = _run_budget_check(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert "counts 1 0" in proc.stdout, proc.stdout
-    assert "10.0.0.5:50051 pool=8" in proc.stdout
+    assert "10.0.0.5:50051 pool=10" in proc.stdout
     assert len(calls) == 2
     for call in calls:
         argv, pgpassfile = call.split("|PGPASSFILE=")
@@ -3013,6 +3094,27 @@ def test_budget_check_fails_the_row_when_a_query_fails(tmp_path: Path, fail_on: 
     assert proc.returncode == 0, proc.stderr
     assert "counts 0 1" in proc.stdout, proc.stdout
     assert "cannot query the catalog server: psql: boom" in proc.stdout
+
+
+def test_budget_check_counts_this_hosts_instances_from_the_data_plane_env(
+    tmp_path: Path,
+) -> None:
+    """Each QIITA_DATA_PLANE_PORTS entry counts at DUCKLAKE_POOL_SIZE plus the lock
+    sessions, whether or not it has a session open."""
+    proc, _calls = _run_budget_check(
+        tmp_path, topology="QIITA_DATA_PLANE_PORTS='50051 50052'\nDUCKLAKE_POOL_SIZE=3\n"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 1 0" in proc.stdout, proc.stdout
+    assert "10.0.0.5:50051 pool=10\n" in proc.stdout
+    assert "10.0.0.5:50052 pool=5 (no session under its name)" in proc.stdout
+
+
+def test_budget_check_fails_the_row_on_a_pool_size_it_cannot_read(tmp_path: Path) -> None:
+    proc, _calls = _run_budget_check(tmp_path, topology="DUCKLAKE_POOL_SIZE=many\n")
+    assert proc.returncode == 0, proc.stderr
+    assert "counts 0 1" in proc.stdout, proc.stdout
+    assert "DUCKLAKE_POOL_SIZE 'many'" in proc.stdout
 
 
 def test_verify_runs_the_budget_against_the_data_plane_env() -> None:

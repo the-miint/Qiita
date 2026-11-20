@@ -27,3 +27,45 @@ pub(crate) fn data_path() -> String {
     std::fs::create_dir_all(&data_path).expect("create the test catalog's data path");
     data_path
 }
+
+/// Counts the test catalog server's backends open under one instance's session
+/// names, `ducklake::catalog_application_name(port, pool_size)`, through an
+/// observer attach of its own.
+pub(crate) struct CatalogSessions {
+    observer: duckdb::Connection,
+    /// Derived from the process id, so concurrent test processes against one
+    /// catalog are unlikely to share a session name.
+    pub(crate) port: u16,
+}
+
+impl CatalogSessions {
+    pub(crate) fn new() -> Self {
+        let observer = duckdb::Connection::open_in_memory().unwrap();
+        observer
+            .execute_batch(&format!(
+                "LOAD postgres; ATTACH '{}' AS observer (TYPE postgres);",
+                connstr()
+            ))
+            .unwrap();
+        Self {
+            observer,
+            port: 1 + (std::process::id() % 60000) as u16,
+        }
+    }
+
+    /// Backends open now under the name `pool_size` gives.
+    pub(crate) fn count(&self, pool_size: usize) -> i64 {
+        let name = crate::ducklake::catalog_application_name(self.port, pool_size);
+        self.observer
+            .query_row(
+                &format!(
+                    "SELECT n FROM postgres_query('observer', \
+                     'SELECT count(*) AS n FROM pg_stat_activity \
+                      WHERE application_name = ''{name}''')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
