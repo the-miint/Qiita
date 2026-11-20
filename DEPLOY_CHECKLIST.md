@@ -64,6 +64,9 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   first. (#864)
 - `20261113000000_output_equivalence` adds `qiita.output_equivalence` and `qiita.output_equivalence_event`, empty, and `20261113000001_exported_processing_mask` adds a nullable `mask_idx` to `qiita.exported_processing` and `qiita.exported_identifier`, widening their one-processing CHECKs to it; no row changes. `dbmate` applies both. `20261116000000_work_ticket_processing_idx` adds a nullable `processing_idx` to `qiita.work_ticket`, and `20261116000001_backfill_work_ticket_processing_idx` sets it on the started `long-read-assembly` tickets to the processing each one minted; idempotent, and a no-op on a fresh DB. A ticket that the old build starts between `make migrate` and the restart is not covered; the bucket-6 re-run closes that. `20261116000002_exported_identifier_prep_sample_delete` makes `qiita.exported_identifier.prep_sample_idx` nullable and ON DELETE SET NULL, adds two nullable description columns and a CHECK that every live row names a prep_sample (every existing row does: the column was NOT NULL), and adds a BEFORE DELETE trigger on `qiita.prep_sample`; no row changes. `20261116000003_work_ticket_reap_pending` adds two nullable columns to `qiita.work_ticket` (`reap_pending_since`, `reap_note`) and a CHECK that they are set together; no row changes. `20261116000004_definition_settings_lock` adds `qiita.definition_settings_edit` (empty), the function `qiita.edit_definition_settings`, and BEFORE UPDATE triggers on `qiita.mask_definition`, `qiita.alignment_definition` and `qiita.processing` that refuse a change to a definition's settings outside that function; no row changes. (#874)
 - `[operator]` (#872) `make migrate` applies `20261117000000_field_exception_excludes_unique_in_study.sql` (triggers that keep a field exception off `unique_in_study` fields, and a NOT NULL `updated_by_idx` on both `*_field_exception` tables, filled from `created_by_idx` on any row already there). It refuses to apply, naming the rule, if an existing exception row already keys on a `unique_in_study` field. No route wrote exception rows before this deploy, so only a row written by hand can trip it. If it does refuse, stop and follow its HINT.
+- `20261117120000_genome_derivation` (new table) and `20261119000000_exported_feature_genome_idx`
+  (an index; the migration's comment gives its measured build time): plain `dbmate`, no setup. The bucket-6 WoL
+  repair needs both. (#926)
 
 ### 4. Deploy
 
@@ -174,6 +177,33 @@ _None yet._
   residue line has an explanation. `--retry-failed` resubmits runs whose recovery
   ticket ended without completing. If the dry run stops with a permission error, run it
   as an account that can read the ticket workspaces.
+- `[operator]` **Fold reference 18's (`web-of-life` `3-rc4`) `GCA_G<n>` genomes into `G<n>`.**
+  Until this runs, every feature table built against reference 18 lists almost every genome
+  twice, as `G<n>` and `GCA_G<n>`, each with half its reads. The repair also records each rc4 genome's
+  NCBI parent assembly. It is one transaction that refuses anything unexpected. It locks the
+  genome tables while it runs; its genome delete alone measured 3.3 s at this size, and the whole
+  run is unmeasured. A reference load or label mint waits behind it, and the repair gives up after
+  30 s rather than hang if one holds them first. (#926)
+  1. Fetch the release's metadata into a fresh directory. The repair refuses a file whose genomes
+     are not exactly reference 18's.
+  2. Dry-run. Expect `196062 GCA_G genome(s) to fold`: already linked to G<n> 195943, to link
+     117, to create 2; stale WoL links 117; derivations to add 196062, present 0. Labels to retire was 46621 on 2026-11-17, and is
+     higher only if reference-18 tables were built since. Any other count, or `refused:`, means
+     stop and raise the report.
+  3. Execute, writing the manifest somewhere kept. It lists every row deleted and label retired,
+     and the run refuses to overwrite one. A `refused:` that names a lock timeout or a deadlock
+     wrote nothing: run it again.
+  4. Dry-run again. Expect `0 GCA_G genome(s) to fold` and 196062 derivations present.
+  5. Ask the builder of the reference-18 feature tables (principal 2, alignment 3; the reporter
+     of #893) to rebuild them.
+  ```bash
+  # [operator] in the pulled checkout; DATABASE_URL as above
+  W=$(mktemp -d) && curl -fsS -o "$W/metadata.txt" https://ftp.microbio.me/wol3/wol3_rc4_ftp/metadata/metadata.txt
+  cd ~/qiita-miint/qiita-control-plane
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill wol-genome-repair --reference-idx 18 --metadata "$W/metadata.txt"   # 2 and 4: dry run
+  /usr/local/bin/uv run --reinstall-package qiita-common qiita-admin backfill wol-genome-repair --reference-idx 18 --metadata "$W/metadata.txt" \
+    --execute --manifest ~/wol-genome-repair-ref18-$(date +%F).csv                                                                             # 3: writes
+  ```
 
 ### Notes (no host action)
 
@@ -191,6 +221,7 @@ _None yet._
 - `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
 - New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
 - The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
+- `DELETE /reference/{reference_idx}` now answers 409, with or without `force`, for a reference that asserts a genome derivation (`qiita.genome_derivation`); after the bucket-6 WoL repair, reference 18 does. (#926)
 - The checkm step reads the gene_call step's genes, from a new image, `long-read-assembly-checkm-1.0.2.sif`, which the deploy builds. **Keep `long-read-assembly-checkm-1.0.1.sif`**: 1.0.1 still names it and no spec builds it any more (`sif-build.d/checkm.env`). (#898)
 - `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise, for a ticket in a redrivable state, the refusal a submit of that work would get (403/422). The ticket is checked against its action's current definition, so a ticket stored under a version since edited in place (a tighter `context_schema`, a lower `mem_ceiling_gb`) is refused with 422 and the work must be submitted again. Scripts that re-run other users' tickets need an admin token. (#902)
 - (#872) New field-exception routes `GET`/`PUT`/`DELETE /study/{S}/biosample/{B}/field-exception/{F}` and `.../sequenced-sample/{SS}/field-exception/{F}` (CLI `qiita biosample|sequenced-sample get-/set-/clear-field-exception`). Soft contract change: a field `PATCH` declaring `unique_in_study` now answers 409 when field exceptions are set on the field.

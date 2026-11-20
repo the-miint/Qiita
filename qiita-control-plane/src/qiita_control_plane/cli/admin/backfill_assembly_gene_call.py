@@ -27,7 +27,7 @@ from ...backfill.assembly_gene_call import (
 )
 from ...workspace import WORK_TICKET_SUBDIR
 from .. import _common
-from ._helpers import open_admin_pool
+from ._helpers import EXIT_PRECONDITION_FAILED, open_admin_pool
 
 
 def add_assembly_gene_call_parser(backfill_sub: argparse._SubParsersAction) -> None:
@@ -108,14 +108,14 @@ def _handle(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         print("error: DATABASE_URL not set", file=sys.stderr)
-        return 2
+        return EXIT_PRECONDITION_FAILED
     scratch = os.environ.get("PATH_SCRATCH")
     if not scratch or not Path(scratch).is_absolute():
         print("error: PATH_SCRATCH must be set to an absolute path", file=sys.stderr)
-        return 2
+        return EXIT_PRECONDITION_FAILED
     if args.limit is not None and args.limit <= 0:
         print("error: --limit must be positive", file=sys.stderr)
-        return 2
+        return EXIT_PRECONDITION_FAILED
     token = None
     if args.execute:
         try:

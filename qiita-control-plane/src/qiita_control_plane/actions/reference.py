@@ -17,6 +17,8 @@ from qiita_common.models import (
     ReferenceStatus,
 )
 
+from ..repositories import row_lock_clause
+
 # Column projection backing every ReferenceResponse. Imported by
 # routes/reference.py too, so the two callers can't drift (they previously
 # kept hand-synced copies).
@@ -42,9 +44,10 @@ _WORK_TICKET_TERMINAL_STATES = TERMINAL_WORK_TICKET_STATES
 
 
 class ReferenceDeleteBlocked(Exception):
-    """Raised when a reference cannot be deleted. `alignment_definitions` blocks
-    UNCONDITIONALLY (even with force); `in_flight` work tickets always block;
-    `terminal` work tickets block only when the caller did not pass force=True."""
+    """Raised when a reference cannot be deleted. `alignment_definitions` and
+    `genome_derivations` block unconditionally (even with force); `in_flight` work
+    tickets always block; `terminal` work tickets block only when the caller did not
+    pass force=True."""
 
     def __init__(
         self,
@@ -53,13 +56,16 @@ class ReferenceDeleteBlocked(Exception):
         in_flight: int,
         terminal: int,
         alignment_definitions: int = 0,
+        genome_derivations: int = 0,
     ) -> None:
         self.reference_idx = reference_idx
         self.in_flight = in_flight
         self.terminal = terminal
         self.alignment_definitions = alignment_definitions
-        # Alignment definitions are the force-proof reason and the one the operator
-        # most needs to act on, so it is reported first when present. The DuckLake
+        self.genome_derivations = genome_derivations
+        # Alignment definitions and genome derivations both block even with force;
+        # alignment definitions are the one the operator most needs to act on, so they
+        # are reported first when present. The DuckLake
         # `alignment` rows are keyed on `feature_idx`, which this delete would
         # orphan-GC, and no route deletes a completed alignment's rows, so a
         # reference that has been aligned against is kept.
@@ -71,6 +77,13 @@ class ReferenceDeleteBlocked(Exception):
                 "that has been aligned against cannot be deleted, with or without "
                 "force. Deprecating the alignment "
                 f"(PATCH {URL_ALIGNMENT_DEFINITION_STATUS}) does not change that"
+            )
+        elif genome_derivations:
+            # The COMMENT on qiita.genome_derivation.asserted_by_reference_idx says why
+            # a derivation holds its reference.
+            reason = (
+                f"it asserts {genome_derivations} genome derivation(s) "
+                "(qiita.genome_derivation), so it cannot be deleted, with or without force"
             )
         elif in_flight:
             reason = (
@@ -102,16 +115,27 @@ async def assert_reference_deletable(
     reference_idx: int,
     *,
     force: bool,
+    hold: bool = False,
 ) -> str:
     """Existence + work-ticket gating precheck for a reference delete.
 
     Returns the reference's current status on success. Raises
     ReferenceNotFound if it doesn't exist, or ReferenceDeleteBlocked if work
-    tickets reference it (in-flight always; terminal unless force) or if any
-    alignment definition aligns against it (always, even with force). Run this
-    *before* any destructive step so a blocked delete touches nothing."""
+    tickets reference it (in-flight always; terminal unless force), if any
+    alignment definition aligns against it, or if it asserts any genome derivation
+    (both always, even with force). Run this
+    *before* any destructive step so a blocked delete touches nothing.
+
+    `hold=True` locks the reference row until the caller's transaction ends, which must
+    be a READ COMMITTED one (under REPEATABLE READ the counts after the wait would not
+    see what the wait was for). An INSERT of a row whose foreign key names the reference
+    (a work ticket, a genome derivation) takes a key-share lock on it: one that has not
+    committed yet makes this wait and then count its row, and one that starts later
+    waits for the delete. A write that leaves no such lock is not held out: a change to
+    an existing ticket's state, or an alignment definition, whose reference is JSON."""
+    lock = row_lock_clause(conn, "update" if hold else None)
     status = await conn.fetchval(
-        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+        f"SELECT status FROM qiita.reference WHERE reference_idx = $1{lock}", reference_idx
     )
     if status is None:
         raise ReferenceNotFound(reference_idx)
@@ -134,12 +158,17 @@ async def assert_reference_deletable(
         " WHERE (params->>'reference_idx')::bigint = $1",
         reference_idx,
     )
-    if alignment_definitions or in_flight or (terminal and not force):
+    genome_derivations = await conn.fetchval(
+        "SELECT count(*) FROM qiita.genome_derivation WHERE asserted_by_reference_idx = $1",
+        reference_idx,
+    )
+    if alignment_definitions or genome_derivations or in_flight or (terminal and not force):
         raise ReferenceDeleteBlocked(
             reference_idx=reference_idx,
             in_flight=in_flight,
             terminal=terminal,
             alignment_definitions=alignment_definitions,
+            genome_derivations=genome_derivations,
         )
     return status
 

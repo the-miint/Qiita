@@ -133,6 +133,7 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
         "exported_feature_live_genome",
         "exported_feature_live_reference_feature",
         "exported_feature_export_feature_id_unique",
+        "exported_feature_genome_idx",
     }, indexes
 
     # The one index whose PREDICATE is the asymmetry the namespace depends on: a
@@ -148,6 +149,24 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
         )
     ]
     assert "NOT retired" in namespace and "'feature'" in namespace, namespace
+
+
+async def test_a_genome_delete_finds_its_labels_through_a_plain_index(postgres_pool):
+    """A plain index on genome_idx serves the FK's ON DELETE SET NULL lookup; the
+    migration that adds it says why the partial live-genome index cannot."""
+    rows = await postgres_pool.fetch(
+        "SELECT i.indpred IS NULL AS plain,"
+        "       array(SELECT a.attname FROM unnest(i.indkey) k"
+        "              JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k)"
+        "         AS columns"
+        "  FROM pg_index i"
+        "  JOIN pg_class ic ON ic.oid = i.indexrelid"
+        "  JOIN pg_class t ON t.oid = i.indrelid"
+        "  JOIN pg_namespace n ON n.oid = t.relnamespace"
+        " WHERE n.nspname = 'qiita' AND t.relname = 'exported_feature'"
+        "   AND ic.relname = 'exported_feature_genome_idx'"
+    )
+    assert [(r["plain"], r["columns"]) for r in rows] == [(True, ["genome_idx"])]
 
 
 async def test_a_genome_publishes_its_accession(postgres_pool):
