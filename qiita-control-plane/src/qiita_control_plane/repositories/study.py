@@ -335,6 +335,37 @@ _STUDY_ACCESSION_UNIQUE_CONSTRAINTS = frozenset(
 )
 
 
+# pg_advisory_xact_lock(class, key) class serializing the creation of one
+# study per bioproject accession; allocated in repositories/__init__'s registry,
+# distinct from sequencing_run's.
+STUDY_ACCESSION_LOCK_CLASS = 0x0574_0001
+
+
+# Outlasts a creating import's open registration transaction; see POOL_LOCK_WAIT_TIMEOUT_S.
+STUDY_LOCK_WAIT_TIMEOUT_S = 90.0
+
+
+async def lock_study_accession(conn: asyncpg.Connection, *, bioproject_accession: str) -> None:
+    """Take the per-accession study-creation advisory lock, held to transaction commit.
+
+    Raises TimeoutError naming the accession after `STUDY_LOCK_WAIT_TIMEOUT_S`.
+    Always taken before the sequencing_run lock.
+    """
+    require_transaction(conn)
+    try:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            STUDY_ACCESSION_LOCK_CLASS,
+            bioproject_accession,
+            timeout=STUDY_LOCK_WAIT_TIMEOUT_S,
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"another import holds {bioproject_accession}; gave up waiting"
+            f" {STUDY_LOCK_WAIT_TIMEOUT_S:g}s for it"
+        ) from exc
+
+
 async def get_or_create_study_by_ena_accessions(
     conn: asyncpg.Connection,
     *,

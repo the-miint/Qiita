@@ -48,6 +48,9 @@ INT4_MASK = 0x7FFF_FFFF
 #   repositories.block             1-arg, hashtextextended(mask_idx:prep_sample_idx)
 #   repositories.sequencing_run    2-arg class POOL_RESOLVE_LOCK_CLASS (pool
 #                                  writes vs the download-roster read)
+#   repositories.study             2-arg class STUDY_ACCESSION_LOCK_CLASS,
+#                                  hashtext(bioproject_accession) (study creation
+#                                  through the import's registration commit)
 #   repositories.sequence_range    2-arg class PREP_SAMPLE_RANGE_LOCK_CLASS (range
 #                                  mint vs the empty-completion writer)
 #   repositories.output_equivalence   2-arg class DEFINITION_GROUP_LOCK_CLASS, key 0 (the
