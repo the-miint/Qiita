@@ -3,22 +3,31 @@
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import get_args
 
 import duckdb
+from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BULK_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY,
+    PATH_BIOSAMPLE_LOOKUP_BY_STUDY,
     PATH_STUDY_PREFIX,
 )
 from qiita_common.models import (
     BIOSAMPLE_ATTRIBUTE_FIELDS,
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
+    UNIQUE_FIELD_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
     BiosampleImportRequest,
+    BiosampleStudyLookupKey,
+    BiosampleStudyLookupRequest,
 )
 
-from ...delimited_text import read_headed_tsv
+from ...delimited_text import count_data_lines, read_headed_tsv
 from .. import _common
 from ._helpers import _build_body
 
@@ -26,6 +35,27 @@ from ._helpers import _build_body
 _TSV_FILE_FLAG = "--tsv-file"
 _OUTPUT_FLAG = "--output"
 _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG = "--owner-biosample-id-field-name"
+_KEY_FLAG = "--key"
+_UNIQUE_FIELD_NAME_FLAG = "--unique-field-name"
+_RETURN_KEY_FLAG = "--return-key"
+# The CLI's spelling of a biosample's idx.
+_BIOSAMPLE_IDX = "biosample_idx"
+# Each `lookup --key` choice to the request key that it sends: every study-scoped key
+# but unique_field, which --unique-field-name selects. The request's idx key is
+# offered as biosample_idx.
+_LOOKUP_KEY_BY_CHOICE = {
+    (_BIOSAMPLE_IDX if key == IDX_KEY else key): key
+    for key in get_args(BiosampleStudyLookupKey)
+    if key != UNIQUE_FIELD_KEY
+}
+# export_entity_id is listed first, as the identifier kind preferred everywhere.
+_LOOKUP_KEY_CHOICES = (
+    EXPORT_ENTITY_ID,
+    *(choice for choice in _LOOKUP_KEY_BY_CHOICE if choice != EXPORT_ENTITY_ID),
+)
+# Each `lookup --return-key` choice, which also heads the output's second column,
+# to the request's return_key.
+_LOOKUP_RETURN_KEY_BY_CHOICE = {EXPORT_ENTITY_ID: EXPORT_ENTITY_ID, _BIOSAMPLE_IDX: IDX_KEY}
 # Where DuckDB's read error turns to advice for whoever wrote the reading code.
 _DUCKDB_ADVICE_MARKER = "Possible fixes"
 # The fields of each created biosample that the output TSV carries, after the
@@ -70,13 +100,13 @@ def _handle_biosample_create(args: argparse.Namespace, parser: argparse.Argument
     return _common.run_http_subcommand(_run)
 
 
-def _read_biosample_tsv(
-    tsv_file: Path, owner_biosample_id_column: str, parser: argparse.ArgumentParser
+def _read_tsv_with_column(
+    tsv_file: Path, required_column: str, parser: argparse.ArgumentParser, *, column_flag: str
 ) -> list[dict[str, str]]:
     """Read the TSV file at `tsv_file` into one dict per row, keyed on its
     stripped column headers. A file that cannot be read, that lacks the
-    `owner_biosample_id_column` column, or that holds no rows exits through `parser.error`,
-    naming the file and the fault."""
+    `required_column` column, or that holds no rows exits through `parser.error`,
+    naming the file and the fault; `column_flag` is the flag that named the column."""
     try:
         tsv_rows = read_headed_tsv(tsv_file, source_name=_TSV_FILE_FLAG)
     except duckdb.Error as exc:
@@ -89,12 +119,20 @@ def _read_biosample_tsv(
 
     if not tsv_rows:
         parser.error(f"{_TSV_FILE_FLAG} {tsv_file} holds no rows")
-    if owner_biosample_id_column not in tsv_rows[0]:
+    if required_column not in tsv_rows[0]:
         parser.error(
-            f"{_TSV_FILE_FLAG} {tsv_file} has no {owner_biosample_id_column!r} column, which"
-            f" {_OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG} names"
+            f"{_TSV_FILE_FLAG} {tsv_file} has no {required_column!r} column, which"
+            f" {column_flag} names"
         )
     return tsv_rows
+
+
+def _require_new_output(output: Path, parser: argparse.ArgumentParser) -> None:
+    """Exit through `parser.error` unless a new file can be written at `output`."""
+    try:
+        _common.require_new_output_file(output, flag=_OUTPUT_FLAG)
+    except (FileNotFoundError, PermissionError, FileExistsError) as exc:
+        parser.error(str(exc))
 
 
 def _bulk_create_rows(
@@ -146,11 +184,13 @@ def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.Arg
 
     # Check the output path and read the input file first, so an unusable output path
     # or an unreadable input file stops the command before any biosample is created.
-    try:
-        _common.require_new_output_file(args.output, flag=_OUTPUT_FLAG)
-    except (FileNotFoundError, PermissionError, FileExistsError) as exc:
-        parser.error(str(exc))
-    tsv_rows = _read_biosample_tsv(args.tsv_file, owner_biosample_id_column, parser)
+    _require_new_output(args.output, parser)
+    tsv_rows = _read_tsv_with_column(
+        args.tsv_file,
+        owner_biosample_id_column,
+        parser,
+        column_flag=_OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
+    )
 
     def _run(token: str) -> list[tuple[str, ...]]:
         _common.resolve_study_idx(args, parser, args.base_url, token)
@@ -194,3 +234,121 @@ def _handle_biosample_bulk_create(args: argparse.Namespace, parser: argparse.Arg
             sys.exit(1)
 
     return _common.run_http_subcommand(_run, render=_render)
+
+
+def _lookup_column_to_tsv(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    column: str,
+    column_flag: str,
+    returned_column: str,
+    build_request: Callable[[list[str]], BaseModel],
+    lookup_path: Callable[[], str],
+) -> int:
+    """Look up every value of `column` in the --tsv-file, and write to --output
+    each row's value and the identifier that it resolved to, headed `column` and
+    `returned_column`, one row per input row in input order.
+
+    `build_request` makes the lookup request from the column's values and
+    `lookup_path` names the route once the study is resolved; any value that does
+    not resolve makes the command exit 1 listing them all, with no file written.
+    """
+    # The output's two headers must differ ignoring case, or the write refuses them.
+    if column.casefold() == returned_column.casefold():
+        parser.error(
+            f"{column_flag} {column} and {_RETURN_KEY_FLAG} {returned_column} would give both"
+            f" output columns the same header; choose another {_RETURN_KEY_FLAG}"
+        )
+
+    # Check the output, read the file, and build the request before any request is sent.
+    _require_new_output(args.output, parser)
+    tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=column_flag)
+
+    # The output pastes beside the file only when each data line is one row; the
+    # reader skips an empty line in a file of several columns and joins a quoted cell
+    # that spans lines.
+    data_line_count = count_data_lines(args.tsv_file)
+    if data_line_count != len(tsv_rows):
+        parser.error(
+            f"{_TSV_FILE_FLAG} {args.tsv_file} has {data_line_count} data line(s) but"
+            f" {len(tsv_rows)} row(s), so the output would not line up with the file:"
+            " remove any empty line between rows and any line break inside a cell"
+        )
+    # Name each blank cell by its line as DuckDB's read errors do, the header being line 1.
+    blank_lines = [
+        str(line) for line, tsv_row in enumerate(tsv_rows, start=2) if not tsv_row[column].strip()
+    ]
+    if blank_lines:
+        parser.error(
+            f"{_TSV_FILE_FLAG} {args.tsv_file} has a blank {column!r} cell on line(s)"
+            f" {', '.join(blank_lines)}, counting the header as line 1"
+        )
+    try:
+        lookup_request = build_request([tsv_row[column] for tsv_row in tsv_rows])
+    except ValidationError as exc:
+        messages = "; ".join(error["msg"] for error in exc.errors())
+        parser.error(f"{_TSV_FILE_FLAG} {args.tsv_file} column {column!r}: {messages}")
+
+    def _run(token: str) -> list[tuple[str, str]]:
+        _common.resolve_study_idx(args, parser, args.base_url, token)
+        lookup = _common.lookup_natural_keys(args.base_url, token, lookup_path(), lookup_request)
+        if lookup.missing:
+            print(
+                f"error: {len(lookup.missing)} value(s) of column {column!r} did not resolve:"
+                f" {', '.join(lookup.missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # The request holds each row's value as sent, so each output row pairs with its input row.
+        output_rows = [(value, str(lookup.resolved[value])) for value in lookup_request.values]
+        return output_rows
+
+    def _render(output_rows: list[tuple[str, str]]) -> None:
+        try:
+            _common.write_tsv_output(args.output, (column, returned_column), output_rows)
+        except (OSError, duckdb.Error) as exc:
+            print(f"error: writing {args.output} failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    return _common.run_http_subcommand(_run, render=_render)
+
+
+def _handle_biosample_lookup(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Resolve a TSV file's column of biosample identifiers, among one study's
+    biosamples, and write each row's value and the identifier that it resolved to."""
+    # The column is named by the unique field when one is given, else by the kind.
+    if args.unique_field_name is not None:
+        column = args.unique_field_name.strip()
+        if not column:
+            parser.error(f"{_UNIQUE_FIELD_NAME_FLAG}: must not be blank")
+        key, column_flag, field_name = UNIQUE_FIELD_KEY, _UNIQUE_FIELD_NAME_FLAG, column
+    else:
+        column = args.key
+        key, column_flag, field_name = _LOOKUP_KEY_BY_CHOICE[args.key], _KEY_FLAG, None
+
+    # The request model and the route, chosen together for a study-scoped lookup.
+    def _build_request(values: list[str]) -> BiosampleStudyLookupRequest:
+        lookup_request = BiosampleStudyLookupRequest(
+            key=key,
+            values=values,
+            return_key=_LOOKUP_RETURN_KEY_BY_CHOICE[args.return_key],
+            unique_field_display_name=field_name,
+        )
+        return lookup_request
+
+    def _lookup_path() -> str:
+        return f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_STUDY}".format(
+            study_idx=args.study_idx
+        )
+
+    return _lookup_column_to_tsv(
+        args,
+        parser,
+        column=column,
+        column_flag=column_flag,
+        returned_column=args.return_key,
+        build_request=_build_request,
+        lookup_path=_lookup_path,
+    )

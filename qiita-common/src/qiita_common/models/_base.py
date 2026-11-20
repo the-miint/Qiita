@@ -62,6 +62,11 @@ MAX_NATURAL_KEY_LOOKUP_VALUES = 10_000
 # The identifier that a lookup returns for each resolved value. The route fixes the
 # entity, so this names only the kind of identifier.
 LookupReturnKey = Literal["export_entity_id", "idx"]
+# The name of the export_entity_id identifier kind, for code that names it outside a
+# Literal type.
+EXPORT_ENTITY_ID = "export_entity_id"
+# The name of a lookup by an entity's idx, as a key or return_key, outside a Literal type.
+IDX_KEY = "idx"
 
 
 def _strip_text(value: Any) -> Any:
@@ -489,7 +494,7 @@ class NaturalKeyLookupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
-    return_key: LookupReturnKey = "export_entity_id"
+    return_key: LookupReturnKey = EXPORT_ENTITY_ID
 
 
 class NaturalKeyLookupResponse(BaseModel):

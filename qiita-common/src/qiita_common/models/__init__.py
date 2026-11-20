@@ -35,6 +35,8 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 from qiita_common.models._base import (
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
     AccessionText,
     BlockScopeTarget,
     ComputeTarget,
@@ -103,6 +105,7 @@ from qiita_common.models.biosample import (
     NCBI_TAXONOMY_MOUSE_TERM_ID,
     NCBI_TAXONOMY_NAME,
     TERMINOLOGY_TERM_VALUE_COLUMN,
+    UNIQUE_FIELD_KEY,
     BiosampleAccessionField,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
@@ -534,10 +537,12 @@ __all__ = [
     "BIOSAMPLE_FIELD_TAXON_ID",
     "BIOSAMPLE_GLOBAL_FIELD_IDX_WIRE",
     "BIOSAMPLE_STUDY_FIELD_IDX_WIRE",
+    "EXPORT_ENTITY_ID",
     "GLOBAL_FIELD_IDX_ATTR",
     "HOST_FILTER_INDEX_TYPE_MINIMAP2",
     "HOST_FILTER_INDEX_TYPE_RYPE",
     "HOST_FILTER_REQUIRED_INDEX_TYPES",
+    "IDX_KEY",
     "INDEX_TYPE_BOWTIE2",
     "INDEX_TYPE_MINIMAP2",
     "INDEX_TYPE_RYPE_ROUTER",
@@ -556,6 +561,7 @@ __all__ = [
     "PREP_SAMPLE_STUDY_FIELD_IDX_WIRE",
     "STUDY_FIELD_IDX_ATTR",
     "TERMINOLOGY_TERM_VALUE_COLUMN",
+    "UNIQUE_FIELD_KEY",
     "VALID_STATUS_TRANSITIONS",
     "VALID_TERMINOLOGY_STATUS_TRANSITIONS",
     # Shared base types.

@@ -31,6 +31,9 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import (
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
+    UNIQUE_FIELD_KEY,
     BiosampleAccessionField,
     BiosampleStudyLinkResponse,
     BiosampleStudyLookupKey,
@@ -3093,7 +3096,7 @@ async def test_lookup_biosample_returns_idx_when_asked(ctx):
 
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_LOOKUP,
-        json={"key": "biosample_accession", "values": [acc], "return_key": "idx"},
+        json={"key": "biosample_accession", "values": [acc], "return_key": IDX_KEY},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"resolved": {acc: biosample_idx}, "missing": []}
@@ -5207,7 +5210,7 @@ async def _seed_biosample_named_by_kind(ctx, *, key, study_idx, display_name):
         biosample_idx = await _seed_biosample_with_matrix_tube_id(
             ctx, matrix_tube_id=value, owner_idx=wet_idx
         )
-    elif key == "unique_field":
+    elif key == UNIQUE_FIELD_KEY:
         value = "S-1"
         biosample_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
         written = await _patch_biosample_metadata(
@@ -5223,12 +5226,12 @@ async def _seed_biosample_named_by_kind(ctx, *, key, study_idx, display_name):
         value = {
             "biosample_accession": accession,
             "ena_sample_accession": accession,
-            "export_entity_id": await fetch_export_entity_id(
+            EXPORT_ENTITY_ID: await fetch_export_entity_id(
                 ctx["pool"], kind="biosample", entity_idx=biosample_idx
             ),
-            "idx": str(biosample_idx),
+            IDX_KEY: str(biosample_idx),
         }[key]
-        if key == "idx":
+        if key == IDX_KEY:
             unknown = _ABSENT_BIOSAMPLE_IDX
     return value, unknown, biosample_idx
 
@@ -5246,7 +5249,7 @@ async def test_resolve_biosample_idxs_by_kind(ctx, key):
     await retire_biosample(
         ctx["pool"], biosample_idx=biosample_idx, retired_by_idx=ctx["wet_session"]["principal_idx"]
     )
-    field_name = display_name if key == "unique_field" else None
+    field_name = display_name if key == UNIQUE_FIELD_KEY else None
 
     async with ctx["pool"].acquire() as conn:
         resolved = await route_helpers.resolve_biosample_idxs_by_kind(
@@ -5259,7 +5262,7 @@ async def test_resolve_biosample_idxs_by_kind(ctx, key):
         )
 
     expected = {value: biosample_idx}
-    if key == "idx":
+    if key == IDX_KEY:
         expected[unknown] = int(unknown)
     assert resolved == expected
 
@@ -5525,7 +5528,7 @@ async def test_lookup_biosample_in_study(ctx, key, return_key):
         ctx, key=key, study_idx=study_idx, display_name=display_name
     )
     body = {"key": key, "values": [value, unknown], "return_key": return_key}
-    if key == "unique_field":
+    if key == UNIQUE_FIELD_KEY:
         body["unique_field_display_name"] = display_name
     else:
         await seed_biosample_to_study_link(
@@ -5535,7 +5538,7 @@ async def test_lookup_biosample_in_study(ctx, key, return_key):
             created_by_idx=ctx["wet_session"]["principal_idx"],
         )
     identifier = biosample_idx
-    if return_key == "export_entity_id":
+    if return_key == EXPORT_ENTITY_ID:
         identifier = await fetch_export_entity_id(
             ctx["pool"], kind="biosample", entity_idx=biosample_idx
         )
@@ -5566,7 +5569,7 @@ async def test_lookup_biosample_in_study_missing(ctx):
     values += [_ABSENT_BIOSAMPLE_IDX, str(unlinked)]
 
     resp = await _lookup_in_study(
-        ctx["wet"], study_idx, {"key": "idx", "values": values, "return_key": "idx"}
+        ctx["wet"], study_idx, {"key": IDX_KEY, "values": values, "return_key": IDX_KEY}
     )
 
     assert resp.status_code == 200, resp.text
@@ -5584,7 +5587,7 @@ async def test_lookup_biosample_in_study_unique_field_resolution(ctx, case):
     value they answer 404 for is missing."""
     setup, single_status, expected_detail = _UNIQUE_FIELD_RESOLUTION[case]
     study_idx, display_name, value = await setup(ctx, case)
-    body = {"key": "unique_field", "unique_field_display_name": display_name, "values": [value]}
+    body = {"key": UNIQUE_FIELD_KEY, "unique_field_display_name": display_name, "values": [value]}
 
     resp = await _lookup_in_study(ctx["wet"], study_idx, body)
 
@@ -5603,7 +5606,8 @@ async def test_lookup_biosample_in_study_bad_body_422(ctx):
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="lbs-422"
     )
 
-    resp = await _lookup_in_study(ctx["wet"], study_idx, {"key": "unique_field", "values": ["S-1"]})
+    body = {"key": UNIQUE_FIELD_KEY, "values": ["S-1"]}
+    resp = await _lookup_in_study(ctx["wet"], study_idx, body)
 
     assert resp.status_code == 422, resp.text
 
@@ -5614,7 +5618,7 @@ async def test_lookup_biosample_in_study_authz(ctx, case, no_biosample_read_clie
     calls the study lookup: the route enforces the same bar as the reads."""
 
     async def _send(client, study_idx, sample_idx):
-        body = {"key": "idx", "values": [str(sample_idx)]}
+        body = {"key": IDX_KEY, "values": [str(sample_idx)]}
         return await _lookup_in_study(client, study_idx, body)
 
     await assert_study_scoped_sample_read_authz(

@@ -20,6 +20,7 @@ from pydantic import (
 
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models._base import (
+    IDX_KEY,
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
@@ -58,11 +59,14 @@ MatrixTubeIdText = Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]
 # so it always fits the BIGINT column it is compared against.
 LOOKUP_IDX_PATTERN = r"^[1-9][0-9]{0,17}$"
 
+# The name of a study-scoped lookup by a unique field of the study, outside a Literal type.
+UNIQUE_FIELD_KEY = "unique_field"
+
 # The lookup keys whose values must match a pattern, and that pattern; a key
 # not named here takes any non-blank text.
 _LOOKUP_VALUE_PATTERNS: dict[str, str] = {
     "matrix_tube_id": MATRIX_TUBE_ID_PATTERN,
-    "idx": LOOKUP_IDX_PATTERN,
+    IDX_KEY: LOOKUP_IDX_PATTERN,
 }
 
 # The request fields that set a biosample attribute directly, named as
@@ -708,9 +712,9 @@ class BiosampleStudyLookupRequest(BiosampleLookupRequest):
     @model_validator(mode="after")
     def _check_unique_field_display_name(self) -> BiosampleStudyLookupRequest:
         named = self.unique_field_display_name is not None
-        if self.key == "unique_field" and not named:
+        if self.key == UNIQUE_FIELD_KEY and not named:
             raise ValueError("unique_field_display_name is required when key is unique_field")
-        if self.key != "unique_field" and named:
+        if self.key != UNIQUE_FIELD_KEY and named:
             raise ValueError("unique_field_display_name is allowed only when key is unique_field")
         return self
 

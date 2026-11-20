@@ -23,7 +23,12 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from qiita_common.models import FieldDataType, MissingReasonRef, TerminologyTermRef
+from qiita_common.models import (
+    EXPORT_ENTITY_ID,
+    FieldDataType,
+    MissingReasonRef,
+    TerminologyTermRef,
+)
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -478,7 +483,7 @@ async def test_resolve_natural_keys_export_ids_need_a_source():
         return dict.fromkeys(values, 1)
 
     with pytest.raises(ValueError, match="export_ids_from"):
-        await resolve_natural_keys(values=["a"], fetcher=_fetch, return_key="export_entity_id")
+        await resolve_natural_keys(values=["a"], fetcher=_fetch, return_key=EXPORT_ENTITY_ID)
 
 
 # ---------------------------------------------------------------------------

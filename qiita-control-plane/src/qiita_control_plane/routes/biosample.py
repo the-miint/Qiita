@@ -40,6 +40,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    IDX_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
     BiosampleGlobalFieldResponse,
@@ -1598,7 +1599,7 @@ async def lookup_biosample_by_accession(
     lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.accession_field),
-        return_key="idx",
+        return_key=IDX_KEY,
     )
     return lookup_response
 
@@ -1615,7 +1616,7 @@ async def lookup_biosample_by_matrix_tube_id(
     lookup_response = await resolve_natural_keys(
         values=body.matrix_tube_ids,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key="matrix_tube_id"),
-        return_key="idx",
+        return_key=IDX_KEY,
     )
     return lookup_response
 

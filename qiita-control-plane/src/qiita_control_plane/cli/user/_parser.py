@@ -39,6 +39,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.models import (
     BIOSAMPLE_ATTRIBUTE_FIELDS,
+    EXPORT_ENTITY_ID,
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INCLUDE_DEPRECATED_FLAG,
@@ -88,11 +89,17 @@ from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_expor
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import (
     _BULK_CREATE_OUTPUT_FIELDS,
+    _KEY_FLAG,
+    _LOOKUP_KEY_CHOICES,
+    _LOOKUP_RETURN_KEY_BY_CHOICE,
     _OUTPUT_FLAG,
     _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
+    _RETURN_KEY_FLAG,
     _TSV_FILE_FLAG,
+    _UNIQUE_FIELD_NAME_FLAG,
     _handle_biosample_bulk_create,
     _handle_biosample_create,
+    _handle_biosample_lookup,
 )
 from .ena_import import (
     _handle_ena_import_list,
@@ -713,6 +720,56 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_global_internal_names_arg(p_biosample_bulk_create, keys="the TSV file's column headers")
     p_biosample_bulk_create.set_defaults(handler=_handle_biosample_bulk_create)
+
+    p_biosample_lookup = p_biosample_sub.add_parser(
+        "lookup",
+        help=(
+            "Resolve a TSV file's column of biosample identifiers, among a study's"
+            " biosamples, to each one's export_entity_id or biosample_idx"
+            " (POST /study/{S}/biosample/lookup)"
+        ),
+    )
+    _add_study_arg(p_biosample_lookup)
+    p_biosample_lookup.add_argument(
+        _TSV_FILE_FLAG,
+        type=Path,
+        required=True,
+        help=(
+            f"tab-separated file with a header row; the column headed by the {_KEY_FLAG} or"
+            f" {_UNIQUE_FIELD_NAME_FLAG} value holds one identifier per row, and every other"
+            " column is ignored"
+        ),
+    )
+    lookup_key_group = p_biosample_lookup.add_mutually_exclusive_group(required=True)
+    lookup_key_group.add_argument(
+        _KEY_FLAG,
+        choices=_LOOKUP_KEY_CHOICES,
+        help="the identifier kind, which also heads its column",
+    )
+    lookup_key_group.add_argument(
+        _UNIQUE_FIELD_NAME_FLAG,
+        help=(
+            "display_name of a unique-in-study field that the study defines, for a file"
+            " holding that field's values in the column with this header"
+        ),
+    )
+    p_biosample_lookup.add_argument(
+        _RETURN_KEY_FLAG,
+        choices=tuple(_LOOKUP_RETURN_KEY_BY_CHOICE),
+        default=EXPORT_ENTITY_ID,
+        help="the identifier to return, which also heads the output's second column",
+    )
+    p_biosample_lookup.add_argument(
+        _OUTPUT_FLAG,
+        type=Path,
+        required=True,
+        help=(
+            "TSV file to write: the identifier column, then the returned identifier, one row"
+            " per input row in input order; it must not exist, and is written only when every"
+            " value resolves"
+        ),
+    )
+    p_biosample_lookup.set_defaults(handler=_handle_biosample_lookup)
 
     biosample_study_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY}"
 

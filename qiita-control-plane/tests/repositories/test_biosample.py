@@ -18,7 +18,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
-from qiita_common.models import FieldDataType
+from qiita_common.models import EXPORT_ENTITY_ID, FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
     DuplicateGlobalFieldTargetError,
@@ -1483,7 +1483,7 @@ async def test_fetch_biosamples_by_idxs(ctx):
         row = actual.get(idx, {})
         return {
             "idx": idx,
-            "export_entity_id": await fetch_export_entity_id(
+            EXPORT_ENTITY_ID: await fetch_export_entity_id(
                 ctx["pool"], kind="biosample", entity_idx=idx
             ),
             "owner_idx": ctx["principal_idx"],
@@ -2167,10 +2167,10 @@ async def test_fetch_biosample_idxs_by_natural_key_include_retired(ctx):
     await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
 
     included = await fetch_biosample_idxs_by_natural_key(
-        ctx["pool"], key="export_entity_id", values=[bs_handle], include_retired=True
+        ctx["pool"], key=EXPORT_ENTITY_ID, values=[bs_handle], include_retired=True
     )
     default = await fetch_biosample_idxs_by_natural_key(
-        ctx["pool"], key="export_entity_id", values=[bs_handle]
+        ctx["pool"], key=EXPORT_ENTITY_ID, values=[bs_handle]
     )
 
     assert (included, default) == ({bs_handle: bs_idx}, {})

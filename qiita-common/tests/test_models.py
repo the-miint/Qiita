@@ -11,7 +11,10 @@ from pydantic import ValidationError
 import qiita_common.models as models_module
 from qiita_common.auth_constants import MAX_ACCESSION_LENGTH
 from qiita_common.models import (
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
     MATRIX_TUBE_ID_PATTERN,
+    UNIQUE_FIELD_KEY,
     BiosampleLookupByAccessionRequest,
     BiosampleLookupByMatrixTubeIdRequest,
     BiosampleLookupRequest,
@@ -34,19 +37,19 @@ from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 _LOOKUP_REQUEST_CAP_CASES = [
     (
         StudyLookupRequest,
-        {"key": "bioproject_accession", "return_key": "export_entity_id"},
+        {"key": "bioproject_accession", "return_key": EXPORT_ENTITY_ID},
         "values",
         lambda i: f"PRJ{i}",
     ),
     (
         BiosampleLookupRequest,
-        {"key": "matrix_tube_id", "return_key": "export_entity_id"},
+        {"key": "matrix_tube_id", "return_key": EXPORT_ENTITY_ID},
         "values",
         lambda i: f"{i:010d}",
     ),
     (
         BiosampleStudyLookupRequest,
-        {"key": "idx", "return_key": "export_entity_id", "unique_field_display_name": None},
+        {"key": IDX_KEY, "return_key": EXPORT_ENTITY_ID, "unique_field_display_name": None},
         "values",
         lambda i: f"{i + 1}",
     ),
@@ -1839,11 +1842,11 @@ def test_natural_key_lookup_request_return_key_defaults_to_export_entity_id(mode
     """Tests the case where a lookup request names no return_key: it asks for
     the export_entity_id, and an explicit idx is kept as sent."""
     defaulted = model.model_validate({"key": key, "values": ["X1"]})
-    explicit = model.model_validate({"key": key, "values": ["X1"], "return_key": "idx"})
+    explicit = model.model_validate({"key": key, "values": ["X1"], "return_key": IDX_KEY})
 
     expected = (
-        {"key": key, "values": ["X1"], "return_key": "export_entity_id"},
-        {"key": key, "values": ["X1"], "return_key": "idx"},
+        {"key": key, "values": ["X1"], "return_key": EXPORT_ENTITY_ID},
+        {"key": key, "values": ["X1"], "return_key": IDX_KEY},
     )
     assert (defaulted.model_dump(), explicit.model_dump()) == expected
 
@@ -1898,7 +1901,7 @@ def test_biosample_study_lookup_request_names_malformed_idxs():
     too_long = "1" + "0" * 18
     with pytest.raises(ValidationError) as exc_info:
         BiosampleStudyLookupRequest.model_validate(
-            {"key": "idx", "values": ["812", longest, "0", "01", "abc", "-1", too_long]}
+            {"key": IDX_KEY, "values": ["812", longest, "0", "01", "abc", "-1", too_long]}
         )
     messages = [error["msg"] for error in exc_info.value.errors()]
     expected = [
@@ -1917,8 +1920,8 @@ def test_biosample_study_lookup_request_checks_tube_ids_too():
 @pytest.mark.parametrize(
     ("body", "accepted"),
     [
-        ({"key": "unique_field", "unique_field_display_name": "sample_id"}, True),
-        ({"key": "unique_field"}, False),
+        ({"key": UNIQUE_FIELD_KEY, "unique_field_display_name": "sample_id"}, True),
+        ({"key": UNIQUE_FIELD_KEY}, False),
         ({"key": "biosample_accession", "unique_field_display_name": "sample_id"}, False),
     ],
     ids=["unique-field-named", "unique-field-unnamed", "other-key-named"],

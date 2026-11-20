@@ -1,5 +1,5 @@
-"""`qiita biosample bulk-create`: the TSV file it reads, the request it sends, how it
-names the study, and the TSV file it writes."""
+"""`qiita biosample bulk-create` and `qiita biosample lookup`: the TSV file each reads,
+the request it sends, how it names the study, and the TSV file it writes."""
 
 import json
 import os
@@ -9,8 +9,10 @@ import pytest
 from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BULK_BY_STUDY,
+    URL_BIOSAMPLE_LOOKUP_BY_STUDY,
     URL_STUDY_LOOKUP,
 )
+from qiita_common.models import EXPORT_ENTITY_ID, IDX_KEY, UNIQUE_FIELD_KEY
 from qiita_common.models.biosample import BIOSAMPLE_BULK_IMPORT_MAX_ROWS
 
 from qiita_control_plane.cli import _common as cli_common
@@ -23,6 +25,49 @@ _OUTPUT_FILE_NAME = "created.tsv"
 _OWNER_BIOSAMPLE_ID_COLUMN = "sample_name"
 _STUDY_IDX = 7
 _BULK_URL = URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=_STUDY_IDX)
+_LOOKUP_URL = URL_BIOSAMPLE_LOOKUP_BY_STUDY.format(study_idx=_STUDY_IDX)
+# lookup case -> (identifier flags, column header, request key, two values)
+_LOOKUP_CASES: dict[str, tuple[tuple[str, ...], str, str, tuple[str, str]]] = {
+    EXPORT_ENTITY_ID: (
+        ("--key", EXPORT_ENTITY_ID),
+        EXPORT_ENTITY_ID,
+        EXPORT_ENTITY_ID,
+        ("QB1", "QB2"),
+    ),
+    "biosample_idx": (("--key", "biosample_idx"), "biosample_idx", IDX_KEY, ("41", "42")),
+    "biosample_accession": (
+        ("--key", "biosample_accession"),
+        "biosample_accession",
+        "biosample_accession",
+        ("SAMN01", "SAMN02"),
+    ),
+    "ena_sample_accession": (
+        ("--key", "ena_sample_accession"),
+        "ena_sample_accession",
+        "ena_sample_accession",
+        ("SAMEA1", "SAMEA2"),
+    ),
+    "matrix_tube_id": (
+        ("--key", "matrix_tube_id"),
+        "matrix_tube_id",
+        "matrix_tube_id",
+        ("0012345678", "0012345679"),
+    ),
+    UNIQUE_FIELD_KEY: (
+        ("--unique-field-name", "sample_id"),
+        "sample_id",
+        UNIQUE_FIELD_KEY,
+        ("S-1", "S-2"),
+    ),
+}
+# (case, return key) pairs that look a kind up for itself, which would head both
+# output columns alike and so are refused rather than resolved.
+_LOOKUP_SELF_PAIRS = {(EXPORT_ENTITY_ID, EXPORT_ENTITY_ID), ("biosample_idx", "biosample_idx")}
+# return key -> the two identifiers the stubbed route returns for a case's two values
+_LOOKUP_IDENTIFIERS: dict[str, tuple[str | int, str | int]] = {
+    EXPORT_ENTITY_ID: ("QB517", "QB518"),
+    "biosample_idx": (517, 518),
+}
 _TSV_TEXT = (
     "sample_name\tmatrix_tube_id\tbiosample_accession\thost taxon id\t depth \n"
     "SMK-001\t0012345678\tSAMN01\t9606\t 5 \n"
@@ -323,7 +368,7 @@ def test__handle_biosample_bulk_create_by_study_export_id(monkeypatch, tmp_path)
         (
             "POST",
             _BASE + URL_STUDY_LOOKUP,
-            {"key": "export_entity_id", "values": ["QS7"], "return_key": "idx"},
+            {"key": EXPORT_ENTITY_ID, "values": ["QS7"], "return_key": IDX_KEY},
         ),
         ("GET", _BASE + URL_AUTH_WHOAMI, None),
         ("POST", _BASE + _BULK_URL, {"rows": _expected_rows(42)}),
@@ -390,7 +435,7 @@ def test__handle_biosample_bulk_create_requires_one_study_flag(tmp_path, study_a
     ],
     ids=["no-owner-biosample-id-column", "empty-file", "ragged-row", "header-only"],
 )
-def test__read_biosample_tsv_refuses_bad_file(monkeypatch, tmp_path, capsys, text, message):
+def test__read_tsv_with_column_refuses_bad_file(monkeypatch, tmp_path, capsys, text, message):
     """Tests the case where the file lacks the owner_biosample_id column, is
     empty, has a row of the wrong width, or holds no rows: the command exits 2
     naming the fault, without DuckDB's advice for code authors, before any
@@ -426,7 +471,7 @@ def test__handle_biosample_bulk_create_refuses_oversized_tsv(monkeypatch, tmp_pa
     assert (exc_info.value.code, methods) == (2, ["GET"])
 
 
-def test__read_biosample_tsv_refuses_unreadable_file(monkeypatch, tmp_path, capsys):
+def test__read_tsv_with_column_refuses_unreadable_file(monkeypatch, tmp_path, capsys):
     """Tests the case where the TSV file exists but cannot be opened: the command
     exits 2 naming the file, before any request."""
     captured: dict = {}
@@ -493,3 +538,213 @@ def test__handle_biosample_bulk_create_refuses_owner_biosample_id_column_name(
     stderr = capsys.readouterr().err
     names_flag = f"--owner-biosample-id-field-name {owner_biosample_id_column!r}" in stderr
     assert (exc_info.value.code, captured["requests"], names_flag) == (2, [], True)
+
+
+def _lookup_argv(tsv_file: Path, *extra: str, study_args: tuple[str, ...] = ()) -> list[str]:
+    """The lookup argv; the output is `_OUTPUT_FILE_NAME` beside the TSV file."""
+    study = study_args or ("--study-idx", str(_STUDY_IDX))
+    return [
+        "--base-url",
+        _BASE,
+        "biosample",
+        "lookup",
+        *study,
+        "--tsv-file",
+        str(tsv_file),
+        "--output",
+        str(tsv_file.with_name(_OUTPUT_FILE_NAME)),
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("case", "return_key"),
+    [
+        (case, return_key)
+        for case in _LOOKUP_CASES
+        for return_key in _LOOKUP_IDENTIFIERS
+        if (case, return_key) not in _LOOKUP_SELF_PAIRS
+    ],
+)
+def test__handle_biosample_lookup(monkeypatch, tmp_path, case, return_key):
+    """Tests the case where each identifier kind is looked up for each returned
+    identifier, in a file whose first value is padded and repeats in a later row:
+    one request carries every row's value, and the output maps each input row, in
+    input order, to the identifier that its value resolved to."""
+    flags, column, request_key, (first, second) = _LOOKUP_CASES[case]
+    first_id, second_id = _LOOKUP_IDENTIFIERS[return_key]
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {second: second_id, first: first_id}, "missing": []},
+    )
+    tsv_text = f"{column}\tnote\n {first} \tone\n{second}\t\n{first}\tagain\n"
+
+    rc = main(_lookup_argv(_write_tsv_file(tmp_path, tsv_text), *flags, "--return-key", return_key))
+
+    calls = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    expected_body = {
+        "values": [first, second, first],
+        "return_key": IDX_KEY if return_key == "biosample_idx" else return_key,
+        "key": request_key,
+        "unique_field_display_name": column if request_key == UNIQUE_FIELD_KEY else None,
+    }
+    expected_output = (
+        f"{column}\t{return_key}\n{first}\t{first_id}\n{second}\t{second_id}\n{first}\t{first_id}\n"
+    )
+    outcome = (rc, calls, _read_output(tmp_path))
+    assert outcome == (0, [("POST", _BASE + _LOOKUP_URL, expected_body)], expected_output)
+
+
+def test__handle_biosample_lookup_by_study_export_id(monkeypatch, tmp_path):
+    """Tests the case where the study is named by --study-export-id: it is
+    resolved through the study lookup, and the values are looked up in that
+    study."""
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {"0012345678": "QB517"}, "missing": []},
+        responses_by_url={URL_STUDY_LOOKUP: {"resolved": {"QS7": _STUDY_IDX}, "missing": []}},
+    )
+    tsv_file = _write_tsv_file(tmp_path, "matrix_tube_id\n0012345678\n")
+
+    rc = main(
+        _lookup_argv(tsv_file, "--key", "matrix_tube_id", study_args=("--study-export-id", "QS7"))
+    )
+
+    urls = [r["url"] for r in captured["requests"]]
+    expected_output = "matrix_tube_id\texport_entity_id\n0012345678\tQB517\n"
+    outcome = (rc, urls, _read_output(tmp_path))
+    assert outcome == (0, [_BASE + URL_STUDY_LOOKUP, _BASE + _LOOKUP_URL], expected_output)
+
+
+def test__handle_biosample_lookup_reads_crlf_file(monkeypatch, tmp_path):
+    """Tests the case where the file has Windows line endings: each line is one row,
+    so the file is not refused, and the output maps each row in order."""
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {"QB1": 517, "QB2": 518}, "missing": []},
+    )
+    tsv_file = tmp_path / "biosamples.tsv"
+    tsv_file.write_bytes(b"export_entity_id\tnote\r\nQB1\ta\r\nQB2\tb\r\n")
+
+    rc = main(_lookup_argv(tsv_file, "--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"))
+
+    expected_output = "export_entity_id\tbiosample_idx\nQB1\t517\nQB2\t518\n"
+    assert (rc, _read_output(tmp_path)) == (0, expected_output)
+
+
+def test__handle_biosample_lookup_refuses_missing_values(monkeypatch, tmp_path, capsys):
+    """Tests the case where some values resolve to no biosample in the study: the
+    command exits 1 listing every missing value, and writes no output file."""
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {"SAMN01": "QB517"}, "missing": ["SAMN02", "SAMN03"]},
+    )
+    tsv_file = _write_tsv_file(tmp_path, "biosample_accession\nSAMN01\nSAMN02\nSAMN03\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_lookup_argv(tsv_file, "--key", "biosample_accession"))
+
+    stderr = capsys.readouterr().err
+    outcome = (
+        exc_info.value.code,
+        "SAMN02" in stderr and "SAMN03" in stderr,
+        (tmp_path / _OUTPUT_FILE_NAME).exists(),
+    )
+    assert outcome == (1, True, False)
+
+
+@pytest.mark.parametrize(
+    ("tsv_text", "flags", "message"),
+    [
+        (
+            "export_entity_id\nQB1\n  \n",
+            ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
+            "line(s) 3, counting",
+        ),
+        ("export_entity_id\nQB1\n", ("--key", EXPORT_ENTITY_ID), "same header"),
+        (
+            "biosample_idx\n41\n",
+            ("--key", "biosample_idx", "--return-key", "biosample_idx"),
+            "same header",
+        ),
+        ("Export_Entity_ID\nS-1\n", ("--unique-field-name", "Export_Entity_ID"), "same header"),
+        ("matrix_tube_id\nX\n", ("--key", "matrix_tube_id"), "must match ^[0-9]{10}$: ['X']"),
+        (
+            "sample_id\nS-1\n",
+            ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
+            "no 'export_entity_id' column",
+        ),
+        ("sample_id\nS-1\n", ("--unique-field-name", " "), "must not be blank"),
+        (
+            "sample_id\nS-1\n",
+            ("--key", "matrix_tube_id", "--unique-field-name", "sample_id"),
+            "not allowed with",
+        ),
+        ("export_entity_id\nQB1\n", (), "one of the arguments"),
+        (
+            "export_entity_id\tnote\nQB1\ta\n\nQB2\tb\n",
+            ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
+            "3 data line(s) but 2 row(s)",
+        ),
+        (
+            'export_entity_id\tnote\nQB1\t"a\nb"\nQB2\tc\n',
+            ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
+            "3 data line(s) but 2 row(s)",
+        ),
+    ],
+    ids=[
+        "blank-cell",
+        "returned-column-clash",
+        "returned-column-clash-idx",
+        "returned-column-clash-unique-field-case",
+        "invalid-value",
+        "missing-column",
+        "blank-field-name",
+        "both-identifier-flags",
+        "no-identifier-flag",
+        "empty-line-in-multi-column-file",
+        "cell-spanning-lines",
+    ],
+)
+def test__handle_biosample_lookup_refuses_before_request(
+    monkeypatch, tmp_path, capsys, tsv_text, flags, message
+):
+    """Tests the case where the file or flags cannot make a valid lookup: the
+    command exits 2 naming the problem, before any request."""
+    captured: dict = {}
+    # A consistent answer, so a lookup that wrongly reaches the route fails the assertion.
+    _stub_post(monkeypatch, captured, response_json={"resolved": {}, "missing": ["QB1", "QB2"]})
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_lookup_argv(_write_tsv_file(tmp_path, tsv_text), *flags))
+
+    stderr = capsys.readouterr().err
+    assert (exc_info.value.code, captured["requests"], message in stderr) == (2, [], True), stderr
+
+
+def test__handle_biosample_lookup_refuses_existing_output(monkeypatch, tmp_path, capsys):
+    """Tests the case where --output names an existing file: the command exits 2
+    before any request, and the file is left as it was."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"resolved": {}, "missing": []})
+    (tmp_path / _OUTPUT_FILE_NAME).write_text("SENTINEL\n", encoding="utf-8")
+    tsv_file = _write_tsv_file(tmp_path, "export_entity_id\nQB1\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_lookup_argv(tsv_file, "--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"))
+
+    outcome = (
+        exc_info.value.code,
+        captured["requests"],
+        "already exists" in capsys.readouterr().err,
+        _read_output(tmp_path),
+    )
+    assert outcome == (2, [], True, "SENTINEL\n")

@@ -290,6 +290,19 @@ snippets below are short Python.
 The export IDs are assigned by Qiita: `export_entity_id` in the output of
 `qiita study create`, `qiita biosample bulk-create` and `qiita biosample create`.
 
+To get the biosamples' export IDs later from your own identifiers, `qiita biosample
+lookup` reads a column of your TSV file (here the owner's biosample names) and writes
+each row's value and the biosample's `export_entity_id`, one row per input row in the
+same order:
+
+```bash
+qiita biosample lookup \
+    --study-export-id "$STUDY_EXPORT_ID" \
+    --tsv-file biosamples.tsv \
+    --unique-field-name sample_id \
+    --output export-ids.tsv
+```
+
 Every project a row names must already be among its biosample's studies. A
 biosample starts out linked only to the study it was created in, so a control that
 names several projects needs a link to each of the others first:

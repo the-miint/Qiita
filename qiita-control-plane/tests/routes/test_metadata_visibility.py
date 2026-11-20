@@ -33,6 +33,8 @@ from qiita_common.api_paths import (
 from qiita_common.models import (
     BIOSAMPLE_DISPLAY_HOST_TAXON_ID,
     BIOSAMPLE_FIELD_HOST_TAXON_ID,
+    IDX_KEY,
+    UNIQUE_FIELD_KEY,
     FieldDataType,
     Tier,
 )
@@ -414,10 +416,10 @@ async def test_study_lookup_hidden_value_is_missing(ctx):
     corpus = await _seed_biosample_corpus(ctx, study_idx)
     url = URL_BIOSAMPLE_LOOKUP_BY_STUDY.format(study_idx=study_idx)
     body = {
-        "key": "unique_field",
+        "key": UNIQUE_FIELD_KEY,
         "unique_field_display_name": corpus.owner_id_field,
         "values": [corpus.owner_id_value],
-        "return_key": "idx",
+        "return_key": IDX_KEY,
     }
 
     hidden = await ctx["user"].post(url, json=body)

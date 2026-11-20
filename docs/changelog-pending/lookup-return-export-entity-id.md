@@ -7,6 +7,14 @@
   A value naming no live biosample linked to the study, or a unique-field value that the
   caller's tier cannot read, is listed in `missing`. Access is that of the study-scoped
   biosample reads.
+- **`qiita biosample lookup` resolves a TSV file's column of biosample identifiers within one
+  study (#N).** `--key` names the identifier kind, or `--unique-field-name` a unique field of
+  the study, and the file's column with that exact header holds the values. The command writes
+  to `--output` each row's value and its `export_entity_id` (or, with
+  `--return-key biosample_idx`, its `biosample_idx`), one row per input row in input order, so the result
+  pastes beside the input file. Any value that does not resolve makes the command list every
+  such value and write no file. A file whose data lines are not one row each (an empty line
+  between rows, or a line break inside a cell) is refused, since its output would not line up.
 
 ### Changed
 

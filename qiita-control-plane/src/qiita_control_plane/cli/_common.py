@@ -57,6 +57,8 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
     INCLUDE_DEPRECATED_FLAG,
     DefinitionKind,
     NaturalKeyLookupResponse,
@@ -642,7 +644,7 @@ def resolve_study_idx(
         parser.error(f"{STUDY_EXPORT_ID_FLAG}: must not be blank")
     # The request strips the id, so the response is keyed on the stripped form.
     lookup_request = StudyLookupRequest(
-        key="export_entity_id", values=[args.study_export_id], return_key="idx"
+        key=EXPORT_ENTITY_ID, values=[args.study_export_id], return_key=IDX_KEY
     )
     export_id = lookup_request.values[0]
     lookup = lookup_natural_keys(

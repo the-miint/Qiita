@@ -27,6 +27,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    IDX_KEY,
     NaturalKeyLookupResponse,
     StudyCreate,
     StudyLookupByAccessionRequest,
@@ -513,6 +514,6 @@ async def lookup_study_by_accession(
     lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.accession_field),
-        return_key="idx",
+        return_key=IDX_KEY,
     )
     return lookup_response

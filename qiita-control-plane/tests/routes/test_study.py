@@ -39,6 +39,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    IDX_KEY,
     LEGACY_IDX_RESERVED_CEILING,
     StudyAccessVia,
     StudyRecordView,
@@ -1473,7 +1474,7 @@ async def test_lookup_study_returns_idx_when_asked(ctx):
 
     resp = await ctx["user"].post(
         URL_STUDY_LOOKUP,
-        json={"key": "bioproject_accession", "values": [acc], "return_key": "idx"},
+        json={"key": "bioproject_accession", "values": [acc], "return_key": IDX_KEY},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"resolved": {acc: study_idx}, "missing": []}

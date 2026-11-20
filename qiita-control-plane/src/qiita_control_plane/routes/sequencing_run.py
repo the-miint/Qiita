@@ -84,6 +84,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.host_filter_plan import PoolPlanRefusal
 from qiita_common.models import (
     AS_OF_SCOPE,
+    IDX_KEY,
     AlignPlanRequest,
     AlignPlanResponse,
     BlockMaskPlanRequest,
@@ -1554,6 +1555,6 @@ async def lookup_run_by_instrument_run_id(
     lookup_response = await resolve_natural_keys(
         values=body.instrument_run_ids,
         fetcher=partial(fetch_sequencing_run_idxs_by_instrument_run_id, pool),
-        return_key="idx",
+        return_key=IDX_KEY,
     )
     return lookup_response

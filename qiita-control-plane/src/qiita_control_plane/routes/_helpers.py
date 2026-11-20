@@ -14,9 +14,12 @@ import asyncpg
 from fastapi import HTTPException
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
+    EXPORT_ENTITY_ID,
     GLOBAL_FIELD_IDX_ATTR,
+    IDX_KEY,
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
+    UNIQUE_FIELD_KEY,
     AlignmentDefinitionStatus,
     BiosampleStudyLookupKey,
     DefinitionGroupRefusal,
@@ -852,7 +855,7 @@ async def resolve_biosample_idxs_by_kind(
     those of the study's field named by unique_field_display_name. Under `idx`,
     each value maps to itself as a number, whether or not a biosample has it.
     """
-    if key == "unique_field":
+    if key == UNIQUE_FIELD_KEY:
         if unique_field_display_name is None:
             raise ValueError("key unique_field needs unique_field_display_name")
         resolved = await resolve_unique_field_values(
@@ -864,7 +867,7 @@ async def resolve_biosample_idxs_by_kind(
             noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             tiers=tiers,
         )
-    elif key == "idx":
+    elif key == IDX_KEY:
         resolved = {value: int(value) for value in values}
     else:
         resolved = await fetch_biosample_idxs_by_natural_key(
@@ -2079,7 +2082,7 @@ async def resolve_natural_keys(
 
     # Swap each idx for its export_entity_id in one read of the resolved idxs
     resolved: dict[str, int | str] = dict(resolved_idxs)
-    if return_key == "export_entity_id":
+    if return_key == EXPORT_ENTITY_ID:
         if export_ids_from is None:
             raise ValueError("return_key export_entity_id needs export_ids_from")
         conn, kind = export_ids_from

@@ -161,6 +161,19 @@ def read_headed_tsv(path: Path, *, source_name: str) -> list[dict[str, str]]:
     return stripped_rows
 
 
+def count_data_lines(tsv_file: Path) -> int:
+    """The number of lines after the header in the text file at `tsv_file`, not
+    counting the empty string after a final line ending."""
+    # Universal newlines read \r\n as one line ending, as read_tsv's DuckDB reader does.
+    with tsv_file.open(encoding="utf-8-sig") as handle:
+        text = handle.read()
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines = lines[:-1]
+    data_line_count = len(lines) - 1
+    return data_line_count
+
+
 def write_tsv(
     path: Path,
     columns: tuple[str, ...],
