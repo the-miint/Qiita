@@ -434,7 +434,9 @@ def _access_row_allows(
     narrowing filter and the raising gate both read many rows in one query, and
     `require_study_access` reads one. A second copy of this ladder is how they
     would come to disagree about who may read what, which shows up as a
-    discovery route advertising something the mint then 403s.
+    discovery route advertising something the mint then 403s. The one copy
+    there is, the study listing's search, is checked against
+    `study_record_view` on every row it reads.
 
     A non-existent study returns True: it is not this predicate's job to 404.
     The authoring gates' composers surface a missing study as one 422 from their
@@ -477,10 +479,13 @@ def study_record_view(
     bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
 ) -> StudyRecordView | None:
     """How much of this study's own record `caller` may read: FULL, SUMMARY,
-    PUBLIC, or None (nothing). The one implementation of the rule defined in
+    PUBLIC, or None (nothing). The implementation of the rule defined in
     docs/architecture/data-model.md ("What a tier reads of a study's own
     record"); GET /study/{idx} and the GET /study listing both decide through
-    it, so a study is listed exactly when it can be opened.
+    it, so a study is listed exactly when it can be opened. The listing's query
+    (`repositories.study.fetch_study_list_candidates`) repeats this ladder in
+    SQL to search each study in the view its caller reads, and the listing
+    raises on a row where the two disagree: a change here is made there too.
 
     FULL: `bypass_role`, the owner, or a grant at or above the study's
     `default_tier`. SUMMARY: any other grant, i.e. one below `default_tier`.

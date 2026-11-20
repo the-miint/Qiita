@@ -296,11 +296,10 @@ async def list_studies(
                 StudyRecordView(row["match_view"]) if row["match_view"] is not None else None
             )
             if match_view != view:
-                # The query matched `q` against another view's fields than the
-                # one this caller reads, so its ladder and study_record_view's
-                # have drifted apart.
+                # The query's copy of the record-view ladder and
+                # study_record_view disagree on this row.
                 raise RuntimeError(
-                    f"study {row['idx']}: the list query searched the {match_view} view,"
+                    f"study {row['idx']}: the list query's view is {match_view},"
                     f" but study_record_view gives {view}"
                 )
             if view is None:

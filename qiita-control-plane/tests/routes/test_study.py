@@ -1888,7 +1888,8 @@ async def test_list_studies_cursor_does_not_reveal_matches_on_hidden_fields(ctx,
     """Enough studies that match `q` only in their notes to spend every fill
     round, read through a view that leaves the notes out: the page is empty and
     has no cursor. A cursor would say that studies matched on the hidden notes,
-    and name one of them."""
+    and name one of them. The same caller lists every one of them, in that
+    view, by a word in their titles."""
     from qiita_control_plane.routes.study import _MAX_LIST_FILL_ROUNDS
 
     token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
@@ -1917,6 +1918,62 @@ async def test_list_studies_cursor_does_not_reveal_matches_on_hidden_fields(ctx,
         "studies": [],
         "next_after_study_idx": None,
     }
+    by_title = await _list(ctx["user"], q=token, limit=_MAX_LIST_FILL_ROUNDS + 1)
+    assert [r["record_view"] for r in by_title["studies"]] == [view] * _MAX_LIST_FILL_ROUNDS
+
+
+async def test_list_studies_grant_at_the_default_tier_searches_the_full_record(ctx):
+    """A member grant on a viewer-default study reaches its default, so the
+    grantee reads the full record and finds the study by a word in its notes.
+    'member' sorts before 'viewer' as text, so this also pins the comparison to
+    the tiers' order."""
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"mem-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} granted",
+        owner_idx=other,
+        default_tier=Tier.VIEWER,
+        notes=f"internal {secret}",
+    )
+    idx = created.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier=Tier.MEMBER,
+        granted_by_idx=other,
+    )
+    rows = (await _list(ctx["user"], q=secret))["studies"]
+    assert [(r["study_idx"], r["record_view"]) for r in rows] == [(idx, StudyRecordView.FULL)]
+
+
+async def test_list_studies_search_words_may_span_the_accessions_and_other_fields(ctx):
+    """One query whose words fall in a study's abstract and in its accession
+    finds the study for a public-view reader and for a full-record reader
+    alike: each view's fields are searched as one document."""
+    token, word = f"lst{secrets.token_hex(4)}", f"zd{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"span-{token}")
+    ctx["created"]["user_principals"].append(other)
+    accession = f"PRJNA{secrets.randbelow(10**9)}"
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} spanning",
+        owner_idx=other,
+        default_tier=Tier.PUBLIC,
+        abstract=f"about {word}",
+        bioproject_accession=accession,
+    )
+    assert created.status_code == 201, created.text
+    qs = await fetch_export_entity_id(
+        ctx["pool"], kind="study", entity_idx=created.json()["study_idx"]
+    )
+    for client, view in ((ctx["user"], StudyRecordView.PUBLIC), (ctx["wet"], StudyRecordView.FULL)):
+        rows = (await _list(client, q=f"{word} {accession}"))["studies"]
+        assert [(r["export_entity_id"], r["record_view"]) for r in rows] == [(qs, view)], view
 
 
 async def test_list_studies_role_reader_searches_the_full_record_under_min_tier(ctx):

@@ -271,9 +271,9 @@ that default unless its migration names another tier.
   it). A study that an import only matched by accession keeps its tier. The
   migration refuses while one of those studies holds a biosample or
   sequenced_sample that did not come from ENA: it was linked while the study was
-  `member`, and nobody chose to publish it. One linked into an import-created
-  study now is linked into a public study, and is published with it, as in any
-  public study.
+  `member`, and nobody chose to publish it. An import creates its study public,
+  so a biosample or sequenced_sample linked into it afterwards is published with
+  it, as in any public study.
 - On a `public` study, a purely-local field with no `tier_override` is public
   too, because its field tier falls through to the study's default; only the
   owner-biosample-id floor and field exceptions still apply. Making a study
@@ -287,7 +287,8 @@ This is the definition, and it supersedes, for the study's own record, the
 comment on `qiita.study` in the applied migration `20260501000006_study.sql`
 (an applied migration cannot be edited in place). It is enforced by
 `auth.guards.study_record_view`, which `GET /api/v1/study/{idx}` and the
-`GET /api/v1/study` listing both decide through.
+`GET /api/v1/study` listing both decide through; the listing's query repeats it
+for search (see `study_record_view`).
 
 A caller's tier on a study is their `qiita.study_access` row (`admin` for the
 study's owner, with or without a row), or `public` when they hold none. The
@@ -310,10 +311,10 @@ leaves out changes. Its `GET /api/v1/study` row carries neither `study_idx` nor
 `POST /api/v1/study/lookup`.
 
 Search follows the same line: a summary reader's `q` matches only the summary
-fields, and a public-view reader's only the public view's fields. The listing
-query applies that match itself, so a study that matches only in a field the
-caller cannot read is never paged over, and neither a row nor the listing's
-cursor discloses the word.
+fields, and a public-view reader's only the public view's fields. A study that
+matches only in a field the caller cannot read is not listed, and the listing's
+cursor does not pass over it (`repositories.study.fetch_study_list_candidates`
+says why).
 
 ## Raw Data Fingerprint
 

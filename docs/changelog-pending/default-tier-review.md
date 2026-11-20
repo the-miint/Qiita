@@ -18,3 +18,15 @@
   - A study that an import only matched by accession keeps its tier.
   - The default tier of every global field, and why each is `public`, is now written down in
     `docs/architecture/data-model.md` ("Default tiers").
+
+### Fixed
+
+- **`GET /api/v1/study`'s cursor no longer reveals studies that matched `q` only in fields the
+  caller cannot read (#929).** A caller who reads only a study's summary could get an empty page
+  whose `next_after_study_idx` named a study that matched only in its notes, abstract,
+  description or funding. Such a study is no longer a candidate, so the cursor never passes
+  over it. The public view is searched the same way.
+- **A full-record reader's study search treats the record as one document (#929).** `q` now
+  finds a study whose words fall in an accession and in another field (`soil PRJNA123`) for its
+  owner, grantees at its `default_tier` and wet-lab admins, as it already did for summary
+  readers.

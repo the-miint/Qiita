@@ -221,8 +221,9 @@ async def test_up_ignores_a_sample_retired_from_the_study(mig, retired):
 
 
 async def test_up_ignores_a_study_that_the_import_only_matched(mig):
-    """A sample without an ENA accession in a study that an import only matched
-    does not block, since that study is not made public."""
+    """A biosample and a sequenced_sample without ENA accessions, in a study
+    that an import only matched, do not block, since that study is not made
+    public."""
     biosample_idx = await _seed_biosample_in(
         mig, study_idx=mig["matched_idx"], with_ena_accession=False
     )

@@ -472,9 +472,17 @@ async def _resolve_study_by_ena_accessions(
     return row
 
 
+# The full record as a search document: the generated search_vector, which
+# holds the full-record text, plus the accessions, which it does not. One
+# document, as for the two views below, so a query's words may fall in
+# different fields.
+_STUDY_FULL_TSVECTOR = (
+    "(study.search_vector || to_tsvector('english', concat_ws(' ',"
+    " study.bioproject_accession, study.ena_study_accession)))"
+)
 # The summary fields as a search document: what a caller who may read only a
 # study's summary may search (`auth.guards.study_record_view`). Same 'english'
-# configuration as the generated search_vector, which holds the full-record text.
+# configuration as the generated search_vector.
 _STUDY_SUMMARY_TSVECTOR = (
     "to_tsvector('english', concat_ws(' ', study.title, study.alias,"
     " study.bioproject_accession, study.ena_study_accession))"
@@ -507,25 +515,23 @@ async def fetch_study_list_candidates(
     the study, holds any qiita.study_access row on it, or (with
     `include_ungranted_public`) its default_tier is public; `all_studies`
     (a role bypass) returns every study. The caller decides each row with
-    `auth.guards.study_record_view`, so the record-read rule keeps one
-    definition; the prefilter must stay a superset of what that admits.
+    `auth.guards.study_record_view`; the prefilter must stay a superset of what
+    that admits.
     `include_ungranted_public=False` is for a caller asking only for studies
     where their own tier reaches above public, which a study they hold no
     grant on can never satisfy — without it, public studies would fill pages
     only to be dropped.
 
     `query` is a websearch-syntax full-text query, matched only against the
-    fields of the view the caller reads of each study: the full record's
-    `search_vector` plus the accessions, which it does not cover, for the full
-    view; the summary fields for the summary view; the public view's fields for
-    the public view. The match must be made here, not by the caller: the caller
-    pages past every row this returns, so a row that matched only on a field its
-    view hides would move the cursor, and a cursor would tell the caller that a
-    hidden field holds the words. Each row's `match_view` is the view the query
-    matched against, worked out from the same inputs as `study_record_view`
-    (`role_reads_full_record` is the caller's role bypass there); the caller
-    checks that the two agree. All three use the 'english' configuration, so
-    words are stemmed and matched whole.
+    fields of the view the caller reads of each study, as one document per
+    view. The match must be made here, not by the caller: the caller pages past
+    every row this returns, so a row that matched only on a field its view hides
+    would move the cursor, and a cursor would tell the caller that a hidden
+    field holds the words. So the query repeats `study_record_view`'s ladder in
+    SQL (`role_reads_full_record` is the caller's role bypass there) and returns
+    the view it worked out as `match_view`; the caller raises on a row where the
+    two disagree. All three documents use the 'english' configuration, so words
+    are stemmed and matched whole.
 
     Keyset paging on idx (`after_study_idx`) never re-reads a skipped row, but
     a page scans down from the highest idx until it has `limit` candidates or
@@ -550,8 +556,7 @@ async def fetch_study_list_candidates(
         " WHERE ($2 OR study.owner_idx = $1 OR sa.access_tier IS NOT NULL"
         "        OR ($6 AND study.default_tier = $7::qiita.tier))"
         "   AND ($3::text IS NULL OR CASE v.match_view"
-        "        WHEN $9 THEN study.search_vector @@ websearch_to_tsquery('english', $3)"
-        f"            OR {_STUDY_SUMMARY_TSVECTOR} @@ websearch_to_tsquery('english', $3)"
+        f"       WHEN $9 THEN {_STUDY_FULL_TSVECTOR} @@ websearch_to_tsquery('english', $3)"
         f"       WHEN $10 THEN {_STUDY_SUMMARY_TSVECTOR}"
         "            @@ websearch_to_tsquery('english', $3)"
         f"       WHEN $11 THEN {_STUDY_PUBLIC_TSVECTOR}"
