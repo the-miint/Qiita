@@ -268,7 +268,12 @@ that default unless its migration names another tier.
 - Every study that an ENA import created is `public`, since ENA already
   publishes its data (`repositories.study.get_or_create_study_by_ena_accessions`;
   `20261120000000_ena_imported_studies_public.sql` set the ones created before
-  it). A study that an import only matched by accession keeps its tier.
+  it). A study that an import only matched by accession keeps its tier. The
+  migration refuses while one of those studies holds a biosample or
+  sequenced_sample that did not come from ENA: it was linked while the study was
+  `member`, and nobody chose to publish it. One linked into an import-created
+  study now is linked into a public study, and is published with it, as in any
+  public study.
 - On a `public` study, a purely-local field with no `tier_override` is public
   too, because its field tier falls through to the study's default; only the
   owner-biosample-id floor and field exceptions still apply. Making a study
