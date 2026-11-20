@@ -21,9 +21,12 @@ Every backfill in here must be:
     after curation lands is safe and is the expected way to use it;
   * **fail-open-to-the-report, never to a guess** — anything the rules do not settle
     is listed as residue, not filled in with a default. The residue is the curation
-    worklist.
+    worklist. A repair that a partial run would leave worse than none (one whose rows
+    must change together) refuses the whole run instead, naming the rows it cannot
+    settle.
 
 **Retirement.** A backfill is done when its residue is empty and no new rows can
-arrive without the field. Delete it then; it is not load-bearing and nothing imports
-it but its CLI entry point.
+arrive without the field, or, for one that refuses rather than leave residue, when it
+has run on every deployment. Delete it then, together with any use of it outside its
+CLI entry point and tests.
 """

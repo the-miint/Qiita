@@ -797,9 +797,9 @@ async def delete_reference(
     """Fully purge a reference — Postgres rows, DuckLake data, and on-disk
     indexes. system_admin only (`reference:delete`).
 
-    Gating: work tickets in-flight (pending/queued/processing) block the delete
-    unconditionally (409); terminal tickets (completed/no_data/failed) block it
-    unless `force=true` is passed. Shared features (claimed by another reference) are never deleted.
+    Gating (409): `assert_reference_deletable` says what blocks the delete, and which
+    blockers `force=true` overrides. Shared features (claimed by another reference) are
+    never deleted.
 
     Ordering is data-plane → orchestrator → Postgres, chosen so the operation
     is *retriable*: every step is idempotent and the `qiita.reference` row — the
@@ -855,13 +855,14 @@ async def delete_reference(
         artifacts_removed = purge.removed
 
     # Re-gate inside the teardown transaction to close the precheck→cascade
-    # window: a work ticket that went in-flight since the precheck must abort
-    # the teardown (and 409 loudly) rather than be silently deleted by the
-    # cascade. force=True here means only a *new in-flight* ticket aborts —
-    # terminal tickets are still the cascade's to delete.
+    # window: a blocker that appeared since the precheck (a work ticket gone
+    # in-flight, a derivation committed) must abort the teardown (and 409 loudly)
+    # rather than be silently deleted by the cascade. force=True here because
+    # terminal tickets are still the cascade's to delete; every other blocker
+    # aborts. `hold`: `assert_reference_deletable` says which writers it holds out.
     async with tx() as conn:
         try:
-            await assert_reference_deletable(conn, reference_idx, force=True)
+            await assert_reference_deletable(conn, reference_idx, force=True, hold=True)
         except ReferenceNotFound:
             raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
         except ReferenceDeleteBlocked as exc:

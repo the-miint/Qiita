@@ -59,6 +59,7 @@ SWEEP_TIERS = (
         ("exported_feature", (("genome_idx", GENOME_OF_PREP_SAMPLE),)),
         ("exported_identifier", (("prep_sample_idx", PREP_SAMPLE),)),
         ("feature_genome", (("genome_idx", GENOME_OF_PREP_SAMPLE),)),
+        ("genome_derivation", (("genome_idx", GENOME_OF_PREP_SAMPLE),)),
         ("mask_sample", (("prep_sample_idx", PREP_SAMPLE),)),
         ("prep_sample_field_exception", (("prep_sample_idx", PREP_SAMPLE),)),
         ("prep_sample_metadata", (("prep_sample_idx", PREP_SAMPLE),)),
