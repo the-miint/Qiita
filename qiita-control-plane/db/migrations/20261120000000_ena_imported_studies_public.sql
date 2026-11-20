@@ -13,10 +13,11 @@
 --
 -- Making a study public publishes its public view and its local fields with no
 -- tier_override. So the migration refuses while an import-created study holds
--- a sample that did not come from ENA: a biosample linked to it with no
--- ena_sample_accession (the import writes one on every biosample it creates),
--- or a sequenced_sample in it with no ena_run_accession (likewise). A sample
--- whose link to the study is retired is no longer in it, and is not counted.
+-- a biosample or sequenced_sample that did not come from ENA: a biosample linked
+-- to it with no ena_sample_accession (the import writes one on every biosample
+-- it creates), or a sequenced_sample in it with no ena_run_accession (likewise).
+-- A biosample or prep_sample whose link to the study is retired is no longer in
+-- it, and is not counted.
 --
 -- The migration does not check two kinds of content that a person may have
 -- added after the import, and publishes them: the study's alias, description,
@@ -49,7 +50,9 @@ BEGIN
         RAISE EXCEPTION 'ENA-imported studies % hold data that did not come from ENA', offending
           USING HINT = 'Making these studies public would publish their biosamples or'
                        ' sequenced_samples that did not come from ENA. Stop the deploy and'
-                       ' raise each study with its owner; no route moves samples out of a study.';
+                       ' raise each study with its owner. No route removes a biosample from a'
+                       ' study; a sequenced_sample leaves one only when a system_admin deletes'
+                       ' its whole sequenced_pool.';
     END IF;
 END
 $$;

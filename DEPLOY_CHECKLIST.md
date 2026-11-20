@@ -61,7 +61,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   them, and before the deploy raise with each study's owner any that should not be public.
   1. The studies that still hold a biosample or sequenced_sample with no ENA accession.
      The migration refuses while any do, so expect no rows; otherwise stop the deploy and
-     raise each study with its owner (no route moves samples out of a study).
+     raise each study with its owner. No route removes a biosample from a study; a
+     sequenced_sample leaves one only when a system_admin deletes its whole sequenced_pool.
   2. The studies whose alias, description, abstract or funding a person added (an import
      writes none of them). The owner edits these with `PATCH /api/v1/study/{study_idx}`.
   3. On the studies that an import created, the local fields with no `tier_override` that no
