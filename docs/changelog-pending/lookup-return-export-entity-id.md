@@ -25,8 +25,11 @@
   when they resolve `--study-export-id`. In the OpenAPI spec, `NaturalKeyLookupResponse`'s
   `resolved` values become integer-or-string, which a generated client sees on every route
   that returns it, including the deprecated lookups and
-  `POST /sequencing-run/lookup-by-instrument-run-id`; those still return integers.
+  `POST /sequencing-run/lookup-by-instrument-run-id`; those still return integers. A
+  `qiita` CLI installed from main since #896 must be reinstalled before it uses
+  `--study-export-id` against a server with this change.
 - **`qiita biosample bulk-create` writes the created biosamples' TSV to a file named by a
   required `--output` (#934), instead of printing it.** The command refuses an existing file
   or a missing directory before it creates anything, and writes the file only on success,
-  so a failed run leaves no partial file behind.
+  so a failed run leaves no partial file behind. A last line in the input file that holds only
+  tabs is now ignored instead of becoming a row with no values.

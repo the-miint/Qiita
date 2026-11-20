@@ -104,9 +104,10 @@ def _read_tsv_with_column(
     tsv_file: Path, required_column: str, parser: argparse.ArgumentParser, *, column_flag: str
 ) -> list[dict[str, str]]:
     """Read the TSV file at `tsv_file` into one dict per row, keyed on its
-    stripped column headers. A file that cannot be read, that lacks the
-    `required_column` column, or that holds no rows exits through `parser.error`,
-    naming the file and the fault; `column_flag` is the flag that named the column."""
+    stripped column headers, leaving out rows at the end of the file whose cells
+    are all blank. A file that cannot be read, that lacks the `required_column`
+    column, or that holds no rows exits through `parser.error`, naming the file
+    and the fault; `column_flag` is the flag that named the column."""
     try:
         tsv_rows = read_headed_tsv(tsv_file, source_name=_TSV_FILE_FLAG)
     except duckdb.Error as exc:
@@ -117,6 +118,9 @@ def _read_tsv_with_column(
     except ValueError as exc:
         parser.error(str(exc))
 
+    # A blank row at the end of the file, read from a blank last line, holds no data.
+    while tsv_rows and not any(cell.strip() for cell in tsv_rows[-1].values()):
+        tsv_rows = tsv_rows[:-1]
     if not tsv_rows:
         parser.error(f"{_TSV_FILE_FLAG} {tsv_file} holds no rows")
     if required_column not in tsv_rows[0]:

@@ -805,8 +805,8 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 PATH_STUDY_PREFIX = "/study"
 PATH_STUDY_ROOT = ""  # POST (create) and GET (list) against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
-# Bulk lookup of study_idx by the natural key that the body names. POST (not GET) so
-# the value list rides in the body, which has no URL-line cap.
+# Bulk lookup by the natural key that the body names. POST (not GET) so the value
+# list rides in the body, which has no URL-line cap.
 PATH_STUDY_LOOKUP = "/lookup"
 # Deprecated in favor of PATH_STUDY_LOOKUP.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
@@ -1006,8 +1006,8 @@ PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
 # The studies that a biosample is actively linked to, with their accessions.
 PATH_BIOSAMPLE_STUDY_LIST = "/{biosample_idx}/study/list"
-# Bulk lookup of biosample_idx by the natural key that the body names; POST for the
-# reason PATH_STUDY_LOOKUP gives.
+# Bulk lookup by the natural key that the body names; POST for the reason
+# PATH_STUDY_LOOKUP gives.
 PATH_BIOSAMPLE_LOOKUP = "/lookup"
 # Deprecated in favor of PATH_BIOSAMPLE_LOOKUP.
 PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"

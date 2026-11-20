@@ -179,6 +179,23 @@ def test__handle_biosample_bulk_create(monkeypatch, tmp_path):
     assert (rc, calls, _read_output(tmp_path)) == (0, expected_calls, _EXPECTED_OUTPUT)
 
 
+@pytest.mark.parametrize("blank_line", ["\n", "\t\t\t\t\n"], ids=["empty-line", "tab-only-line"])
+def test__handle_biosample_bulk_create_ignores_trailing_blank_line(
+    monkeypatch, tmp_path, blank_line
+):
+    """Tests the case where the file ends in a blank line after its last row: the
+    request carries only the real rows, and the created biosamples are written as
+    usual."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BULK_RESPONSE, whoami_idx=42)
+
+    rc = main(_bulk_create_argv(_write_tsv_file(tmp_path, _TSV_TEXT + blank_line)))
+
+    posted = [r["json"] for r in captured["requests"] if r["method"] == "POST"]
+    expected = (0, [{"rows": _expected_rows(42)}], _EXPECTED_OUTPUT)
+    assert (rc, posted, _read_output(tmp_path)) == expected
+
+
 def test__handle_biosample_bulk_create_explicit_owner_and_internal_names(monkeypatch, tmp_path):
     """Tests the case where --owner-idx and --global-internal-names are passed:
     no whoami call is made, and every row carries that owner and the flag."""
@@ -620,6 +637,38 @@ def test__handle_biosample_lookup_by_study_export_id(monkeypatch, tmp_path):
     assert outcome == (0, [_BASE + URL_STUDY_LOOKUP, _BASE + _LOOKUP_URL], expected_output)
 
 
+@pytest.mark.parametrize(
+    "tsv_text",
+    [
+        "biosample_accession\nSAMN01\nSAMN02\n\n",
+        "biosample_accession\tnote\nSAMN01\tx\nSAMN02\ty\n\n",
+        "biosample_accession\nSAMN01\nSAMN02\n  \n",
+        "biosample_accession\tnote\nSAMN01\tx\nSAMN02\ty\n\t\n",
+    ],
+    ids=["one-column", "two-columns", "whitespace-line", "tab-only-line"],
+)
+def test__handle_biosample_lookup_ignores_trailing_blank_lines(monkeypatch, tmp_path, tsv_text):
+    """Tests the case where the file ends in a blank line after its last row: the
+    line holds no row to misalign, so the file is not refused, and only the real
+    rows are looked up and written."""
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {"SAMN01": "QB517", "SAMN02": "QB518"}, "missing": []},
+    )
+
+    rc = main(_lookup_argv(_write_tsv_file(tmp_path, tsv_text), "--key", "biosample_accession"))
+
+    sent_values = [r["json"]["values"] for r in captured["requests"]]
+    expected_output = "biosample_accession\texport_entity_id\nSAMN01\tQB517\nSAMN02\tQB518\n"
+    assert (rc, sent_values, _read_output(tmp_path)) == (
+        0,
+        [["SAMN01", "SAMN02"]],
+        expected_output,
+    )
+
+
 def test__handle_biosample_lookup_reads_crlf_file(monkeypatch, tmp_path):
     """Tests the case where the file has Windows line endings: each line is one row,
     so the file is not refused, and the output maps each row in order."""
@@ -665,7 +714,7 @@ def test__handle_biosample_lookup_refuses_missing_values(monkeypatch, tmp_path, 
     ("tsv_text", "flags", "message"),
     [
         (
-            "export_entity_id\nQB1\n  \n",
+            "export_entity_id\nQB1\n  \nQB2\n",
             ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
             "line(s) 3, counting",
         ),
@@ -676,6 +725,11 @@ def test__handle_biosample_lookup_refuses_missing_values(monkeypatch, tmp_path, 
             "same header",
         ),
         ("Export_Entity_ID\nS-1\n", ("--unique-field-name", "Export_Entity_ID"), "same header"),
+        (
+            "export_entity_id\tnote\nQB1\ta\n\tb\n",
+            ("--key", EXPORT_ENTITY_ID, "--return-key", "biosample_idx"),
+            "line(s) 3, counting",
+        ),
         ("matrix_tube_id\nX\n", ("--key", "matrix_tube_id"), "must match ^[0-9]{10}$: ['X']"),
         (
             "sample_id\nS-1\n",
@@ -705,6 +759,7 @@ def test__handle_biosample_lookup_refuses_missing_values(monkeypatch, tmp_path, 
         "returned-column-clash",
         "returned-column-clash-idx",
         "returned-column-clash-unique-field-case",
+        "partly-blank-last-row",
         "invalid-value",
         "missing-column",
         "blank-field-name",

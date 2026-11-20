@@ -3,6 +3,7 @@
 import json
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import get_args
 from uuid import UUID
 
 import pytest
@@ -24,9 +25,15 @@ from qiita_common.models import (
     StudyLookupRequest,
     TerminologyManifestFile,
 )
-from qiita_common.models._base import MAX_NATURAL_KEY_LOOKUP_VALUES, NaturalKeyLookupResponse
+from qiita_common.models._base import (
+    MAX_NATURAL_KEY_LOOKUP_VALUES,
+    LookupReturnKey,
+    NaturalKeyLookupResponse,
+)
 from qiita_common.models.biosample import (
     LOOKUP_IDX_PATTERN,
+    BiosampleLookupKey,
+    BiosampleStudyLookupKey,
     BiosampleStudyLookupRequest,
 )
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
@@ -1890,6 +1897,14 @@ def test_natural_key_lookup_response_refuses_non_positive_idx(idx):
     it is refused rather than accepted as some other identifier."""
     with pytest.raises(ValidationError):
         NaturalKeyLookupResponse.model_validate({"resolved": {"a": idx}, "missing": []})
+
+
+def test_lookup_literals_match_their_name_constants():
+    """Tests the case where each lookup Literal type is compared with the name
+    constants for its values: the test fails when the two differ."""
+    added_by_study_lookup = get_args(BiosampleStudyLookupKey)[len(get_args(BiosampleLookupKey)) :]
+    actual = (get_args(LookupReturnKey), added_by_study_lookup)
+    assert actual == ((EXPORT_ENTITY_ID, IDX_KEY), (IDX_KEY, UNIQUE_FIELD_KEY))
 
 
 def test_biosample_study_lookup_request_names_malformed_idxs():
