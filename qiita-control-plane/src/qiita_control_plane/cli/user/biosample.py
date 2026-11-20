@@ -48,7 +48,7 @@ _LOOKUP_KEY_BY_CHOICE = {
     for key in get_args(BiosampleStudyLookupKey)
     if key != UNIQUE_FIELD_KEY
 }
-# export_entity_id is listed first, as the identifier kind preferred everywhere.
+# export_entity_id is listed first, as the default identifier kind.
 _LOOKUP_KEY_CHOICES = (
     EXPORT_ENTITY_ID,
     *(choice for choice in _LOOKUP_KEY_BY_CHOICE if choice != EXPORT_ENTITY_ID),
@@ -60,7 +60,7 @@ _LOOKUP_RETURN_KEY_BY_CHOICE = {EXPORT_ENTITY_ID: EXPORT_ENTITY_ID, _BIOSAMPLE_I
 _DUCKDB_ADVICE_MARKER = "Possible fixes"
 # The fields of each created biosample that the output TSV carries, after the
 # owner_biosample_id column.
-_BULK_CREATE_OUTPUT_FIELDS = ("biosample_idx", "export_entity_id")
+_BULK_CREATE_OUTPUT_FIELDS = (_BIOSAMPLE_IDX, EXPORT_ENTITY_ID)
 # Names that the owner_biosample_id column cannot take: the output columns and
 # the attribute names. One rule ignores case for both, although routing a
 # column to an attribute matches its exact name.

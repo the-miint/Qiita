@@ -63,7 +63,7 @@ _LOOKUP_CASES: dict[str, tuple[tuple[str, ...], str, str, tuple[str, str]]] = {
 # (case, return key) pairs that look a kind up for itself, which would head both
 # output columns alike and so are refused rather than resolved.
 _LOOKUP_SELF_PAIRS = {(EXPORT_ENTITY_ID, EXPORT_ENTITY_ID), ("biosample_idx", "biosample_idx")}
-# return key -> the two identifiers the stubbed route returns for a case's two values
+# return key -> the two identifiers that the stubbed route returns for a case's two values
 _LOOKUP_IDENTIFIERS: dict[str, tuple[str | int, str | int]] = {
     EXPORT_ENTITY_ID: ("QB517", "QB518"),
     "biosample_idx": (517, 518),

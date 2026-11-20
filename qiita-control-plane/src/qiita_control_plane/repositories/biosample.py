@@ -34,7 +34,7 @@ from .biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
     insert_owner_biosample_id_metadata,
 )
-from .exported_entity import export_entity_id_lookup, export_entity_id_select
+from .exported_entity import EntityKind, export_entity_id_lookup, export_entity_id_select
 from .study_access import CallerMetadataTiers
 
 # Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
@@ -90,7 +90,8 @@ _BIOSAMPLE_RETURNING_COLS = (
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
-    " retired, retired_by_idx, retired_at, retire_reason, " + export_entity_id_select("biosample")
+    " retired, retired_by_idx, retired_at, retire_reason, "
+    + export_entity_id_select(EntityKind.BIOSAMPLE)
 )
 
 
@@ -321,7 +322,7 @@ _BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
     "biosample_accession": ("biosample.biosample_accession", ""),
     "ena_sample_accession": ("biosample.ena_sample_accession", ""),
     "matrix_tube_id": ("biosample.matrix_tube_id", ""),
-    "export_entity_id": export_entity_id_lookup("biosample"),
+    "export_entity_id": export_entity_id_lookup(EntityKind.BIOSAMPLE),
 }
 
 

@@ -327,9 +327,7 @@ def write_tsv_output(
 ) -> None:
     """Write `rows` as the tab-separated table at `path`, headed by `columns`,
     all at once: the table is written to `<path>.partial` and renamed into place,
-    so a failed write leaves no file at `path` and no partial behind. A file that
-    appears at `path` before the rename is left as it was, and the call raises
-    FileExistsError.
+    so a failed write leaves no file at `path` and no partial behind.
 
     Raises what `write_tsv` raises, FileExistsError, or OSError from the rename.
     """

@@ -7133,7 +7133,7 @@ async def _fetch_unique(ctx, spec, field_idx, values, tiers=ADMIN_EVERYWHERE):
 async def test_fetch_entity_idxs_by_unique_field_values(ctx, spec):
     """Tests the case where a unique_in_study field carries several of the
     values on different entities: each hit maps to its own entity's idx, and a
-    value no entity carries through the field is absent from the result.
+    value that no entity carries through the field is absent from the result.
     """
     field_idx, first_entity = await _seed_unique_value(
         ctx, spec, suffix="uniq-hit", value="Sample 1"
@@ -7161,7 +7161,7 @@ async def test_fetch_entity_idxs_by_unique_field_values(ctx, spec):
 )
 async def test_fetch_entity_idxs_by_unique_field_values_hidden_omitted(ctx, spec):
     """Tests the case where the matching value sits above the caller's tier: it
-    is absent from the result, exactly as a value no entity carries, so the
+    is absent from the result, exactly as a value that no entity carries, so the
     lookup cannot confirm a hidden value; a caller at the field's tier finds it.
     """
     field_idx, entity_idx = await _seed_unique_value(

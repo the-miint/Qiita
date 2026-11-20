@@ -54,7 +54,7 @@ from ..auth.guards import (
     study_record_view,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories.exported_entity import EntityKind, require_export_entity_id
 from ..repositories.study import (
     create_study,
@@ -122,7 +122,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
     return StudyResponse.model_validate(
         {
             "study_idx": row["idx"],
-            "export_entity_id": require_export_entity_id(row, kind="study"),
+            "export_entity_id": require_export_entity_id(row, kind=EntityKind.STUDY),
             "owner_idx": row["owner_idx"],
             "principal_investigator_idx": row["principal_investigator_idx"],
             "title": row["title"],
@@ -298,7 +298,7 @@ async def list_studies(
             studies.append(
                 StudySummary(
                     study_idx=row["idx"],
-                    export_entity_id=require_export_entity_id(row, kind="study"),
+                    export_entity_id=require_export_entity_id(row, kind=EntityKind.STUDY),
                     title=row["title"],
                     alias=row["alias"],
                     bioproject_accession=row["bioproject_accession"],
@@ -363,7 +363,7 @@ async def get_study(
     if view is StudyRecordView.SUMMARY:
         return StudyRecordSummary(
             study_idx=row["idx"],
-            export_entity_id=require_export_entity_id(row, kind="study"),
+            export_entity_id=require_export_entity_id(row, kind=EntityKind.STUDY),
             title=row["title"],
             alias=row["alias"],
             bioproject_accession=row["bioproject_accession"],
@@ -473,7 +473,7 @@ async def patch_study(
 @router.post(PATH_STUDY_LOOKUP)
 async def lookup_study(
     body: StudyLookupRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> NaturalKeyLookupResponse:
@@ -489,7 +489,7 @@ async def lookup_study(
     # runs here (see auth docstring).
     _ = user
     # One read-only snapshot, so the export ids read the same rows that the lookup read
-    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+    async with snapshot() as conn:
         lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
             # handler twin of lookup_biosample; differs only in fetcher and kind
             values=body.values,

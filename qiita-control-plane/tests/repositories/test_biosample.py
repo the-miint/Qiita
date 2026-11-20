@@ -47,6 +47,7 @@ from qiita_control_plane.repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
+from qiita_control_plane.repositories.exported_entity import EntityKind
 from qiita_control_plane.testing.db_seeds import (
     fetch_export_entity_id,
     retire_biosample,
@@ -1484,7 +1485,7 @@ async def test_fetch_biosamples_by_idxs(ctx):
         return {
             "idx": idx,
             EXPORT_ENTITY_ID: await fetch_export_entity_id(
-                ctx["pool"], kind="biosample", entity_idx=idx
+                ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=idx
             ),
             "owner_idx": ctx["principal_idx"],
             "metadata_checklist_idx": None,
@@ -1569,7 +1570,7 @@ async def test_fetch_biosample_returns_row(ctx):
     expected = {
         "idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
@@ -1786,7 +1787,7 @@ async def test_update_biosample_writes_single_field(ctx):
     expected = {
         "idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": ctx["biosample_owner_idx"],
         "metadata_checklist_idx": ctx["checklist_idx"],
@@ -1847,7 +1848,7 @@ async def test_update_biosample_writes_all_editable_fields(ctx):
     expected = {
         "idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": ctx["principal_idx"],
         "metadata_checklist_idx": None,
@@ -2124,9 +2125,11 @@ async def test_fetch_biosample_idxs_by_natural_key_export_entity_id(ctx):
         bs_acc=unique_accession("LK-EE"),
         ena_acc=unique_accession("LK-EE-ENA"),
     )
-    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    bs_handle = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
+    )
     study_handle = await fetch_export_entity_id(
-        ctx["pool"], kind="study", entity_idx=ctx["study_idx"]
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=ctx["study_idx"]
     )
 
     result = await fetch_biosample_idxs_by_natural_key(
@@ -2145,7 +2148,9 @@ async def test_fetch_biosample_idxs_by_natural_key_export_entity_id_excludes_ret
         bs_acc=unique_accession("LK-EE-RET"),
         ena_acc=unique_accession("LK-EE-RET-ENA"),
     )
-    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    bs_handle = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
+    )
     await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
 
     result = await fetch_biosample_idxs_by_natural_key(
@@ -2155,7 +2160,7 @@ async def test_fetch_biosample_idxs_by_natural_key_export_entity_id_excludes_ret
 
 
 async def test_fetch_biosample_idxs_by_natural_key_include_retired(ctx):
-    """Tests the case where the biosample a value names is retired: with
+    """Tests the case where the biosample that a value names is retired: with
     include_retired it resolves, and by default it does not."""
     bs_idx = await _seed_full_biosample(
         ctx,
@@ -2163,7 +2168,9 @@ async def test_fetch_biosample_idxs_by_natural_key_include_retired(ctx):
         bs_acc=unique_accession("LK-INC-RET"),
         ena_acc=unique_accession("LK-INC-RET-ENA"),
     )
-    bs_handle = await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=bs_idx)
+    bs_handle = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
+    )
     await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=ctx["principal_idx"])
 
     included = await fetch_biosample_idxs_by_natural_key(

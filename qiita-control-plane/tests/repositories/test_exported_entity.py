@@ -53,10 +53,12 @@ async def _expect(postgres_pool, entries):
     expected = []
     for study, biosample in entries:
         if study is not None:
-            handle = await fetch_export_entity_id(postgres_pool, kind="study", entity_idx=study)
+            handle = await fetch_export_entity_id(
+                postgres_pool, kind=EntityKind.STUDY, entity_idx=study
+            )
         else:
             handle = await fetch_export_entity_id(
-                postgres_pool, kind="biosample", entity_idx=biosample
+                postgres_pool, kind=EntityKind.BIOSAMPLE, entity_idx=biosample
             )
         expected.append(
             {"study_idx": study, "biosample_idx": biosample, "export_entity_id": handle}
@@ -104,7 +106,7 @@ async def test_fetch_exported_entities_one_kind_alone(postgres_pool, probe):
     assert actual == expected
 
 
-@pytest.mark.parametrize("kind", ["study", "biosample"])
+@pytest.mark.parametrize("kind", list(EntityKind))
 async def test_fetch_exported_entities_raise_missing(postgres_pool, probe, kind):
     """Tests the case where a request names an entity of `kind` that has no
     export_entity_id, beside entities of both kinds that resolve.
@@ -158,7 +160,7 @@ async def test_fetch_export_entity_ids_by_idx_raise_missing(postgres_pool, kind)
 
 async def test_fetch_export_entity_ids_by_idx_empty(postgres_pool):
     """Tests the case where no idxs are given: the result is empty."""
-    actual = await fetch_export_entity_ids_by_idx(postgres_pool, kind="study", idxs=[])
+    actual = await fetch_export_entity_ids_by_idx(postgres_pool, kind=EntityKind.STUDY, idxs=[])
 
     assert actual == {}
 
@@ -166,7 +168,7 @@ async def test_fetch_export_entity_ids_by_idx_empty(postgres_pool):
 def test_require_export_entity_id():
     """Tests the case where an entity row carries its export_entity_id."""
     row = {"idx": 7, "export_entity_id": "QS3"}
-    assert require_export_entity_id(row, kind="study") == "QS3"
+    assert require_export_entity_id(row, kind=EntityKind.STUDY) == "QS3"
 
 
 def test_require_export_entity_id_raise_missing():
@@ -177,7 +179,7 @@ def test_require_export_entity_id_raise_missing():
     """
     row = {"idx": 7, "export_entity_id": None}
     with pytest.raises(MissingExportedEntityError) as caught:
-        require_export_entity_id(row, kind="biosample")
+        require_export_entity_id(row, kind=EntityKind.BIOSAMPLE)
 
     actual = {"missing": caught.value.missing, "kind": caught.value.kind}
     expected = {"missing": [7], "kind": "biosample"}
@@ -195,7 +197,7 @@ def test_entity_idx_column_raise_bad_kind():
 
 def test_export_entity_id_select():
     """Tests the case where a study query selects its export_entity_id."""
-    actual = export_entity_id_select("study")
+    actual = export_entity_id_select(EntityKind.STUDY)
     expected = (
         "(SELECT export_entity_id FROM qiita.exported_entity ee"
         " WHERE ee.study_idx = study.idx) AS export_entity_id"
@@ -205,7 +207,7 @@ def test_export_entity_id_select():
 
 def test_export_entity_id_lookup():
     """Tests the case where a biosample query keys a lookup on export_entity_id."""
-    actual = export_entity_id_lookup("biosample")
+    actual = export_entity_id_lookup(EntityKind.BIOSAMPLE)
     expected = (
         "ee.export_entity_id",
         " JOIN qiita.exported_entity ee ON ee.biosample_idx = biosample.idx",

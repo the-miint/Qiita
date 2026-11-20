@@ -19,9 +19,7 @@ from qiita_common.models import (
     IDX_KEY,
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
-    UNIQUE_FIELD_KEY,
     AlignmentDefinitionStatus,
-    BiosampleStudyLookupKey,
     DefinitionGroupRefusal,
     DefinitionKind,
     DeprecatedUpstream,
@@ -109,8 +107,6 @@ from ..repositories.alignment_definition import (
     AlignmentHasLiveWork,
     fetch_alignment_definition_by_idx,
 )
-from ..repositories.biosample import fetch_biosample_idxs_by_natural_key
-from ..repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from ..repositories.block import list_incomplete_alignment_samples
 from ..repositories.exported_entity import EntityKind, fetch_export_entity_ids_by_idx
 from ..repositories.mask_definition import MaskHasLiveWork, fetch_mask_definition_by_idx
@@ -785,7 +781,7 @@ async def resolve_unique_field_values(
 
     display_name names one of the study's fields, which must declare
     unique_in_study; one that does not is refused (422), as is a name the
-    study does not use. A value no entity carries, and one whose match is
+    study does not use. A value that no entity carries, and one whose match is
     hidden from `tiers`, are both absent from the result. Retirement is not
     consulted; the caller decides what it means for its operation.
     """
@@ -835,44 +831,6 @@ async def resolve_unique_field_values(
         for parsed, entity_idx in entity_idxs.items()
         for sent in sent_by_parsed[parsed]
     }
-    return resolved
-
-
-async def resolve_biosample_idxs_by_kind(
-    conn: asyncpg.Connection,
-    *,
-    study_idx: int,
-    key: BiosampleStudyLookupKey,
-    values: list[str],
-    unique_field_display_name: str | None,
-    tiers: CallerMetadataTiers,
-) -> dict[str, int]:
-    """Resolve values of the identifier kind named by `key` to biosample idxs,
-    keyed by each value as sent.
-
-    Retired biosamples and biosamples outside study_idx still resolve; the
-    caller decides which of them count. Under `unique_field`, the values are
-    those of the study's field named by unique_field_display_name. Under `idx`,
-    each value maps to itself as a number, whether or not a biosample has it.
-    """
-    if key == UNIQUE_FIELD_KEY:
-        if unique_field_display_name is None:
-            raise ValueError("key unique_field needs unique_field_display_name")
-        resolved = await resolve_unique_field_values(
-            conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            study_idx=study_idx,
-            display_name=unique_field_display_name,
-            values=values,
-            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
-            tiers=tiers,
-        )
-    elif key == IDX_KEY:
-        resolved = {value: int(value) for value in values}
-    else:
-        resolved = await fetch_biosample_idxs_by_natural_key(
-            conn, key=key, values=values, include_retired=True
-        )
     return resolved
 
 
@@ -2054,7 +2012,7 @@ async def resolve_natural_keys(
     values: list[str],
     fetcher: Callable[..., Awaitable[dict[str, int]]],
     return_key: LookupReturnKey,
-    export_ids_from: tuple[asyncpg.Pool | asyncpg.Connection, EntityKind] | None = None,
+    export_ids_from: tuple[asyncpg.Connection, EntityKind] | None = None,
 ) -> NaturalKeyLookupResponse:
     """Dedup `values` in input order and resolve survivors via
     `fetcher(values=...)`.
@@ -2064,9 +2022,9 @@ async def resolve_natural_keys(
     the input-order deduped list of values that did not resolve.
 
     `return_key` names what each resolved value maps to. Under
-    `export_entity_id`, `export_ids_from` must give a pool or connection and the
-    kind of entity that `fetcher` returns idxs of, and each idx is replaced by
-    that entity's `export_entity_id`.
+    `export_entity_id`, `export_ids_from` must give the connection that `fetcher`
+    reads through and the kind of entity that it returns idxs of, and each idx is
+    replaced by that entity's `export_entity_id`.
     """
     # Dedup while preserving input order so `missing` is deterministic.
     dedup_ordered: list[str] = []
@@ -2080,16 +2038,21 @@ async def resolve_natural_keys(
     resolved_idxs = await fetcher(values=dedup_ordered)
     missing = [v for v in dedup_ordered if v not in resolved_idxs]
 
-    # Swap each idx for its export_entity_id in one read of the resolved idxs
-    resolved: dict[str, int | str] = dict(resolved_idxs)
-    if return_key == EXPORT_ENTITY_ID:
+    # Map each resolved value to the identifier that return_key names
+    resolved: dict[str, int | str]
+    if return_key == IDX_KEY:
+        resolved = dict(resolved_idxs)
+    elif return_key == EXPORT_ENTITY_ID:
         if export_ids_from is None:
             raise ValueError("return_key export_entity_id needs export_ids_from")
+        # Swap each idx for its export_entity_id in one read of the resolved idxs
         conn, kind = export_ids_from
         export_id_by_idx = await fetch_export_entity_ids_by_idx(
             conn, kind=kind, idxs=list(resolved_idxs.values())
         )
         resolved = {value: export_id_by_idx[idx] for value, idx in resolved_idxs.items()}
+    else:
+        raise ValueError(f"unknown return_key {return_key!r}")
 
     lookup_response = NaturalKeyLookupResponse(resolved=resolved, missing=missing)
     return lookup_response

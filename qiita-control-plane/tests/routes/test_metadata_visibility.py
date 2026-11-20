@@ -410,7 +410,7 @@ async def test_lookup_by_unique_field_hidden_value_is_a_miss(ctx):
 
 async def test_study_lookup_hidden_value_is_missing(ctx):
     """Tests the case where a viewer looks up biosamples in a study by an
-    owner-biosample-id they cannot see: the value is missing, as one that no
+    owner-biosample-id that they cannot see: the value is missing, as one that no
     biosample carries, while the bypass role's lookup resolves it."""
     study_idx = await _seed_study_for_case(ctx, "viewer")
     corpus = await _seed_biosample_corpus(ctx, study_idx)

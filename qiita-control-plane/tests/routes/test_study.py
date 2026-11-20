@@ -46,6 +46,7 @@ from qiita_common.models import (
     Tier,
 )
 
+from qiita_control_plane.repositories.exported_entity import EntityKind
 from qiita_control_plane.testing.db_seeds import (
     fetch_export_entity_id,
     seed_service_principal,
@@ -209,7 +210,7 @@ async def test_post_study_full_body_round_trips(ctx):
         "updated_at": rj["updated_at"],
         # Read from the table independently of the route under test.
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="study", entity_idx=rj["study_idx"]
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=rj["study_idx"]
         ),
         "owner_idx": caller_idx,
         "principal_investigator_idx": None,
@@ -552,7 +553,7 @@ async def test_post_study_system_admin_explicit_study_idx_lands_there(ctx):
     assert rj["study_idx"] == study_idx
     assert rj["owner_idx"] == target_idx
     assert rj["export_entity_id"] == await fetch_export_entity_id(
-        ctx["pool"], kind="study", entity_idx=study_idx
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
     )
     grant = await ctx["pool"].fetchval(
         "SELECT access_tier FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
@@ -778,7 +779,7 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "updated_at",
         }
         assert body["export_entity_id"] == await fetch_export_entity_id(
-            ctx["pool"], kind="study", entity_idx=study_idx
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
         )
         assert "ETag" not in resp.headers
     else:
@@ -1437,7 +1438,9 @@ async def test_lookup_study_resolves_by_export_entity_id(ctx):
     study_idx = await _create_study_with_accession(
         ctx, accession=unique_accession("PRJ-LOOKUP-EXP")
     )
-    export_id = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+    export_id = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
+    )
     unknown_id = unique_accession("EXPORT-LOOKUP-MISS")
 
     resp = await ctx["user"].post(
@@ -1455,7 +1458,9 @@ async def test_lookup_study_resolves_by_bioproject_accession(ctx):
     acc = unique_accession("PRJ-LOOKUP-NEW")
     acc_missing = unique_accession("PRJ-LOOKUP-NEW-MISS")
     study_idx = await _create_study_with_accession(ctx, accession=acc)
-    export_id = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+    export_id = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
+    )
 
     resp = await ctx["user"].post(
         URL_STUDY_LOOKUP,
@@ -1571,7 +1576,8 @@ async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     assert rows[idxs["own"]]["record_view"] == StudyRecordView.FULL
     # Each row carries its export_entity_id, read from the table independently.
     expected_ids = {
-        idx: await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx) for idx in rows
+        idx: await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
+        for idx in rows
     }
     assert {idx: row["export_entity_id"] for idx, row in rows.items()} == expected_ids
     # Newest first.

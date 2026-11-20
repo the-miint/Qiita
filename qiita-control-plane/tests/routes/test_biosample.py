@@ -44,6 +44,7 @@ from qiita_common.models import (
 
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.exported_entity import EntityKind
 from qiita_control_plane.routes import _helpers as route_helpers
 from qiita_control_plane.routes import biosample as routes_biosample
 from qiita_control_plane.testing.db_seeds import (
@@ -255,7 +256,7 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         "biosample_idx": rj["biosample_idx"],
         # Read from the table independently of the route under test.
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=rj["biosample_idx"]
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=rj["biosample_idx"]
         ),
         "owner_id_biosample_study_field_idx": rj["owner_id_biosample_study_field_idx"],
         "owner_id_biosample_study_field_created": True,
@@ -1663,7 +1664,7 @@ async def test_get_biosample_owner_returns_response(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
@@ -1715,7 +1716,7 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
@@ -1756,7 +1757,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
@@ -1795,7 +1796,7 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
@@ -1870,7 +1871,7 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
@@ -1950,7 +1951,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": ctx["wet_session"]["principal_idx"],
         "metadata_checklist": None,
@@ -2199,7 +2200,7 @@ async def test_get_biosample_in_study_returns_global_and_local_metadata(ctx, own
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": study_owner_idx,
         "metadata_checklist": None,
@@ -2262,7 +2263,7 @@ async def test_get_biosample_in_study_admin_tier_returns_response(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": wet_idx,
         "metadata_checklist": None,
@@ -2420,7 +2421,7 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=bs_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=bs_idx
         ),
         "owner_idx": owner_idx,
         "metadata_checklist": None,
@@ -3074,7 +3075,7 @@ async def test_lookup_biosample_resolves_by_export_entity_id(ctx):
         ctx, accession=unique_accession("LOOKUP-EXP"), owner_idx=owner_idx
     )
     export_id = await fetch_export_entity_id(
-        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=biosample_idx
     )
     unknown_id = unique_accession("EXPORT-LOOKUP-MISS")
 
@@ -3123,7 +3124,7 @@ async def test_lookup_biosample_resolves_by_matrix_tube_id_excluding_retired(ctx
     )
     assert resp.status_code == 200, resp.text
     live_export_id = await fetch_export_entity_id(
-        ctx["pool"], kind="biosample", entity_idx=live_idx
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=live_idx
     )
     assert resp.json() == {"resolved": {live_tube: live_export_id}, "missing": [retired_tube]}
 
@@ -3183,7 +3184,7 @@ async def _seed_tube_in_study(ctx, *, study_idx: int, tube: str) -> int:
 
 
 async def _study_handle(ctx, study_idx: int) -> str:
-    return await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+    return await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx)
 
 
 async def test_resolve_roster_by_tube_returns_biosample_and_study(ctx):
@@ -3379,7 +3380,7 @@ async def test_resolve_roster_by_export_entity_id(ctx):
     secondary_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-ee-2")
     biosample_idx = await _seed_biosample_in_studies(ctx, study_idxs=[primary_idx, secondary_idx])
     biosample_handle = await fetch_export_entity_id(
-        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=biosample_idx
     )
 
     resp = await ctx["wet"].post(
@@ -3417,7 +3418,7 @@ async def test_resolve_roster_secondary_not_linked(ctx):
     other_idx = await _seed_study(ctx, owner_idx=owner_idx, suffix="roster-sec-2")
     biosample_idx = await _seed_biosample_in_studies(ctx, study_idxs=[primary_idx])
     biosample_handle = await fetch_export_entity_id(
-        ctx["pool"], kind="biosample", entity_idx=biosample_idx
+        ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=biosample_idx
     )
     other_handle = await _study_handle(ctx, other_idx)
 
@@ -5139,14 +5140,14 @@ async def test_patch_biosample_metadata_unique_field_resend_200(ctx):
 
 
 # ---------------------------------------------------------------------------
-# resolve_unique_field_values / resolve_biosample_idxs_by_kind (route helpers)
+# resolve_unique_field_values (route helper) / resolve_biosample_idxs_by_kind
 # ---------------------------------------------------------------------------
 
 
 async def test_resolve_unique_field_values(ctx):
     """Tests the case where several values of a unique field are resolved at
     once: each carried value maps to its biosample, keyed as sent, and a value
-    no biosample carries is absent."""
+    that no biosample carries is absent."""
     study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="ufv-hit")
     wet_idx = ctx["wet_session"]["principal_idx"]
     first_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
@@ -5164,7 +5165,7 @@ async def test_resolve_unique_field_values(ctx):
             study_idx=study_idx,
             display_name=display_name,
             values=["S-1", "S-2", "S-3"],
-            noun="biosample",
+            noun=EntityKind.BIOSAMPLE,
             tiers=ADMIN_EVERYWHERE,
         )
 
@@ -5188,7 +5189,7 @@ async def test_resolve_unique_field_values_bad_field_422(ctx, field_state):
                 study_idx=study_idx,
                 display_name=named,
                 values=["S-1"],
-                noun="biosample",
+                noun=EntityKind.BIOSAMPLE,
                 tiers=ADMIN_EVERYWHERE,
             )
 
@@ -5227,7 +5228,7 @@ async def _seed_biosample_named_by_kind(ctx, *, key, study_idx, display_name):
             "biosample_accession": accession,
             "ena_sample_accession": accession,
             EXPORT_ENTITY_ID: await fetch_export_entity_id(
-                ctx["pool"], kind="biosample", entity_idx=biosample_idx
+                ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=biosample_idx
             ),
             IDX_KEY: str(biosample_idx),
         }[key]
@@ -5238,7 +5239,7 @@ async def _seed_biosample_named_by_kind(ctx, *, key, study_idx, display_name):
 
 @pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
 async def test_resolve_biosample_idxs_by_kind(ctx, key):
-    """Tests the case where the one biosample a value names is retired and,
+    """Tests the case where the one biosample that a value names is retired and,
     except under unique_field, outside the study: it still resolves, since the
     caller decides which biosamples count. A value naming nothing is absent,
     except under idx, where every value maps to itself as a number."""
@@ -5252,7 +5253,7 @@ async def test_resolve_biosample_idxs_by_kind(ctx, key):
     field_name = display_name if key == UNIQUE_FIELD_KEY else None
 
     async with ctx["pool"].acquire() as conn:
-        resolved = await route_helpers.resolve_biosample_idxs_by_kind(
+        resolved = await routes_biosample.resolve_biosample_idxs_by_kind(
             conn,
             study_idx=study_idx,
             key=key,
@@ -5519,7 +5520,7 @@ async def _lookup_in_study(client, study_idx, body):
 @pytest.mark.parametrize("key", get_args(BiosampleStudyLookupKey))
 async def test_lookup_biosample_in_study(ctx, key, return_key):
     """Tests the case where a value of each identifier kind names a live
-    biosample linked to the study: it resolves to the identifier the request
+    biosample linked to the study: it resolves to the identifier that the request
     chose, and a value naming nothing is missing."""
     study_idx, display_name, _ = await _seed_study_with_unique_field(
         ctx, suffix=f"lbs-{key}-{return_key}"
@@ -5540,7 +5541,7 @@ async def test_lookup_biosample_in_study(ctx, key, return_key):
     identifier = biosample_idx
     if return_key == EXPORT_ENTITY_ID:
         identifier = await fetch_export_entity_id(
-            ctx["pool"], kind="biosample", entity_idx=biosample_idx
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=biosample_idx
         )
 
     resp = await _lookup_in_study(ctx["wet"], study_idx, body)
@@ -5551,7 +5552,7 @@ async def test_lookup_biosample_in_study(ctx, key, return_key):
 
 async def test_lookup_biosample_in_study_missing(ctx):
     """Tests the case where values name a biosample not linked to the study, a
-    retired biosample, one whose link is retired, and an idx no biosample has,
+    retired biosample, one whose link is retired, and an idx that no biosample has,
     one of them sent twice: each is missing, listed once in input order, and
     only the live, linked biosample resolves."""
     wet_idx = ctx["wet_session"]["principal_idx"]
@@ -5583,8 +5584,8 @@ async def test_lookup_biosample_in_study_missing(ctx):
 @pytest.mark.parametrize("case", UNIQUE_FIELD_RESOLUTION_CASES)
 async def test_lookup_biosample_in_study_unique_field_resolution(ctx, case):
     """Tests the case where each shared resolution case reaches the study
-    lookup: a field the single lookups refuse is refused the same way, and a
-    value they answer 404 for is missing."""
+    lookup: a field that the single lookups refuse is refused the same way, and a
+    value that they answer 404 for is missing."""
     setup, single_status, expected_detail = _UNIQUE_FIELD_RESOLUTION[case]
     study_idx, display_name, value = await setup(ctx, case)
     body = {"key": UNIQUE_FIELD_KEY, "unique_field_display_name": display_name, "values": [value]}
@@ -5904,7 +5905,9 @@ async def test_bulk_import_creates_all_rows(ctx):
     assert [r["owner_id_biosample_study_field_created"] for r in results] == [True, False, False]
     # Each row carries its export_entity_id, read from the table independently.
     expected_ids = [
-        await fetch_export_entity_id(ctx["pool"], kind="biosample", entity_idx=r["biosample_idx"])
+        await fetch_export_entity_id(
+            ctx["pool"], kind=EntityKind.BIOSAMPLE, entity_idx=r["biosample_idx"]
+        )
         for r in results
     ]
     assert [r["export_entity_id"] for r in results] == expected_ids

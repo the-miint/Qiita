@@ -998,7 +998,7 @@ async def fetch_entity_idxs_by_unique_field_values(
     """Return `{value: entity_idx}` for each of `values` that an entity carries
     through the given study field and that `tiers` may read.
 
-    A value no row carries and a value whose match is hidden from `tiers` are
+    A value that no row carries and a value whose match is hidden from `tiers` are
     both absent from the result, so the lookup cannot confirm a hidden value.
 
     The caller must have established that the field declares unique_in_study.

@@ -486,6 +486,17 @@ async def test_resolve_natural_keys_export_ids_need_a_source():
         await resolve_natural_keys(values=["a"], fetcher=_fetch, return_key=EXPORT_ENTITY_ID)
 
 
+async def test_resolve_natural_keys_refuses_unknown_return_key():
+    """Tests the case where return_key names no identifier that the helper maps
+    to: it raises rather than returning idxs."""
+
+    async def _fetch(*, values: list[str]) -> dict[str, int]:
+        return dict.fromkeys(values, 1)
+
+    with pytest.raises(ValueError, match="unknown return_key"):
+        await resolve_natural_keys(values=["a"], fetcher=_fetch, return_key="accession")
+
+
 # ---------------------------------------------------------------------------
 # raise_for_transient_write_race -> 503 + Retry-After
 # ---------------------------------------------------------------------------

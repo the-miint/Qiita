@@ -693,8 +693,8 @@ class BiosampleLookupRequest(NaturalKeyLookupRequest):
         return self
 
 
-# The kinds of identifier a study-scoped biosample lookup accepts: the natural
-# keys, the biosample's idx, and a unique-in-study field of the study.
+# The kinds of identifier that a study-scoped biosample lookup accepts: the
+# natural keys, the biosample's idx, and a unique-in-study field of the study.
 BiosampleStudyLookupKey = Literal[*get_args(BiosampleLookupKey), "idx", "unique_field"]
 
 

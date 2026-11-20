@@ -41,6 +41,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
     IDX_KEY,
+    UNIQUE_FIELD_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
     BiosampleGlobalFieldResponse,
@@ -160,10 +161,10 @@ from ._helpers import (
     require_etag_match,
     require_if_match,
     resolve_and_write_study_scoped_metadata,
-    resolve_biosample_idxs_by_kind,
     resolve_metadata_checklist_idx,
     resolve_natural_keys,
     resolve_study_entity_by_unique_field,
+    resolve_unique_field_values,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -880,6 +881,44 @@ async def lookup_biosample_in_study_by_unique_field(
         )
 
 
+async def resolve_biosample_idxs_by_kind(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    key: BiosampleStudyLookupKey,
+    values: list[str],
+    unique_field_display_name: str | None,
+    tiers: CallerMetadataTiers,
+) -> dict[str, int]:
+    """Resolve values of the identifier kind named by `key` to biosample idxs,
+    keyed by each value as sent.
+
+    Neither retirement nor a link to study_idx is checked; the caller decides
+    which matches count. Under `unique_field`, the values are those of the
+    study's field named by unique_field_display_name. Under `idx`, each value
+    maps to itself as a number, whether or not a biosample has it.
+    """
+    if key == UNIQUE_FIELD_KEY:
+        if unique_field_display_name is None:
+            raise ValueError("key unique_field needs unique_field_display_name")
+        resolved = await resolve_unique_field_values(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=unique_field_display_name,
+            values=values,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            tiers=tiers,
+        )
+    elif key == IDX_KEY:
+        resolved = {value: int(value) for value in values}
+    else:
+        resolved = await fetch_biosample_idxs_by_natural_key(
+            conn, key=key, values=values, include_retired=True
+        )
+    return resolved
+
+
 async def _fetch_linked_biosample_idxs_by_kind(
     conn: asyncpg.Connection,
     *,
@@ -1367,7 +1406,7 @@ def _biosample_core_row_dict(
     """
     return {
         "biosample_idx": row["idx"],
-        "export_entity_id": require_export_entity_id(row, kind="biosample"),
+        "export_entity_id": require_export_entity_id(row, kind=EntityKind.BIOSAMPLE),
         "owner_idx": row["owner_idx"],
         "metadata_checklist": MetadataChecklistRef.from_row(
             row["metadata_checklist_idx"], row["metadata_checklist_name"]
@@ -1555,7 +1594,7 @@ async def get_biosample(
 @biosample_router.post(PATH_BIOSAMPLE_LOOKUP)
 async def lookup_biosample(
     body: BiosampleLookupRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> NaturalKeyLookupResponse:
@@ -1574,7 +1613,7 @@ async def lookup_biosample(
     # runs here (see auth docstring).
     _ = user
     # One read-only snapshot, so the export ids read the same rows that the lookup read
-    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+    async with snapshot() as conn:
         lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
             # handler twin of lookup_study; differs only in fetcher and kind
             values=body.values,
