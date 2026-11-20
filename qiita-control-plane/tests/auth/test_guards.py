@@ -1129,12 +1129,29 @@ def _access_row(*, owner_idx=99, access_tier=None, default_tier=Tier.MEMBER):
         (Tier.ADMIN, Tier.MEMBER, StudyRecordView.SUMMARY),
         (Tier.MEMBER, Tier.MEMBER, StudyRecordView.FULL),
         (Tier.VIEWER, Tier.VIEWER, StudyRecordView.FULL),
-        (Tier.PUBLIC, None, StudyRecordView.FULL),
+        (Tier.PUBLIC, Tier.VIEWER, StudyRecordView.FULL),
     ],
 )
 def test_study_record_view_is_full_at_default_tier_and_summary_below(default_tier, grant, expected):
     row = _access_row(access_tier=grant, default_tier=default_tier)
     assert study_record_view(row, caller=_human_with_idx(7)) is expected
+
+
+def test_study_record_view_is_public_through_the_public_default_alone():
+    """No grant, not the owner, no bypass role: only the study's public default
+    admits the caller, so they read the public view, not the full record."""
+    row = _access_row(default_tier=Tier.PUBLIC)
+    assert study_record_view(row, caller=_human_with_idx(7)) is StudyRecordView.PUBLIC
+
+
+@pytest.mark.parametrize(
+    ("owner_idx", "role"),
+    [(7, SystemRole.USER), (99, SystemRole.WET_LAB_ADMIN)],
+    ids=["owner", "bypass_role"],
+)
+def test_study_record_view_is_full_on_a_public_study_for_owner_and_bypass(owner_idx, role):
+    row = _access_row(owner_idx=owner_idx, default_tier=Tier.PUBLIC)
+    assert study_record_view(row, caller=_human_with_idx(7, role=role)) is StudyRecordView.FULL
 
 
 def test_study_record_view_owner_is_full_even_without_a_row():

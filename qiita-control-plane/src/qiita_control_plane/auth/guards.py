@@ -434,7 +434,9 @@ def _access_row_allows(
     narrowing filter and the raising gate both read many rows in one query, and
     `require_study_access` reads one. A second copy of this ladder is how they
     would come to disagree about who may read what, which shows up as a
-    discovery route advertising something the mint then 403s.
+    discovery route advertising something the mint then 403s. The one copy
+    there is, the study listing's search, is checked against
+    `study_record_view` on every row it reads.
 
     A non-existent study returns True: it is not this predicate's job to 404.
     The authoring gates' composers surface a missing study as one 422 from their
@@ -477,23 +479,26 @@ def study_record_view(
     bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
 ) -> StudyRecordView | None:
     """How much of this study's own record `caller` may read: FULL, SUMMARY,
-    or None (nothing). The one implementation of the rule defined in
+    PUBLIC, or None (nothing). The implementation of the rule defined in
     docs/architecture/data-model.md ("What a tier reads of a study's own
     record"); GET /study/{idx} and the GET /study listing both decide through
-    it, so a study is listed exactly when it can be opened.
+    it, so a study is listed exactly when it can be opened. The listing's query
+    (`repositories.study.fetch_study_list_candidates`) repeats this ladder in
+    SQL to search each study in the view its caller reads, and the listing
+    raises on a row where the two disagree: a change here is made there too.
 
-    FULL: `bypass_role`, the owner, or a tier at or above the study's
-    `default_tier` (a public-default study is FULL to everyone). SUMMARY: any
-    other grant, i.e. one below `default_tier`. None: no grant on a study that
-    is not public.
+    FULL: `bypass_role`, the owner, or a grant at or above the study's
+    `default_tier`. SUMMARY: any other grant, i.e. one below `default_tier`.
+    PUBLIC: no grant on a public-default study, which only that default
+    admits the caller to. None: no grant on a study that is not public.
     """
     if caller.has_role_at_least(bypass_role):
         return StudyRecordView.FULL
+    if row.access_tier is None and row.owner_idx != caller.principal_idx:
+        return StudyRecordView.PUBLIC if row.default_tier is Tier.PUBLIC else None
     if _access_row_allows(row, caller=caller, min_tier=row.default_tier):
         return StudyRecordView.FULL
-    if row.access_tier is not None:
-        return StudyRecordView.SUMMARY
-    return None
+    return StudyRecordView.SUMMARY
 
 
 def caller_effective_tier(row: CallerStudyAccessRow, *, caller: Principal) -> Tier:
@@ -946,8 +951,8 @@ def require_study_access(
     `min_tier`. Routes that must surface 404 on a missing study for
     bypass-role callers should compose `require_study_exists` alongside
     this guard (see `list_biosample_idxs_in_study`). Reading the study's own
-    record is not gated here: it has two levels, decided by
-    `study_record_view`.
+    record is not gated here: `study_record_view` decides which view of it a
+    caller reads.
 
     `bypass_role` defaults to `SYSTEM_ADMIN` (existing behavior). Pass
     `WET_LAB_ADMIN` for routes whose policy admits any wet_lab_admin

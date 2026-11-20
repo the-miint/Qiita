@@ -15,7 +15,6 @@ carries every identifier that differs between the two stacks.
 import secrets
 from datetime import date
 from decimal import Decimal
-from pathlib import Path
 
 import asyncpg
 import pytest
@@ -39,6 +38,7 @@ from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADA
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.routes._helpers import parse_kv_detail
 from qiita_control_plane.testing.db_seeds import seed_sequenced_prep_sample
+from qiita_control_plane.testing.migrations import MIGRATIONS_DIR, migrate_up
 from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
@@ -1460,17 +1460,11 @@ async def test_fetch_study_field_for_update_locks_the_row(ctx, spec):
 # =============================================================================
 
 
-def _owner_id_migration_sql():
+def _owner_id_migration_sql() -> str:
     """The migration's `migrate:up` body, read from the file so the test tracks
     the real migration rather than a hand-copied duplicate."""
-    path = (
-        Path(__file__).resolve().parents[2]
-        / "db"
-        / "migrations"
-        / "20260911000000_owner_biosample_id_unique_in_study.sql"
-    )
-    text = path.read_text()
-    return text.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0].strip()
+    path = MIGRATIONS_DIR / "20260911000000_owner_biosample_id_unique_in_study.sql"
+    return migrate_up(path.read_text())
 
 
 async def _run_owner_id_migration(ctx):

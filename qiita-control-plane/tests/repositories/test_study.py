@@ -811,6 +811,61 @@ async def test_get_or_create_study_by_ena_accessions_reuses_on_hit(postgres_pool
             await tr.rollback()
 
 
+async def test_get_or_create_study_by_ena_accessions_creates_the_study_public(postgres_pool):
+    """The study an import creates is public (docs/architecture/data-model.md,
+    "Default tiers")."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=_suffix("PRJNA"),
+                ena_study_accession=_suffix("ERP"),
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="an imported study",
+            )
+
+            assert created is True
+            assert row["default_tier"] == Tier.PUBLIC
+        finally:
+            await tr.rollback()
+
+
+async def test_get_or_create_study_by_ena_accessions_leaves_a_matched_studys_tier(postgres_pool):
+    """Matching an existing study by accession never changes its tier."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bioproject = _suffix("PRJNA")
+            existing = await create_study(
+                conn,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="a native study",
+                bioproject_accession=bioproject,
+            )
+
+            row, created = await get_or_create_study_by_ena_accessions(
+                conn,
+                bioproject_accession=bioproject,
+                ena_study_accession=None,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title="ignored on the reuse path",
+            )
+
+            assert created is False
+            assert row["idx"] == existing["idx"]
+            assert row["default_tier"] == Tier.MEMBER
+        finally:
+            await tr.rollback()
+
+
 async def test_get_or_create_study_by_ena_accessions_null_secondary_accession(postgres_pool):
     """ena_study_accession is optional on EnaStudyHeader (a study may lack a
     secondary accession); None must round-trip as NULL, not a stringified

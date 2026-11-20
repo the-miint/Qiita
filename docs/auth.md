@@ -276,7 +276,7 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 | Guard | Predicate |
 |---|---|
 | `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison. |
-| `study_record_view(row, caller)` | the full / summary / none view of a study's own record; the rule is in `architecture/data-model.md`. `GET /study/{idx}` and the `GET /study` listing both decide through it, so a study is listed exactly when it can be opened. |
+| `study_record_view(row, caller)` | the full / summary / public / none view of a study's own record; the rule is in `architecture/data-model.md`. `GET /study/{idx}` and the `GET /study` listing both decide through it, so a study is listed exactly when it can be opened. |
 | `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
 | `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
 | `require_caller_has_tier_on_all_studies(min_tier, ...)` | body-time helper (not a `Depends`); caller has `min_tier` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. Comparison goes through `_TIER_ORDER`, never the `Tier` members, which are a `StrEnum` and compare *lexically* (`'admin' < 'member' < 'public' < 'viewer'`). |
@@ -362,22 +362,23 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 ### Reading and listing studies
 
 What a caller may read of a study's own record — the **full** record, its
-**summary**, or nothing — is defined in
+**summary**, its **public** view, or nothing — is defined in
 [`architecture/data-model.md`](architecture/data-model.md) ("What a tier reads
 of a study's own record"). `GET /api/v1/study/{idx}` returns the view the caller
 has (`view` in the body says which; only the full view carries an `ETag`).
 
-`GET /api/v1/study` lists the studies the caller can read at either view, highest
+`GET /api/v1/study` lists the studies the caller can read at any view, highest
 `study_idx` first (a study created at a legacy `study_idx` lists after every study minted at
 25000 and up), `study:read`. Query parameters: `q` (full-text, web-search syntax:
 stemmed English words matched whole, over title, alias and the accessions, plus
-abstract, description, notes and funding on studies whose full record the caller
-reads; NUL is refused), `min_tier` (only studies where the caller's *own* tier
+abstract, description and funding on studies whose public view or full record the
+caller reads, and notes on those whose full record they read; NUL is refused), `min_tier` (only studies where the caller's *own* tier
 reaches it — an owner counts as `admin`; above `public` it also drops public
 studies they hold no grant on and role-only reads), `after_study_idx` (the
 previous page's `next_after_study_idx`) and `limit` (≤ 500). Each row carries the
 caller's `caller_tier`, `access_via` (`owner` / `grant` / `public` / `role`) and
-`record_view`. A page can come back shorter than `limit` with a cursor when many
+`record_view`; a row whose `record_view` is `public` carries no `study_idx` or
+`updated_at`. A page can come back shorter than `limit` with a cursor when many
 candidates were filtered out; follow the cursor.
 
 ### Study access (`qiita.study_access`)
