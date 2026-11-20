@@ -1,6 +1,6 @@
 """DB test for the migration that makes every ENA-imported study public.
 
-The migration (db/migrations/20261119000000_ena_imported_studies_public.sql) sets
+The migration (db/migrations/20261120000000_ena_imported_studies_public.sql) sets
 `default_tier = 'public'` on each study that an ENA import created
 (`qiita.ena_import_batch_item.study_created`). It refuses to apply, naming the
 studies, while one of them holds a sample that did not come from ENA: a
@@ -45,7 +45,7 @@ from qiita_control_plane.testing.unique_names import unique_ena_accession
 
 pytestmark = pytest.mark.db
 
-_MIGRATION = MIGRATIONS_DIR / "20261119000000_ena_imported_studies_public.sql"
+_MIGRATION = MIGRATIONS_DIR / "20261120000000_ena_imported_studies_public.sql"
 
 
 @pytest_asyncio.fixture

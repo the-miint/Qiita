@@ -86,7 +86,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `20261117120000_genome_derivation` (new table) and `20261119000000_exported_feature_genome_idx`
   (an index; the migration's comment gives its measured build time): plain `dbmate`, no setup. The bucket-6 WoL
   repair needs both. (#926)
-- `[operator]` (#929) `make migrate` applies `20261119000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
+- `[operator]` (#929) `make migrate` applies `20261120000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 
 ### 4. Deploy
 
@@ -111,7 +111,7 @@ _None yet._
   ```bash
   # [operator] in the pulled checkout; DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step)
   cd ~/qiita-miint/qiita-control-plane
-  sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261119000000_ena_imported_studies_public.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
+  sed -n '/^-- migrate:up/,/^-- migrate:down/p' db/migrations/20261120000000_ena_imported_studies_public.sql | psql "$DATABASE_URL" -v ON_ERROR_STOP=1
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.study WHERE idx IN (SELECT study_idx FROM qiita.ena_import_batch_item WHERE study_created) AND default_tier <> 'public'"
   ```
 - `[operator]` **Find the failed tickets that still hide a completed gate, check each, and cancel

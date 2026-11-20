@@ -267,7 +267,7 @@ that default unless its migration names another tier.
   its record. No route changes it after the study is created.
 - Every study that an ENA import created is `public`, since ENA already
   publishes its data (`repositories.study.get_or_create_study_by_ena_accessions`;
-  `20261119000000_ena_imported_studies_public.sql` set the ones created before
+  `20261120000000_ena_imported_studies_public.sql` set the ones created before
   it). A study that an import only matched by accession keeps its tier.
 - On a `public` study, a purely-local field with no `tier_override` is public
   too, because its field tier falls through to the study's default; only the
