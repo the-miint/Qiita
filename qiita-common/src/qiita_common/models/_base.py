@@ -508,3 +508,23 @@ class NaturalKeyLookupResponse(BaseModel):
 
     resolved: dict[str, Annotated[int, Field(gt=0)] | str]
     missing: list[str]
+
+
+class RequestItemProblem(BaseModel):
+    """One problem with one item of a request, as a message for the caller.
+    `item_id` is the caller's own identifier for the item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    message: str
+
+
+class AllOrNothingFailure(BaseModel):
+    """Every problem across a request that is refused whole when any item has a
+    problem, so one round trip names them all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    problems: list[RequestItemProblem] = Field(min_length=1)

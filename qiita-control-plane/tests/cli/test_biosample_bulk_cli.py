@@ -1,10 +1,12 @@
 """`qiita biosample bulk-create` and `qiita biosample lookup`: the TSV file each reads,
-the request it sends, how it names the study, and the TSV file it writes."""
+the request it sends, how it names the study, and the TSV file it writes. Also the
+reading of a refusal that lists every problem with a request."""
 
 import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
@@ -12,7 +14,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_STUDY,
     URL_STUDY_LOOKUP,
 )
-from qiita_common.models import EXPORT_ENTITY_ID, IDX_KEY, UNIQUE_FIELD_KEY
+from qiita_common.models import EXPORT_ENTITY_ID, IDX_KEY, UNIQUE_FIELD_KEY, AllOrNothingFailure
 from qiita_common.models.biosample import BIOSAMPLE_BULK_IMPORT_MAX_ROWS
 
 from qiita_control_plane.cli import _common as cli_common
@@ -803,3 +805,74 @@ def test__handle_biosample_lookup_refuses_existing_output(monkeypatch, tmp_path,
         _read_output(tmp_path),
     )
     assert outcome == (2, [], True, "SENTINEL\n")
+
+
+def _http_status_error(status_code: int, **content) -> httpx.HTTPStatusError:
+    """An HTTPStatusError for a response with `status_code` and `content`, as
+    httpx.Response takes it (`json=` or `text=`)."""
+    request = httpx.Request("POST", f"{_BASE}/any")
+    response = httpx.Response(status_code, request=request, **content)
+    error = httpx.HTTPStatusError("refused", request=request, response=response)
+    return error
+
+
+# A refusal over several items, one of them with two problems
+_ALL_OR_NOTHING_DETAIL = {
+    "message": "2 of 3 things went wrong",
+    "problems": [
+        {"item_id": "a", "message": "first problem with a"},
+        {"item_id": "a", "message": "second problem with a"},
+        {"item_id": "c", "message": "the problem with c"},
+    ],
+}
+
+
+def test_all_or_nothing_failure_from():
+    """Tests the case where the error is a 422 whose detail lists every problem:
+    the refusal comes back as the shared model."""
+    error = _http_status_error(422, json={"detail": _ALL_OR_NOTHING_DETAIL})
+
+    failure = cli_common.all_or_nothing_failure_from(error)
+
+    assert failure == AllOrNothingFailure.model_validate(_ALL_OR_NOTHING_DETAIL)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "content"),
+    [
+        pytest.param(
+            422,
+            {"json": {"detail": [{"loc": ["body"], "msg": "bad", "type": "x"}]}},
+            id="request_shape_422",
+        ),
+        pytest.param(422, {"text": "<html>bad gateway</html>"}, id="non_json_422"),
+        pytest.param(409, {"json": {"detail": _ALL_OR_NOTHING_DETAIL}}, id="not_a_422"),
+    ],
+)
+def test_all_or_nothing_failure_from_other_error(status_code, content):
+    """Tests the case where the error is not a 422 listing problems: None."""
+    error = _http_status_error(status_code, **content)
+
+    failure = cli_common.all_or_nothing_failure_from(error)
+
+    assert failure is None
+
+
+def test_exit_with_all_or_nothing_failure(capsys):
+    """Tests the case where a refusal is reported: each problem prints against its
+    item's label, then the advice, and the command exits 1."""
+    failure = AllOrNothingFailure.model_validate(_ALL_OR_NOTHING_DETAIL)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_common.exit_with_all_or_nothing_failure(
+            failure, label_for=lambda item_id: f"row {item_id}", advice="fix them and re-run."
+        )
+
+    expected_stderr = (
+        "error: 2 of 3 things went wrong:\n"
+        "  - row a: first problem with a\n"
+        "  - row a: second problem with a\n"
+        "  - row c: the problem with c\n"
+        "fix them and re-run.\n"
+    )
+    assert (exc_info.value.code, capsys.readouterr().err) == (1, expected_stderr)

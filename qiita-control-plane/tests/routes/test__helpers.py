@@ -27,6 +27,7 @@ from qiita_common.models import (
     EXPORT_ENTITY_ID,
     FieldDataType,
     MissingReasonRef,
+    RequestItemProblem,
     TerminologyTermRef,
 )
 
@@ -45,6 +46,7 @@ from qiita_control_plane.routes._helpers import (
     detail_for_biosample_link_rejection,
     detail_for_slot_collision,
     parse_kv_detail,
+    raise_all_or_nothing_failure,
     raise_for_transient_write_race,
     raise_http_for_sample_metadata_write_error,
     resolve_natural_keys,
@@ -523,6 +525,38 @@ def test_raise_for_transient_write_race():
         ),
         {"Retry-After": "1"},
     )
+
+
+# ---------------------------------------------------------------------------
+# raise_all_or_nothing_failure -> 422 listing every problem
+# ---------------------------------------------------------------------------
+
+
+def test_raise_all_or_nothing_failure():
+    """Tests the case where the problems span several items and one item has two:
+    one 422 lists every problem in order, and its summary counts each item once.
+    """
+    problems = [
+        RequestItemProblem(item_id="a", message="first problem with a"),
+        RequestItemProblem(item_id="a", message="second problem with a"),
+        RequestItemProblem(item_id="c", message="the problem with c"),
+    ]
+    with pytest.raises(HTTPException) as excinfo:
+        raise_all_or_nothing_failure(problems, item_count=4, outcome="things went wrong")
+
+    raised = excinfo.value
+    expected = (
+        422,
+        {
+            "message": "2 of 4 things went wrong",
+            "problems": [
+                {"item_id": "a", "message": "first problem with a"},
+                {"item_id": "a", "message": "second problem with a"},
+                {"item_id": "c", "message": "the problem with c"},
+            ],
+        },
+    )
+    assert (raised.status_code, raised.detail) == expected
 
 
 # ---------------------------------------------------------------------------

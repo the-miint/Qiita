@@ -40,6 +40,7 @@ import urllib.parse
 import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import NoReturn
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -60,6 +61,7 @@ from qiita_common.models import (
     EXPORT_ENTITY_ID,
     IDX_KEY,
     INCLUDE_DEPRECATED_FLAG,
+    AllOrNothingFailure,
     DefinitionKind,
     NaturalKeyLookupResponse,
     PrincipalLookupRequest,
@@ -725,6 +727,37 @@ def print_http_status_error(resp: httpx.Response) -> None:
         )
         return
     print(f"http error {resp.status_code}: {resp.text}", file=sys.stderr)
+
+
+def all_or_nothing_failure_from(exc: httpx.HTTPStatusError) -> AllOrNothingFailure | None:
+    """The `AllOrNothingFailure` that `exc` carries when it is a 422 whose `detail`
+    is one, else None."""
+    # Only a JSON 422 can carry the failure; a proxy's 422 may not be JSON at all
+    if exc.response.status_code != 422:
+        return None
+    try:
+        body = exc.response.json()
+    except ValueError:
+        return None
+
+    # A request-shape 422 carries a list of validation errors instead
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, dict) or "problems" not in detail:
+        return None
+    failure = AllOrNothingFailure.model_validate(detail)
+    return failure
+
+
+def exit_with_all_or_nothing_failure(
+    failure: AllOrNothingFailure, *, label_for: Callable[[str], str], advice: str
+) -> NoReturn:
+    """Print `failure`'s message, each problem against `label_for(item_id)`, and
+    `advice` to stderr, then raise SystemExit(1)."""
+    lines = [f"error: {failure.message}:"]
+    lines += [f"  - {label_for(p.item_id)}: {p.message}" for p in failure.problems]
+    lines.append(advice)
+    print("\n".join(lines), file=sys.stderr)
+    raise SystemExit(1)
 
 
 def validation_messages(exc: ValidationError) -> str:

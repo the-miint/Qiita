@@ -4,7 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from qiita_common.models import (
+    AllOrNothingFailure,
     BiosampleRef,
+    RequestItemProblem,
     RosterProblem,
     RosterResolveFailure,
     RosterResolveRequest,
@@ -101,11 +103,17 @@ def test_request_refuses_empty_and_extra() -> None:
 
 
 def test_failure_round_trips() -> None:
-    failure = RosterResolveFailure(
+    failure = AllOrNothingFailure(
         message="1 of 2 rows did not resolve",
         problems=[
-            RosterProblem(item_id="1", message="no biosample has matrix_tube_id '0363157924'")
+            RequestItemProblem(item_id="1", message="no biosample has matrix_tube_id '0363157924'")
         ],
     )
-    again = RosterResolveFailure.model_validate(failure.model_dump(mode="json"))
+    again = AllOrNothingFailure.model_validate(failure.model_dump(mode="json"))
     assert again == failure
+
+
+def test_roster_failure_names_are_the_shared_models() -> None:
+    """Tests the case where outside code imports the roster-specific names: each is
+    the shared all-or-nothing model itself."""
+    assert (RosterProblem, RosterResolveFailure) == (RequestItemProblem, AllOrNothingFailure)

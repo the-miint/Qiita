@@ -23,6 +23,7 @@ from qiita_common.models._base import (
     IDX_KEY,
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
+    AllOrNothingFailure,
     MetadataRequestModel,
     NaturalKeyLookupRequest,
     NaturalKeyLookupResponse,
@@ -30,6 +31,7 @@ from qiita_common.models._base import (
     NonBlankText,
     PatchRequestModel,
     ReadCounts,
+    RequestItemProblem,
 )
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
@@ -890,23 +892,9 @@ class RosterResolveResponse(BaseModel):
     rows: list[RosterResolvedRow]
 
 
-class RosterProblem(BaseModel):
-    """Why one roster row did not resolve, as a message for the submitter."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    item_id: str
-    message: str
-
-
-class RosterResolveFailure(BaseModel):
-    """The 422 `detail` of POST /api/v1/biosample/resolve-roster: every
-    problem across the roster, so one round trip names them all."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    message: str
-    problems: list[RosterProblem] = Field(min_length=1)
+# Roster-specific names for the shared all-or-nothing models, kept for outside importers.
+RosterProblem = RequestItemProblem
+RosterResolveFailure = AllOrNothingFailure
 
 
 class BiosamplePatchRequest(PatchRequestModel):

@@ -62,7 +62,6 @@ from qiita_common.models import (
     MetadataChecklistRef,
     MetadataEntry,
     NaturalKeyLookupResponse,
-    RosterResolveFailure,
     RosterResolveRequest,
     RosterResolveResponse,
     SampleFieldExceptionPutRequest,
@@ -152,6 +151,7 @@ from ._helpers import (
     map_study_field_row,
     metadata_entries_from_rows,
     patch_and_map_study_field,
+    raise_all_or_nothing_failure,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
     raise_transient_retry,
@@ -1662,7 +1662,7 @@ async def lookup_biosample_by_matrix_tube_id(
 
 @biosample_router.post(
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
-    responses={422: {"description": "Rows that did not resolve; detail is a RosterResolveFailure"}},
+    responses={422: {"description": "Rows that did not resolve; detail is an AllOrNothingFailure"}},
 )
 async def resolve_biosample_roster(
     body: RosterResolveRequest,
@@ -1676,7 +1676,7 @@ async def resolve_biosample_roster(
 
     The rules live in `roster_resolution`; this route gathers the facts and
     maps the outcome. Any unresolved row refuses the whole roster with a 422
-    whose `detail` is a `RosterResolveFailure` naming every problem, so a
+    whose `detail` is an `AllOrNothingFailure` naming every problem, so a
     submitter fixes the sheet once rather than one miss per attempt.
 
     Auth: `biosample:read` and `study:read`, since the answer names both. No
@@ -1690,12 +1690,9 @@ async def resolve_biosample_roster(
         facts = await fetch_roster_facts(conn, body.rows)
     resolved, problems = classify_roster(body.rows, facts)
     if problems:
-        unresolved = len({p.item_id for p in problems})
-        failure = RosterResolveFailure(
-            message=f"{unresolved} of {len(body.rows)} roster rows did not resolve",
-            problems=problems,
+        raise_all_or_nothing_failure(
+            problems, item_count=len(body.rows), outcome="roster rows did not resolve"
         )
-        raise HTTPException(status_code=422, detail=failure.model_dump(mode="json"))
     return RosterResolveResponse(rows=resolved)
 
 

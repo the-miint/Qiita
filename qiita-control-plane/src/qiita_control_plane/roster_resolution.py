@@ -12,7 +12,7 @@ import asyncpg
 from qiita_common.models import (
     BiosampleLookupKey,
     BiosampleRef,
-    RosterProblem,
+    RequestItemProblem,
     RosterResolvedRow,
     RosterResolveRow,
     StudyLookupKey,
@@ -113,7 +113,7 @@ def _resolve_ref(
 
 def classify_roster(
     rows: list[RosterResolveRow], facts: RosterFacts
-) -> tuple[list[RosterResolvedRow], list[RosterProblem]]:
+) -> tuple[list[RosterResolvedRow], list[RequestItemProblem]]:
     """Apply the resolution rules to every row.
 
     Returns (resolved, problems): `resolved` in request order for the rows
@@ -121,7 +121,7 @@ def classify_roster(
     refuses the roster when `problems` is non-empty.
     """
     resolved: list[RosterResolvedRow] = []
-    problems: list[RosterProblem] = []
+    problems: list[RequestItemProblem] = []
     for row in rows:
         row_problems: list[str] = []
         biosample = _resolve_ref(
@@ -145,7 +145,9 @@ def classify_roster(
                     row_problems.append(f"{study.description} is also the primary project")
 
         if row_problems:
-            problems.extend(RosterProblem(item_id=row.item_id, message=m) for m in row_problems)
+            problems.extend(
+                RequestItemProblem(item_id=row.item_id, message=m) for m in row_problems
+            )
             continue
         assert biosample is not None and primary_study is not None
         assert None not in secondary_studies
