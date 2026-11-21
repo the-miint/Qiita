@@ -246,27 +246,75 @@ What such a caller may touch:
   study wrote, which shows a study admin that some other study wrote a value
   there.
 
+### Default tiers
+
+**Global fields.** Every global field is `public`, the column default of both
+global-field tables (`20260501000007_biosample_field.sql`,
+`20260501000010_prep_protocol_prep_sample_field.sql`). A new global field takes
+that default unless its migration names another tier.
+
+| Global fields | Tier | Why |
+|---|---|---|
+| collection date; geographic location (country and/or sea, latitude, longitude) | `public` | ENA publishes them with every biosample that carries them, as legacy Qiita and redbiom did, and they are what people search for biosamples by. A study can increase the tier of single values with field exceptions, but not of a global field as a whole: a study-local field linked to a global field carries no `tier_override` (see **Field tier** above). Keeping a study non-public keeps these values from callers with no grant on it, though not from a caller who reads the same biosample through another study. Nothing in Qiita coarsens a value: one that must not be published has to be coarsened by its submitter before it reaches Qiita or ENA. |
+| broad-scale environmental context, local environmental context, environmental medium, and their verbatim twins (`env_broad_scale`, `env_local_scale`, `env_medium`) | `public` | They describe the biosample's environment, not a person, and people search for biosamples by them. |
+| taxon id, host taxon id, depth, qiita sample type | `public` | They name the organism, its host species (such as human, never an individual), and the biosample's depth and kind, and people search for biosamples by them. |
+| prep_sample title, design description | `public` | ENA publishes them with the experiment. |
+
+**Studies.**
+
+- `qiita.study.default_tier` defaults to `member`: unless a study was created
+  public, only its owner, the people it is shared with, and wet_lab_admin+ read
+  its record. No route changes it after the study is created.
+- Every study that an ENA import created is `public`, since ENA already
+  publishes its data (`repositories.study.get_or_create_study_by_ena_accessions`;
+  `20261120000000_ena_imported_studies_public.sql` set the ones created before
+  it). A study that an import only matched by accession keeps its tier. The
+  migration refuses while one of those studies holds a biosample or
+  sequenced_sample that did not come from ENA: it was linked while the study was
+  `member`, and nobody chose to publish it. An import creates its study public,
+  so a biosample or sequenced_sample linked into it afterwards is published with
+  it, as in any public study.
+- On a `public` study, a purely-local field with no `tier_override` is public
+  too, because its field tier falls through to the study's default; only the
+  owner-biosample-id floor and field exceptions still apply. Making a study
+  public therefore publishes its untiered local fields. On an ENA-imported
+  study those include the `ena library *` fields and the unmapped ENA
+  attributes, which ENA publishes already.
+
 ### What a tier reads of a study's own record
 
 This is the definition, and it supersedes, for the study's own record, the
 comment on `qiita.study` in the applied migration `20260501000006_study.sql`
 (an applied migration cannot be edited in place). It is enforced by
 `auth.guards.study_record_view`, which `GET /api/v1/study/{idx}` and the
-`GET /api/v1/study` listing both decide through.
+`GET /api/v1/study` listing both decide through; the listing's query repeats it
+for search (see `study_record_view`).
 
 A caller's tier on a study is their `qiita.study_access` row (`admin` for the
 study's owner, with or without a row), or `public` when they hold none. The
-study's record has two views:
+study's record has three views:
 
 | View | Who | Fields |
 |---|---|---|
-| **full** | wet_lab_admin+ by role; the owner; a caller whose tier is at or above the study's `default_tier` (so anyone, on a `public`-default study) | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
+| **full** | wet_lab_admin+ by role; the owner; a grant at or above the study's `default_tier` | every column of `StudyResponse`: title, alias, description, abstract, funding, notes, `extra_metadata`, accessions, submission state, owner / PI / creator idxs, tiers, timestamps |
 | **summary** | any other grant: a tier below `default_tier` | `study_idx`, `export_entity_id`, title, alias, `bioproject_accession`, `ena_study_accession`, `default_tier`, `updated_at` |
+| **public** | no grant on a `public`-default study, which only its default admits the caller to | `export_entity_id`, title, alias, description, abstract, funding, `bioproject_accession`, `ena_study_accession`, `default_tier` |
 
 Anyone else gets nothing (403). The summary is what lets someone a study was
 shared with find it and recognise it, without the fields its tier does not
-reach. Search follows the same line: a summary reader's `q` matches only the
-summary fields, so a match cannot disclose a word in a field they cannot read.
+reach. The public view is what a reader outside the study sees of a public
+study: what describes it, without its internal idxs, notes, extra metadata or
+submission state. It also leaves out `updated_at`, which moves when a field it
+leaves out changes. Its `GET /api/v1/study` row carries neither `study_idx` nor
+`updated_at`; `export_entity_id` is the handle. Two places still return a
+`study_idx` to such a caller: the listing's cursor, `next_after_study_idx`, and
+`POST /api/v1/study/lookup`.
+
+Search follows the same line: a summary reader's `q` matches only the summary
+fields, and a public-view reader's only the public view's fields. A study that
+matches only in a field the caller cannot read is not listed, and the listing's
+cursor does not pass over it (`repositories.study.fetch_study_list_candidates`
+says why).
 
 ## Raw Data Fingerprint
 

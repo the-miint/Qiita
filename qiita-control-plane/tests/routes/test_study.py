@@ -196,7 +196,7 @@ async def test_post_study_full_body_round_trips(ctx):
         bioproject_accession="PRJNA000001",
         notes="notes-1",
         extra_metadata=extra,
-        default_tier="viewer",
+        default_tier=Tier.VIEWER,
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -646,7 +646,7 @@ async def test_get_study_returns_same_shape_as_post(ctx):
         ena_study_accession="ERP000001",
         notes="notes-1",
         extra_metadata=extra,
-        default_tier="viewer",
+        default_tier=Tier.VIEWER,
     )
     assert create_resp.status_code == 201, create_resp.text
     posted = create_resp.json()
@@ -712,7 +712,7 @@ async def test_get_study_without_grant_403(ctx):
         ctx,
         title=_unique_title("get-403"),
         owner_idx=other_owner,
-        default_tier="member",
+        default_tier=Tier.MEMBER,
     )
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
@@ -725,17 +725,20 @@ async def test_get_study_without_grant_403(ctx):
 @pytest.mark.parametrize(
     ("default_tier", "grant", "status", "view"),
     [
-        ("member", Tier.VIEWER, 200, StudyRecordView.SUMMARY),
-        ("admin", Tier.VIEWER, 200, StudyRecordView.SUMMARY),
-        ("admin", Tier.MEMBER, 200, StudyRecordView.SUMMARY),
-        ("member", Tier.MEMBER, 200, StudyRecordView.FULL),
-        ("member", None, 403, None),
-        ("public", None, 200, StudyRecordView.FULL),
+        (Tier.MEMBER, Tier.VIEWER, 200, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.VIEWER, 200, StudyRecordView.SUMMARY),
+        (Tier.ADMIN, Tier.MEMBER, 200, StudyRecordView.SUMMARY),
+        (Tier.MEMBER, Tier.MEMBER, 200, StudyRecordView.FULL),
+        (Tier.MEMBER, None, 403, None),
+        (Tier.PUBLIC, None, 200, StudyRecordView.PUBLIC),
+        (Tier.PUBLIC, Tier.VIEWER, 200, StudyRecordView.FULL),
     ],
 )
 async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant, status, view):
     """The full record at or above the study's default_tier; below it, a grant
-    reads only the summary, which carries none of the record's private fields."""
+    reads only the summary, which carries none of the record's private fields.
+    A caller whom only a public default admits reads the public view, with the
+    fields that docs/architecture/data-model.md lists for it."""
     other_owner = await seed_user_principal(
         ctx["pool"], prefix=_SEED_PREFIX, suffix=f"view-{secrets.token_hex(3)}"
     )
@@ -746,6 +749,9 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
         title=_unique_title("view"),
         owner_idx=other_owner,
         default_tier=default_tier,
+        description="a description",
+        abstract="an abstract",
+        funding="a grant",
         notes="private note",
         extra_metadata={"k": "v"},
     )
@@ -778,6 +784,28 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "default_tier",
             "updated_at",
         }
+        assert body["export_entity_id"] == await fetch_export_entity_id(
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
+        )
+        assert "ETag" not in resp.headers
+    elif view == StudyRecordView.PUBLIC:
+        assert set(body) == {
+            "view",
+            "export_entity_id",
+            "title",
+            "alias",
+            "description",
+            "abstract",
+            "funding",
+            "bioproject_accession",
+            "ena_study_accession",
+            "default_tier",
+        }
+        assert (body["description"], body["abstract"], body["funding"]) == (
+            "a description",
+            "an abstract",
+            "a grant",
+        )
         assert body["export_entity_id"] == await fetch_export_entity_id(
             ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
         )
@@ -1535,7 +1563,7 @@ async def _seed_list_fixture(ctx) -> tuple[str, dict[str, int]]:
     other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"list-{token}")
     ctx["created"]["user_principals"].append(other)
     idxs: dict[str, int] = {}
-    for name, tier in (("private", "member"), ("shared", "member"), ("public", "public")):
+    for name, tier in (("private", Tier.MEMBER), ("shared", Tier.MEMBER), ("public", Tier.PUBLIC)):
         resp = await _post_study(
             ctx["wet"], ctx, title=f"{token} {name}", owner_idx=other, default_tier=tier
         )
@@ -1560,38 +1588,62 @@ async def _list(client, **params) -> dict:
     return resp.json()
 
 
+async def _export_ids(ctx, idxs: dict[str, int]) -> dict[str, str]:
+    """Each fixture study's export_entity_id, read from the table. A row that
+    only a public default admits carries no study_idx, so a test that lists
+    one keys every row on this instead."""
+    return {
+        name: await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
+        for name, idx in idxs.items()
+    }
+
+
 async def test_list_studies_shows_owned_shared_and_public_only(ctx):
     token, idxs = await _seed_list_fixture(ctx)
+    qs = await _export_ids(ctx, idxs)
     body = await _list(ctx["user"], q=token)
-    rows = {r["study_idx"]: r for r in body["studies"]}
-    assert set(rows) == {idxs["shared"], idxs["public"], idxs["own"]}
-    assert rows[idxs["shared"]]["caller_tier"] == Tier.VIEWER
-    assert rows[idxs["public"]]["caller_tier"] == Tier.PUBLIC
-    assert rows[idxs["own"]]["access_via"] == StudyAccessVia.OWNER
-    assert rows[idxs["shared"]]["access_via"] == StudyAccessVia.GRANT
-    assert rows[idxs["public"]]["access_via"] == StudyAccessVia.PUBLIC
+    # Keyed on the export_entity_id that each row carries, read from the table
+    # independently.
+    rows = {r["export_entity_id"]: r for r in body["studies"]}
+    assert set(rows) == {qs["shared"], qs["public"], qs["own"]}
+    assert rows[qs["shared"]]["caller_tier"] == Tier.VIEWER
+    assert rows[qs["public"]]["caller_tier"] == Tier.PUBLIC
+    assert rows[qs["own"]]["access_via"] == StudyAccessVia.OWNER
+    assert rows[qs["shared"]]["access_via"] == StudyAccessVia.GRANT
+    assert rows[qs["public"]]["access_via"] == StudyAccessVia.PUBLIC
     # A viewer grant on a member-default study reads only its summary.
-    assert rows[idxs["shared"]]["record_view"] == StudyRecordView.SUMMARY
-    assert rows[idxs["public"]]["record_view"] == StudyRecordView.FULL
-    assert rows[idxs["own"]]["record_view"] == StudyRecordView.FULL
-    # Each row carries its export_entity_id, read from the table independently.
-    expected_ids = {
-        idx: await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
-        for idx in rows
+    assert rows[qs["shared"]]["record_view"] == StudyRecordView.SUMMARY
+    # Only the public default admits them to the public study: its public view,
+    # whose row carries no study_idx and no updated_at.
+    assert set(rows[qs["public"]]) == {
+        "export_entity_id",
+        "title",
+        "alias",
+        "bioproject_accession",
+        "ena_study_accession",
+        "default_tier",
+        "caller_tier",
+        "access_via",
+        "record_view",
     }
-    assert {idx: row["export_entity_id"] for idx, row in rows.items()} == expected_ids
+    assert rows[qs["public"]]["record_view"] == StudyRecordView.PUBLIC
+    assert rows[qs["own"]]["record_view"] == StudyRecordView.FULL
+    assert rows[qs["shared"]]["study_idx"] == idxs["shared"]
+    assert rows[qs["own"]]["study_idx"] == idxs["own"]
     # Newest first.
-    assert [r["study_idx"] for r in body["studies"]] == sorted(rows, reverse=True)
+    newest_first = sorted(("shared", "public", "own"), key=idxs.__getitem__, reverse=True)
+    assert [r["export_entity_id"] for r in body["studies"]] == [qs[n] for n in newest_first]
 
 
 async def test_list_studies_agrees_with_get_by_idx(ctx):
     """For every fixture study, the list includes it exactly when
     GET /study/{idx} admits the same caller."""
     token, idxs = await _seed_list_fixture(ctx)
-    listed = {r["study_idx"] for r in (await _list(ctx["user"], q=token))["studies"]}
+    qs = await _export_ids(ctx, idxs)
+    listed = {r["export_entity_id"] for r in (await _list(ctx["user"], q=token))["studies"]}
     for name, idx in idxs.items():
         status = (await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=idx))).status_code
-        assert (status == 200) == (idx in listed), (name, status)
+        assert (status == 200) == (qs[name] in listed), (name, status)
 
 
 async def test_list_studies_wet_lab_admin_sees_every_study(ctx):
@@ -1607,15 +1659,15 @@ async def test_list_studies_wet_lab_admin_sees_every_study(ctx):
 async def test_list_studies_min_tier_filters_on_the_callers_own_tier(ctx):
     token, idxs = await _seed_list_fixture(ctx)
     viewer = {
-        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="viewer"))["studies"]
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier=Tier.VIEWER))["studies"]
     }
     assert viewer == {idxs["shared"], idxs["own"]}
     member = {
-        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="member"))["studies"]
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier=Tier.MEMBER))["studies"]
     }
     assert member == {idxs["own"]}
     # Applies to a role-bypass caller too: the wet_lab_admin holds no grant here.
-    assert (await _list(ctx["wet"], q=token, min_tier="viewer"))["studies"] == []
+    assert (await _list(ctx["wet"], q=token, min_tier=Tier.VIEWER))["studies"] == []
 
 
 async def test_list_studies_search_matches_title_words(ctx):
@@ -1628,15 +1680,17 @@ async def test_list_studies_cursor_pages_through_without_gaps_or_repeats(ctx):
     """limit=1 forces one candidate study per page; following the cursor
     yields exactly the readable set, newest first, each study once."""
     token, idxs = await _seed_list_fixture(ctx)
-    seen: list[int] = []
+    qs = await _export_ids(ctx, idxs)
+    seen: list[str] = []
     params: dict = {"q": token, "limit": 1}
     for _ in range(10):
         body = await _list(ctx["user"], **params)
-        seen += [r["study_idx"] for r in body["studies"]]
+        seen += [r["export_entity_id"] for r in body["studies"]]
         if body["next_after_study_idx"] is None:
             break
         params["after_study_idx"] = body["next_after_study_idx"]
-    assert seen == sorted({idxs["shared"], idxs["public"], idxs["own"]}, reverse=True)
+    newest_first = sorted(("shared", "public", "own"), key=idxs.__getitem__, reverse=True)
+    assert seen == [qs[n] for n in newest_first]
 
 
 async def test_list_studies_anonymous_401(ctx):
@@ -1659,12 +1713,12 @@ async def test_list_studies_min_tier_pages_are_not_padded_with_dropped_rows(ctx)
     and the shared one is not a candidate, so page two is the shared study —
     not an empty page carrying a cursor."""
     token, idxs = await _seed_list_fixture(ctx)
-    first = await _list(ctx["user"], q=token, min_tier="viewer", limit=1)
+    first = await _list(ctx["user"], q=token, min_tier=Tier.VIEWER, limit=1)
     assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
     second = await _list(
         ctx["user"],
         q=token,
-        min_tier="viewer",
+        min_tier=Tier.VIEWER,
         limit=1,
         after_study_idx=first["next_after_study_idx"],
     )
@@ -1677,12 +1731,12 @@ async def test_list_studies_reads_past_dropped_candidates_to_the_end(ctx):
     study reads past it and reports the end, rather than returning an empty
     page with a cursor."""
     token, idxs = await _seed_list_fixture(ctx)
-    first = await _list(ctx["user"], q=token, min_tier="member", limit=1)
+    first = await _list(ctx["user"], q=token, min_tier=Tier.MEMBER, limit=1)
     assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
     second = await _list(
         ctx["user"],
         q=token,
-        min_tier="member",
+        min_tier=Tier.MEMBER,
         limit=1,
         after_study_idx=first["next_after_study_idx"],
     )
@@ -1705,7 +1759,7 @@ async def test_list_studies_explicit_public_min_tier_matches_no_filter(ctx):
     token, _ = await _seed_list_fixture(ctx)
     for client in (ctx["user"], ctx["wet"]):
         plain = await _list(client, q=token)
-        public = await _list(client, q=token, min_tier="public")
+        public = await _list(client, q=token, min_tier=Tier.PUBLIC)
         assert public == plain
 
 
@@ -1771,7 +1825,7 @@ async def test_list_studies_stops_after_the_fill_round_cap_and_resumes(ctx):
         await shared(f"viewer{i}", Tier.VIEWER) for i in range(_MAX_LIST_FILL_ROUNDS + 1)
     ]
 
-    params = {"q": token, "min_tier": "member", "limit": 1}
+    params = {"q": token, "min_tier": Tier.MEMBER, "limit": 1}
     first = await _list(ctx["user"], **params)
     # Rounds spent on the newest viewer studies: nothing kept, cursor at the last one read.
     assert first == {
@@ -1822,6 +1876,154 @@ async def test_list_studies_summary_reader_cannot_search_fields_they_cannot_read
     assert [r["study_idx"] for r in full] == [idx]
 
 
+async def test_list_studies_public_reader_cannot_search_fields_the_public_view_leaves_out(ctx):
+    """A public-default study with one word only in its notes and another only
+    in its abstract. A caller with no grant reads its public view, so they find
+    it by the abstract's word and not by the notes' word, which the public view
+    leaves out. A full-record reader (a wet_lab_admin) finds it by either."""
+    token = f"lst{secrets.token_hex(4)}"
+    secret, described = f"zq{secrets.token_hex(5)}", f"zd{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"pub-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} open",
+        owner_idx=other,
+        default_tier=Tier.PUBLIC,
+        notes=f"internal {secret}",
+        abstract=f"about {described}",
+    )
+    assert created.status_code == 201, created.text
+    idx = created.json()["study_idx"]
+
+    qs = await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
+
+    assert (await _list(ctx["user"], q=secret))["studies"] == []
+    by_abstract = (await _list(ctx["user"], q=described))["studies"]
+    assert [(r["export_entity_id"], r["record_view"]) for r in by_abstract] == [
+        (qs, StudyRecordView.PUBLIC)
+    ]
+    for word in (secret, described):
+        full = (await _list(ctx["wet"], q=word))["studies"]
+        assert [r["study_idx"] for r in full] == [idx], word
+
+
+@pytest.mark.parametrize("view", [StudyRecordView.PUBLIC, StudyRecordView.SUMMARY])
+async def test_list_studies_cursor_does_not_reveal_matches_on_hidden_fields(ctx, view):
+    """Enough studies that match `q` only in their notes to spend every fill
+    round, read through a view that leaves the notes out: the page is empty and
+    has no cursor. A cursor would say that studies matched on the hidden notes,
+    and name one of them. The same caller lists every one of them, in that
+    view, by a word in their titles."""
+    from qiita_control_plane.routes.study import _MAX_LIST_FILL_ROUNDS
+
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"cur-{token}")
+    ctx["created"]["user_principals"].append(other)
+    for n in range(_MAX_LIST_FILL_ROUNDS):
+        created = await _post_study(
+            ctx["wet"],
+            ctx,
+            title=f"{token} hidden {n}",
+            owner_idx=other,
+            default_tier=Tier.PUBLIC if view is StudyRecordView.PUBLIC else Tier.MEMBER,
+            notes=f"internal {secret}",
+        )
+        assert created.status_code == 201, created.text
+        if view is StudyRecordView.SUMMARY:
+            await _grant_study_access(
+                ctx,
+                study_idx=created.json()["study_idx"],
+                principal_idx=ctx["user_session"]["principal_idx"],
+                tier=Tier.VIEWER,
+                granted_by_idx=other,
+            )
+
+    assert await _list(ctx["user"], q=secret, limit=1) == {
+        "studies": [],
+        "next_after_study_idx": None,
+    }
+    by_title = await _list(ctx["user"], q=token, limit=_MAX_LIST_FILL_ROUNDS + 1)
+    assert [r["record_view"] for r in by_title["studies"]] == [view] * _MAX_LIST_FILL_ROUNDS
+
+
+async def test_list_studies_grant_at_the_default_tier_searches_the_full_record(ctx):
+    """A member grant on a viewer-default study reaches its default, so the
+    grantee reads the full record and finds the study by a word in its notes.
+    'member' sorts before 'viewer' as text, so this also pins the comparison to
+    the tiers' order."""
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"mem-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} granted",
+        owner_idx=other,
+        default_tier=Tier.VIEWER,
+        notes=f"internal {secret}",
+    )
+    idx = created.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier=Tier.MEMBER,
+        granted_by_idx=other,
+    )
+    rows = (await _list(ctx["user"], q=secret))["studies"]
+    assert [(r["study_idx"], r["record_view"]) for r in rows] == [(idx, StudyRecordView.FULL)]
+
+
+async def test_list_studies_search_words_may_span_the_accessions_and_other_fields(ctx):
+    """One query whose words fall in a study's abstract and in its accession
+    finds the study for a public-view reader and for a full-record reader
+    alike: each view's fields are searched as one document."""
+    token, word = f"lst{secrets.token_hex(4)}", f"zd{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"span-{token}")
+    ctx["created"]["user_principals"].append(other)
+    accession = f"PRJNA{secrets.randbelow(10**9)}"
+    created = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=f"{token} spanning",
+        owner_idx=other,
+        default_tier=Tier.PUBLIC,
+        abstract=f"about {word}",
+        bioproject_accession=accession,
+    )
+    assert created.status_code == 201, created.text
+    qs = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=created.json()["study_idx"]
+    )
+    for client, view in ((ctx["user"], StudyRecordView.PUBLIC), (ctx["wet"], StudyRecordView.FULL)):
+        rows = (await _list(client, q=f"{word} {accession}"))["studies"]
+        assert [(r["export_entity_id"], r["record_view"]) for r in rows] == [(qs, view)], view
+
+
+async def test_list_studies_role_reader_searches_the_full_record_under_min_tier(ctx):
+    """A wet_lab_admin reads every study's full record, also when `min_tier`
+    limits the listing to their own grants: a study they hold only a viewer
+    grant on is found by a word in its notes."""
+    token, secret = f"lst{secrets.token_hex(4)}", f"zq{secrets.token_hex(5)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"role-{token}")
+    ctx["created"]["user_principals"].append(other)
+    created = await _post_study(
+        ctx["wet"], ctx, title=f"{token} granted", owner_idx=other, notes=f"internal {secret}"
+    )
+    idx = created.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=idx,
+        principal_idx=ctx["wet_session"]["principal_idx"],
+        tier=Tier.VIEWER,
+        granted_by_idx=other,
+    )
+    rows = (await _list(ctx["wet"], q=secret, min_tier=Tier.VIEWER))["studies"]
+    assert [(r["study_idx"], r["record_view"]) for r in rows] == [(idx, StudyRecordView.FULL)]
+
+
 async def test_list_studies_owner_without_an_access_row_is_admin(ctx):
     """An owner whose own study_access row was deleted is still listed, as
     admin, passes every min_tier, and still reads the full record."""
@@ -1832,7 +2034,7 @@ async def test_list_studies_owner_without_an_access_row_is_admin(ctx):
     await ctx["pool"].execute(
         "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2", idx, me
     )
-    for min_tier in (None, "viewer", "admin"):
+    for min_tier in (None, Tier.VIEWER, Tier.ADMIN):
         params = {"q": token} | ({"min_tier": min_tier} if min_tier else {})
         rows = (await _list(ctx["user"], **params))["studies"]
         assert [(r["study_idx"], r["caller_tier"], r["access_via"]) for r in rows] == [
@@ -1866,7 +2068,7 @@ async def test_list_studies_pages_past_a_dropped_row_mid_page(ctx):
         if grant == Tier.MEMBER:
             member_idxs.append(idx)
     seen: list[int] = []
-    params: dict = {"q": token, "limit": 3, "min_tier": "member"}
+    params: dict = {"q": token, "limit": 3, "min_tier": Tier.MEMBER}
     for _ in range(10):
         body = await _list(ctx["user"], **params)
         seen += [r["study_idx"] for r in body["studies"]]

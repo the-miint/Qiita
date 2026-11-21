@@ -101,12 +101,14 @@ class StudyRecordView(StrEnum):
 
     FULL = "full"
     SUMMARY = "summary"
+    PUBLIC = "public"
 
 
 class StudyResponse(BaseModel):
     """Returned by POST /api/v1/study on success, and by GET and PATCH
     /api/v1/study/{study_idx} to a caller who may read the full record
-    (`view` = full; see `StudyRecordSummary` for the other view).
+    (`view` = full; see `StudyRecordSummary` and `StudyRecordPublic` for the
+    other views).
 
     Mirrors the qiita.study row's caller-visible columns, with the
     generated search_vector and parent_study_idx (not exposed in v1)
@@ -150,14 +152,16 @@ class StudyAccessVia(StrEnum):
 
 
 class StudySummary(BaseModel):
-    """One row of GET /api/v1/study — a study the caller may read.
+    """One row of GET /api/v1/study: a study the caller may read through
+    ownership, a grant or a role. A study that only its public default admits
+    them to is a `StudyPublicSummary` row instead; `record_view` tells the two
+    apart.
 
     `caller_tier` is the caller's own tier on the study: `admin` for its
     owner, else their qiita.study_access row, or `public` when they hold none.
-    `access_via`
-    says why they can read it, which `caller_tier` alone cannot: a
-    wet_lab_admin with no grant and a stranger on a public study both have
-    `caller_tier` public.
+    `access_via` says why they can read it, which `caller_tier` alone cannot:
+    a wet_lab_admin with no grant has `caller_tier` public, as the reader of a
+    `StudyPublicSummary` row does.
     """
 
     study_idx: Annotated[int, Field(gt=0)]
@@ -170,8 +174,30 @@ class StudySummary(BaseModel):
     caller_tier: Tier
     access_via: StudyAccessVia
     # What GET /study/{study_idx} would return this caller.
-    record_view: StudyRecordView
+    record_view: Literal[StudyRecordView.FULL, StudyRecordView.SUMMARY]
     updated_at: AwareDatetime
+
+
+class StudyPublicSummary(BaseModel):
+    """One row of GET /api/v1/study for a study that only its public default
+    admits the caller to: its handle, `export_entity_id`, with its title, alias,
+    accessions and tiers, and no `study_idx` or `updated_at`.
+    `default_tier`, `caller_tier` and `access_via` are always `public` here, and
+    are kept so that every row reads the same way.
+
+    Its fields are listed here rather than shared with `StudySummary` through a
+    base class, so that a field added for callers with a grant cannot reach it.
+    """
+
+    export_entity_id: str
+    title: str
+    alias: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
+    caller_tier: Tier
+    access_via: StudyAccessVia
+    record_view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
 
 
 class StudySummaryListResponse(BaseModel):
@@ -184,7 +210,7 @@ class StudySummaryListResponse(BaseModel):
     study the page considered, including ones the `min_tier` filter dropped.
     """
 
-    studies: list[StudySummary]
+    studies: list[Annotated[StudySummary | StudyPublicSummary, Field(discriminator="record_view")]]
     next_after_study_idx: int | None
 
 
@@ -202,6 +228,29 @@ class StudyRecordSummary(BaseModel):
     ena_study_accession: str | None
     default_tier: Tier
     updated_at: AwareDatetime
+
+
+class StudyRecordPublic(BaseModel):
+    """GET /api/v1/study/{study_idx} for a caller whom only the study's public
+    default admits: no grant, not the owner, no bypass role. Which fields it
+    holds is defined in docs/architecture/data-model.md ("What a tier reads of
+    a study's own record"); the full record is `StudyResponse`.
+
+    Its fields are listed here rather than shared with the other views through
+    a base class, so that a field added for callers with a grant cannot reach
+    it.
+    """
+
+    view: Literal[StudyRecordView.PUBLIC] = StudyRecordView.PUBLIC
+    export_entity_id: str
+    title: str
+    alias: str | None
+    description: str | None
+    abstract: str | None
+    funding: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
 
 
 def _reject_public_tier(tier: Tier) -> Tier:

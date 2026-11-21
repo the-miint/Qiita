@@ -508,8 +508,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_list.add_argument(
         "--query",
         help=(
-            "full-text search: title, alias and accessions, plus abstract, description,"
-            " notes and funding where you can read the full record; whole English words"
+            "full-text search: title, alias and accessions; abstract, description and"
+            " funding where you can read the public view or the full record; and notes"
+            " where you can read the full record; whole English words"
         ),
     )
     p_study_list.add_argument(
