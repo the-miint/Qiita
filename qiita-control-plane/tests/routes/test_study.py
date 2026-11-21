@@ -39,12 +39,14 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
+    IDX_KEY,
     LEGACY_IDX_RESERVED_CEILING,
     StudyAccessVia,
     StudyRecordView,
     Tier,
 )
 
+from qiita_control_plane.repositories.exported_entity import EntityKind
 from qiita_control_plane.testing.db_seeds import (
     fetch_export_entity_id,
     seed_service_principal,
@@ -208,7 +210,7 @@ async def test_post_study_full_body_round_trips(ctx):
         "updated_at": rj["updated_at"],
         # Read from the table independently of the route under test.
         "export_entity_id": await fetch_export_entity_id(
-            ctx["pool"], kind="study", entity_idx=rj["study_idx"]
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=rj["study_idx"]
         ),
         "owner_idx": caller_idx,
         "principal_investigator_idx": None,
@@ -551,7 +553,7 @@ async def test_post_study_system_admin_explicit_study_idx_lands_there(ctx):
     assert rj["study_idx"] == study_idx
     assert rj["owner_idx"] == target_idx
     assert rj["export_entity_id"] == await fetch_export_entity_id(
-        ctx["pool"], kind="study", entity_idx=study_idx
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
     )
     grant = await ctx["pool"].fetchval(
         "SELECT access_tier FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
@@ -783,7 +785,7 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "updated_at",
         }
         assert body["export_entity_id"] == await fetch_export_entity_id(
-            ctx["pool"], kind="study", entity_idx=study_idx
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
         )
         assert "ETag" not in resp.headers
     elif view == StudyRecordView.PUBLIC:
@@ -805,7 +807,7 @@ async def test_get_study_view_follows_the_callers_tier(ctx, default_tier, grant,
             "a grant",
         )
         assert body["export_entity_id"] == await fetch_export_entity_id(
-            ctx["pool"], kind="study", entity_idx=study_idx
+            ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
         )
         assert "ETag" not in resp.headers
     else:
@@ -1459,11 +1461,14 @@ async def test_lookup_study_by_accession_rejects_extra_field_422(ctx):
 # deprecated lookup route's tests ends when that route is removed
 async def test_lookup_study_resolves_by_export_entity_id(ctx):
     """Tests the case where the body keys on export_entity_id: a study's minted
-    id resolves to its idx and an unknown id lands in `missing`."""
+    id resolves to that same id (the default return_key), and an unknown id
+    lands in `missing`."""
     study_idx = await _create_study_with_accession(
         ctx, accession=unique_accession("PRJ-LOOKUP-EXP")
     )
-    export_id = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=study_idx)
+    export_id = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
+    )
     unknown_id = unique_accession("EXPORT-LOOKUP-MISS")
 
     resp = await ctx["user"].post(
@@ -1471,22 +1476,41 @@ async def test_lookup_study_resolves_by_export_entity_id(ctx):
         json={"key": "export_entity_id", "values": [export_id, unknown_id]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"resolved": {export_id: study_idx}, "missing": [unknown_id]}
+    assert resp.json() == {"resolved": {export_id: export_id}, "missing": [unknown_id]}
 
 
 async def test_lookup_study_resolves_by_bioproject_accession(ctx):
     """Tests the case where the body keys on bioproject_accession: a seeded
-    accession resolves and an absent one lands in `missing`."""
+    accession resolves to the study's export_entity_id, the default return_key,
+    and an absent one lands in `missing`."""
     acc = unique_accession("PRJ-LOOKUP-NEW")
     acc_missing = unique_accession("PRJ-LOOKUP-NEW-MISS")
     study_idx = await _create_study_with_accession(ctx, accession=acc)
+    export_id = await fetch_export_entity_id(
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=study_idx
+    )
 
     resp = await ctx["user"].post(
         URL_STUDY_LOOKUP,
         json={"key": "bioproject_accession", "values": [acc, acc_missing]},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"resolved": {acc: study_idx}, "missing": [acc_missing]}
+    assert resp.json() == {"resolved": {acc: export_id}, "missing": [acc_missing]}
+
+
+# same-pattern-ok: per-entity twin of the POST /biosample/lookup tests
+async def test_lookup_study_returns_idx_when_asked(ctx):
+    """Tests the case where the body sets return_key to idx: a seeded accession
+    resolves to the study's idx instead of its export_entity_id."""
+    acc = unique_accession("PRJ-LOOKUP-IDX")
+    study_idx = await _create_study_with_accession(ctx, accession=acc)
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP,
+        json={"key": "bioproject_accession", "values": [acc], "return_key": IDX_KEY},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {acc: study_idx}, "missing": []}
 
 
 # same-pattern-ok: per-entity twin of the POST /biosample/lookup tests; the overlap with the
@@ -1497,13 +1521,15 @@ async def test_lookup_study_resolves_by_bioproject_accession(ctx):
         {"values": ["PRJ000001"]},
         {"key": "title", "values": ["PRJ000001"]},
         {"key": "bioproject_accession", "values": []},
+        {"key": "bioproject_accession", "values": ["PRJ000001"], "return_key": "study_idx"},
     ],
-    ids=["key-absent", "key-invalid", "values-empty"],
+    ids=["key-absent", "key-invalid", "values-empty", "return-key-invalid"],
 )
 async def test_lookup_study_rejects_bad_body_422(ctx, body):
     """Tests the case where the body omits `key`, names a key outside
-    StudyLookupKey, or carries no values: the request model rejects it with 422
-    before any DB work runs."""
+    StudyLookupKey, carries no values, or names a return_key outside
+    LookupReturnKey: the request model rejects it with 422 before any DB work
+    runs."""
     resp = await ctx["user"].post(URL_STUDY_LOOKUP, json=body)
     assert resp.status_code == 422
 
@@ -1567,7 +1593,7 @@ async def _export_ids(ctx, idxs: dict[str, int]) -> dict[str, str]:
     only a public default admits carries no study_idx, so a test that lists
     one keys every row on this instead."""
     return {
-        name: await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx)
+        name: await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
         for name, idx in idxs.items()
     }
 
@@ -1871,7 +1897,7 @@ async def test_list_studies_public_reader_cannot_search_fields_the_public_view_l
     assert created.status_code == 201, created.text
     idx = created.json()["study_idx"]
 
-    qs = await fetch_export_entity_id(ctx["pool"], kind="study", entity_idx=idx)
+    qs = await fetch_export_entity_id(ctx["pool"], kind=EntityKind.STUDY, entity_idx=idx)
 
     assert (await _list(ctx["user"], q=secret))["studies"] == []
     by_abstract = (await _list(ctx["user"], q=described))["studies"]
@@ -1969,7 +1995,7 @@ async def test_list_studies_search_words_may_span_the_accessions_and_other_field
     )
     assert created.status_code == 201, created.text
     qs = await fetch_export_entity_id(
-        ctx["pool"], kind="study", entity_idx=created.json()["study_idx"]
+        ctx["pool"], kind=EntityKind.STUDY, entity_idx=created.json()["study_idx"]
     )
     for client, view in ((ctx["user"], StudyRecordView.PUBLIC), (ctx["wet"], StudyRecordView.FULL)):
         rows = (await _list(client, q=f"{word} {accession}"))["studies"]

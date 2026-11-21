@@ -49,7 +49,13 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX, SystemRole
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, BiosampleRef, StudyRef
+from qiita_common.models import (
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
+    LEGACY_IDX_RESERVED_CEILING,
+    BiosampleRef,
+    StudyRef,
+)
 from run_preflight.constants import InputSampleIdentifierKind, ProjectIdentifierKind
 from run_preflight.db import (
     ERR_CATEGORY_MISSING_IDENTIFIER,
@@ -1042,7 +1048,7 @@ def test_biosample_link_by_study_export_id(monkeypatch, capsys):
         (
             "POST",
             f"https://q.example.test{URL_STUDY_LOOKUP}",
-            {"key": "export_entity_id", "values": ["QS7"]},
+            {"key": EXPORT_ENTITY_ID, "values": ["QS7"], "return_key": IDX_KEY},
         ),
         ("POST", f"https://q.example.test{link_url}", None),
     ]

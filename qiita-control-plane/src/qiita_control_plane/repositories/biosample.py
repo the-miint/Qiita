@@ -34,7 +34,7 @@ from .biosample_metadata import (
     BiosampleOwnerIdMissingValueError,
     insert_owner_biosample_id_metadata,
 )
-from .exported_entity import export_entity_id_lookup, export_entity_id_select
+from .exported_entity import EntityKind, export_entity_id_lookup, export_entity_id_select
 from .study_access import CallerMetadataTiers
 
 # Owners' ids for their own biosamples sometimes inadvertently contain PII, so an
@@ -81,7 +81,7 @@ async def insert_biosample(
     )
 
 
-# Columns returned by both fetch_biosample and update_biosample so the
+# Columns returned by both fetch_biosamples_by_idxs and update_biosample so the
 # row -> response shaping has a single source of truth.
 _BIOSAMPLE_RETURNING_COLS = (
     "idx, owner_idx, metadata_checklist_idx,"
@@ -90,8 +90,37 @@ _BIOSAMPLE_RETURNING_COLS = (
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error,"
     " created_by_idx, created_at, updated_at,"
-    " retired, retired_by_idx, retired_at, retire_reason, " + export_entity_id_select("biosample")
+    " retired, retired_by_idx, retired_at, retire_reason, "
+    + export_entity_id_select(EntityKind.BIOSAMPLE)
 )
+
+
+async def fetch_biosamples_by_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idxs: Sequence[int],
+    *,
+    lock: RowLock | None = None,
+) -> dict[int, asyncpg.Record]:
+    """Return `{biosample_idx: row}` for every idx in `biosample_idxs` that has a
+    qiita.biosample row, retired ones included; an absent idx is omitted.
+
+    Selects every caller-visible column on the row so the
+    row -> response shaping has a single source of truth. Accepts
+    either a pool or a connection so the helper composes inside an
+    open transaction or stands alone.
+
+    `lock` takes that row lock on every returned biosample; see row_lock_clause.
+    """
+    # Ordered by idx so that concurrent callers locking overlapping sets take
+    # the rows in the same order.
+    sql = (
+        f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample"
+        " WHERE idx = ANY($1::bigint[]) ORDER BY idx"
+    )
+    sql += row_lock_clause(pool_or_conn, lock)
+    rows = await pool_or_conn.fetch(sql, list(biosample_idxs))
+    by_idx = {r["idx"]: r for r in rows}
+    return by_idx
 
 
 async def fetch_biosample(
@@ -100,18 +129,10 @@ async def fetch_biosample(
     *,
     lock: RowLock | None = None,
 ) -> asyncpg.Record | None:
-    """Return the qiita.biosample row for the given idx, or None on miss.
-
-    Selects every caller-visible column on the row so the
-    row -> response shaping has a single source of truth. Accepts
-    either a pool or a connection so the helper composes inside an
-    open transaction or stands alone.
-
-    `lock` takes that row lock on the biosample; see row_lock_clause.
-    """
-    sql = f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample WHERE idx = $1"
-    sql += row_lock_clause(pool_or_conn, lock)
-    return await pool_or_conn.fetchrow(sql, biosample_idx)
+    """`fetch_biosamples_by_idxs` for one idx: its row, or None on miss."""
+    rows = await fetch_biosamples_by_idxs(pool_or_conn, [biosample_idx], lock=lock)
+    row = rows.get(biosample_idx)
+    return row
 
 
 # Columns this repo's PATCH composer is allowed to write. Held as a
@@ -141,7 +162,7 @@ async def update_biosample(
     Thin wrapper around the shared update_row composer that pins the
     table, allowlist, and RETURNING shape for qiita.biosample. See
     update_row for the field-validation and explicit-null semantics;
-    see fetch_biosample for the returned column list.
+    see fetch_biosamples_by_idxs for the returned column list.
     """
     return await update_row(
         conn,
@@ -266,14 +287,15 @@ async def fetch_biosample_idxs_for_study(
     *,
     study_idx: int,
     limit: int,
+    among_idxs: Sequence[int] | None = None,
 ) -> list[int]:
     """Return up to `limit` biosample idxs linked to study_idx, newest-linked first.
 
-    Excludes retired links and retired biosamples. Callers that need
-    to detect truncation pass `limit = cap + 1`; if the returned list
-    has length > cap, the underlying set exceeded the cap. Accepts
-    either a pool or a connection so the helper composes inside an
-    open transaction or stands alone.
+    With `among_idxs`, only those idxs are considered. Excludes retired links
+    and retired biosamples. Callers that need to detect truncation pass
+    `limit = cap + 1`; if the returned list has length > cap, the underlying
+    set exceeded the cap. Accepts either a pool or a connection so the helper
+    composes inside an open transaction or stands alone.
     """
     # The retired-link predicate is index-covered; the join filters
     # out separately-retired biosamples.
@@ -284,10 +306,12 @@ async def fetch_biosample_idxs_for_study(
         " WHERE bts.study_idx = $1"
         "   AND bts.retired = false"
         "   AND b.retired = false"
+        "   AND ($3::bigint[] IS NULL OR bts.biosample_idx = ANY($3::bigint[]))"
         " ORDER BY bts.created_at DESC, bts.biosample_idx DESC"
         " LIMIT $2",
         study_idx,
         limit,
+        None if among_idxs is None else list(among_idxs),
     )
     return [r["biosample_idx"] for r in rows]
 
@@ -298,7 +322,7 @@ _BIOSAMPLE_LOOKUP_SQL: dict[BiosampleLookupKey, tuple[str, str]] = {
     "biosample_accession": ("biosample.biosample_accession", ""),
     "ena_sample_accession": ("biosample.ena_sample_accession", ""),
     "matrix_tube_id": ("biosample.matrix_tube_id", ""),
-    "export_entity_id": export_entity_id_lookup("biosample"),
+    "export_entity_id": export_entity_id_lookup(EntityKind.BIOSAMPLE),
 }
 
 
@@ -307,15 +331,15 @@ async def fetch_biosample_idxs_by_natural_key(
     *,
     key: BiosampleLookupKey,
     values: list[str],
+    include_retired: bool = False,
 ) -> dict[str, int]:  # same-pattern-ok: biosample has a tube key and drops
     # retired rows; study has neither
     """Return `{value: biosample_idx}` for every value in `values` that
-    resolves to a non-retired qiita.biosample row via the natural key named by
-    `key`.
+    resolves to a qiita.biosample row via the natural key named by `key`.
 
-    Values absent from the table or carried only by retired rows are
-    omitted from the returned map, so a caller can detect misses by
-    set-difference against the input `values`.
+    Values absent from the table are omitted from the returned map, so a caller
+    can detect misses by set-difference against the input `values`. So are
+    values carried only by retired rows, unless `include_retired` is set.
     """
     if key not in _BIOSAMPLE_LOOKUP_SQL:
         raise ValueError(f"invalid biosample lookup key: {key!r}")
@@ -325,8 +349,9 @@ async def fetch_biosample_idxs_by_natural_key(
     rows = await pool_or_conn.fetch(
         f"SELECT biosample.idx, {column_sql} AS lookup_value FROM qiita.biosample{join_sql}"
         f" WHERE {column_sql} = ANY($1::text[])"
-        "   AND biosample.retired = false",
+        "   AND (biosample.retired = false OR $2)",
         values,
+        include_retired,
     )
     resolved = {r["lookup_value"]: r["idx"] for r in rows}
     return resolved

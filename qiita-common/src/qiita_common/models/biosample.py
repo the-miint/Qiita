@@ -1,6 +1,7 @@
 """Biosample import models, metadata value shapes, natural-key lookups, the
 shared bulk-idx / list response envelopes, and the biosample PATCH body."""
 
+import re
 from collections import Counter
 from datetime import date
 from decimal import Decimal
@@ -12,8 +13,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    TypeAdapter,
-    ValidationError,
     computed_field,
     field_validator,
     model_validator,
@@ -21,9 +20,11 @@ from pydantic import (
 
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models._base import (
+    IDX_KEY,
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
     MetadataRequestModel,
+    NaturalKeyLookupRequest,
     NaturalKeyLookupResponse,
     NonBlankName,
     NonBlankText,
@@ -53,7 +54,20 @@ MATRIX_TUBE_ID_PATTERN = (
     rf"^[0-9]{{{MATRIX_TUBE_ID_WIDTH}}}$"  # same-pattern-ok: DB CHECK parity (see above)
 )
 MatrixTubeIdText = Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]
-_MATRIX_TUBE_ID_LIST_ADAPTER = TypeAdapter(list[MatrixTubeIdText])
+
+# A biosample idx given as text: a positive whole number of at most 18 digits,
+# so it always fits the BIGINT column it is compared against.
+LOOKUP_IDX_PATTERN = r"^[1-9][0-9]{0,17}$"
+
+# The name of a study-scoped lookup by a unique field of the study, outside a Literal type.
+UNIQUE_FIELD_KEY = "unique_field"
+
+# The lookup keys whose values must match a pattern, and that pattern; a key
+# not named here takes any non-blank text.
+_LOOKUP_VALUE_PATTERNS: dict[str, str] = {
+    "matrix_tube_id": MATRIX_TUBE_ID_PATTERN,
+    IDX_KEY: LOOKUP_IDX_PATTERN,
+}
 
 # The request fields that set a biosample attribute directly, named as
 # BiosampleImportRequest names them; every other biosample value is metadata.
@@ -660,29 +674,48 @@ BiosampleLookupKey = Literal[
 ]
 
 
-# same-pattern-ok: per-entity key set; parallels StudyLookupRequest
-class BiosampleLookupRequest(BaseModel):
-    """Resolves a list of values of the natural key named by `key` to
-    biosample_idxs in one round trip. Under `matrix_tube_id`, every value must
-    match MATRIX_TUBE_ID_PATTERN.
+class BiosampleLookupRequest(NaturalKeyLookupRequest):
+    """Resolves a list of values of the biosample natural key named by `key`,
+    each to the biosample identifier that `return_key` names. Under
+    `matrix_tube_id`, every value must be a matrix tube id.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     key: BiosampleLookupKey
-    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
 
     @model_validator(mode="after")
-    def _check_matrix_tube_ids(self) -> BiosampleLookupRequest:
-        if self.key != "matrix_tube_id":
+    def _check_value_pattern(self) -> BiosampleLookupRequest:
+        pattern = _LOOKUP_VALUE_PATTERNS.get(self.key)
+        if pattern is None:
             return self
-        try:
-            _MATRIX_TUBE_ID_LIST_ADAPTER.validate_python(self.values)
-        except ValidationError as exc:
-            malformed = [self.values[error["loc"][0]] for error in exc.errors()]
-            raise ValueError(
-                f"matrix_tube_id values must match {MATRIX_TUBE_ID_PATTERN}: {malformed}"
-            ) from exc
+        malformed = [value for value in self.values if re.fullmatch(pattern, value) is None]
+        if malformed:
+            raise ValueError(f"{self.key} values must match {pattern}: {malformed}")
+        return self
+
+
+# The kinds of identifier that a study-scoped biosample lookup accepts: the
+# natural keys, the biosample's idx, and a unique-in-study field of the study.
+BiosampleStudyLookupKey = Literal[*get_args(BiosampleLookupKey), "idx", "unique_field"]
+
+
+class BiosampleStudyLookupRequest(BiosampleLookupRequest):
+    """Resolves a list of values of the identifier kind named by `key`, among the
+    biosamples of one study, each to the biosample identifier that `return_key`
+    names. Under `idx`, every value must be a positive whole number that fits
+    an idx. Under `unique_field`, `unique_field_display_name` names the study's
+    field.
+    """
+
+    key: BiosampleStudyLookupKey
+    unique_field_display_name: NonBlankText | None = None
+
+    @model_validator(mode="after")
+    def _check_unique_field_display_name(self) -> BiosampleStudyLookupRequest:
+        named = self.unique_field_display_name is not None
+        if self.key == UNIQUE_FIELD_KEY and not named:
+            raise ValueError("unique_field_display_name is required when key is unique_field")
+        if self.key != UNIQUE_FIELD_KEY and named:
+            raise ValueError("unique_field_display_name is allowed only when key is unique_field")
         return self
 
 
@@ -720,15 +753,12 @@ StudyAccessionField = Literal["ena_study_accession", "bioproject_accession"]
 StudyLookupKey = Literal[*get_args(StudyAccessionField), "export_entity_id"]
 
 
-class StudyLookupRequest(BaseModel):
-    """Resolves a list of values of the natural key named by `key` to
-    study_idxs in one round trip.
+class StudyLookupRequest(NaturalKeyLookupRequest):
+    """Resolves a list of values of the study natural key named by `key`, each
+    to the study identifier that `return_key` names.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     key: StudyLookupKey
-    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_NATURAL_KEY_LOOKUP_VALUES)
 
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest

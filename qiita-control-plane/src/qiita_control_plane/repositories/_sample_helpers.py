@@ -986,26 +986,26 @@ async def fetch_study_fields_by_display_names(
     return _field_rows_by_key(rows, key_column="display_name")
 
 
-async def fetch_entity_idx_by_unique_field_value(
+async def fetch_entity_idxs_by_unique_field_values(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     spec: EntityMetadataSpec,
     study_field_idx: int,
     data_type: FieldDataType,
-    value: str | Decimal | date | bool,
+    values: Sequence[str | Decimal | date | bool],
     tiers: CallerMetadataTiers,
-) -> int | None:
-    """Return the entity idx carrying `value` through the given study field, or
-    None when no row does or the matching value is hidden from `tiers`.
+) -> dict[str | Decimal | date | bool, int]:
+    """Return `{value: entity_idx}` for each of `values` that an entity carries
+    through the given study field and that `tiers` may read.
 
-    A hidden match returns None, as no match does, so the lookup cannot
-    confirm a hidden value.
+    A value that no row carries and a value whose match is hidden from `tiers` are
+    both absent from the result, so the lookup cannot confirm a hidden value.
 
     The caller must have established that the field declares unique_in_study.
     Without it every row under the field carries the flag false, so the term
-    below filters them all out and this returns None rather than a match. Under
-    the flag the partial unique index over (study_field_idx, value_<type>) makes
-    at most one row match, so the answer is total.
+    below filters them all out and the result is empty rather than a match.
+    Under the flag the partial unique index over (study_field_idx, value_<type>)
+    makes at most one row match each value, so the answer is total.
 
     No study_idx term is needed: a study field belongs to exactly one study, so
     naming the field already scopes the search to it. Matching is whatever the
@@ -1022,21 +1022,22 @@ async def fetch_entity_idx_by_unique_field_value(
     # The match reads the base table, because the visibility function's value
     # columns are CASE expressions, which no index serves. The unique_in_study
     # term spells the partial index's own predicate, which the planner needs in
-    # order to use that index. The join on m.idx then checks the matched row's
-    # visibility.
-    row = await pool_or_conn.fetchrow(
-        f"SELECT raw.{spec.entity_key_column}"
+    # order to use that index. The join on m.idx then checks each matched row's
+    # visibility. `= ANY($5)` takes the value column's own array type.
+    rows = await pool_or_conn.fetch(
+        f"SELECT raw.{value_column} AS matched_value, raw.{spec.entity_key_column}"
         f" FROM {spec.metadata_table} raw"
         f" JOIN {visible_metadata_source(spec)} ON m.idx = raw.idx"
         f" WHERE raw.{spec.study_field_idx_column} = $4"
-        f"   AND raw.{value_column} = $5"
+        f"   AND raw.{value_column} = ANY($5)"
         f"   AND raw.unique_in_study"
         f"   AND m.visible",
         *tiers.sql_args(),
         study_field_idx,
-        value,
+        list(values),
     )
-    return None if row is None else row[spec.entity_key_column]
+    matched = {r["matched_value"]: r[spec.entity_key_column] for r in rows}
+    return matched
 
 
 async def fetch_missing_value_reason_idxs_by_names(
