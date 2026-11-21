@@ -26,6 +26,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+    PATH_BIOSAMPLE_LOOKUP_BY_STUDY,
     PATH_BIOSAMPLE_METADATA_BY_STUDY,
     PATH_BIOSAMPLE_METADATA_BY_STUDY_UNIQUE_FIELD,
     PATH_BIOSAMPLE_PREFIX,
@@ -39,6 +40,8 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    IDX_KEY,
+    UNIQUE_FIELD_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
     BiosampleGlobalFieldResponse,
@@ -53,6 +56,8 @@ from qiita_common.models import (
     BiosampleStudyFieldCreateRequest,
     BiosampleStudyFieldResponse,
     BiosampleStudyLinkResponse,
+    BiosampleStudyLookupKey,
+    BiosampleStudyLookupRequest,
     IdxsListResponse,
     MetadataChecklistRef,
     MetadataEntry,
@@ -120,7 +125,11 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
-from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
+from ..repositories.exported_entity import (
+    EntityKind,
+    fetch_exported_entities,
+    require_export_entity_id,
+)
 from ..repositories.study_access import CallerMetadataTiers
 from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._field_exception import (
@@ -152,9 +161,10 @@ from ._helpers import (
     require_etag_match,
     require_if_match,
     resolve_and_write_study_scoped_metadata,
-    resolve_idxs_by_natural_key,
     resolve_metadata_checklist_idx,
+    resolve_natural_keys,
     resolve_study_entity_by_unique_field,
+    resolve_unique_field_values,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -871,6 +881,118 @@ async def lookup_biosample_in_study_by_unique_field(
         )
 
 
+async def resolve_biosample_idxs_by_kind(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    key: BiosampleStudyLookupKey,
+    values: list[str],
+    unique_field_display_name: str | None,
+    tiers: CallerMetadataTiers,
+) -> dict[str, int]:
+    """Resolve values of the identifier kind named by `key` to biosample idxs,
+    keyed by each value as sent.
+
+    Neither retirement nor a link to study_idx is checked; the caller decides
+    which matches count. Under `unique_field`, the values are those of the
+    study's field named by unique_field_display_name. Under `idx`, each value
+    maps to itself as a number, whether or not a biosample has it.
+    """
+    if key == UNIQUE_FIELD_KEY:
+        if unique_field_display_name is None:
+            raise ValueError("key unique_field needs unique_field_display_name")
+        resolved = await resolve_unique_field_values(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            display_name=unique_field_display_name,
+            values=values,
+            noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            tiers=tiers,
+        )
+    elif key == IDX_KEY:
+        resolved = {value: int(value) for value in values}
+    else:
+        resolved = await fetch_biosample_idxs_by_natural_key(
+            conn, key=key, values=values, include_retired=True
+        )
+    return resolved
+
+
+async def _fetch_linked_biosample_idxs_by_kind(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    key: BiosampleStudyLookupKey,
+    unique_field_display_name: str | None,
+    tiers: CallerMetadataTiers,
+    values: list[str],
+) -> dict[str, int]:
+    """Resolve values of the identifier kind named by `key` to the idxs of live
+    biosamples with a live link to study_idx, keyed by each value as sent.
+
+    A value that names no such biosample is absent.
+    """
+    # Resolve every value to an idx, whatever its retirement or study membership
+    idx_by_value = await resolve_biosample_idxs_by_kind(
+        conn,
+        study_idx=study_idx,
+        key=key,
+        values=values,
+        unique_field_display_name=unique_field_display_name,
+        tiers=tiers,
+    )
+
+    # Keep only the idxs that are live and have a live link to the study
+    candidate_idxs = list(set(idx_by_value.values()))
+    linked_idxs = await fetch_biosample_idxs_for_study(
+        conn, study_idx=study_idx, limit=len(candidate_idxs), among_idxs=candidate_idxs
+    )
+    linked = set(linked_idxs)
+    linked_idx_by_value = {value: idx for value, idx in idx_by_value.items() if idx in linked}
+    return linked_idx_by_value
+
+
+@router.post(PATH_BIOSAMPLE_LOOKUP_BY_STUDY)
+async def lookup_biosample_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: BiosampleStudyLookupRequest,
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=METADATA_BYPASS_ROLE)
+    ),
+) -> NaturalKeyLookupResponse:
+    """Resolve a list of values of the identifier kind named by `body.key` to
+    the identifier named by `body.return_key` of each biosample in the study.
+
+    Access is that of the study-scoped biosample reads. A value is `missing`
+    when it names no biosample, a biosample not linked to the study, a retired
+    biosample, a retired link, or a unique-field value above the caller's tier;
+    the response does not say which.
+    """
+    # One snapshot, so the resolution, the live-link filter and the export ids agree
+    async with snapshot() as conn:
+        tiers = await caller_metadata_tiers(conn, user)
+        fetcher = partial(
+            _fetch_linked_biosample_idxs_by_kind,
+            conn,
+            study_idx=study_idx,
+            key=body.key,
+            unique_field_display_name=body.unique_field_display_name,
+            tiers=tiers,
+        )
+        lookup_response = await resolve_natural_keys(
+            values=body.values,
+            fetcher=fetcher,
+            return_key=body.return_key,
+            export_ids_from=(conn, EntityKind.BIOSAMPLE),
+        )
+    return lookup_response
+
+
 @router.get(PATH_BIOSAMPLE_BY_STUDY_AND_IDX)
 async def get_biosample_in_study(
     study_idx: Annotated[int, Field(gt=0)],
@@ -1284,7 +1406,7 @@ def _biosample_core_row_dict(
     """
     return {
         "biosample_idx": row["idx"],
-        "export_entity_id": require_export_entity_id(row, kind="biosample"),
+        "export_entity_id": require_export_entity_id(row, kind=EntityKind.BIOSAMPLE),
         "owner_idx": row["owner_idx"],
         "metadata_checklist": MetadataChecklistRef.from_row(
             row["metadata_checklist_idx"], row["metadata_checklist_name"]
@@ -1472,17 +1594,17 @@ async def get_biosample(
 @biosample_router.post(PATH_BIOSAMPLE_LOOKUP)
 async def lookup_biosample(
     body: BiosampleLookupRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> NaturalKeyLookupResponse:
-    """Resolve a list of values of the natural key named by `body.key` to
-    biosample_idx.
+    """Resolve a list of values of the natural key named by `body.key` to each
+    biosample's identifier named by `body.return_key`.
 
     Auth: HumanUser with Scope.BIOSAMPLE_READ. No per-row access predicate
-    runs — the response carries only the (value, idx) mapping with no
-    biosample columns, so a caller who sees the idx still cannot read the
-    row without satisfying GET /biosample/{idx}'s tier+access checks.
+    runs — the response carries only the mapping from value to identifier,
+    with no biosample columns, so a caller still cannot read the row without
+    satisfying GET /biosample/{idx}'s tier+access checks.
 
     Retired biosamples are excluded from `resolved` (and therefore listed
     in `missing`).
@@ -1490,10 +1612,15 @@ async def lookup_biosample(
     # `user` is resolved only to require a human caller; no per-caller filter
     # runs here (see auth docstring).
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
-        values=body.values,
-        fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.key),
-    )
+    # One read-only snapshot, so the export ids read the same rows that the lookup read
+    async with snapshot() as conn:
+        lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
+            # handler twin of lookup_study; differs only in fetcher and kind
+            values=body.values,
+            fetcher=partial(fetch_biosample_idxs_by_natural_key, conn, key=body.key),
+            export_ids_from=(conn, EntityKind.BIOSAMPLE),
+            return_key=body.return_key,
+        )
     return lookup_response
 
 
@@ -1508,9 +1635,10 @@ async def lookup_biosample_by_accession(
     keyed on the accession column named by `body.accession_field` (default
     biosample_accession)."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key=body.accession_field),
+        return_key=IDX_KEY,
     )
     return lookup_response
 
@@ -1524,9 +1652,10 @@ async def lookup_biosample_by_matrix_tube_id(
 ) -> NaturalKeyLookupResponse:
     """Deprecated in favor of POST /biosample/lookup with key matrix_tube_id."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.matrix_tube_ids,
         fetcher=partial(fetch_biosample_idxs_by_natural_key, pool, key="matrix_tube_id"),
+        return_key=IDX_KEY,
     )
     return lookup_response
 

@@ -40,13 +40,15 @@ class _RefSpec:
 
 
 _BIOSAMPLE_SPEC = _RefSpec(
-    noun="biosample",
+    noun=EntityKind.BIOSAMPLE,
     ref_model=BiosampleRef,
     fetch=fetch_biosample_idxs_by_natural_key,
     normalizers={"matrix_tube_id": normalize_matrix_tube_id},
     miss_messages={"matrix_tube_id": "no {noun} has {label}; register it before submitting"},
 )
-_STUDY_SPEC = _RefSpec(noun="study", ref_model=StudyRef, fetch=fetch_study_idxs_by_natural_key)
+_STUDY_SPEC = _RefSpec(
+    noun=EntityKind.STUDY, ref_model=StudyRef, fetch=fetch_study_idxs_by_natural_key
+)
 
 
 @dataclass(frozen=True)

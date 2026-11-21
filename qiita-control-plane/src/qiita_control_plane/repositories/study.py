@@ -14,7 +14,7 @@ import asyncpg
 from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, StudyLookupKey, StudyRecordView, Tier
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
-from .exported_entity import export_entity_id_lookup, export_entity_id_select
+from .exported_entity import EntityKind, export_entity_id_lookup, export_entity_id_select
 from .study_access import insert_study_access
 
 _STUDY_RETURNING_COLS = (
@@ -22,7 +22,7 @@ _STUDY_RETURNING_COLS = (
     " description, abstract, funding, ena_study_accession,"
     " bioproject_accession, notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
-    " created_at, updated_at, " + export_entity_id_select("study")
+    " created_at, updated_at, " + export_entity_id_select(EntityKind.STUDY)
 )
 
 # Each lookup key's (column expression, join) over `qiita.study`; see
@@ -30,7 +30,7 @@ _STUDY_RETURNING_COLS = (
 _STUDY_LOOKUP_SQL: dict[StudyLookupKey, tuple[str, str]] = {
     "bioproject_accession": ("study.bioproject_accession", ""),
     "ena_study_accession": ("study.ena_study_accession", ""),
-    "export_entity_id": export_entity_id_lookup("study"),
+    "export_entity_id": export_entity_id_lookup(EntityKind.STUDY),
 }
 
 

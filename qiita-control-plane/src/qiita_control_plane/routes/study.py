@@ -27,6 +27,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.http_headers import ETAG_HEADER, IF_MATCH_HEADER
 from qiita_common.models import (
+    IDX_KEY,
     NaturalKeyLookupResponse,
     StudyCreate,
     StudyLookupByAccessionRequest,
@@ -55,8 +56,8 @@ from ..auth.guards import (
     study_record_view,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories.exported_entity import require_export_entity_id
+from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..repositories.exported_entity import EntityKind, require_export_entity_id
 from ..repositories.study import (
     create_study,
     fetch_study,
@@ -71,7 +72,7 @@ from ._helpers import (
     raise_for_unique_violation,
     require_etag_match,
     require_if_match,
-    resolve_idxs_by_natural_key,
+    resolve_natural_keys,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
@@ -124,7 +125,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
         {
             **dict(row),
             "study_idx": row["idx"],
-            "export_entity_id": require_export_entity_id(row, kind="study"),
+            "export_entity_id": require_export_entity_id(row, kind=EntityKind.STUDY),
             "extra_metadata": extra_metadata,
         }
     )
@@ -224,7 +225,7 @@ def _list_row(
     """One GET /study row, in the model for `view`."""
     fields = {
         **dict(row),
-        "export_entity_id": require_export_entity_id(row, kind="study"),
+        "export_entity_id": require_export_entity_id(row, kind=EntityKind.STUDY),
         "caller_tier": caller_effective_tier(access, caller=principal),
         "access_via": study_access_via(access, caller=principal),
     }
@@ -367,12 +368,12 @@ async def get_study(
             {
                 **dict(row),
                 "study_idx": row["idx"],
-                "export_entity_id": require_export_entity_id(row, kind="study"),
+                "export_entity_id": require_export_entity_id(row, kind=EntityKind.STUDY),
             }
         )
     if view is StudyRecordView.PUBLIC:
         return StudyRecordPublic.model_validate(
-            {**dict(row), "export_entity_id": require_export_entity_id(row, kind="study")}
+            {**dict(row), "export_entity_id": require_export_entity_id(row, kind=EntityKind.STUDY)}
         )
     if view is StudyRecordView.FULL:
         response.headers[ETAG_HEADER] = etag_for_updated_at(row["updated_at"])
@@ -478,25 +479,30 @@ async def patch_study(
 @router.post(PATH_STUDY_LOOKUP)
 async def lookup_study(
     body: StudyLookupRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> NaturalKeyLookupResponse:
-    """Resolve a list of values of the natural key named by `body.key` to
-    study_idx.
+    """Resolve a list of values of the natural key named by `body.key` to each
+    study's identifier named by `body.return_key`.
 
-    Auth: HumanUser with Scope.STUDY_READ. The response is only the
-    (value, idx) mapping — no study columns — so resolution does not itself
+    Auth: HumanUser with Scope.STUDY_READ. The response is only the mapping
+    from value to identifier — no study columns — so resolution does not itself
     disclose row contents; reading a row still requires the per-row access
     policy on GET /study/{idx}.
     """
     # `user` is resolved only to require a human caller; no per-caller filter
     # runs here (see auth docstring).
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
-        values=body.values,
-        fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.key),
-    )
+    # One read-only snapshot, so the export ids read the same rows that the lookup read
+    async with snapshot() as conn:
+        lookup_response = await resolve_natural_keys(  # same-pattern-ok: per-entity
+            # handler twin of lookup_biosample; differs only in fetcher and kind
+            values=body.values,
+            fetcher=partial(fetch_study_idxs_by_natural_key, conn, key=body.key),
+            export_ids_from=(conn, EntityKind.STUDY),
+            return_key=body.return_key,
+        )
     return lookup_response
 
 
@@ -511,8 +517,9 @@ async def lookup_study_by_accession(
     on the accession column named by `body.accession_field` (default
     bioproject_accession)."""
     _ = user
-    lookup_response = await resolve_idxs_by_natural_key(
+    lookup_response = await resolve_natural_keys(
         values=body.accessions,
         fetcher=partial(fetch_study_idxs_by_natural_key, pool, key=body.accession_field),
+        return_key=IDX_KEY,
     )
     return lookup_response
