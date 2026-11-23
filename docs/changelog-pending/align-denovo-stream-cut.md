@@ -3,8 +3,9 @@
 - **nginx no longer resets a Flight DoGet whose client has stopped reading for 60 s
   (#936).** Both Flight locations in `deploy/nginx/qiita.conf` set `send_timeout 3600s`,
   beside `grpc_read_timeout` / `grpc_send_timeout`. Without it, nginx 1.26.3 reset a
-  stream about 66 s after its client paused (measured on the 443 edge and the loopback
-  listener), which is what an `align-denovo` job's aligner does while it works.
+  stream about 66 s after its client paused, and 1.30.7 reset one paused 90 s (measured
+  on the 443 edge and the loopback listener); an `align-denovo` job's aligner pauses
+  its stream while it works.
 - **A data-plane stream that ends short fails instead of being used (#936).** Every
   DoGet, in a job, the control plane, `qiita` (reference, assembly and feature-table
   exports and builds) and `qiita-admin masked-read-export`, first asks the new
