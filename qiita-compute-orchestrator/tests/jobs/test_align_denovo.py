@@ -26,6 +26,10 @@ from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.duckdb_relation import registered
 from qiita_common.testing.bounded import run_bounded
 
+from qiita_compute_orchestrator.data_plane_client import (
+    StreamRowCountMismatch,
+    registered_counted,
+)
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
 from qiita_compute_orchestrator.miint import open_miint_conn
@@ -121,11 +125,14 @@ _READ_SCHEMA = pa.schema(
 _CHUNK_BP = 4_096
 
 
-def _install_streams(monkeypatch, genome, *, contigs=None, reads=None) -> None:
+def _install_streams(monkeypatch, genome, *, contigs=None, reads=None, delivered=None) -> None:
     """Replace both data seams with registered readers over `genome`.
 
     `contigs` / `reads` override what the corresponding stream carries, for the cases
-    that need an empty or reduced one.
+    that need an empty or reduced one. The read stream is registered through
+    `registered_counted`, the production seam's count check, with the data plane's
+    count taken as every read; `delivered` keeps only that many of them on the wire,
+    a stream that ends early without an error.
     """
     contig_rows = [
         {
@@ -156,10 +163,14 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None) -> None:
         with registered(conn, relation, _reader(_CHUNK_SCHEMA, contig_rows)):
             yield relation
 
+    on_wire = read_rows if delivered is None else read_rows[:delivered]
+
     @asynccontextmanager
     async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads"):
         assert (prep_sample_idx, mask_idx) == (_PREP_SAMPLE_IDX, _MASK_IDX)
-        with registered(conn, relation, _reader(_READ_SCHEMA, read_rows)):
+        with registered_counted(
+            conn, relation, _reader(_READ_SCHEMA, on_wire), expected_rows=len(read_rows)
+        ):
             yield relation
 
     monkeypatch.setattr(align_denovo, "open_assembly_chunk_stream", _chunks)
@@ -510,6 +521,20 @@ def test_an_empty_contig_roster_is_refused_and_leaves_no_partial_output(
     workspace = tmp_path / "ws"
     _install_streams(monkeypatch, genome, contigs={})
     with pytest.raises(RuntimeError, match="has no contigs"):
+        asyncio.run(execute(_inputs(), workspace))
+    assert not (workspace / "alignment.parquet").exists()
+    assert not (workspace / "alignment_origin_spanning.parquet").exists()
+
+
+def test_a_read_stream_that_ends_early_fails_the_job_and_leaves_no_output(
+    monkeypatch, genome, tmp_path
+):
+    """The stream carries two of the five reads and ends without an error. The aligner
+    emits no row for a missing read any more than for an unaligned one, so nothing in
+    the output can show the loss; the job has to fail on the count."""
+    workspace = tmp_path / "ws"
+    _install_streams(monkeypatch, genome, delivered=2)
+    with pytest.raises(StreamRowCountMismatch, match="delivered 2 rows.* counts 5"):
         asyncio.run(execute(_inputs(), workspace))
     assert not (workspace / "alignment.parquet").exists()
     assert not (workspace / "alignment_origin_spanning.parquet").exists()
