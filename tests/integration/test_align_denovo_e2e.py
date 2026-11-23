@@ -321,8 +321,16 @@ def _install_real_streams(monkeypatch, denovo):
             {"prep_sample_idx": [prep_sample_idx], "mask_idx": [mask_idx]},
             denovo["data_plane"]["secret"],
         )
+        # The production seam's count check, against the live `count_masked`.
+        expected_rows = data_plane_client.count_masked_reads(
+            data_plane_url=url, ticket_bytes=ticket
+        )
         with data_plane_client.open_doget_stream(
-            conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
+            conn,
+            data_plane_url=url,
+            ticket_bytes=ticket,
+            relation=relation,
+            expected_rows=expected_rows,
         ) as rel:
             yield rel
 
