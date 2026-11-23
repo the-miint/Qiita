@@ -125,7 +125,7 @@ def open_doget_stream(
     (already base64-decoded).
 
     The stream is checked against the data plane's count of its rows
-    (`qiita_common.flight_stream.counted_reader`, which also says what
+    (`qiita_common.flight_stream.CountedStream`, which also says what
     `require_drained` adds).
     """
     import pyarrow.flight as flight  # noqa: PLC0415
@@ -362,7 +362,7 @@ async def open_read_masked_stream(
     valid empty table and runs to a clean no-op.
 
     **The body must read every row** (`require_drained`, see
-    `qiita_common.flight_stream.counted_reader`): an aligner emits no row for a read
+    `qiita_common.flight_stream.CountedStream`): an aligner emits no row for a read
     it never saw, so its output cannot show one went missing, and the count is the
     only place a lost read shows.
 

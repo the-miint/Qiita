@@ -51,7 +51,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.duckdb_relation import registered
-from qiita_common.flight_stream import StreamRowCountMismatch, counted_doget
+from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
     MAX_EXPORTED_FEATURE_ENTITIES,
@@ -719,10 +719,11 @@ def staged_streams(
 
     # Each stream is counted on its own; a later one's check runs as its stream ends,
     # inside the scan, and the first one's when the block returns. DuckDB reports an
-    # exception raised inside a scan as its own error (measured on 2.0.0:
-    # InvalidInputException, the original text inside), which the build's handler
-    # reads as the analytic failing; the mismatch is kept and raised in its place.
-    mismatch: list[StreamRowCountMismatch] = []
+    # exception raised inside a scan as its own error (measured on 2.0.0, for a
+    # RuntimeError and a ValueError alike: InvalidInputException, the original text
+    # inside), which the build's handler reads as the analytic failing; an exception
+    # raised here, a later stream's mismatch or schema, is kept and raised in its place.
+    raised: list[Exception] = []
     with counted_doget(flight_client, mints[0](), name=name(1)) as first:
 
         def batches():
@@ -736,16 +737,16 @@ def staged_streams(
                                 f"{reader.schema} where the first has {first.schema}"
                             )
                         yield from reader
-                except StreamRowCountMismatch as exc:
-                    mismatch.append(exc)
+                except Exception as exc:
+                    raised.append(exc)
                     raise
 
         with registered(con, relation, pa.RecordBatchReader.from_batches(first.schema, batches())):
             try:
                 yield relation
             except duckdb.Error as exc:
-                if mismatch:
-                    raise mismatch[0] from exc
+                if raised:
+                    raise raised[0] from exc
                 raise
 
 

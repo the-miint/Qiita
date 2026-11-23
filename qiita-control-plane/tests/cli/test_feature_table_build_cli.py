@@ -1976,7 +1976,14 @@ _TWO_POOL_RESOLVE = {
 
 
 def _patched_two_pools(
-    monkeypatch, *, resolve=None, listings=None, denovo_map=None, alignment=None, overcounted=None
+    monkeypatch,
+    *,
+    resolve=None,
+    listings=None,
+    denovo_map=None,
+    alignment=None,
+    overcounted=None,
+    reshaped=None,
 ):
     """`_patched` over the two pools above, with an alignment ticket per alignment and
     the de novo seams keyed by `(prep_sample_idx, processing_idx)`. Records each
@@ -2110,6 +2117,20 @@ def _patched_two_pools(
 
         factory.count = overcount
         readers[overcounted] = factory
+    if reshaped is not None:
+        # This ticket's stream carries its columns under other names.
+        original = readers[reshaped]
+
+        def renamed():
+            inner = original()
+            names = [f"renamed_{n}" for n in inner.schema.names]
+            schema = pa.schema([f.with_name(n) for f, n in zip(inner.schema, names, strict=True)])
+            return pa.RecordBatchReader.from_batches(
+                schema, (batch.rename_columns(names) for batch in inner)
+            )
+
+        renamed.count = original.count
+        readers[reshaped] = renamed
     monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
     return rec
 
@@ -3073,4 +3094,17 @@ def test_a_short_later_part_is_reported_as_a_short_stream(monkeypatch, tmp_path,
     err = capsys.readouterr().err
     assert "error: the stream" in err
     assert "stream 2 of 2" in err
+    assert "the analytic failed" not in err
+
+
+def test_a_later_part_of_another_schema_is_reported_as_such(monkeypatch, tmp_path, capsys):
+    """Part 2's stream carries columns the first does not. The refusal is raised
+    inside DuckDB's scan, which DuckDB reports as its own error; the build reports
+    the schema, not the analytic failing."""
+    _patched_two_pools(monkeypatch, reshaped=b"alignment-13")
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "stream 2 of 2 has schema" in err
     assert "the analytic failed" not in err
