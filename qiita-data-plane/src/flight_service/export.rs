@@ -9,7 +9,7 @@ use tonic::{Response, Status};
 
 use crate::auth;
 
-use super::query::{single_i64_filter, verified_ticket_query, EXPORT_READ_COLUMNS};
+use super::query::{single_i64_filter, ticket_query, EXPORT_READ_COLUMNS};
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -81,7 +81,7 @@ impl QiitaFlightService {
     }
 
     /// How many rows a DoGet of the same signed ticket streams: `count(*)` over the
-    /// query `verified_ticket_query` builds for `do_get`. A consumer compares it with the rows it received, which
+    /// query `ticket_query` builds for `do_get`. A consumer compares it with the rows it received, which
     /// is how a stream that ends short without an error is caught.
     ///
     /// The DoGet ticket is the authorization, as for `count_masked`: a count of the
@@ -90,7 +90,9 @@ impl QiitaFlightService {
         &self,
         action: &Action,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
-        let (sql, table) = verified_ticket_query(&action.body, &self.flight_public_key)?;
+        let payload = auth::verify_ticket(&action.body, &self.flight_public_key)
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let (sql, table) = ticket_query(&payload)?;
         let count: i64 = self
             .blocking_lake("count_doget", move |conn| {
                 conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |row| {

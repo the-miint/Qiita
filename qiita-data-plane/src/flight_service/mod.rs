@@ -35,6 +35,7 @@ use duckdb::Connection;
 use futures::stream::{self, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth;
 use crate::pool::{LakePool, LakeWriter};
 
 mod doget;
@@ -47,7 +48,7 @@ mod registration;
 mod test_support;
 
 use doget::{requested_ipc_codec, stream_ducklake_batches};
-use query::verified_ticket_query;
+use query::ticket_query;
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
@@ -264,7 +265,9 @@ impl FlightService for QiitaFlightService {
         let codec = requested_ipc_codec(request.metadata())?;
         let ticket_bytes = &request.into_inner().ticket;
 
-        let (sql, table) = verified_ticket_query(ticket_bytes, &self.flight_public_key)?;
+        let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        let (sql, table) = ticket_query(&payload)?;
 
         // Stream the result incrementally, from an instance borrowed for the
         // life of the stream: a blocking task feeds RecordBatches through a
