@@ -99,6 +99,23 @@ def test_capture_scrubs_authorization_values(tmp_path):
     assert "<redacted>" in text
 
 
+def test_capture_scrubs_authorization_values_in_a_traceback(tmp_path):
+    """A token that reaches the record only through an exception or its traceback —
+    not the message or a string arg — must be scrubbed too: the formatter redacts the
+    whole formatted line, and the file is served to the originator."""
+    log = logging.getLogger("qiita_common.tests.step_log.scrub_exc")
+    log.setLevel(logging.INFO)
+    with capture_to(tmp_path, "mint"):
+        try:
+            raise RuntimeError("upstream said Authorization: Bearer qk_secret67890")
+        except RuntimeError:
+            log.exception("action failed")
+    text = (tmp_path / "stderr").read_text()
+    assert "Traceback" in text  # the exception text was formatted into the line
+    assert "qk_secret67890" not in text
+    assert "<redacted>" in text
+
+
 def test_write_receipt_is_best_effort(tmp_path):
     """A receipt write that fails (the dir is gone) must not raise — the step's real
     outcome is recorded elsewhere and must not be masked by a log-file I/O error."""

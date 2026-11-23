@@ -247,9 +247,9 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
 
     async def _bounded_run() -> None:
         # A dispatched ticket is its own unit of work even when a step scheduled it
-        # (plan-shards fans out children through `dispatch_cb` → here). create_task
-        # copies the scheduling context, so without this the child inherits the
-        # parent step's scope and its log lines and summary land under that step.
+        # (plan-shards fans out children through `dispatch_cb` → here), so it runs
+        # outside the scheduling step's scope — see `no_step_scope` for why
+        # create_task would otherwise leak that scope into the child.
         with no_step_scope():
             await _bounded_run_inner()
 

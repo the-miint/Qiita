@@ -57,6 +57,7 @@ from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from qiita_common.actions import STEP_STDERR_FILENAME, STEP_STDOUT_FILENAME
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_CANCEL,
@@ -783,11 +784,13 @@ async def get_work_ticket_step_logs(
 ) -> WorkTicketStepLogs:
     """Read a bounded tail of a step attempt's stdout/stderr.
 
-    The logs live in the attempt's `logs/` directory (layout: `workspace.py`),
-    owned `qiita-orch:qiita-pipeline` (mode 2770). The CP service account is in
-    `qiita-pipeline`, so it reads them straight off shared scratch
-    and serves the tail here — letting an operator diagnose an OOM / bad input
-    / contract violation without a host shell or sudo.
+    The logs live in the attempt's `logs/` directory (layout: `workspace.py`). A
+    native step's logs are written by the orchestrator (owned
+    `qiita-orch:qiita-pipeline`, mode 2770), which the CP reads off shared scratch
+    (its service account is in `qiita-pipeline`); an in-process `action:` step's logs
+    are written by the CP process itself. Either way the CP serves the tail here —
+    letting an operator diagnose an OOM / bad input / contract violation without a
+    host shell or sudo.
 
     Auth mirrors `GET /work-ticket/{idx}` exactly: 401 on Anonymous; the
     originator passes; wet_lab_admin+ bypasses; anyone else gets 404 (not 403),
@@ -855,10 +858,10 @@ async def get_work_ticket_step_logs(
         )
     )
     stdout, stdout_truncated = read_text_tail(
-        logs_dir / "stdout", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
+        logs_dir / STEP_STDOUT_FILENAME, max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
     )
     stderr, stderr_truncated = read_text_tail(
-        logs_dir / "stderr", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
+        logs_dir / STEP_STDERR_FILENAME, max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
     )
     return WorkTicketStepLogs(
         work_ticket_idx=work_ticket_idx,

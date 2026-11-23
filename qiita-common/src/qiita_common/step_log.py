@@ -14,8 +14,9 @@ or, for an outcome other than success, the same object with `kind` set to
 `no_data` or the failure kind and a `reason` in place of `summary`. The summary
 holds the counts a job reported with `summarize()`.
 
-A native job gets both from its launcher; a control-plane `action:` gets both from
-`capture_to()`, which the runner wraps around the primitive.
+A native job gets both from its launcher. A control-plane `action:` gets its stderr
+from `capture_to()`, which the runner wraps around the primitive, and its stdout
+receipt from `write_receipt()`, which the runner calls once the outcome is known.
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from qiita_common.log import AuthorizationScrubFilter
+from qiita_common.actions import STEP_STDERR_FILENAME, STEP_STDOUT_FILENAME
+from qiita_common.log import scrub_authorization
 
 # The `kind` of a receipt for a step that succeeded. A step that did not succeed
 # carries `no_data` or its failure kind instead.
@@ -72,6 +74,17 @@ class _StepFilter(logging.Filter):
 
 def step_formatter() -> logging.Formatter:
     return logging.Formatter(STEP_LOG_FORMAT, datefmt=STEP_LOG_DATEFMT)
+
+
+class _ScrubbingStepFormatter(logging.Formatter):
+    """Step formatter that redacts `Authorization` values from the whole formatted
+    line — message, args, and any appended traceback. The field-level
+    `AuthorizationScrubFilter` only rewrites `record.msg`/args, so a token that reaches
+    a record through an exception or traceback would survive it; scrubbing the formatted
+    result catches that too. Used where the file is served to the ticket originator."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return scrub_authorization(super().format(record))
 
 
 def step_handler(handler: logging.Handler, only: StepScope | None = None) -> logging.Handler:
@@ -132,10 +145,10 @@ def capture_to(logs_dir: Path, step_name: str) -> Iterator[StepScope]:
     captures its output. Records reach the file only from code running in this
     block's context — tasks it starts inherit it, other tickets' do not — and only
     at the emitting logger's effective level or above. The file is scrubbed of
-    `Authorization` values, because it is served to the ticket originator (the
-    boot-time scrubber covers only the handlers present at boot, not this one). The
-    caller writes the receipt to `logs_dir/stdout` with `write_receipt` once it knows
-    the outcome.
+    `Authorization` values — the formatter redacts the whole formatted line,
+    tracebacks included — because it is served to the ticket originator (the boot-time
+    scrubber covers only the handlers present at boot, not this one). The caller writes
+    the receipt to `logs_dir/stdout` with `write_receipt` once it knows the outcome.
 
     The log file is best-effort: if it cannot be opened the block still runs and its
     outcome is still recorded — a step is not failed because its log could not be
@@ -145,9 +158,9 @@ def capture_to(logs_dir: Path, step_name: str) -> Iterator[StepScope]:
         try:
             logs_dir.mkdir(parents=True, exist_ok=True)
             handler = step_handler(
-                logging.FileHandler(logs_dir / "stderr", encoding="utf-8"), scope
+                logging.FileHandler(logs_dir / STEP_STDERR_FILENAME, encoding="utf-8"), scope
             )
-            handler.addFilter(AuthorizationScrubFilter())
+            handler.setFormatter(_ScrubbingStepFormatter(STEP_LOG_FORMAT, datefmt=STEP_LOG_DATEFMT))
             logging.getLogger().addHandler(handler)
         except OSError:
             logging.getLogger(__name__).warning(
@@ -186,7 +199,7 @@ def write_receipt(logs_dir: Path, line: str) -> None:
     the last is the latest attempt's outcome, and the file is a display convenience for the
     ticket log, never the source of truth. A within-run retry gets a fresh attempt dir."""
     try:
-        with (logs_dir / "stdout").open("a", encoding="utf-8") as out:
+        with (logs_dir / STEP_STDOUT_FILENAME).open("a", encoding="utf-8") as out:
             out.write(line + "\n")
     except OSError:
         logging.getLogger(__name__).warning(

@@ -567,6 +567,94 @@ async def test_action_dispatch_writes_a_failure_receipt(monkeypatch, tmp_path):
     }
 
 
+async def test_action_dispatch_writes_a_transient_failure_receipt(monkeypatch, tmp_path):
+    """The retriable arm writes its receipt too: a busy data plane leaves a
+    `DATA_PLANE_TRANSIENT` receipt, not only the progress row."""
+    import json
+
+    import pyarrow.flight as flight
+    import pytest
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.backend_failure import BackendFailure
+
+    from qiita_control_plane.runner import _reconstruct
+    from qiita_control_plane.workspace import step_logs_dir
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _raise(*a, **k):
+        raise flight.FlightUnavailableError(_REAL_BUSY)
+
+    monkeypatch.setattr(_reconstruct.step_progress, "record_submitting", _noop)
+    monkeypatch.setattr(_reconstruct, "_best_effort_record_failed", _noop)
+    monkeypatch.setattr(_reconstruct, "_run_action_primitive", _raise)
+    entry = WorkflowAction(kind="action", name="register-files", inputs=[], outputs=[])
+    with pytest.raises(BackendFailure):
+        await _reconstruct._dispatch_action(
+            run_context(
+                pool=object(),
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+                work_ticket_idx=1,
+                signing_key=b"\x00" * 32,
+                data_plane_url="grpc://dp:50051",
+            ),
+            entry,
+            {},
+            tmp_path,
+            step_index=0,
+            attempt=0,
+        )
+    receipt_row = json.loads((step_logs_dir(tmp_path) / "stdout").read_text().strip())
+    assert receipt_row["kind"] == FailureKind.DATA_PLANE_TRANSIENT.value
+    assert receipt_row["step_name"] == "register-files"
+    assert receipt_row["reason"]  # the untyped error's reason is carried, not empty
+
+
+async def test_action_dispatch_writes_an_unknown_permanent_receipt(monkeypatch, tmp_path):
+    """The non-retriable arm writes its receipt too: a plain Python error leaves an
+    `UNKNOWN_PERMANENT` receipt carrying the full reason, and re-raises unchanged."""
+    import json
+
+    import pytest
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _reconstruct
+    from qiita_control_plane.workspace import step_logs_dir
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _raise(*a, **k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(_reconstruct.step_progress, "record_submitting", _noop)
+    monkeypatch.setattr(_reconstruct, "_best_effort_record_failed", _noop)
+    monkeypatch.setattr(_reconstruct, "_run_action_primitive", _raise)
+    entry = WorkflowAction(kind="action", name="register-files", inputs=[], outputs=[])
+    with pytest.raises(ValueError):
+        await _reconstruct._dispatch_action(
+            run_context(
+                pool=object(),
+                scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+                work_ticket_idx=1,
+                signing_key=b"\x00" * 32,
+                data_plane_url="grpc://dp:50051",
+            ),
+            entry,
+            {},
+            tmp_path,
+            step_index=0,
+            attempt=0,
+        )
+    receipt_row = json.loads((step_logs_dir(tmp_path) / "stdout").read_text().strip())
+    assert receipt_row == {
+        "kind": FailureKind.UNKNOWN_PERMANENT.value,
+        "step_name": "register-files",
+        "reason": "ValueError: boom",
+    }
+
+
 async def test_action_entry_busy_data_plane_is_retried(monkeypatch):
     """A busy refusal from an `action:` entry's DoAction leaves `_dispatch_action` as a
     transient `DATA_PLANE_TRANSIENT` failure, which the retry loop re-runs."""
