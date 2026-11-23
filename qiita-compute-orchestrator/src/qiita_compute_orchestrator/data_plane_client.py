@@ -168,11 +168,9 @@ def registered_counted(
     """`registered`, with a `StreamRowCountMismatch` raised when the body returns and
     the stream did not deliver `expected_rows` rows.
 
-    A stream cut mid-body can end without an error, and the consumer then sees a
-    short input as a complete one: nginx resetting a DoGet whose consumer had stopped
-    reading for longer than `send_timeout` ended an `align_minimap2` input that way
-    under an earlier miint, and the alignment was registered from 8% of the sample's
-    reads. Comparing the count fails the job whatever cut the stream.
+    A transport check: a stream that ends early without an error looks to its
+    consumer like a complete one, and the count makes that case fail the job whatever
+    ended it.
 
     The rows counted are those the body pulled from `reader` plus any it left, which
     are drained after the body returns: a consumer need not read every row (a join
@@ -181,14 +179,14 @@ def registered_counted(
     unread, for a consumer whose output depends on having seen every one.
 
     The check runs only when the body returns: an exception from the body propagates
-    unchanged.
+    unchanged. The timing line is logged either way.
     """
     import pyarrow as pa  # noqa: PLC0415
 
     delivered = 0
     # How long the body left the stream unread: from registration to its first ask,
     # and from each batch handed over to its next ask. Waiting on the data plane is
-    # not counted. The longest of these is what nginx's `send_timeout` has to cover.
+    # not counted; see `send_timeout` in deploy/nginx/qiita.conf for why it matters.
     opened = time.monotonic()
     first_ask: float | None = None
     longest_hold = 0.0
@@ -203,27 +201,29 @@ def registered_counted(
             longest_hold = max(longest_hold, time.monotonic() - handed)
 
     counted = pa.RecordBatchReader.from_batches(reader.schema, _batches())
-    with registered(conn, relation, counted):
-        yield relation
-    _LOG.info(
-        "stream %s: %d rows read; first batch asked for %.1f s after the stream opened, "
-        "longest hold of a batch before asking for the next %.1f s",
-        relation,
-        delivered,
-        first_ask if first_ask is not None else float("nan"),
-        longest_hold,
-    )
+    try:
+        with registered(conn, relation, counted):
+            yield relation
+    finally:
+        _LOG.info(
+            "stream %s: %d rows read; first batch asked for %s; "
+            "longest hold of a batch before asking for the next %.1f s",
+            relation,
+            delivered,
+            "never" if first_ask is None else f"{first_ask:.1f} s after the stream opened",
+            longest_hold,
+        )
     unread = sum(batch.num_rows for batch in reader)
     if delivered + unread != expected_rows:
         raise StreamRowCountMismatch(
-            f"the DoGet stream registered as {relation!r} delivered "
-            f"{delivered + unread} rows; the data plane counts {expected_rows} for the "
-            "same ticket"
+            f"the stream {relation!r} delivered {delivered + unread} rows, but the data "
+            f"plane counted {expected_rows} for the same ticket: the stream ended early, "
+            "or the rows changed between the count and the stream"
         )
     if require_drained and unread:
         raise StreamRowCountMismatch(
-            f"the body read {delivered} of the {expected_rows} rows of {relation!r} "
-            "and must read them all"
+            f"the job read {delivered} of the {expected_rows} rows streamed as "
+            f"{relation!r}; it must read every row"
         )
 
 
@@ -458,7 +458,7 @@ async def open_read_masked_stream(
 
     **The body must read every row** (`require_drained`, see `registered_counted`):
     an aligner emits no row for a read it never saw, so its output cannot show one
-    went missing.
+    went missing, and the count is the only place a lost read shows.
 
     Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
     the ticket is minted; only the Flight client/stream stays open for the body's

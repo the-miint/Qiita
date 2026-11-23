@@ -585,7 +585,6 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
     assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
     assert captured["stream"]["ticket_bytes"] == b"signed-read-masked-ticket"
     assert captured["stream"]["relation"] == "masked_reads"
-    # The aligner's output cannot show a read it never saw, so every row must be read.
     assert captured["stream"]["require_drained"] is True
 
 
@@ -694,7 +693,9 @@ def test_registered_counted_refuses_a_stream_that_ends_short():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 5 rows.*counts 7"):
+        with pytest.raises(
+            dpc.StreamRowCountMismatch, match="delivered 5 rows, but the data plane counted 7"
+        ):
             with dpc.registered_counted(conn, "r", _int_reader(5), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
@@ -703,7 +704,9 @@ def test_registered_counted_refuses_a_stream_longer_than_counted():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 8 rows.*counts 7"):
+        with pytest.raises(
+            dpc.StreamRowCountMismatch, match="delivered 8 rows, but the data plane counted 7"
+        ):
             with dpc.registered_counted(conn, "r", _int_reader(8), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
@@ -733,7 +736,7 @@ def test_registered_counted_require_drained_refuses_a_body_that_left_rows():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="must read them all"):
+        with pytest.raises(dpc.StreamRowCountMismatch, match="must read every row"):
             with dpc.registered_counted(
                 conn, "r", _int_reader(30_000), expected_rows=30_000, require_drained=True
             ) as rel:
@@ -796,7 +799,9 @@ def test_open_doget_stream_refuses_a_stream_shorter_than_the_count():
     import duckdb  # noqa: PLC0415
 
     with _CountingFlightServer(rows=4000, counted=5000) as server, duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 4000 rows.*counts 5000"):
+        with pytest.raises(
+            dpc.StreamRowCountMismatch, match="delivered 4000 rows, but the data plane counted 5000"
+        ):
             with dpc.open_doget_stream(
                 conn, data_plane_url=server.url, ticket_bytes=b"signed", relation="r"
             ) as rel:
@@ -817,3 +822,27 @@ def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog
     [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
     assert line.startswith("stream r: 7 rows read; first batch asked for 0.")
     assert float(line.split("asked for ")[1].split(" s")[0]) >= 0.3
+
+
+def test_registered_counted_logs_the_timing_when_the_body_raises(caplog):
+    """A cut stream raises in the body, which is the case the timing line is for."""
+    import duckdb  # noqa: PLC0415
+
+    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
+        with pytest.raises(ValueError, match="cut"):
+            with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
+                conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
+                raise ValueError("cut")
+    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
+    assert line.startswith("stream r: 7 rows read; first batch asked for ")
+
+
+def test_registered_counted_says_never_when_no_batch_was_asked_for(caplog):
+    import duckdb  # noqa: PLC0415
+
+    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
+        with pytest.raises(ValueError):
+            with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
+                raise ValueError("before any read")
+    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
+    assert "first batch asked for never;" in line

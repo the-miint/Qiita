@@ -533,12 +533,13 @@ def test_an_empty_contig_roster_is_refused_and_leaves_no_partial_output(
 def test_a_read_stream_that_ends_early_fails_the_job_and_leaves_no_output(
     monkeypatch, genome, tmp_path
 ):
-    """The stream carries two of the five reads and ends without an error. The aligner
-    emits no row for a missing read any more than for an unaligned one, so nothing in
-    the output can show the loss; the job has to fail on the count."""
+    """The stream carries two of the five reads and ends without an error, through the
+    real aligner; the job fails on the count and writes nothing."""
     workspace = tmp_path / "ws"
     _install_streams(monkeypatch, genome, delivered=2)
-    with pytest.raises(StreamRowCountMismatch, match="delivered 2 rows.*counts 5"):
+    with pytest.raises(
+        StreamRowCountMismatch, match="delivered 2 rows, but the data plane counted 5"
+    ):
         asyncio.run(execute(_inputs(), workspace))
     assert not (workspace / "alignment.parquet").exists()
     assert not (workspace / "alignment_origin_spanning.parquet").exists()

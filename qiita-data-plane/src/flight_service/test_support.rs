@@ -8,6 +8,7 @@ use arrow_schema::{DataType, Field, Schema};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use super::*;
+use crate::auth;
 
 // The pool owns attaching DuckLake, so the table-creation helpers these tests
 // call are imported here rather than inherited through `flight_service`; only the

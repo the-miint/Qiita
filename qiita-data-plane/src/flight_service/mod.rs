@@ -35,7 +35,6 @@ use duckdb::Connection;
 use futures::stream::{self, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth;
 use crate::pool::{LakePool, LakeWriter};
 
 mod doget;
@@ -48,7 +47,7 @@ mod registration;
 mod test_support;
 
 use doget::{requested_ipc_codec, stream_ducklake_batches};
-use query::{build_query, ALLOWED_TABLES};
+use query::verified_ticket_query;
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
@@ -265,25 +264,7 @@ impl FlightService for QiitaFlightService {
         let codec = requested_ipc_codec(request.metadata())?;
         let ticket_bytes = &request.into_inner().ticket;
 
-        // Verify Ed25519 signature, expiry, and parse payload
-        let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
-            .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        // Validate table name
-        if !ALLOWED_TABLES.contains(&payload.table.as_str()) {
-            return Err(Status::invalid_argument(format!(
-                "unknown table: {:?}",
-                payload.table
-            )));
-        }
-
-        // Build query from filter
-        let (sql, table) = build_query(
-            &payload.table,
-            &payload.filter,
-            &payload.members,
-            &payload.columns,
-        )?;
+        let (sql, table) = verified_ticket_query(ticket_bytes, &self.flight_public_key)?;
 
         // Stream the result incrementally, from an instance borrowed for the
         // life of the stream: a blocking task feeds RecordBatches through a
