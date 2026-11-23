@@ -11,9 +11,10 @@
   `align-denovo` also fails when the aligner did not read every read. Before this,
   some `align-denovo` runs completed and registered alignments of only part of their
   sample's reads after nginx cut the stream; a short stream now fails the ticket
-  whatever cut it. Every de novo alignment completed before this deploy is re-run after
-  it, under the same `alignment_idx`, and feature tables built from them before the
-  re-run need rebuilding.
+  whatever cut it. After this deploy, the de novo samples completed before it are re-run
+  under the same `alignment_idx` where their alignment's params allow it (the rest are
+  listed for follow-up), and feature tables built from them before the re-run need
+  rebuilding.
 
 ### Added
 
