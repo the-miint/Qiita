@@ -5,9 +5,13 @@
   beside `grpc_read_timeout` / `grpc_send_timeout`. Without it, nginx 1.26.3 reset a
   stream about 66 s after its client paused (measured on the 443 edge and the loopback
   listener), which is what an `align-denovo` job's aligner does while it works.
-- **A native job fails when a data-plane stream ends short (#N).** Every DoGet a job
-  opens first asks the new `count_doget` DoAction how many rows the same ticket
-  streams, and the job fails when the stream delivered a different number.
+- **A data-plane stream that ends short fails instead of being used (#N).** Every
+  DoGet, in a job, the control plane, `qiita` (reference, assembly and feature-table
+  exports and builds) and `qiita-admin masked-read-export`, first asks the new
+  `count_doget` DoAction how many rows the same ticket streams, and fails when the
+  stream delivered a different number. `qiita-admin masked-read-export` compares an
+  existing Parquet with that count too, in place of `count_masked`, which also counted
+  a passing read whose stored read is missing.
   `align-denovo` also fails when the aligner did not read every read. Before this,
   some `align-denovo` runs completed and registered alignments of only part of their
   sample's reads after nginx cut the stream; a short stream now fails the ticket
