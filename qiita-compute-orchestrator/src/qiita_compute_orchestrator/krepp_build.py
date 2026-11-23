@@ -45,9 +45,7 @@ JEST_NULL = f"{JEST_SUBDIR}/null.txt"
 MANIFEST_FORMAT = 1
 
 # The metadata keys Qiita reads from every `metadata-*.txt` in `index/`: all are
-# recorded in the manifest and README, all but `frac` in reference_index.params, and
-# `krepp version` is compared with the linked krepp by the readiness probe, which
-# warns on a difference (krepp indexes are read across krepp versions).
+# recorded in the manifest and README, and all but `frac` in reference_index.params.
 RECORDED_METADATA_KEYS = ("krepp version", "k", "w", "h", "m", "frac")
 
 _HASH_CHUNK = 8 << 20

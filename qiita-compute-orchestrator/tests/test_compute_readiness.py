@@ -727,7 +727,8 @@ def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
 
 def test_probe_script_maps_the_krepp_node_check_exit_codes():
     """krepp_node_check's exit code is the krepp-index row's status: a bad copy on the
-    probe's one node warns, a krepp mismatch fails."""
+    probe's one node, or a krepp version difference, warns; a missing PATH_NODE_LOCAL
+    or an unreachable control plane fails."""
     from qiita_compute_orchestrator import krepp_node_check as kc
 
     script = cr.build_probe_script(path_scratch="/scratch/qiita")

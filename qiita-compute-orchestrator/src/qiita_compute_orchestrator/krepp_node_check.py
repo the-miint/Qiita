@@ -16,8 +16,9 @@ The exit code is the row's status, so the probe script can tell them apart:
   krepp other than the one the loaded miint links (or miint reports no
   `krepp-version` row to compare). A bad copy is one node: a krepp job that lands
   here fails, and the cluster admins re-copy the folder and run its verify.sh
-  (docs/runbooks/krepp-index.md). A version difference does not stop placement;
-  krepp reads indexes across versions. Neither fails the deploy;
+  (docs/runbooks/krepp-index.md). A version difference only warns: nothing refuses a
+  build for it, and activation checks a build by placing known tips with the krepp
+  miint links. Neither fails the deploy;
 - 1 `fail`: PATH_NODE_LOCAL is not in the job env, or the control plane cannot be
   asked.
 

@@ -10,8 +10,7 @@
   backbone tips with it, and makes it the reference's active build when enough land on
   their own edge, retiring the previous one. `qiita-admin krepp-index remove` marks a
   registered or retired build removed. No workflow places contigs with a build. The
-  build's krepp version is recorded, not required to match the linked krepp's: krepp
-  reads indexes across versions.
+  build's krepp version is recorded, not required to match the linked krepp's.
 - **`qiita.reference_index` rows carry `state` (`registered`, `active`, `retired`,
   `removed`) and `fs_path_root` (#TBD).** Every existing row is `active` and `absolute`;
   a krepp row's `fs_path` is relative to `PATH_NODE_LOCAL` (and to `PATH_DERIVED` for
@@ -28,7 +27,7 @@
   its node's copy of every active krepp build and `warn`s, without failing the deploy,
   for a missing or changed copy on that node or a build written by a krepp other than
   the one miint links (`miint_versions()`'s `krepp-version` row, duckdb-miint#473 /
-  #475).
+  duckdb-miint#475).
 
 ### Changed
 
