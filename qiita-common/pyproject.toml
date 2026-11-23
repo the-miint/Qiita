@@ -15,6 +15,8 @@ dependencies = [
     # consumer's suite. Exact, and equal to every other DuckDB pin in the repo:
     # see tests/test_duckdb_version_sync.py.
     "duckdb==2.0.0",
+    # `qiita_common.flight_stream`: the counted DoGet stream every Flight consumer opens.
+    "pyarrow>=19",
 ]
 
 [dependency-groups]

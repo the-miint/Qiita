@@ -30,6 +30,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_CHUNKS_TABLE,
     ASSEMBLED_SEQUENCE_TABLE,
 )
+from qiita_common.flight_stream import StreamRowCountMismatch
 
 import qiita_compute_orchestrator.data_plane_client as dpc
 from qiita_compute_orchestrator.data_plane_client import (
@@ -667,93 +668,6 @@ async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monke
     assert opened == []
 
 
-# `registered_counted` — the row-count check `open_read_masked_stream` applies. Run on
-# a plain DuckDB connection over an in-memory reader: what is under test is the count
-# of rows DuckDB pulls, not the transport.
-
-
-def _int_reader(n: int, *, batch: int = 3):
-    import pyarrow as pa  # noqa: PLC0415
-
-    table = pa.table({"sequence_idx": pa.array(range(n), pa.int64())})
-    return pa.RecordBatchReader.from_batches(table.schema, table.to_batches(max_chunksize=batch))
-
-
-def test_registered_counted_passes_a_stream_drained_in_full():
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
-            conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-        assert conn.execute("SELECT count(*) FROM t").fetchone() == (7,)
-
-
-def test_registered_counted_refuses_a_stream_that_ends_short():
-    """Seven rows counted, five on the wire, and the stream ends without an error."""
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with pytest.raises(
-            dpc.StreamRowCountMismatch, match="delivered 5 rows, but the data plane counted 7"
-        ):
-            with dpc.registered_counted(conn, "r", _int_reader(5), expected_rows=7) as rel:
-                conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-
-
-def test_registered_counted_refuses_a_stream_longer_than_counted():
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with pytest.raises(
-            dpc.StreamRowCountMismatch, match="delivered 8 rows, but the data plane counted 7"
-        ):
-            with dpc.registered_counted(conn, "r", _int_reader(8), expected_rows=7) as rel:
-                conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-
-
-def test_registered_counted_counts_the_rows_a_body_left_unread():
-    """A body need not read every row (a join whose other side is empty may stop
-    scanning this one); the rest is drained and counted, so a whole stream passes."""
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with dpc.registered_counted(conn, "r", _int_reader(30_000), expected_rows=30_000) as rel:
-            conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
-
-
-def test_registered_counted_still_refuses_a_short_stream_a_body_left_unread():
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 29999 rows"):
-            with dpc.registered_counted(
-                conn, "r", _int_reader(29_999), expected_rows=30_000
-            ) as rel:
-                conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
-
-
-def test_registered_counted_require_drained_refuses_a_body_that_left_rows():
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="must read every row"):
-            with dpc.registered_counted(
-                conn, "r", _int_reader(30_000), expected_rows=30_000, require_drained=True
-            ) as rel:
-                conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
-
-
-def test_registered_counted_lets_the_body_exception_through():
-    """A body that raises is not checked: its own exception reaches the caller, not a
-    count mismatch over the rows it never read."""
-    import duckdb  # noqa: PLC0415
-
-    with duckdb.connect() as conn:
-        with pytest.raises(ValueError, match="from the body"):
-            with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
-                raise ValueError("from the body")
-
-
 class _CountingFlightServer:
     """An in-process Flight server whose DoGet streams `rows` rows and whose
     `count_doget` answers `counted`, so a test can give the two different answers."""
@@ -800,49 +714,9 @@ def test_open_doget_stream_refuses_a_stream_shorter_than_the_count():
 
     with _CountingFlightServer(rows=4000, counted=5000) as server, duckdb.connect() as conn:
         with pytest.raises(
-            dpc.StreamRowCountMismatch, match="delivered 4000 rows, but the data plane counted 5000"
+            StreamRowCountMismatch, match="delivered 4000 rows, but the data plane counted 5000"
         ):
             with dpc.open_doget_stream(
                 conn, data_plane_url=server.url, ticket_bytes=b"signed", relation="r"
             ) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-
-
-def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog):
-    """The numbers nginx's `send_timeout` has to cover, in the job's step log. The
-    body here holds the stream 0.3 s before its first ask."""
-    import time  # noqa: PLC0415
-
-    import duckdb  # noqa: PLC0415
-
-    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
-        with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
-            time.sleep(0.3)
-            conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
-    assert line.startswith("stream r: 7 rows read; first batch asked for 0.")
-    assert float(line.split("asked for ")[1].split(" s")[0]) >= 0.3
-
-
-def test_registered_counted_logs_the_timing_when_the_body_raises(caplog):
-    """A cut stream raises in the body, which is the case the timing line is for."""
-    import duckdb  # noqa: PLC0415
-
-    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
-        with pytest.raises(ValueError, match="cut"):
-            with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
-                conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
-                raise ValueError("cut")
-    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
-    assert line.startswith("stream r: 7 rows read; first batch asked for ")
-
-
-def test_registered_counted_says_never_when_no_batch_was_asked_for(caplog):
-    import duckdb  # noqa: PLC0415
-
-    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
-        with pytest.raises(ValueError):
-            with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
-                raise ValueError("before any read")
-    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
-    assert "first batch asked for never;" in line

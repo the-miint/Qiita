@@ -14,6 +14,7 @@ from qiita_common.api_paths import (
     compute_reads_staging_path,
 )
 from qiita_common.backend_failure import StepNoData
+from qiita_common.flight_stream import counted_doget, read_all_counted
 from qiita_common.parquet import PARQUET_COMPRESSION_INTERMEDIATE, validate_parquet_path
 from qiita_common.work_ticket_constants import ENA_RUN_ACCESSIONS_KEY
 
@@ -119,7 +120,7 @@ def _do_get_reference_sequences_roster(
     import pyarrow.parquet as pq  # noqa: PLC0415
 
     with flight.FlightClient(data_plane_url) as client:
-        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+        table = read_all_counted(client, ticket_bytes, name="reference_sequences")
     # Project to exactly the roster columns the build jobs expect (drop
     # sequence_hash) — the shard build reads `feature_idx` to scope its own chunk
     # stream and `sequence_length_bp` for plan() sizing.
@@ -650,8 +651,11 @@ def _stream_masked_reads_to_fastq(data_plane_url: str, ticket_bytes: bytes, dest
     read_opts = flight.FlightCallOptions(
         read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
     )
-    with flight.FlightClient(data_plane_url) as client, connect_with_miint_staged() as con:
-        reader = client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
+    with (
+        flight.FlightClient(data_plane_url) as client,
+        connect_with_miint_staged() as con,
+        counted_doget(client, ticket_bytes, name="masked", options=read_opts) as reader,
+    ):
         con.register("masked", reader)
         return _copy_masked_to_fastq(con, dest)
 

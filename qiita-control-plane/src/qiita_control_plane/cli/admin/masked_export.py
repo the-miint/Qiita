@@ -35,6 +35,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.flight_constants import ipc_compression_headers
+from qiita_common.flight_stream import count_doget, counted_reader
 from qiita_common.models import (
     MaskedReadExportSample,
     SampleResolution,
@@ -317,20 +318,6 @@ def _parquet_row_count(path: Path) -> int:
     import pyarrow.parquet as pq  # noqa: PLC0415
 
     return pq.ParquetFile(path).metadata.num_rows
-
-
-def _count_masked(flight_client, ticket_bytes: bytes) -> int:
-    """How many masked reads the signed ticket selects, via the data plane's
-    ``count_masked`` DoAction — a cheap ``count(*)`` against the light ``read_mask``
-    table that never streams or materializes the read sequences. Reuses the very
-    ticket the export streams with: counting is strictly less than reading, so the
-    ticket's ``(prep_sample_idx, mask_idx)`` authorization already covers it."""
-    import pyarrow.flight as flight  # noqa: PLC0415
-
-    results = list(flight_client.do_action(flight.Action("count_masked", ticket_bytes)))
-    if not results:
-        raise RuntimeError("count_masked DoAction returned no result")
-    return json.loads(results[0].body.to_pybytes())["count"]
 
 
 # The output directory's record of which prep_sample and which mask each exported file
@@ -821,19 +808,23 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     },
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])
-                # Idempotent parquet re-export: only probe the data plane's count
-                # when a recorded output file already exists (a first export pays
-                # nothing), then skip on a match (nothing changed) and fall through
-                # to overwrite on a mismatch. An adopted file is always rewritten, and
-                # fastq took the all-or-nothing existence check above, so both export.
+                # Idempotent parquet re-export: skip a recorded output file whose row
+                # count matches (nothing changed), and fall through to overwrite on a
+                # mismatch. An adopted file is always rewritten, and fastq took the
+                # all-or-nothing existence check above, so both export.
+                # The data plane's count of the ticket's rows, taken once: it is what an
+                # existing file is compared with, and what the stream is checked against.
+                expected_rows = count_doget(flight_client, ticket_bytes)
                 if args.format == "parquet" and not rewrite:
                     target = output_dir / f"{stem}.parquet"
-                    if target.exists() and _parquet_row_count(target) == _count_masked(
-                        flight_client, ticket_bytes
-                    ):
+                    if target.exists() and _parquet_row_count(target) == expected_rows:
                         return [target.name], False
-                reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
-                return _write_masked_sample(reader, stem, output_dir, args.format, con), True
+                stream = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts)
+                with counted_reader(
+                    stream.to_reader(), expected_rows=expected_rows, name=stem
+                ) as reader:
+                    written = _write_masked_sample(reader, stem, output_dir, args.format, con)
+                return written, True
 
             try:
                 names, written = _with_retry(export_one, prep, args.retry_seconds)

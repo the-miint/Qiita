@@ -46,6 +46,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_SUBJECT_KEY,
     BIN_QUALITY_TABLE,
 )
+from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import AlignmentDefinitionStatus
 from qiita_common.parquet import PARQUET_OPTS_INTERMEDIATE, validate_parquet_path
 
@@ -274,7 +275,7 @@ def _do_get_bin_quality(data_plane_url: str, ticket_bytes: bytes) -> pa.Table:
     799 rows on the largest run — so narrowing it would buy nothing.
     """
     with flight.FlightClient(data_plane_url) as client:
-        return client.do_get(flight.Ticket(ticket_bytes)).read_all()
+        return read_all_counted(client, ticket_bytes, name="bin_quality")
 
 
 def _write_denovo_genome_quality(

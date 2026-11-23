@@ -26,10 +26,7 @@ import path for jobs that never stream).
 from __future__ import annotations
 
 import base64
-import json
-import logging
 import os
-import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
@@ -46,6 +43,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_TABLE,
 )
 from qiita_common.duckdb_relation import registered
+from qiita_common.flight_stream import counted_doget
 
 from .config import get_settings
 from .cp_client import make_cp_client
@@ -60,13 +58,10 @@ from .cp_client import make_cp_client
 # env var if they want the paranoid `reallocate` behaviour.
 os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
 
-_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import duckdb
     import httpx
-    import pyarrow as pa
-    import pyarrow.flight as flight
 
 
 async def fetch_reference_doget_ticket(
@@ -129,113 +124,23 @@ def open_doget_stream(
     exit. `ticket_bytes` is the raw signed ticket from a `fetch_*_doget_ticket` call
     (already base64-decoded).
 
-    Before streaming, the data plane's `count_doget` for the same ticket is fetched,
-    and the rows the stream delivered are checked against it on exit
-    (`registered_counted`, which also says what `require_drained` adds).
+    The stream is checked against the data plane's count of its rows
+    (`qiita_common.flight_stream.counted_reader`, which also says what
+    `require_drained` adds).
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
     client = flight.FlightClient(data_plane_url)
     try:
-        expected_rows = _count_doget(client, ticket_bytes)
-        reader = client.do_get(flight.Ticket(ticket_bytes)).to_reader()
-        with registered_counted(
-            conn,
-            relation,
-            reader,
-            expected_rows=expected_rows,
-            require_drained=require_drained,
+        with (
+            counted_doget(
+                client, ticket_bytes, name=relation, require_drained=require_drained
+            ) as reader,
+            registered(conn, relation, reader),
         ):
             yield relation
     finally:
         client.close()
-
-
-class StreamRowCountMismatch(RuntimeError):
-    """A DoGet stream delivered a different number of rows than the data plane
-    counted for the same ticket."""
-
-
-@contextmanager
-def registered_counted(
-    conn: duckdb.DuckDBPyConnection,
-    relation: str,
-    reader: pa.RecordBatchReader,
-    *,
-    expected_rows: int,
-    require_drained: bool = False,
-) -> Iterator[str]:
-    """`registered`, with a `StreamRowCountMismatch` raised when the body returns and
-    the stream did not deliver `expected_rows` rows.
-
-    A transport check: a stream that ends early without an error looks to its
-    consumer like a complete one, and the count makes that case fail the job whatever
-    ended it.
-
-    The rows counted are those the body pulled from `reader` plus any it left, which
-    are drained after the body returns: a consumer need not read every row (a join
-    whose other side is empty may stop scanning this one), and what is checked is
-    that the stream was whole. `require_drained` also refuses a body that left rows
-    unread, for a consumer whose output depends on having seen every one.
-
-    The check runs only when the body returns: an exception from the body propagates
-    unchanged. The timing line is logged either way.
-    """
-    import pyarrow as pa  # noqa: PLC0415
-
-    delivered = 0
-    # How long the body left the stream unread: from registration to its first ask,
-    # and from each batch handed over to its next ask. Waiting on the data plane is
-    # not counted; see `send_timeout` in deploy/nginx/qiita.conf for why it matters.
-    opened = time.monotonic()
-    first_ask: float | None = None
-    longest_hold = 0.0
-
-    def _batches() -> Iterator[pa.RecordBatch]:
-        nonlocal delivered, first_ask, longest_hold
-        first_ask = time.monotonic() - opened
-        for batch in reader:
-            delivered += batch.num_rows
-            handed = time.monotonic()
-            yield batch
-            longest_hold = max(longest_hold, time.monotonic() - handed)
-
-    counted = pa.RecordBatchReader.from_batches(reader.schema, _batches())
-    try:
-        with registered(conn, relation, counted):
-            yield relation
-    finally:
-        _LOG.info(
-            "stream %s: %d rows read; first batch asked for %s; "
-            "longest hold of a batch before asking for the next %.1f s",
-            relation,
-            delivered,
-            "never" if first_ask is None else f"{first_ask:.1f} s after the stream opened",
-            longest_hold,
-        )
-    unread = sum(batch.num_rows for batch in reader)
-    if delivered + unread != expected_rows:
-        raise StreamRowCountMismatch(
-            f"the stream {relation!r} delivered {delivered + unread} rows, but the data "
-            f"plane counted {expected_rows} for the same ticket: the stream ended early, "
-            "or the rows changed between the count and the stream"
-        )
-    if require_drained and unread:
-        raise StreamRowCountMismatch(
-            f"the job read {delivered} of the {expected_rows} rows streamed as "
-            f"{relation!r}; it must read every row"
-        )
-
-
-def _count_doget(client: flight.FlightClient, ticket_bytes: bytes) -> int:
-    """How many rows a DoGet of `ticket_bytes` streams, from the data plane's
-    `count_doget` DoAction, which takes the same signed ticket."""
-    import pyarrow.flight as flight  # noqa: PLC0415
-
-    results = list(client.do_action(flight.Action("count_doget", ticket_bytes)))
-    if len(results) != 1:
-        raise RuntimeError(f"count_doget returned {len(results)} results, expected 1")
-    return int(json.loads(results[0].body.to_pybytes())["count"])
 
 
 @asynccontextmanager
@@ -456,9 +361,10 @@ async def open_read_masked_stream(
     and a zero-row Arrow stream still carries its schema, so a caller materializes a
     valid empty table and runs to a clean no-op.
 
-    **The body must read every row** (`require_drained`, see `registered_counted`):
-    an aligner emits no row for a read it never saw, so its output cannot show one
-    went missing, and the count is the only place a lost read shows.
+    **The body must read every row** (`require_drained`, see
+    `qiita_common.flight_stream.counted_reader`): an aligner emits no row for a read
+    it never saw, so its output cannot show one went missing, and the count is the
+    only place a lost read shows.
 
     Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
     the ticket is minted; only the Flight client/stream stays open for the body's

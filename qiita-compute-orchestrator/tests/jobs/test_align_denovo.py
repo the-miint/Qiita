@@ -24,12 +24,9 @@ import pyarrow as pa
 import pytest
 from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.duckdb_relation import registered
+from qiita_common.flight_stream import StreamRowCountMismatch, registered_counted
 from qiita_common.testing.bounded import run_bounded
 
-from qiita_compute_orchestrator.data_plane_client import (
-    StreamRowCountMismatch,
-    registered_counted,
-)
 from qiita_compute_orchestrator.jobs import align_denovo
 from qiita_compute_orchestrator.jobs.align_denovo import Inputs, execute
 from qiita_compute_orchestrator.miint import open_miint_conn

@@ -214,6 +214,17 @@ class _FakeFlightClient:
         self.tickets.append(ticket.ticket)
         return _FakeStream(self._readers[ticket.ticket]())
 
+    def do_action(self, action, *options):
+        """The `count_doget` the stream is checked against: the rows the DoGet of
+        the same ticket serves."""
+        import pyarrow.flight as flight  # noqa: PLC0415
+
+        assert action.type == "count_doget"
+        factory = self._readers[action.body.to_pybytes()]
+        counter = getattr(factory, "count", None)
+        rows = counter() if counter is not None else factory().read_all().num_rows
+        return [flight.Result(json.dumps({"count": rows}).encode())]
+
     def close(self):
         self.closed = True
 
@@ -2072,6 +2083,9 @@ def _patched_two_pools(
 
             return pa.RecordBatchReader.from_batches(inner.schema, batches())
 
+        # The fake's `count_doget` answer, counted without draining a reader: a drain
+        # here would record a "drained" event at count time, before the real one.
+        reader.count = lambda: sum(r[0] in rec["tickets"][alignment_idx] for r in rows)
         return reader
 
     rows = _ALIGNMENT if alignment is None else alignment

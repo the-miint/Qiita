@@ -8,6 +8,7 @@ real FASTA writer (miint FORMAT FASTA) round-trip is the integration test's job
 (miint isn't guaranteed in the pure-unit tier)."""
 
 import base64
+import json
 from pathlib import Path
 
 import httpx
@@ -118,15 +119,36 @@ class _FakeStream:
         return self._reader
 
 
+def _no_chunks():
+    """A real, empty chunk stream: the dispatch tests stub the writers, so no row
+    is read, and the stream's count check needs a reader it can drain."""
+    return pa.table(
+        {
+            "feature_idx": pa.array([], pa.int64()),
+            "chunk_index": pa.array([], pa.int64()),
+            "chunk_data": pa.array([], pa.string()),
+        }
+    ).to_reader()
+
+
 class _FakeFlightClient:
     def __init__(self, reader):
-        self._reader = reader
+        self._table = reader.read_all()
         self.tickets = []
 
     def do_get(self, ticket, *options):
         # FASTA path passes FlightCallOptions (buffer realignment); parquet doesn't.
         self.tickets.append(ticket)
-        return _FakeStream(self._reader)
+        return _FakeStream(self._table.to_reader())
+
+    def do_action(self, action, *options):
+        """The `count_doget` the stream is checked against: the rows the DoGet of
+        the same ticket serves."""
+        import pyarrow.flight as flight  # noqa: PLC0415
+
+        assert action.type == "count_doget"
+        rows = self._table.num_rows
+        return [flight.Result(json.dumps({"count": rows}).encode())]
 
 
 def test_export_one_genome_dispatch_parquet(monkeypatch, tmp_path):
@@ -149,8 +171,7 @@ def test_export_one_genome_dispatch_parquet(monkeypatch, tmp_path):
         "_write_genome_fasta",
         lambda reader, acc, target, con: calls.update(fasta=(reader, acc, target, con)) or 1,
     )
-    sentinel_reader = object()
-    fc = _FakeFlightClient(sentinel_reader)
+    fc = _FakeFlightClient(_no_chunks())
 
     out = ref._export_one_genome(
         base_url="http://cp",
@@ -163,7 +184,9 @@ def test_export_one_genome_dispatch_parquet(monkeypatch, tmp_path):
         output_dir=tmp_path,
     )
     assert out == tmp_path / "5.10.parquet"
-    assert calls["parquet"] == (sentinel_reader, tmp_path / "5.10.parquet")
+    reader, target = calls["parquet"]
+    assert reader.schema.names == ["feature_idx", "chunk_index", "chunk_data"]
+    assert target == tmp_path / "5.10.parquet"
     assert "fasta" not in calls
 
 
@@ -184,7 +207,7 @@ def test_export_one_genome_dispatch_fasta(monkeypatch, tmp_path):
         lambda reader, acc, target, con: calls.update(fasta=(reader, acc, target, con)) or 2,
     )
     sentinel_con = object()
-    fc = _FakeFlightClient(object())
+    fc = _FakeFlightClient(_no_chunks())
 
     out = ref._export_one_genome(
         base_url="http://cp",
@@ -226,7 +249,7 @@ def test_export_one_genome_raises_and_removes_file_on_short_export(monkeypatch, 
         return 2  # only 2 of 3 members had chunks in DuckLake
 
     monkeypatch.setattr(ref, "_write_genome_parquet", _short_writer)
-    fc = _FakeFlightClient(object())
+    fc = _FakeFlightClient(_no_chunks())
 
     with pytest.raises(ref._IncompleteExportError, match="wrote 2 of 3"):
         ref._export_one_genome(

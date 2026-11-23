@@ -812,7 +812,7 @@ def _fake_flight_client_class(tables_by_prep, counts_by_prep=None):
     monkeypatched ticket endpoint encodes {"prep_sample_idx": N} as the ticket
     bytes, so the fake maps a DoGet back to its sample without real signing.
 
-    do_action serves the `count_masked` probe: it returns `{"count": N}` for the
+    do_action serves the `count_doget` probe: it returns `{"count": N}` for the
     ticket's prep, taking N from `counts_by_prep` when given (to simulate a
     data-plane count that differs from what's on disk) else the queued table's
     row count (the consistent "nothing changed" case)."""
@@ -838,7 +838,7 @@ def _fake_flight_client_class(tables_by_prep, counts_by_prep=None):
             return _FakeFlightStream(tables_by_prep[prep])
 
         def do_action(self, action, options=None):
-            assert action.type == "count_masked"
+            assert action.type == "count_doget"
             prep = _json.loads(action.body.to_pybytes())["prep_sample_idx"]
             self.do_action_calls.append(prep)
             if counts_by_prep is not None and prep in counts_by_prep:
@@ -2351,7 +2351,7 @@ def test_masked_read_export_creates_missing_output_dir(monkeypatch, tmp_path):
 
 def test_masked_read_export_skips_unchanged_parquet(monkeypatch, tmp_path, capsys):
     """Re-exporting when nothing changed skips every sample: the second run probes
-    the data plane's count (count_masked), finds it equals the on-disk record
+    the data plane's count (count_doget), finds it equals the on-disk record
     count, and neither re-streams (no DoGet) nor rewrites the file."""
     import pyarrow as pa
 
@@ -2428,7 +2428,7 @@ def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
         out_dir / "SAMN_A.QM542.parquet",
     )
     _record(out_dir, "SAMN_A.QM542.parquet", _mask_handle(3))
-    fake_cls = _fake_flight_client_class(  # count_masked defaults to the table's 2 rows
+    fake_cls = _fake_flight_client_class(  # count_doget defaults to the table's 2 rows
         {42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]})}
     )
     monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)

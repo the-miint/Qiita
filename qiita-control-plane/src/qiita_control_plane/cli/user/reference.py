@@ -20,6 +20,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_PREFIX,
 )
 from qiita_common.chunking import reassemble_chunks_expr
+from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
     ReferenceStatus,
     WorkTicketState,
@@ -403,12 +404,12 @@ def _export_one_genome(
     ticket = _create_chunks_doget_ticket(
         base_url, token, reference_idx=reference_idx, feature_idxs=feature_idxs
     )
-    ticket_obj = flight.Ticket(ticket)
     if fmt == "parquet":
         # Parquet streams straight to a ParquetWriter (no Acero), keeping the bulk
         # chunk buffers zero-copy — so no buffer realignment is needed.
         target = output_dir / f"{reference_idx}.{genome_idx}.parquet"
-        written = _write_genome_parquet(flight_client.do_get(ticket_obj).to_reader(), target)
+        with counted_doget(flight_client, ticket, name=target.name) as reader:
+            written = _write_genome_parquet(reader, target)
     else:
         # The FASTA path registers the reader into DuckDB (miint FORMAT FASTA via
         # Acero), so ask the Flight reader to realign each buffer on receive —
@@ -421,9 +422,8 @@ def _export_one_genome(
         )
         target = output_dir / f"{reference_idx}.{genome_idx}.fasta.gz"
         accession_map = {m["feature_idx"]: m["accession"] for m in members}
-        written = _write_genome_fasta(
-            flight_client.do_get(ticket_obj, read_opts).to_reader(), accession_map, target, con
-        )
+        with counted_doget(flight_client, ticket, name=target.name, options=read_opts) as reader:
+            written = _write_genome_fasta(reader, accession_map, target, con)
     expected = len(feature_idxs)
     if written < expected:
         with contextlib.suppress(FileNotFoundError):

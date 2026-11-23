@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 import duckdb
+from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
@@ -495,7 +496,7 @@ def _do_get_reference_sequence_chunks(
     import pyarrow.flight as flight  # noqa: PLC0415
 
     with flight.FlightClient(data_plane_url) as client:
-        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+        table = read_all_counted(client, ticket_bytes, name="reference_chunks")
     cols = {
         name: table.column(name).to_pylist()
         for name in ("feature_idx", "chunk_index", "chunk_data")

@@ -51,6 +51,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.duckdb_relation import registered
+from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
     INCLUDE_DEPRECATED_FLAG,
     MAX_EXPORTED_FEATURE_ENTITIES,
@@ -678,9 +679,10 @@ def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterat
     `At64Byte`, 15 with `DataTypeSpecific`. So none is passed: an option that measurably
     does not help is worse than no option, because the next reader believes it.
     """
-    import pyarrow.flight as flight  # noqa: PLC0415
-
-    with registered(con, relation, flight_client.do_get(flight.Ticket(ticket)).to_reader()):
+    with (
+        counted_doget(flight_client, ticket, name=relation) as reader,
+        registered(con, relation, reader),
+    ):
         yield relation
 
 
@@ -709,23 +711,27 @@ def staged_streams(
             yield source
         return
     import pyarrow as pa  # noqa: PLC0415
-    import pyarrow.flight as flight  # noqa: PLC0415
 
-    first = flight_client.do_get(flight.Ticket(mints[0]())).to_reader()
+    def name(position: int) -> str:
+        return f"{relation} (stream {position} of {len(mints)})"
 
-    def batches():
-        yield from first
-        for position, mint in enumerate(mints[1:], start=2):
-            reader = flight_client.do_get(flight.Ticket(mint())).to_reader()
-            if not reader.schema.equals(first.schema):
-                raise ValueError(
-                    f"{relation}: stream {position} of {len(mints)} has schema "
-                    f"{reader.schema} where the first has {first.schema}"
-                )
-            yield from reader
+    # Each stream is counted on its own; a later one's check runs as its stream
+    # ends, inside the scan, and the first one's when the block returns.
+    with counted_doget(flight_client, mints[0](), name=name(1)) as first:
 
-    with registered(con, relation, pa.RecordBatchReader.from_batches(first.schema, batches())):
-        yield relation
+        def batches():
+            yield from first
+            for position, mint in enumerate(mints[1:], start=2):
+                with counted_doget(flight_client, mint(), name=name(position)) as reader:
+                    if not reader.schema.equals(first.schema):
+                        raise ValueError(
+                            f"{relation}: stream {position} of {len(mints)} has schema "
+                            f"{reader.schema} where the first has {first.schema}"
+                        )
+                    yield from reader
+
+        with registered(con, relation, pa.RecordBatchReader.from_batches(first.schema, batches())):
+            yield relation
 
 
 def _stage_from_stream(con, flight_client, ticket: bytes, *, relation: str, table_sql) -> None:

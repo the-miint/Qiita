@@ -19,7 +19,10 @@ use tonic::Request;
 #[cfg(feature = "integration")]
 use crate::flight_service::query::build_query;
 #[cfg(feature = "integration")]
-use crate::flight_service::test_support::{doget_fixture, pooled_conn, FEATURE_TABLE_COLUMNS};
+use crate::flight_service::test_support::{
+    doget_fixture, future_expiry_secs, lake_service, pooled_conn, sign_raw, FEATURE_TABLE_COLUMNS,
+    TEST_SEED,
+};
 #[cfg(feature = "integration")]
 use crate::flight_service::QiitaFlightService;
 #[cfg(feature = "integration")]
@@ -657,4 +660,61 @@ async fn count_doget_matches_the_rows_the_same_ticket_streams() {
     let body: serde_json::Value =
         serde_json::from_slice(&results[0].as_ref().expect("result").body).unwrap();
     assert_eq!(body["count"], streamed as i64);
+}
+
+/// `count_masked` counts the mask's `pass` rows; `count_doget` counts what the
+/// `read_masked` DoGet streams, which joins those rows to `read`. A `pass` row whose
+/// read is absent is where they part, so a consumer that checks a stream must use
+/// `count_doget`.
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+async fn count_masked_and_count_doget_part_on_a_pass_row_with_no_read() {
+    use arrow_flight::Action;
+
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let prep: i64 = 921_100;
+    let mask: i64 = 921_101;
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep}, {prep} + 1, 'r1', 'ACGT', NULL, NULL, NULL), \
+                 ({prep}, {prep} + 2, 'r2', 'TTGG', NULL, NULL, NULL);
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
+                 ({mask}, {prep}, {prep} + 1, 'pass', 0, 0), \
+                 ({mask}, {prep}, {prep} + 2, 'pass', 0, 0), \
+                 ({mask}, {prep}, {prep} + 3, 'pass', 0, 0);"
+        ))
+        .unwrap();
+    }
+    let (service, _tmp) = lake_service();
+    let payload = format!(
+        r#"{{"table":"read_masked","filter":{{"mask_idx":[{mask}],"prep_sample_idx":[{prep}]}}}}"#
+    );
+    let ticket = sign_raw(payload.as_bytes(), &TEST_SEED, future_expiry_secs(300));
+    let mut counts = Vec::new();
+    for action in ["count_masked", "count_doget"] {
+        let results: Vec<_> = service
+            .do_action(Request::new(Action {
+                r#type: action.to_string(),
+                body: ticket.clone().into(),
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("{action} failed: {e}"))
+            .into_inner()
+            .collect::<Vec<_>>()
+            .await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&results[0].as_ref().expect("result").body).unwrap();
+        counts.push(body["count"].as_i64().unwrap());
+    }
+    assert_eq!(counts, vec![3, 2], "count_masked, then count_doget");
 }
