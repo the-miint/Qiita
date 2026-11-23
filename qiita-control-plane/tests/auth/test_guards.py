@@ -24,6 +24,7 @@ from qiita_control_plane.auth.guards import (
     caller_tier_reaches,
     classify_owned_resource_refusal,
     raise_for_owned_resource_refusal,
+    resource_not_owned_detail,
     study_access_via,
     study_record_view,
     tier_at_least,
@@ -780,7 +781,7 @@ async def test_require_caller_owns_run_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    expected_detail = f"caller does not own sequencing_run {run_and_pool_ctx['run_idx']}"
+    expected_detail = resource_not_owned_detail("sequencing_run", run_and_pool_ctx["run_idx"])
     assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
@@ -867,7 +868,7 @@ async def test_require_caller_owns_pool_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    expected_detail = f"caller does not own sequenced_pool {run_and_pool_ctx['pool_idx']}"
+    expected_detail = resource_not_owned_detail("sequenced_pool", run_and_pool_ctx["pool_idx"])
     assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
