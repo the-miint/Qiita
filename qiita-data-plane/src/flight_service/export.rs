@@ -81,8 +81,9 @@ impl QiitaFlightService {
     }
 
     /// How many rows a DoGet of the same signed ticket streams: `count(*)` over the
-    /// query `ticket_query` builds for `do_get`. A consumer compares it with the rows it received, which
-    /// is how a stream that ends short without an error is caught.
+    /// query that `ticket_query` builds for `do_get`. A consumer compares it with the
+    /// rows it received, which is how a stream that ends short without an error is
+    /// caught.
     ///
     /// The DoGet ticket is the authorization, as for `count_masked`: a count of the
     /// rows a ticket selects reveals no more than streaming them.
