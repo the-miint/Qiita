@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING
@@ -57,6 +59,8 @@ from .cp_client import make_cp_client
 # handling policy to `ignore` to silence it; operators can override via the
 # env var if they want the paranoid `reallocate` behaviour.
 os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
+
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import duckdb
@@ -182,16 +186,33 @@ def registered_counted(
     import pyarrow as pa  # noqa: PLC0415
 
     delivered = 0
+    # How long the body left the stream unread: from registration to its first ask,
+    # and from each batch handed over to its next ask. Waiting on the data plane is
+    # not counted. The longest of these is what nginx's `send_timeout` has to cover.
+    opened = time.monotonic()
+    first_ask: float | None = None
+    longest_hold = 0.0
 
     def _batches() -> Iterator[pa.RecordBatch]:
-        nonlocal delivered
+        nonlocal delivered, first_ask, longest_hold
+        first_ask = time.monotonic() - opened
         for batch in reader:
             delivered += batch.num_rows
+            handed = time.monotonic()
             yield batch
+            longest_hold = max(longest_hold, time.monotonic() - handed)
 
     counted = pa.RecordBatchReader.from_batches(reader.schema, _batches())
     with registered(conn, relation, counted):
         yield relation
+    _LOG.info(
+        "stream %s: %d rows read; first batch asked for %.1f s after the stream opened, "
+        "longest hold of a batch before asking for the next %.1f s",
+        relation,
+        delivered,
+        first_ask if first_ask is not None else float("nan"),
+        longest_hold,
+    )
     unread = sum(batch.num_rows for batch in reader)
     if delivered + unread != expected_rows:
         raise StreamRowCountMismatch(

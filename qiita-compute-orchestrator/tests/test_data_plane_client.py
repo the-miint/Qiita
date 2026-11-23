@@ -801,3 +801,19 @@ def test_open_doget_stream_refuses_a_stream_shorter_than_the_count():
                 conn, data_plane_url=server.url, ticket_bytes=b"signed", relation="r"
             ) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
+
+
+def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog):
+    """The numbers nginx's `send_timeout` has to cover, in the job's step log. The
+    body here holds the stream 0.3 s before its first ask."""
+    import time  # noqa: PLC0415
+
+    import duckdb  # noqa: PLC0415
+
+    with caplog.at_level("INFO", logger=dpc.__name__), duckdb.connect() as conn:
+        with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
+            time.sleep(0.3)
+            conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
+    [line] = [r.getMessage() for r in caplog.records if r.name == dpc.__name__]
+    assert line.startswith("stream r: 7 rows read; first batch asked for 0.")
+    assert float(line.split("asked for ")[1].split(" s")[0]) >= 0.3
