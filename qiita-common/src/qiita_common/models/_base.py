@@ -1,10 +1,7 @@
-"""Shared base types cross-referenced by multiple model submodules.
+"""Shared base types and checks that the model submodules import.
 
-Holds the genuinely shared foundation — the runtime-selection check, the
-scope-target discriminated union, the two enums the step wire contract and the
-work-ticket models both reference (ComputeTarget, StepStatus), and the PATCH
-base model — so the domain submodules can import FROM here without forming an
-import cycle. No submodule imports back from `models/__init__`.
+They live here so that a submodule can import them without forming an import
+cycle; no submodule imports back from `models/__init__`.
 """
 
 import re
