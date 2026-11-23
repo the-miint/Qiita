@@ -5,9 +5,16 @@
   beside `grpc_read_timeout` / `grpc_send_timeout`. Without it, nginx 1.26.3 reset a
   stream about 66 s after its client paused (measured on the 443 edge and the loopback
   listener), which is what an `align-denovo` job's aligner does while it works.
-- **`align-denovo` fails when its masked-read stream ends short (#N).**
-  `open_read_masked_stream` asks the data plane's `count_masked` DoAction for the
-  pair's read count, under the same ticket, and fails the job when the rows the
-  aligner drained differ from it. Some September runs completed and registered
-  alignments of only part of their sample's reads after nginx cut the stream; a
-  short stream now fails the ticket whatever cut it.
+- **A native job fails when a data-plane stream ends short (#N).** Every DoGet a job
+  opens first asks the new `count_doget` DoAction how many rows the same ticket
+  streams, and the job fails when the stream delivered a different number.
+  `align-denovo` also fails when the aligner did not read every read. Some September
+  `align-denovo` runs completed and registered alignments of only part of their
+  sample's reads after nginx cut the stream; a short stream now fails the ticket
+  whatever cut it.
+
+### Added
+
+- **A job's step log records how long it left each stream unread (#N):** the wait
+  before its first batch and its longest hold of a batch, the two waits nginx's
+  `send_timeout` has to cover.
