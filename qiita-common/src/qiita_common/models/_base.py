@@ -8,6 +8,7 @@ import cycle. No submodule imports back from `models/__init__`.
 """
 
 import re
+from collections import Counter
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
@@ -231,6 +232,16 @@ def check_withdrawal_reason(
             raise ValueError(f"reason is required when {field} is {value!r}")
     elif reason is not None:
         raise ValueError(f"reason is only accepted when {field} is {value!r}")
+
+
+def check_no_repeats(values: Iterable[str], *, field: str) -> None:
+    """Refuse a list whose entries repeat: raise ValueError naming each value that
+    appears more than once, once each, in the order of its first appearance.
+    `field` names the list in the message."""
+    counts = Counter(values)
+    repeated = [value for value, count in counts.items() if count > 1]
+    if repeated:
+        raise ValueError(f"{field} must not repeat: {repeated}")
 
 
 def check_derived_inputs(

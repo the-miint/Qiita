@@ -59,6 +59,7 @@ from qiita_common.models._base import (
     StudyPrepScopeTarget,
     check_derived_inputs,
     check_exactly_one_runtime,
+    check_no_repeats,
     check_withdrawal_reason,
     names_colliding_on_strip,
 )
@@ -594,6 +595,7 @@ __all__ = [
     "StudyPrepScopeTarget",
     "check_derived_inputs",
     "check_exactly_one_runtime",
+    "check_no_repeats",
     "check_withdrawal_reason",
     "names_colliding_on_strip",
     # Health.

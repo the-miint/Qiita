@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_BIOSAMPLE_BULK_BY_STUDY,
+    URL_BIOSAMPLE_BULK_LINK_BY_STUDY,
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_BY_STUDY_AND_IDX,
@@ -3959,6 +3960,287 @@ async def test_create_biosample_study_link_already_linked_retired(ctx):
     row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
     outcome = (resp.status_code, resp.json(), row_after)
     assert outcome == (409, {"detail": expected_detail}, row_before)
+
+
+# ===========================================================================
+# POST /api/v1/study/{study_idx}/biosample/bulk-link
+# ===========================================================================
+
+# The kinds of identifier that a bulk link accepts.
+_BULK_LINK_KEYS = [
+    EXPORT_ENTITY_ID,
+    IDX_KEY,
+    "biosample_accession",
+    "ena_sample_accession",
+    "matrix_tube_id",
+]
+
+
+async def _post_bulk_link(client, study_idx: int, key: str, values: list[str]):
+    url = URL_BIOSAMPLE_BULK_LINK_BY_STUDY.format(study_idx=study_idx)
+    resp = await client.post(url, json={"key": key, "values": values})
+    return resp
+
+
+@pytest.mark.parametrize("key", _BULK_LINK_KEYS)
+async def test_link_biosamples_bulk(ctx, key):
+    """Tests the case where the wet lab admin links a biosample named by each
+    identifier kind: 201 listing the value as linked, and the table holds a new
+    link created by the caller.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix=f"bulk-link-{key}"
+    )
+    value, _unknown, biosample_idx = await _seed_biosample_named_by_kind(
+        ctx, key=key, study_idx=study_idx, display_name=None
+    )
+
+    resp = await _post_bulk_link(ctx["wet"], study_idx, key, [value])
+
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    expected_row = _expected_active_link_row(
+        link_row, biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=wet_idx
+    )
+    outcome = (resp.status_code, resp.json(), link_row)
+    assert outcome == (201, {"linked": [value], "already_linked": []}, expected_row)
+
+
+async def test_link_biosamples_bulk_already_linked(ctx):
+    """Tests the case where one biosample is new to the study and another is
+    already actively linked: 201 listing each under its outcome in request order,
+    and the existing link is left as it was.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-mixed")
+    existing_idx = await _seed_biosample_owned_by(ctx, "user")
+    new_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=existing_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    existing_before = await _fetch_link_row(
+        ctx["pool"], biosample_idx=existing_idx, study_idx=study_idx
+    )
+
+    resp = await _post_bulk_link(ctx["user"], study_idx, IDX_KEY, [str(existing_idx), str(new_idx)])
+
+    existing_after = await _fetch_link_row(
+        ctx["pool"], biosample_idx=existing_idx, study_idx=study_idx
+    )
+    new_row = await _fetch_link_row(ctx["pool"], biosample_idx=new_idx, study_idx=study_idx)
+    expected_new_row = _expected_active_link_row(
+        new_row, biosample_idx=new_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    expected_body = {"linked": [str(new_idx)], "already_linked": [str(existing_idx)]}
+    outcome = (resp.status_code, resp.json(), existing_after, new_row)
+    assert outcome == (201, expected_body, existing_before, expected_new_row)
+
+
+async def test_link_biosamples_bulk_all_already_linked(ctx):
+    """Tests the case where every biosample is already actively linked: 200, since
+    the request created nothing, listing every value as already linked.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-all-linked")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+
+    resp = await _post_bulk_link(ctx["user"], study_idx, IDX_KEY, [str(biosample_idx)])
+
+    expected_body = {"linked": [], "already_linked": [str(biosample_idx)]}
+    assert (resp.status_code, resp.json()) == (200, expected_body)
+
+
+async def test_link_biosamples_bulk_refuses_every_problem(ctx):
+    """Tests the case where one request names, besides one biosample that the
+    caller may link, an idx with no biosample, a live biosample that the caller
+    does not own, a retired one that the caller does not own, a retired one that
+    the caller owns, and one whose link to the study is retired: one 422 lists
+    every problem in request order, each naming the value sent, and nothing is
+    linked.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-refused")
+    linkable_idx = await _seed_biosample_owned_by(ctx, "user")
+    unowned_idx = await _seed_biosample_owned_by(ctx, "wet")
+    unowned_retired_idx = await _seed_biosample_owned_by(ctx, "wet")
+    await retire_biosample(ctx["pool"], biosample_idx=unowned_retired_idx, retired_by_idx=wet_idx)
+    owned_retired_idx = await _seed_biosample_owned_by(ctx, "user")
+    await retire_biosample(ctx["pool"], biosample_idx=owned_retired_idx, retired_by_idx=user_idx)
+    retired_link_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=retired_link_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=retired_link_idx, study_idx=study_idx, retired_by_idx=user_idx
+    )
+    values = [
+        str(linkable_idx),
+        _ABSENT_BIOSAMPLE_IDX,
+        str(unowned_idx),
+        str(unowned_retired_idx),
+        str(owned_retired_idx),
+        str(retired_link_idx),
+    ]
+
+    resp = await _post_bulk_link(ctx["user"], study_idx, IDX_KEY, values)
+
+    expected_problems = [
+        (_ABSENT_BIOSAMPLE_IDX, f"there is no biosample with idx '{_ABSENT_BIOSAMPLE_IDX}'"),
+        (str(unowned_idx), f"caller does not own the biosample with idx '{unowned_idx}'"),
+        (str(unowned_retired_idx), f"there is no biosample with idx '{unowned_retired_idx}'"),
+        (str(owned_retired_idx), f"the biosample with idx '{owned_retired_idx}' is retired"),
+        (
+            str(retired_link_idx),
+            f"the biosample with idx '{retired_link_idx}' has a retired link to study {study_idx}",
+        ),
+    ]
+    expected_detail = {
+        "message": "5 of 6 values could not be linked",
+        "problems": [
+            {"item_id": item_id, "message": message} for item_id, message in expected_problems
+        ],
+    }
+    linkable_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=linkable_idx, study_idx=study_idx
+    )
+    outcome = (resp.status_code, resp.json(), linkable_row)
+    assert outcome == (422, {"detail": expected_detail}, None)
+
+
+async def test_link_biosamples_bulk_refused_request_inserts_nothing(ctx, monkeypatch):
+    """Tests the case where a value's biosample is not the caller's, so the request is
+    refused before any link is written: no link insert is attempted, not even for
+    the biosample that the caller may link, which a request naming it alone does
+    insert.
+    """
+    inserted_idxs: list[int] = []
+    real_insert = routes_biosample.insert_entity_to_study
+
+    async def _recording_insert(*args, **kwargs):
+        inserted_idxs.append(kwargs["entity_idx"])
+        return await real_insert(*args, **kwargs)
+
+    monkeypatch.setattr(routes_biosample, "insert_entity_to_study", _recording_insert)
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-no-writes")
+    linkable_idx = await _seed_biosample_owned_by(ctx, "user")
+    unowned_idx = await _seed_biosample_owned_by(ctx, "wet")
+
+    refused = await _post_bulk_link(
+        ctx["user"], study_idx, IDX_KEY, [str(linkable_idx), str(unowned_idx)]
+    )
+    inserted_when_refused = list(inserted_idxs)
+    accepted = await _post_bulk_link(ctx["user"], study_idx, IDX_KEY, [str(linkable_idx)])
+
+    outcome = (refused.status_code, inserted_when_refused, accepted.status_code, inserted_idxs)
+    assert outcome == (422, [], 201, [linkable_idx])
+
+
+async def test_link_biosamples_bulk_unknown_value(ctx):
+    """Tests the case where a value of a natural key names no biosample: a 422
+    naming the value by its kind, as sent.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-unknown")
+    _value, unknown, _biosample_idx = await _seed_biosample_named_by_kind(
+        ctx, key=EXPORT_ENTITY_ID, study_idx=study_idx, display_name=None
+    )
+
+    resp = await _post_bulk_link(ctx["user"], study_idx, EXPORT_ENTITY_ID, [unknown])
+
+    expected_detail = {
+        "message": "1 of 1 values could not be linked",
+        "problems": [
+            {
+                "item_id": unknown,
+                "message": f"there is no biosample with export_entity_id {unknown!r}",
+            }
+        ],
+    }
+    assert (resp.status_code, resp.json()) == (422, {"detail": expected_detail})
+
+
+async def test_link_biosamples_bulk_bypass(ctx):
+    """Tests the case where the wet lab admin links biosamples that the regular
+    user owns into the regular user's study: both are linked.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-bypass")
+    biosample_idxs = [await _seed_biosample_owned_by(ctx, "user") for _ in range(2)]
+    values = [str(biosample_idx) for biosample_idx in biosample_idxs]
+
+    resp = await _post_bulk_link(ctx["wet"], study_idx, IDX_KEY, values)
+
+    assert (resp.status_code, resp.json()) == (201, {"linked": values, "already_linked": []})
+
+
+async def test_link_biosamples_bulk_identifier_changed_before_lock(ctx):
+    """Tests the case where a transaction that changes the biosample's tube id is
+    still open when a bulk link naming it by the old tube id arrives: the request
+    resolves the old value, waits on the row lock, sees the changed row, and
+    answers a retryable 503 without linking anything.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-race")
+    old_tube_id = unique_matrix_tube_id()
+    biosample_idx = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=old_tube_id, owner_idx=user_idx
+    )
+
+    task, committed = None, False
+    async with ctx["pool"].acquire() as other:
+        tr = other.transaction()
+        await tr.start()
+        try:
+            await other.execute(
+                "UPDATE qiita.biosample SET matrix_tube_id = $2 WHERE idx = $1",
+                biosample_idx,
+                unique_matrix_tube_id(),
+            )
+            task = asyncio.create_task(
+                _post_bulk_link(ctx["user"], study_idx, "matrix_tube_id", [old_tube_id])
+            )
+            await _wait_until_blocked_by(ctx["pool"], other, task)
+            await tr.commit()
+            committed = True
+            resp = await _finish(task)
+        finally:
+            await _cancel(task)
+            if not committed:
+                await tr.rollback()
+
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    expected_detail = "a biosample's matrix_tube_id changed while this request ran; nothing was linked — resubmit the identical request"  # noqa: E501
+    outcome = (resp.status_code, resp.json(), resp.headers.get("Retry-After"), link_row)
+    assert outcome == (503, {"detail": expected_detail}, "1", None)
+
+
+@pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_ADMIN_AUTHZ_CASES)
+async def test_link_biosamples_bulk_authz(ctx, no_biosample_write_client, case):
+    """Tests the case where each study-side access shape calls the bulk link on a
+    biosample that the regular user owns: the ADMIN minimum, the wet_lab_admin
+    bypass, the scope check, the unauthenticated refusal, and the missing-study 404.
+    """
+
+    async def _seed(ctx, _study_idx):
+        return await _seed_biosample_owned_by(ctx, "user")
+
+    async def _send(client, study_idx, biosample_idx):
+        return await _post_bulk_link(client, study_idx, IDX_KEY, [str(biosample_idx)])
+
+    await assert_study_scoped_sample_admin_authz(
+        ctx,
+        case=case,
+        no_scope_client=no_biosample_write_client,
+        seed_sample=_seed,
+        send=_send,
+        success_status=201,
+        required_scope="biosample:write",
+    )
 
 
 # ===========================================================================

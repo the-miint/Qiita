@@ -29,6 +29,7 @@ from qiita_common.models._base import (
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     LookupReturnKey,
     NaturalKeyLookupResponse,
+    check_no_repeats,
 )
 from qiita_common.models.biosample import (
     BIOSAMPLE_BULK_LINK_MAX_VALUES,
@@ -2059,6 +2060,29 @@ def test_biosample_bulk_link_request_cap():
     over_cap_body = {"key": IDX_KEY, "values": [*at_cap, f"{len(at_cap) + 1}"]}
     with pytest.raises(ValidationError):
         BiosampleBulkLinkRequest.model_validate(over_cap_body)
+
+
+def test_check_no_repeats():
+    """Tests the case where a list holds no repeat and where it holds several: the
+    first passes, and the second is refused naming each repeated value once, in the
+    order of its first appearance."""
+    check_no_repeats(["a", "b", "c"], field="things")
+    with pytest.raises(ValueError) as exc_info:
+        check_no_repeats(["b", "a", "b", "c", "a", "b"], field="things")
+
+    assert str(exc_info.value) == "things must not repeat: ['b', 'a']"
+
+
+def test_biosample_bulk_link_request_refuses_repeats():
+    """Tests the case where a bulk link repeats a value, once exactly and once with
+    padding that stripping removes: the refusal names each repeated value."""
+    with pytest.raises(ValidationError) as exc_info:
+        BiosampleBulkLinkRequest.model_validate(
+            {"key": EXPORT_ENTITY_ID, "values": ["QB1", "QB2", "QB1", " QB2 "]}
+        )
+
+    messages = [error["msg"] for error in exc_info.value.errors()]
+    assert messages == ["Value error, values must not repeat: ['QB1', 'QB2']"]
 
 
 @pytest.mark.parametrize(

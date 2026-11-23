@@ -32,6 +32,7 @@ from qiita_common.models._base import (
     PatchRequestModel,
     ReadCounts,
     RequestItemProblem,
+    check_no_repeats,
 )
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
@@ -735,9 +736,9 @@ BIOSAMPLE_BULK_LINK_MAX_VALUES = 2_000
 
 class BiosampleBulkLinkRequest(BaseModel):
     """Links the biosamples named by `values`, each a value of the identifier
-    kind that `key` names, into one study. Under `matrix_tube_id`, every value
-    must be a matrix tube id; under `idx`, a positive whole number that fits an
-    idx.
+    kind that `key` names, into one study. No value may repeat. Under
+    `matrix_tube_id`, every value must be a matrix tube id; under `idx`, a
+    positive whole number that fits an idx.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -746,8 +747,9 @@ class BiosampleBulkLinkRequest(BaseModel):
     values: list[NonBlankText] = Field(min_length=1, max_length=BIOSAMPLE_BULK_LINK_MAX_VALUES)
 
     @model_validator(mode="after")
-    def _check_value_pattern(self) -> BiosampleBulkLinkRequest:
+    def _check_values(self) -> BiosampleBulkLinkRequest:
         _check_lookup_value_pattern(self.key, self.values)
+        check_no_repeats(self.values, field="values")
         return self
 
 
