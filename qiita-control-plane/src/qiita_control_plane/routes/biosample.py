@@ -103,6 +103,7 @@ from ..repositories._sample_helpers import (
     UniqueInStudyViolation,
     classify_unique_in_study_violation,
     fetch_active_studies_for_entity,
+    fetch_entity_to_study_links_by_entity_idxs,
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
@@ -144,6 +145,7 @@ from ._helpers import (
     build_idxs_list_response,
     cap_rows,
     create_and_map_study_field,
+    detail_for_retired_link,
     detail_for_retired_unique_field_entity,
     detail_for_unique_field_miss,
     etag_for_updated_at,
@@ -1049,6 +1051,7 @@ async def get_biosample_in_study(
 async def create_biosample_study_link(
     study_idx: Annotated[int, Field(gt=0)],
     biosample_idx: Annotated[int, Field(gt=0)],
+    response: Response,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
@@ -1060,10 +1063,11 @@ async def create_biosample_study_link(
     """Link an existing biosample into the path's study.
 
     The caller needs Tier.ADMIN on the study (study owner included) and must own
-    the biosample; a wet_lab_admin+ needs neither. 403 below the tier; 404 on a
-    missing study, and the same 404 for a missing biosample and for one that the
-    caller does not own; 409 on a retired biosample or on any existing link for
-    the pair, retired or not.
+    the biosample; a wet_lab_admin+ needs neither. 201 with the new link; 200
+    with the existing link when the pair is already actively linked. 403 below
+    the tier or on a live biosample the caller does not own; 404 on a missing
+    study or biosample, and on a retired one the caller does not own; 409 on a
+    retired biosample, or on a retired link for the pair.
     """
     async with tx() as conn:
         # The share lock holds from the ownership check through commit, so an
@@ -1077,7 +1081,7 @@ async def create_biosample_study_link(
                 caller_idx=user.principal_idx,
                 resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
                 resource_idx=biosample_idx,
-                hide_unowned=True,
+                hide_unowned=row is not None and row["retired"],
             )
 
         # A bypass caller skipped the ownership check, so existence is checked
@@ -1095,26 +1099,44 @@ async def create_biosample_study_link(
                 detail=resource_retired_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
             )
 
-        # The primary key is the link table's only unique constraint.
-        try:
-            created_at = await insert_entity_to_study(
+        # Insert the link; when the pair already has one, the insert does nothing
+        # and returns None
+        created_by_idx = user.principal_idx
+        created_at = await insert_entity_to_study(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=biosample_idx,
+            study_idx=study_idx,
+            created_by_idx=created_by_idx,
+            on_conflict="ignore",
+        )
+
+        # An existing link is returned as it is when active, and refused when retired
+        if created_at is None:
+            links = await fetch_entity_to_study_links_by_entity_idxs(
                 conn,
                 spec=BIOSAMPLE_METADATA_SPEC,
-                entity_idx=biosample_idx,
                 study_idx=study_idx,
-                created_by_idx=user.principal_idx,
+                entity_idxs=[biosample_idx],
             )
-        except asyncpg.UniqueViolationError as exc:
-            raise_for_unique_violation(
-                exc,
-                constraint_messages={},
-                generic=f"{BIOSAMPLE_METADATA_SPEC.entity_kind} {biosample_idx} is already linked to study {study_idx} (the link may be retired)",  # noqa: E501
-            )
+            existing = links[biosample_idx]
+            if existing["retired"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=detail_for_retired_link(
+                        noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
+                        entity_idx=biosample_idx,
+                        study_idx=study_idx,
+                    ),
+                )
+            created_at = existing["created_at"]
+            created_by_idx = existing["created_by_idx"]
+            response.status_code = 200
 
     link_response = BiosampleStudyLinkResponse(
         biosample_idx=biosample_idx,
         study_idx=study_idx,
-        created_by_idx=user.principal_idx,
+        created_by_idx=created_by_idx,
         created_at=created_at,
     )
     return link_response

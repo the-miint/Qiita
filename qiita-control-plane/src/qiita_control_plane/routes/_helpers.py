@@ -531,6 +531,13 @@ def detail_for_unlinked_entity(*, noun: str, entity_idx: int, study_idx: int) ->
     return f"{noun} {entity_idx} is not linked to study {study_idx}"
 
 
+def detail_for_retired_link(*, noun: str, entity_idx: int, study_idx: int) -> str:
+    """Build the HTTP-409 detail for a link write refused because the entity's
+    link to the study exists and is retired. Returns the bare string; the
+    caller wraps it in HTTPException with status 409."""
+    return f"{noun} {entity_idx}'s link to study {study_idx} is retired"
+
+
 def _unique_field_pair_clause(*, noun: str, study_idx: int, display_name: str, value: str) -> str:
     """The clause naming a sample by the study's own name for it.
 

@@ -44,6 +44,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.routes._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     detail_for_biosample_link_rejection,
+    detail_for_retired_link,
     detail_for_slot_collision,
     parse_kv_detail,
     raise_all_or_nothing_failure,
@@ -592,6 +593,13 @@ def test_parse_kv_detail_skips_chunks_without_equals():
 # ---------------------------------------------------------------------------
 # detail_for_biosample_link_rejection -> 422 wording naming the failing study
 # ---------------------------------------------------------------------------
+
+
+def test_detail_for_retired_link():
+    """Tests the case where an entity's link to a study is retired: the detail
+    names the entity and the study."""
+    detail = detail_for_retired_link(noun="biosample", entity_idx=42, study_idx=7)
+    assert detail == "biosample 42's link to study 7 is retired"
 
 
 def test_detail_for_biosample_link_rejection_names_the_study():

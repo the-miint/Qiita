@@ -82,6 +82,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_biosample_checklist_requirements,
     fetch_entity_idxs_by_unique_field_values,
     fetch_entity_is_linked_to_study,
+    fetch_entity_to_study_links_by_entity_idxs,
     fetch_global_fields,
     fetch_global_fields_by_keys,
     fetch_global_metadata,
@@ -3759,6 +3760,63 @@ async def test_fetch_entity_is_linked_to_study_retired_link(ctx, spec):
         ctx["pool"], spec=spec, entity_idx=entity_idx, study_idx=ctx["study_idx"]
     )
     assert linked_after_retire is False
+
+
+# ---------------------------------------------------------------------------
+# fetch_entity_to_study_links_by_entity_idxs (parametrized over both specs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_entity_to_study_links_by_entity_idxs(ctx, spec):
+    """Tests the case where, of the entities asked for, one's link to the study is
+    active, one's is retired, one has no link, and one is linked only to another
+    study, while another entity linked to the study is not asked for: the first two
+    come back keyed by entity idx, each with its own retirement, and the rest are
+    absent.
+    """
+    active_idx = await _create_linked_entity_for_spec(ctx, spec)
+    retired_idx = await _create_linked_entity_for_spec(ctx, spec)
+    await _retire_entity_to_study_link(ctx, spec, retired_idx)
+    unlinked_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
+    # An entity linked to the study that the read is not asked about
+    await _create_linked_entity_for_spec(ctx, spec)
+
+    # An entity whose only link is to another study
+    elsewhere_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
+    (other_study_idx,) = await _seed_secondary_studies_for_entity(ctx, spec, elsewhere_idx, 1)
+    async with ctx["pool"].acquire() as conn:
+        await insert_entity_to_study(
+            conn,
+            spec=spec,
+            entity_idx=elsewhere_idx,
+            study_idx=other_study_idx,
+            created_by_idx=ctx["principal_idx"],
+        )
+
+    links = await fetch_entity_to_study_links_by_entity_idxs(
+        ctx["pool"],
+        spec=spec,
+        study_idx=ctx["study_idx"],
+        entity_idxs=[active_idx, retired_idx, unlinked_idx, elsewhere_idx],
+    )
+
+    # created_at is table-defaulted, so the expected rows take it from the actual ones
+    actual = {entity_idx: dict(row) for entity_idx, row in links.items()}
+    expected = {
+        entity_idx: {
+            "entity_idx": entity_idx,
+            "created_by_idx": ctx["principal_idx"],
+            "created_at": actual.get(entity_idx, {}).get("created_at"),
+            "retired": retired,
+        }
+        for entity_idx, retired in [(active_idx, False), (retired_idx, True)]
+    }
+    assert actual == expected
 
 
 # ---------------------------------------------------------------------------

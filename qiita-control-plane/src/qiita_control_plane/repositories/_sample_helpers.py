@@ -3494,6 +3494,34 @@ async def fetch_entity_is_linked_to_study(
     )
 
 
+async def fetch_entity_to_study_links_by_entity_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    entity_idxs: Sequence[int],
+) -> dict[int, asyncpg.Record]:
+    """Return a dict of entity_idx -> link row for each of entity_idxs that has a
+    spec.link_table row to study_idx, retired links included; each row carries
+    entity_idx, created_by_idx, created_at and retired.
+
+    Scoped to study_idx: an entity with no link row to it is absent from the
+    returned dict. The entity's own retirement is not consulted.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    key_column = spec.link_entity_key_column
+    rows = await pool_or_conn.fetch(
+        f"SELECT {key_column} AS entity_idx, created_by_idx, created_at, retired"
+        f" FROM {spec.link_table}"
+        f" WHERE study_idx = $1 AND {key_column} = ANY($2::bigint[])",
+        study_idx,
+        list(entity_idxs),
+    )
+    links = {row["entity_idx"]: row for row in rows}
+    return links
+
+
 async def fetch_active_studies_for_entity(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,

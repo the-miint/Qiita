@@ -3735,15 +3735,15 @@ async def test_create_biosample_study_link(ctx):
     [
         pytest.param("admin", "user", "user", 201, id="system_admin_owns_neither"),
         pytest.param("wet", "user", "user", 201, id="wet_lab_admin_owns_neither"),
-        pytest.param("user", "user", "wet", 404, id="study_owner_not_biosample_owner"),
+        pytest.param("user", "user", "wet", 403, id="study_owner_not_biosample_owner"),
     ],
 )
 async def test_create_biosample_study_link_biosample_owner_rule(
     ctx, caller_key, study_owner_key, biosample_owner_key, expected_status
 ):
     """Tests the case where the caller passes the study gate but may or may not own
-    the biosample: only its owner or a wet_lab_admin+ links it, and a refused
-    caller gets the missing-biosample 404 and no link row.
+    the live biosample: only its owner or a wet_lab_admin+ links it, and a refused
+    caller gets a 403 naming the biosample and no link row.
     """
     study_idx = await _seed_study(
         ctx, owner_idx=ctx[f"{study_owner_key}_session"]["principal_idx"], suffix="link-owner"
@@ -3754,8 +3754,8 @@ async def test_create_biosample_study_link_biosample_owner_rule(
 
     assert resp.status_code == expected_status, resp.text
     link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
-    if expected_status == 404:
-        assert resp.json() == {"detail": f"biosample {biosample_idx} not found"}
+    if expected_status == 403:
+        assert resp.json() == {"detail": f"caller does not own biosample {biosample_idx}"}
         assert link_row is None
     else:
         expected_row = _expected_active_link_row(
@@ -3774,8 +3774,8 @@ _BIOSAMPLE_STATE_CALLERS = pytest.mark.parametrize("caller_key", ["user", "wet",
 
 @_BIOSAMPLE_STATE_CALLERS
 async def test_create_biosample_study_link_nonexistent_biosample(ctx, caller_key):
-    """Tests the case where the biosample idx names no row: the same 404 that a
-    caller who does not own the biosample gets.
+    """Tests the case where the biosample idx names no row: 404, the answer that a
+    caller who does not own a retired biosample also gets.
     """
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="link-missing"
@@ -3811,7 +3811,7 @@ async def test_create_biosample_study_link_retired_biosample(ctx, caller_key):
 async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx):
     """Tests the case where a transaction that moves the biosample to another owner
     is still open when the owner's link request arrives: the request waits on the
-    row lock, then sees the committed owner and answers the not-owner 404.
+    row lock, then sees the committed owner and answers the not-owner 403.
     """
     user_idx = ctx["user_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-race")
@@ -3839,8 +3839,8 @@ async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx
 
     link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
     assert (resp.status_code, resp.json(), link_row) == (
-        404,
-        {"detail": f"biosample {biosample_idx} not found"},
+        403,
+        {"detail": f"caller does not own biosample {biosample_idx}"},
         None,
     )
 
@@ -3884,32 +3884,80 @@ async def test_create_biosample_study_link_not_blocked_by_open_fk_insert(ctx):
     assert link_row == expected_row
 
 
-@pytest.mark.parametrize("retire_existing", [False, True], ids=["active", "retired"])
-async def test_create_biosample_study_link_already_linked(ctx, retire_existing):
-    """Tests the case where a link for the pair already exists, active or retired:
-    one 409 for both, and the existing row is left as it was.
+async def test_create_biosample_study_link_unowned_retired_biosample(ctx):
+    """Tests the case where a caller who passes the study gate but does not own
+    the biosample tries to link it, and it is retired: the missing-biosample 404,
+    so the answer does not reveal that it exists, and no link row.
     """
     user_idx = ctx["user_session"]["principal_idx"]
-    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-dup")
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-unowned-retired")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "wet")
+    await retire_biosample(
+        ctx["pool"],
+        biosample_idx=biosample_idx,
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
+
+    link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    outcome = (resp.status_code, resp.json(), link_row)
+    assert outcome == (404, {"detail": f"biosample {biosample_idx} not found"}, None)
+
+
+async def test_create_biosample_study_link_already_linked_active(ctx):
+    """Tests the case where an active link for the pair already exists: 200 with
+    that link, whose creator is the one who first linked it, and the row is left
+    as it was.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-dup-active")
     biosample_idx = await _seed_biosample_owned_by(ctx, "user")
     await seed_biosample_to_study_link(
-        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=user_idx
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=wet_idx
     )
-    if retire_existing:
-        await retire_biosample_to_study_link(
-            ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, retired_by_idx=user_idx
-        )
     row_before = await _fetch_link_row(
         ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx
     )
 
     resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
 
-    assert resp.status_code == 409, resp.text
-    expected_detail = f"biosample {biosample_idx} is already linked to study {study_idx} (the link may be retired)"  # noqa: E501
-    assert resp.json() == {"detail": expected_detail}
+    assert resp.status_code == 200, resp.text
+    expected_response = BiosampleStudyLinkResponse(
+        biosample_idx=biosample_idx,
+        study_idx=study_idx,
+        created_by_idx=wet_idx,
+        created_at=row_before["created_at"],
+    )
     row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
-    assert row_after == row_before
+    outcome = (BiosampleStudyLinkResponse.model_validate(resp.json()), row_after)
+    assert outcome == (expected_response, row_before)
+
+
+async def test_create_biosample_study_link_already_linked_retired(ctx):
+    """Tests the case where the pair's link exists and is retired: 409 naming
+    the retired link, and the row is left as it was.
+    """
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="link-dup-retired")
+    biosample_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx, retired_by_idx=user_idx
+    )
+    row_before = await _fetch_link_row(
+        ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx
+    )
+
+    resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
+
+    expected_detail = f"biosample {biosample_idx}'s link to study {study_idx} is retired"
+    row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
+    outcome = (resp.status_code, resp.json(), row_after)
+    assert outcome == (409, {"detail": expected_detail}, row_before)
 
 
 # ===========================================================================

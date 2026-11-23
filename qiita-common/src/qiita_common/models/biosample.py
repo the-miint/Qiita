@@ -142,8 +142,7 @@ class BiosampleImportResponse(BaseModel):
 
 
 class BiosampleStudyLinkResponse(BaseModel):
-    """One qiita.biosample_to_study row, as created by POST
-    /api/v1/study/{study_idx}/biosample/{biosample_idx}/link."""
+    """One qiita.biosample_to_study row."""
 
     biosample_idx: Annotated[int, Field(gt=0)]
     study_idx: Annotated[int, Field(gt=0)]
