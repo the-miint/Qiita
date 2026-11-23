@@ -14,6 +14,7 @@ underlying resolution per-request even when many guards compose.
 
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
+from enum import StrEnum
 from typing import NamedTuple
 
 import asyncpg
@@ -787,11 +788,58 @@ def resource_retired_detail(resource_label: str, resource_idx: int) -> str:
     return f"{resource_label} {resource_idx} is retired"
 
 
+def resource_not_owned_detail(resource_label: str, resource_idx: int) -> str:
+    """The 403 detail for an action refused because someone else owns the resource."""
+    return f"caller does not own {resource_label} {resource_idx}"
+
+
+class OwnedResourceRefusal(StrEnum):
+    """Why a caller may not act on an owned resource."""
+
+    NOT_FOUND = "not_found"
+    NOT_OWNED = "not_owned"
+    RETIRED = "retired"
+
+
+def classify_owned_resource_refusal(
+    owner_idx: int | None, *, retired: bool, caller_idx: int, bypasses_ownership: bool
+) -> OwnedResourceRefusal | None:
+    """Name why the caller may not act on a resource, or None when it may.
+
+    `owner_idx` is None when no such resource exists. A caller who neither owns
+    the resource nor bypasses ownership is told it is not owned, unless it is
+    retired: then it is not found, so the answer does not reveal that it exists.
+    Callers word their own response.
+    """
+    if owner_idx is None:
+        return OwnedResourceRefusal.NOT_FOUND
+    if not bypasses_ownership and owner_idx != caller_idx:
+        return OwnedResourceRefusal.NOT_FOUND if retired else OwnedResourceRefusal.NOT_OWNED
+    if retired:
+        return OwnedResourceRefusal.RETIRED
+    return None
+
+
+def raise_for_owned_resource_refusal(
+    refusal: OwnedResourceRefusal | None, *, resource_label: str, resource_idx: int
+) -> None:
+    """Raise the HTTPException for `refusal` (404 not found, 403 not owned, 409
+    retired), naming the resource by its label and idx; do nothing for None."""
+    if refusal is None:
+        return
+    status_and_detail = {
+        OwnedResourceRefusal.NOT_FOUND: (404, resource_not_found_detail),
+        OwnedResourceRefusal.NOT_OWNED: (403, resource_not_owned_detail),
+        OwnedResourceRefusal.RETIRED: (409, resource_retired_detail),
+    }
+    status_code, detail_for = status_and_detail[refusal]
+    raise HTTPException(status_code=status_code, detail=detail_for(resource_label, resource_idx))
+
+
 def caller_bypasses_ownership(principal: Principal, bypass_role: SystemRole) -> bool:
     """Return True when the caller's role exempts it from an ownership check.
 
-    401 on Anonymous. A caller that does not bypass must then pass
-    `require_caller_owns` against the resource's owner.
+    401 on Anonymous.
     """
     if isinstance(principal, Anonymous):
         raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
@@ -805,25 +853,17 @@ def require_caller_owns(
     caller_idx: int,
     resource_label: str,
     resource_idx: int,
-    hide_unowned: bool = False,
 ) -> None:
     """Pass when `owner_idx`, the resource's owning principal, is `caller_idx`.
 
-    `owner_idx` is None when no such resource exists, which answers 404. A
-    resource that someone else owns answers 403, or with `hide_unowned` the
-    same 404 that a missing one gets, so the answer does not reveal that it
-    exists.
+    `owner_idx` is None when no such resource exists, which answers 404; a
+    resource that someone else owns answers 403.
     """
-    if owner_idx == caller_idx:
-        return
-    if owner_idx is None or hide_unowned:
-        raise HTTPException(
-            status_code=404,
-            detail=resource_not_found_detail(resource_label, resource_idx),
-        )
-    raise HTTPException(
-        status_code=403,
-        detail=f"caller does not own {resource_label} {resource_idx}",
+    refusal = classify_owned_resource_refusal(
+        owner_idx, retired=False, caller_idx=caller_idx, bypasses_ownership=False
+    )
+    raise_for_owned_resource_refusal(
+        refusal, resource_label=resource_label, resource_idx=resource_idx
     )
 
 

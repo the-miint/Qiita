@@ -42,6 +42,7 @@ from qiita_common.models import (
     Tier,
 )
 
+from qiita_control_plane.auth.guards import resource_not_owned_detail
 from qiita_control_plane.repositories import _sample_helpers as sample_helpers
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.exported_entity import EntityKind
@@ -3755,7 +3756,7 @@ async def test_create_biosample_study_link_biosample_owner_rule(
     assert resp.status_code == expected_status, resp.text
     link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
     if expected_status == 403:
-        assert resp.json() == {"detail": f"caller does not own biosample {biosample_idx}"}
+        assert resp.json() == {"detail": resource_not_owned_detail("biosample", biosample_idx)}
         assert link_row is None
     else:
         expected_row = _expected_active_link_row(
@@ -3840,7 +3841,7 @@ async def test_create_biosample_study_link_waits_for_concurrent_owner_change(ctx
     link_row = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
     assert (resp.status_code, resp.json(), link_row) == (
         403,
-        {"detail": f"caller does not own biosample {biosample_idx}"},
+        {"detail": resource_not_owned_detail("biosample", biosample_idx)},
         None,
     )
 
@@ -3954,7 +3955,7 @@ async def test_create_biosample_study_link_already_linked_retired(ctx):
 
     resp = await _post_study_link(ctx["user"], study_idx, biosample_idx)
 
-    expected_detail = f"biosample {biosample_idx}'s link to study {study_idx} is retired"
+    expected_detail = f"biosample {biosample_idx} has a retired link to study {study_idx}"
     row_after = await _fetch_link_row(ctx["pool"], biosample_idx=biosample_idx, study_idx=study_idx)
     outcome = (resp.status_code, resp.json(), row_after)
     assert outcome == (409, {"detail": expected_detail}, row_before)

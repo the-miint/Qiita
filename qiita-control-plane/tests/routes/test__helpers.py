@@ -598,8 +598,8 @@ def test_parse_kv_detail_skips_chunks_without_equals():
 def test_detail_for_retired_link():
     """Tests the case where an entity's link to a study is retired: the detail
     names the entity and the study."""
-    detail = detail_for_retired_link(noun="biosample", entity_idx=42, study_idx=7)
-    assert detail == "biosample 42's link to study 7 is retired"
+    detail = detail_for_retired_link(subject="biosample 42", study_idx=7)
+    assert detail == "biosample 42 has a retired link to study 7"
 
 
 def test_detail_for_biosample_link_rejection_names_the_study():

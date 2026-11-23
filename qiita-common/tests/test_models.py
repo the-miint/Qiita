@@ -31,7 +31,10 @@ from qiita_common.models._base import (
     NaturalKeyLookupResponse,
 )
 from qiita_common.models.biosample import (
+    BIOSAMPLE_BULK_LINK_MAX_VALUES,
     LOOKUP_IDX_PATTERN,
+    BiosampleBulkLinkRequest,
+    BiosampleLinkKey,
     BiosampleLookupKey,
     BiosampleStudyLookupKey,
     BiosampleStudyLookupRequest,
@@ -1902,9 +1905,11 @@ def test_natural_key_lookup_response_refuses_non_positive_idx(idx):
 def test_lookup_literals_match_their_name_constants():
     """Tests the case where each lookup Literal type is compared with the name
     constants for its values: the test fails when the two differ."""
-    added_by_study_lookup = get_args(BiosampleStudyLookupKey)[len(get_args(BiosampleLookupKey)) :]
-    actual = (get_args(LookupReturnKey), added_by_study_lookup)
-    assert actual == ((EXPORT_ENTITY_ID, IDX_KEY), (IDX_KEY, UNIQUE_FIELD_KEY))
+    natural_key_count = len(get_args(BiosampleLookupKey))
+    added_by_study_lookup = get_args(BiosampleStudyLookupKey)[natural_key_count:]
+    added_by_link = get_args(BiosampleLinkKey)[natural_key_count:]
+    actual = (get_args(LookupReturnKey), added_by_study_lookup, added_by_link)
+    assert actual == ((EXPORT_ENTITY_ID, IDX_KEY), (IDX_KEY, UNIQUE_FIELD_KEY), (IDX_KEY,))
 
 
 def test_biosample_study_lookup_request_names_malformed_idxs():
@@ -1977,6 +1982,83 @@ def test_biosample_lookup_request_strips_padded_tube_ids():
     )
     expected = BiosampleLookupRequest(key="matrix_tube_id", values=["0123456789", "0123456780"])
     assert request == expected
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        (EXPORT_ENTITY_ID, "QB1"),
+        (IDX_KEY, "812"),
+        ("biosample_accession", "SAMN1"),
+        ("ena_sample_accession", "ERS1"),
+        ("matrix_tube_id", "0123456789"),
+    ],
+)
+def test_biosample_bulk_link_request_accepts_each_key(key, value):
+    """Tests the case where a bulk link names each identifier kind it accepts,
+    with a well-formed value: the body is accepted as sent."""
+    body = {"key": key, "values": [value]}
+
+    request = BiosampleBulkLinkRequest.model_validate(body)
+
+    assert request.model_dump() == body
+
+
+@pytest.mark.parametrize(
+    ("key", "values", "expected_message"),
+    [
+        (
+            IDX_KEY,
+            ["812", "0", "abc"],
+            f"Value error, idx values must match {LOOKUP_IDX_PATTERN}: ['0', 'abc']",
+        ),
+        (
+            "matrix_tube_id",
+            ["0123456789", "12"],
+            f"Value error, matrix_tube_id values must match {MATRIX_TUBE_ID_PATTERN}: ['12']",
+        ),
+    ],
+    ids=["idx", "matrix_tube_id"],
+)
+def test_biosample_bulk_link_request_names_malformed_values(key, values, expected_message):
+    """Tests the case where values under a key with a required shape include
+    malformed ones: the refusal names each malformed value and only those."""
+    with pytest.raises(ValidationError) as exc_info:
+        BiosampleBulkLinkRequest.model_validate({"key": key, "values": values})
+
+    messages = [error["msg"] for error in exc_info.value.errors()]
+    assert messages == [expected_message]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"key": UNIQUE_FIELD_KEY, "values": ["S-1"]},
+        {"key": EXPORT_ENTITY_ID, "values": []},
+        {"key": EXPORT_ENTITY_ID, "values": [" "]},
+        {"key": EXPORT_ENTITY_ID, "values": ["QB1"], "return_key": IDX_KEY},
+    ],
+    ids=["unique-field-key", "no-values", "blank-value", "extra-field"],
+)
+def test_biosample_bulk_link_request_refuses_bad_body(body):
+    """Tests the case where the body names a kind that depends on a study, sends
+    no values or a blank one, or carries a field the request does not have: it
+    is refused."""
+    with pytest.raises(ValidationError):
+        BiosampleBulkLinkRequest.model_validate(body)
+
+
+def test_biosample_bulk_link_request_cap():
+    """Tests the case where a bulk link carries exactly
+    BIOSAMPLE_BULK_LINK_MAX_VALUES values (accepted) and one more (refused)."""
+    at_cap = [f"{i + 1}" for i in range(BIOSAMPLE_BULK_LINK_MAX_VALUES)]
+    at_cap_body = {"key": IDX_KEY, "values": at_cap}
+    accepted = BiosampleBulkLinkRequest.model_validate(at_cap_body)
+    assert accepted.model_dump() == at_cap_body
+
+    over_cap_body = {"key": IDX_KEY, "values": [*at_cap, f"{len(at_cap) + 1}"]}
+    with pytest.raises(ValidationError):
+        BiosampleBulkLinkRequest.model_validate(over_cap_body)
 
 
 @pytest.mark.parametrize(

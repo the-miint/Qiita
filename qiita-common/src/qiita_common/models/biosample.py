@@ -675,6 +675,17 @@ BiosampleLookupKey = Literal[
 ]
 
 
+def _check_lookup_value_pattern(key: str, values: list[str]) -> None:
+    """Raise ValueError naming every one of `values` that does not match the
+    pattern that `key`'s values must match; a key with no pattern accepts any."""
+    pattern = _LOOKUP_VALUE_PATTERNS.get(key)
+    if pattern is None:
+        return
+    malformed = [value for value in values if re.fullmatch(pattern, value) is None]
+    if malformed:
+        raise ValueError(f"{key} values must match {pattern}: {malformed}")
+
+
 class BiosampleLookupRequest(NaturalKeyLookupRequest):
     """Resolves a list of values of the biosample natural key named by `key`,
     each to the biosample identifier that `return_key` names. Under
@@ -685,12 +696,7 @@ class BiosampleLookupRequest(NaturalKeyLookupRequest):
 
     @model_validator(mode="after")
     def _check_value_pattern(self) -> BiosampleLookupRequest:
-        pattern = _LOOKUP_VALUE_PATTERNS.get(self.key)
-        if pattern is None:
-            return self
-        malformed = [value for value in self.values if re.fullmatch(pattern, value) is None]
-        if malformed:
-            raise ValueError(f"{self.key} values must match {pattern}: {malformed}")
+        _check_lookup_value_pattern(self.key, self.values)
         return self
 
 
@@ -718,6 +724,41 @@ class BiosampleStudyLookupRequest(BiosampleLookupRequest):
         if self.key != UNIQUE_FIELD_KEY and named:
             raise ValueError("unique_field_display_name is allowed only when key is unique_field")
         return self
+
+
+# The kinds of identifier that a bulk biosample link accepts: the natural keys and
+# the biosample's idx, each naming a biosample whatever study it is in.
+BiosampleLinkKey = Literal[*get_args(BiosampleLookupKey), "idx"]
+
+BIOSAMPLE_BULK_LINK_MAX_VALUES = 2_000
+
+
+class BiosampleBulkLinkRequest(BaseModel):
+    """Links the biosamples named by `values`, each a value of the identifier
+    kind that `key` names, into one study. Under `matrix_tube_id`, every value
+    must be a matrix tube id; under `idx`, a positive whole number that fits an
+    idx.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: BiosampleLinkKey
+    values: list[NonBlankText] = Field(min_length=1, max_length=BIOSAMPLE_BULK_LINK_MAX_VALUES)
+
+    @model_validator(mode="after")
+    def _check_value_pattern(self) -> BiosampleBulkLinkRequest:
+        _check_lookup_value_pattern(self.key, self.values)
+        return self
+
+
+class BiosampleBulkLinkResponse(BaseModel):
+    """The values of a bulk biosample link, by outcome: `linked` names a biosample
+    that the request linked, `already_linked` one whose link already existed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    linked: list[str]
+    already_linked: list[str]
 
 
 class BiosampleLookupByAccessionRequest(BaseModel):

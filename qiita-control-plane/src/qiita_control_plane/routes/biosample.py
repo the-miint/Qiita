@@ -81,8 +81,9 @@ from ..auth.guards import (
     METADATA_BYPASS_ROLE,
     caller_bypasses_ownership,
     caller_metadata_tiers,
+    classify_owned_resource_refusal,
+    raise_for_owned_resource_refusal,
     require_biosample_exists,
-    require_caller_owns,
     require_complete_profile,
     require_eligible_owner,
     require_human,
@@ -90,7 +91,6 @@ from ..auth.guards import (
     require_scope,
     require_study_access,
     require_study_exists,
-    resource_not_found_detail,
     resource_retired_detail,
 )
 from ..auth.principal import HumanUser, Principal
@@ -1074,30 +1074,19 @@ async def create_biosample_study_link(
         # owner change or retirement cannot land between the check and the
         # insert; it leaves other inserts that reference the biosample unblocked.
         row = await fetch_biosample(conn, biosample_idx, lock="share")
-        if not caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE):
-            owner_idx = None if row is None else row["owner_idx"]
-            require_caller_owns(
-                owner_idx,
-                caller_idx=user.principal_idx,
-                resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
-                resource_idx=biosample_idx,
-                hide_unowned=row is not None and row["retired"],
-            )
 
-        # A bypass caller skipped the ownership check, so existence is checked
-        # here too.
-        if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail=resource_not_found_detail(
-                    BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx
-                ),
-            )
-        if row["retired"]:
-            raise HTTPException(
-                status_code=409,
-                detail=resource_retired_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
-            )
+        # Refuse a missing, unowned or retired biosample
+        refusal = classify_owned_resource_refusal(
+            None if row is None else row["owner_idx"],
+            retired=row is not None and row["retired"],
+            caller_idx=user.principal_idx,
+            bypasses_ownership=caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE),
+        )
+        raise_for_owned_resource_refusal(
+            refusal,
+            resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            resource_idx=biosample_idx,
+        )
 
         # Insert the link; when the pair already has one, the insert does nothing
         # and returns None
@@ -1124,8 +1113,7 @@ async def create_biosample_study_link(
                 raise HTTPException(
                     status_code=409,
                     detail=detail_for_retired_link(
-                        noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
-                        entity_idx=biosample_idx,
+                        subject=f"{BIOSAMPLE_METADATA_SPEC.entity_kind} {biosample_idx}",
                         study_idx=study_idx,
                     ),
                 )
