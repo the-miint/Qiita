@@ -91,7 +91,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 4. Deploy
 
-- `[admin]` **Data planes on other hosts run this build before jobs resume.** Native jobs now call the data plane's new `count_doget` before every stream, and a data plane on the previous build refuses it, failing the job. If `QIITA_DATA_PLANE_PEERS` in `/etc/qiita/data-plane.env` names other hosts, deploy this build to them in the same window, since `activate.sh` does not restart peers. A job that starts between the checkout update and the local data-plane restart can fail the same way; after the deploy verifies, list failed tickets with `qiita ticket redrive --all` (a dry run without `--execute`) and re-run each one that failed in the restart window with `qiita ticket run <work_ticket_idx>`. (#N)
+- `[admin]` **Data planes on other hosts run this build before jobs resume.** Native jobs now call the data plane's new `count_doget` before every stream, and a data plane on the previous build refuses it, failing the job. If `QIITA_DATA_PLANE_PEERS` in `/etc/qiita/data-plane.env` names other hosts, deploy this build to them in the same window, since `activate.sh` does not restart peers. A job that starts between the checkout update and the local data-plane restart can fail the same way; after the deploy verifies, list failed tickets with `qiita ticket list --state failed --all --limit 500`, and re-run each one whose `updated_at` falls in the restart window with `qiita ticket run <work_ticket_idx>`. **Also, before the restart, let running `align-denovo` tickets finish and submit no new ones until the deploy verifies**: a job already running keeps the old code, without the count check, and bucket 6 selects only the samples completed before the restart. (#N)
 
 ### 5. Verify
 
@@ -236,9 +236,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     --execute --manifest ~/wol-genome-repair-ref18-$(date +%F).csv                                                                             # 3: writes
   ```
 
-- `[operator]` **Realign every de novo alignment completed before this deploy.** Before this deploy, nginx could cut a de novo job's read stream and the job registered the partial alignment as complete. The gate reads `completed` and only the aligned-read count shows the loss, so every de novo sample completed before the restart is re-run. A re-run under the same params reuses the `alignment_idx`, and the workflow deletes the sample's old rows before registering the new ones, so there is no separate purge. Each re-run now fails rather than registering a short stream. (#N)
-  - **Until the last check below is green:** record no `qiita-admin output-equivalence decide` on these alignments, build no feature tables from them, and do not run `lake-gc`. The comparisons below read the pre-realign snapshot.
-  - **Select the samples and record the baseline**, with the restart time from bucket 4 as `<T>`. A row whose `status` is not `active`, or whose mask or assembly gate is no longer `completed`, is refused on re-submit; leave it out and list it in the deploy notes.
+- `[operator]` **Realign every de novo alignment completed before this deploy.** Before this deploy, nginx could cut a de novo job's read stream, and the job registered the partial alignment as complete. The gate reads `completed` and only the aligned-read count shows the loss, so every de novo sample completed before the restart is re-run. A re-run whose params hash the same reuses the `alignment_idx`, and the workflow deletes the sample's old rows before registering the new ones, so there is no separate purge. A re-run now fails rather than registering a short stream. (#N)
+  - **Until the last check below is green:** record no `qiita-admin output-equivalence decide` on these alignments, and build no feature tables from them. Do not run `lake-gc` either: the baseline snapshot saved below is how a sample's pre-realign rows are read back (`AT (VERSION => …)`) if a re-run needs looking into, and `lake-gc` expires it.
+  - **Tell the lab before the first batch.** While a sample's re-run is between deleting its old rows and registering the new ones, its gate still reads `completed`, so a feature table built from it then is missing that sample's rows.
+  - **Select the samples and record the baseline**, with the bucket-4 restart time as `<T>`. Only rows with `status` `active`, `max_secondary` `100` and `version` `1.0.0` re-run under the same `alignment_idx`. A row with another `max_secondary` or `version` was minted under an older params shape: re-submitting it mints a new alignment and leaves the old rows in place. Leave those rows out, list them in the deploy notes, and raise them with the developers. A row whose mask or assembly gate is no longer `completed` is refused on submit.
     ```bash
     # [operator] on the deploy host, in the pulled checkout
     W=$(mktemp -d ~/denovo-realign.XXXXXX)
@@ -249,42 +250,57 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
                  json_extract_string(ad.params::VARCHAR, '\$.preset') AS preset,
                  json_extract_string(ad.params::VARCHAR, '\$.min_identity') AS min_identity,
                  json_extract_string(ad.params::VARCHAR, '\$.min_query_coverage') AS min_query_coverage,
-                 ad.status::VARCHAR AS status
+                 ad.status::VARCHAR AS status,
+                 json_extract_string(ad.params::VARCHAR, '\$.max_secondary') AS max_secondary,
+                 json_extract_string(ad.params::VARCHAR, '\$.version') AS version
             FROM qiita_cp.qiita.alignment_sample s
             JOIN qiita_cp.qiita.alignment_definition ad USING (alignment_idx)
            WHERE json_extract_string(ad.params::VARCHAR, '\$.subject') = 'assembly'
              AND s.state::VARCHAR = 'completed' AND s.updated_at < '<T>'
            ORDER BY 1, 2)
       TO '$W/affected.tsv' (HEADER, DELIMITER '\t');
-    COPY (SELECT alignment_idx, prep_sample_idx, count(DISTINCT sequence_idx) AS aligned_reads
-            FROM qiita_lake.alignment
-           WHERE (alignment_idx, prep_sample_idx) IN
-                 (SELECT alignment_idx, prep_sample_idx FROM read_csv('$W/affected.tsv'))
+    COPY (SELECT a.alignment_idx, a.prep_sample_idx, count(DISTINCT a.sequence_idx) AS aligned_reads
+            FROM qiita_lake.alignment a
+            SEMI JOIN read_csv('$W/affected.tsv') f USING (alignment_idx, prep_sample_idx)
            GROUP BY 1, 2)
       TO '$W/before.tsv' (HEADER, DELIMITER '\t');
-    SELECT max(snapshot_id) AS baseline_snapshot FROM ducklake_snapshots('qiita_lake');"
-    wc -l "$W/affected.tsv"; cut -f8 "$W/affected.tsv" | sort | uniq -c
+    COPY (SELECT max(snapshot_id) AS baseline_snapshot FROM ducklake_snapshots('qiita_lake'))
+      TO '$W/baseline_snapshot.csv' (HEADER);"
+    awk -F'\t' 'NR > 1 && !($8 == "active" && $9 == "100" && $10 == "1.0.0")' "$W/affected.tsv"   # rows to leave out
+    awk -F'\t' 'NR > 1 && $8 == "active" && $9 == "100" && $10 == "1.0.0"' "$W/affected.tsv" > "$W/rerun.tsv"
+    wc -l "$W/rerun.tsv"
     ```
-  - **Submit a canary of 5, then the rest in batches**, as a wet_lab_admin or system_admin with `prep_sample:write`. The control plane dispatches at most 8 tickets at a time. Wait for a batch's tickets to finish (`qiita ticket status <idx>`) before starting the next.
+  - **Submit a canary of 5, then batches of 8**, as a wet_lab_admin or system_admin with `prep_sample:write`. The control plane dispatches 8 tickets at a time across all users, so a batch of 8 leaves no one else's tickets queued behind more than one batch. Wait for a batch's tickets to finish (`qiita ticket status <idx>`) before starting the next. The loop records each ticket idx in `submitted.tsv`.
     ```bash
-    # [operator] canary: the first 5 active rows; then `tail -n +7`, split into batches of 50
-    awk -F'\t' 'NR > 1 && $8 == "active"' "$W/affected.tsv" | head -5 > "$W/batch.tsv"
-    while IFS=$'\t' read -r A P Q M PRESET MINID MINCOV STATUS; do
-      qiita ticket submit --action-id align-denovo --action-version 1.0.0 --prep-sample-idx "$P" \
-        --context-json "{\"assembly_processing_idx\": $Q, \"align_mask_idx\": $M, \"preset\": \"$PRESET\", \"min_identity\": $MINID, \"min_query_coverage\": $MINCOV}"
+    # [operator] canary; then `tail -n +6 "$W/rerun.tsv" | split -l 8 - "$W/batch-"` and run each batch-* file through the same loop
+    head -5 "$W/rerun.tsv" > "$W/batch.tsv"
+    while IFS=$'\t' read -r A P Q M PRESET MINID MINCOV STATUS MAXSEC VERSION; do
+      T=$(qiita ticket submit --action-id align-denovo --action-version 1.0.0 --prep-sample-idx "$P" \
+        --context-json "{\"assembly_processing_idx\": $Q, \"align_mask_idx\": $M, \"preset\": \"$PRESET\", \"min_identity\": $MINID, \"min_query_coverage\": $MINCOV}" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["work_ticket_idx"])') && printf '%s\t%s\t%s\n' "$A" "$P" "$T" >> "$W/submitted.tsv"
     done < "$W/batch.tsv"
     ```
-  - **Check each batch.** Each new ticket's `alignment_idx` must equal the row's (a different one means the params did not match, and the old rows are still in place). A failed ticket is retried with `qiita ticket run <work_ticket_idx>`. Then compare distinct aligned reads per sample with `before.tsv`. A truncated run's old count is a small fraction of the new one (8% in #935). A whole run's is within a few reads of it either way: repeated runs of one sample differed by up to 16 reads (#935).
+  - **Check each batch.** A failed ticket is re-run with `qiita ticket run <work_ticket_idx>`. Then check, for each row of the batch, that its ticket completed under the row's `alignment_idx` (a different one means the params did not hash the same, and the old rows are still in place), and compare distinct aligned reads with `before.tsv`. A truncated run's old count is a small fraction of the new one: about 8% in #935. A whole run's is within a few reads of it either way: repeated runs of one sample differed by up to 16 reads (#935). A sample with 0 `after` rows needs looking into.
     ```bash
-    bash scripts/lake-shell.sh --no-cp -c "
-    SELECT b.alignment_idx, b.prep_sample_idx, b.aligned_reads AS before, count(DISTINCT a.sequence_idx) AS after,
-           round(b.aligned_reads / count(DISTINCT a.sequence_idx), 3) AS ratio
-      FROM read_csv('$W/before.tsv') b
-      JOIN qiita_lake.alignment a USING (alignment_idx, prep_sample_idx)
-     WHERE (b.alignment_idx, b.prep_sample_idx) IN (SELECT column0, column1 FROM read_csv('$W/batch.tsv', header = false))
-     GROUP BY 1, 2, 3 ORDER BY ratio;"
+    bash scripts/lake-shell.sh -c "
+    WITH batch AS (SELECT column0 AS alignment_idx, column1 AS prep_sample_idx, column2 AS work_ticket_idx
+                     FROM read_csv('$W/submitted.tsv', header = false)),
+         after AS (SELECT a.alignment_idx, a.prep_sample_idx, count(DISTINCT a.sequence_idx) AS aligned_reads
+                     FROM qiita_lake.alignment a SEMI JOIN batch USING (alignment_idx, prep_sample_idx)
+                    GROUP BY 1, 2)
+    SELECT b.alignment_idx, b.prep_sample_idx, b.work_ticket_idx, w.state::VARCHAR AS state,
+           w.alignment_idx = b.alignment_idx AS same_alignment,
+           f.aligned_reads AS before, coalesce(n.aligned_reads, 0) AS after,
+           round(f.aligned_reads / nullif(n.aligned_reads, 0), 3) AS ratio
+      FROM batch b
+      JOIN qiita_cp.qiita.work_ticket w ON w.work_ticket_idx = b.work_ticket_idx
+      LEFT JOIN read_csv('$W/before.tsv') f
+        ON f.alignment_idx = b.alignment_idx AND f.prep_sample_idx = b.prep_sample_idx
+      LEFT JOIN after n
+        ON n.alignment_idx = b.alignment_idx AND n.prep_sample_idx = b.prep_sample_idx
+     ORDER BY ratio NULLS FIRST;"
     ```
-  - **When every sample is done**, list who built feature tables from these alignments and ask them to rebuild. A user build records only the first person to mint the alignment's `QP` handle, so also announce it to the lab list.
+  - **When every sample is done**, list who built feature tables from these alignments and ask them to rebuild. A user build records only the first person to mint the alignment's `QP` handle, so the lab notice above is the rest of the coverage.
     ```bash
     # [operator] DATABASE_URL set as in docs/runbooks/redeploy.md (migrate step); <A> = the affected alignment_idx values, comma-separated
     psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
@@ -298,7 +314,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
      ORDER BY created_at;
     SQL
     ```
-  - **`lake-gc`, once every comparison is done** and at least 7 days after the last re-run, the default expiry: `sudo -u qiita-data bash scripts/lake-gc.sh` to report, then `--reclaim`. The deleted rows' files stay on disk until then.
+  - **`lake-gc`, once every check is done** and at least 7 days after the last re-run, the default expiry: `sudo -u qiita-data bash scripts/lake-gc.sh` to report, then `--reclaim`. The deleted rows' files stay on disk until then.
 
 ### Notes (no host action)
 

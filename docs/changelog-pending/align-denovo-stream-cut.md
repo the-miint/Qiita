@@ -8,10 +8,12 @@
 - **A native job fails when a data-plane stream ends short (#N).** Every DoGet a job
   opens first asks the new `count_doget` DoAction how many rows the same ticket
   streams, and the job fails when the stream delivered a different number.
-  `align-denovo` also fails when the aligner did not read every read. Some September
-  `align-denovo` runs completed and registered alignments of only part of their
+  `align-denovo` also fails when the aligner did not read every read. Before this,
+  some `align-denovo` runs completed and registered alignments of only part of their
   sample's reads after nginx cut the stream; a short stream now fails the ticket
-  whatever cut it.
+  whatever cut it. Every de novo alignment completed before this deploy is re-run after
+  it, under the same `alignment_idx`, and feature tables built from them before the
+  re-run need rebuilding.
 
 ### Added
 
