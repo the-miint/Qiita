@@ -15,6 +15,7 @@ Client interfaces are the user-facing layer through which researchers and system
 - **DoGet**: select by key (table + integer identifiers encoded in signed Flight ticket)
 - **DoPut**: upload data (stream RecordBatches to shared filesystem via FlightDescriptor, authorized by signed action token)
 - **DoAction**: register file (`ducklake_add_data_files`), delete by key, insert-from-processing-method (authorized by signed action token)
+- **`count_doget`** (DoAction, authorized by a DoGet ticket): how many rows a DoGet of the same ticket streams. Every orchestrator stream (`data_plane_client.open_doget_stream`) asks for it first and fails the job when the stream delivered a different number, which catches a stream that ends short without an error.
 
 ### Concurrency bound
 

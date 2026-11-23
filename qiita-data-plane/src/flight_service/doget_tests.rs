@@ -612,3 +612,49 @@ async fn lossless_conversion_would_re_type_boolean_and_json_columns() {
     assert_eq!(extension("j").as_deref(), Some("arrow.json"), "{schema:?}");
     assert_eq!(extension("u").as_deref(), Some("arrow.uuid"), "{schema:?}");
 }
+
+/// `count_doget` answers with the number of rows a DoGet of the same ticket
+/// streams. Counted from the stream itself rather than from the fixture's insert,
+/// so the test fails if the two paths ever select different rows.
+#[tokio::test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+async fn count_doget_matches_the_rows_the_same_ticket_streams() {
+    use arrow_flight::Action;
+
+    let (service, ticket, _tmp) = doget_fixture(977_200, 977_210, FEATURE_TABLE_COLUMNS);
+    let response = service
+        .do_get(Request::new(Ticket {
+            ticket: ticket.clone().into(),
+        }))
+        .await
+        .expect("DoGet should succeed");
+    let mut decoder = FlightDataDecoder::new(
+        response
+            .into_inner()
+            .map(|r| r.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)))),
+    );
+    let mut streamed = 0usize;
+    while let Some(message) = decoder.next().await {
+        if let DecodedPayload::RecordBatch(batch) = message.expect("decode").payload {
+            streamed += batch.num_rows();
+        }
+    }
+    assert_eq!(streamed, 20_000, "the fixture streams its 20000 rows");
+
+    let action = Action {
+        r#type: "count_doget".to_string(),
+        body: ticket.into(),
+    };
+    let results: Vec<_> = service
+        .do_action(Request::new(action))
+        .await
+        .expect("count_doget should succeed")
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(results.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(&results[0].as_ref().expect("result").body).unwrap();
+    assert_eq!(body["count"], streamed as i64);
+}

@@ -119,3 +119,22 @@ async fn count_masked_refuses_a_projected_read_masked_ticket() {
         err.message()
     );
 }
+
+/// `count_doget` applies the DoGet table allowlist: a ticket for a table DoGet
+/// would refuse is refused here too, before the lake is touched.
+#[tokio::test]
+async fn count_doget_refuses_a_table_doget_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let service = make_service(tmp.path().to_path_buf());
+    let payload = br#"{"table":"read","filter":{"prep_sample_idx":[3]}}"#;
+    let action = Action {
+        r#type: "count_doget".to_string(),
+        body: sign_raw(payload, &TEST_SEED, future_expiry_secs(300)).into(),
+    };
+    let err = match service.do_action(Request::new(action)).await {
+        Ok(_) => panic!("a raw-read ticket must not be counted"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "got: {err}");
+    assert!(err.message().contains("unknown table"), "{}", err.message());
+}

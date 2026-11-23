@@ -169,7 +169,11 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None, delivered
     async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads"):
         assert (prep_sample_idx, mask_idx) == (_PREP_SAMPLE_IDX, _MASK_IDX)
         with registered_counted(
-            conn, relation, _reader(_READ_SCHEMA, on_wire), expected_rows=len(read_rows)
+            conn,
+            relation,
+            _reader(_READ_SCHEMA, on_wire),
+            expected_rows=len(read_rows),
+            require_drained=True,
         ):
             yield relation
 
@@ -534,7 +538,7 @@ def test_a_read_stream_that_ends_early_fails_the_job_and_leaves_no_output(
     the output can show the loss; the job has to fail on the count."""
     workspace = tmp_path / "ws"
     _install_streams(monkeypatch, genome, delivered=2)
-    with pytest.raises(StreamRowCountMismatch, match="delivered 2 rows.* counts 5"):
+    with pytest.raises(StreamRowCountMismatch, match="delivered 2 rows.*counts 5"):
         asyncio.run(execute(_inputs(), workspace))
     assert not (workspace / "alignment.parquet").exists()
     assert not (workspace / "alignment_origin_spanning.parquet").exists()

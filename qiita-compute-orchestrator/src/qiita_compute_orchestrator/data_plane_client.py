@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     import duckdb
     import httpx
     import pyarrow as pa
+    import pyarrow.flight as flight
 
 
 async def fetch_reference_doget_ticket(
@@ -104,7 +105,7 @@ def open_doget_stream(
     data_plane_url: str,
     ticket_bytes: bytes,
     relation: str = "reference_chunks",
-    expected_rows: int | None = None,
+    require_drained: bool = False,
 ) -> Iterator[str]:
     """Stream a signed DoGet ticket into `conn` as `relation`.
 
@@ -124,20 +125,24 @@ def open_doget_stream(
     exit. `ticket_bytes` is the raw signed ticket from a `fetch_*_doget_ticket` call
     (already base64-decoded).
 
-    `expected_rows`, when given, is checked against the rows the body pulled; see
-    `registered_counted`.
+    Before streaming, the data plane's `count_doget` for the same ticket is fetched,
+    and the rows the stream delivered are checked against it on exit
+    (`registered_counted`, which also says what `require_drained` adds).
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
     client = flight.FlightClient(data_plane_url)
     try:
+        expected_rows = _count_doget(client, ticket_bytes)
         reader = client.do_get(flight.Ticket(ticket_bytes)).to_reader()
-        if expected_rows is None:
-            with registered(conn, relation, reader):
-                yield relation
-        else:
-            with registered_counted(conn, relation, reader, expected_rows=expected_rows):
-                yield relation
+        with registered_counted(
+            conn,
+            relation,
+            reader,
+            expected_rows=expected_rows,
+            require_drained=require_drained,
+        ):
+            yield relation
     finally:
         client.close()
 
@@ -154,20 +159,25 @@ def registered_counted(
     reader: pa.RecordBatchReader,
     *,
     expected_rows: int,
+    require_drained: bool = False,
 ) -> Iterator[str]:
-    """`registered`, with the rows DuckDB pulls from `reader` counted, and a
-    `StreamRowCountMismatch` raised when the body returns and the count is not
-    `expected_rows`.
+    """`registered`, with a `StreamRowCountMismatch` raised when the body returns and
+    the stream did not deliver `expected_rows` rows.
 
     A stream cut mid-body can end without an error, and the consumer then sees a
     short input as a complete one: nginx resetting a DoGet whose consumer had stopped
-    reading for longer than `send_timeout` ended an `align_minimap2` input that way,
-    and the alignment was registered from 8% of the sample's reads. Comparing the
-    count fails the job whatever cut the stream.
+    reading for longer than `send_timeout` ended an `align_minimap2` input that way
+    under an earlier miint, and the alignment was registered from 8% of the sample's
+    reads. Comparing the count fails the job whatever cut the stream.
 
-    The count is of rows that left `reader`, so the body must drain the relation; a
-    body that stops early (a `LIMIT`) fails the check. The check runs only when the
-    body returns: an exception from the body propagates unchanged.
+    The rows counted are those the body pulled from `reader` plus any it left, which
+    are drained after the body returns: a consumer need not read every row (a join
+    whose other side is empty may stop scanning this one), and what is checked is
+    that the stream was whole. `require_drained` also refuses a body that left rows
+    unread, for a consumer whose output depends on having seen every one.
+
+    The check runs only when the body returns: an exception from the body propagates
+    unchanged.
     """
     import pyarrow as pa  # noqa: PLC0415
 
@@ -182,26 +192,28 @@ def registered_counted(
     counted = pa.RecordBatchReader.from_batches(reader.schema, _batches())
     with registered(conn, relation, counted):
         yield relation
-    if delivered != expected_rows:
+    unread = sum(batch.num_rows for batch in reader)
+    if delivered + unread != expected_rows:
         raise StreamRowCountMismatch(
-            f"the DoGet stream registered as {relation!r} delivered {delivered} rows; "
-            f"the data plane counts {expected_rows} for the same ticket"
+            f"the DoGet stream registered as {relation!r} delivered "
+            f"{delivered + unread} rows; the data plane counts {expected_rows} for the "
+            "same ticket"
+        )
+    if require_drained and unread:
+        raise StreamRowCountMismatch(
+            f"the body read {delivered} of the {expected_rows} rows of {relation!r} "
+            "and must read them all"
         )
 
 
-def count_masked_reads(*, data_plane_url: str, ticket_bytes: bytes) -> int:
-    """How many reads an unprojected `read_masked` DoGet ticket selects, from the
-    data plane's `count_masked` DoAction, which takes the same signed ticket and
-    counts without streaming the reads."""
+def _count_doget(client: flight.FlightClient, ticket_bytes: bytes) -> int:
+    """How many rows a DoGet of `ticket_bytes` streams, from the data plane's
+    `count_doget` DoAction, which takes the same signed ticket."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
-    client = flight.FlightClient(data_plane_url)
-    try:
-        results = list(client.do_action(flight.Action("count_masked", ticket_bytes)))
-    finally:
-        client.close()
+    results = list(client.do_action(flight.Action("count_doget", ticket_bytes)))
     if len(results) != 1:
-        raise RuntimeError(f"count_masked returned {len(results)} results, expected 1")
+        raise RuntimeError(f"count_doget returned {len(results)} results, expected 1")
     return int(json.loads(results[0].body.to_pybytes())["count"])
 
 
@@ -211,6 +223,7 @@ async def _open_ticket_stream(
     *,
     mint: Callable[[httpx.AsyncClient], Awaitable[bytes]],
     relation: str,
+    require_drained: bool = False,
 ) -> AsyncIterator[str]:
     """Compose the two seams every public opener shares: mint a signed DoGet ticket
     (CO→CP) then stream it (CO→DP Flight) into `conn` as `relation`.
@@ -230,6 +243,7 @@ async def _open_ticket_stream(
         data_plane_url=get_settings().data_plane_url,
         ticket_bytes=ticket,
         relation=relation,
+        require_drained=require_drained,
     ) as rel:
         yield rel
 
@@ -421,37 +435,22 @@ async def open_read_masked_stream(
     and a zero-row Arrow stream still carries its schema, so a caller materializes a
     valid empty table and runs to a clean no-op.
 
-    **The body must drain the relation.** The data plane's `count_masked` for the
-    same pair is fetched before the stream opens, and the rows the body pulled are
-    checked against it when the body returns (`registered_counted`), so a stream that
-    ends short fails rather than handing the body a partial sample.
+    **The body must read every row** (`require_drained`, see `registered_counted`):
+    an aligner emits no row for a read it never saw, so its output cannot show one
+    went missing.
 
-    The CP client is closed as soon as the ticket is minted; only the Flight
-    client/stream stays open for the body's duration. `data_plane_url` resolves from
-    `get_settings()`.
+    Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
+    the ticket is minted; only the Flight client/stream stays open for the body's
+    duration. `data_plane_url` resolves from `get_settings()`.
     """
 
-    async with make_cp_client() as http:
-        ticket = await fetch_read_masked_doget_ticket(
+    async def _mint(http: httpx.AsyncClient) -> bytes:
+        return await fetch_read_masked_doget_ticket(
             http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx, columns=columns
         )
-        # `count_masked` refuses a projected ticket, so a projected stream is
-        # counted under an unprojected ticket for the same pair.
-        count_ticket = (
-            ticket
-            if columns is None
-            else await fetch_read_masked_doget_ticket(
-                http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx, columns=None
-            )
-        )
-    data_plane_url = get_settings().data_plane_url
-    expected_rows = count_masked_reads(data_plane_url=data_plane_url, ticket_bytes=count_ticket)
-    with open_doget_stream(
-        conn,
-        data_plane_url=data_plane_url,
-        ticket_bytes=ticket,
-        relation=relation,
-        expected_rows=expected_rows,
+
+    async with _open_ticket_stream(
+        conn, mint=_mint, relation=relation, require_drained=True
     ) as rel:
         yield rel
 

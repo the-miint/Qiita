@@ -141,7 +141,7 @@ async def test_open_reference_chunk_stream_composes_ticket_and_stream(monkeypatc
         return b"signed-ticket-bytes"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["stream"] = {
             "conn": conn,
             "data_plane_url": data_plane_url,
@@ -191,7 +191,7 @@ async def test_open_reference_chunk_stream_passes_none_feature_idx(monkeypatch):
         return b"t"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         yield relation
 
     class _Settings:
@@ -280,7 +280,7 @@ async def test_open_alignment_stream_composes_ticket_and_stream(monkeypatch):
         return b"signed-alignment-ticket"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["stream"] = {
             "conn": conn,
             "data_plane_url": data_plane_url,
@@ -334,7 +334,7 @@ async def test_open_reference_sequences_stream_mints_whole_reference(monkeypatch
         return b"signed-lengths-ticket"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["relation"] = relation
         captured["ticket_bytes"] = ticket_bytes
         yield relation
@@ -431,7 +431,7 @@ async def test_open_assembly_chunk_stream_composes_ticket_and_stream(monkeypatch
         return b"signed-assembly-ticket"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["stream"] = {
             "conn": conn,
             "data_plane_url": data_plane_url,
@@ -554,18 +554,14 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
         captured["columns"] = columns
         return b"signed-read-masked-ticket"
 
-    def fake_count(*, data_plane_url, ticket_bytes):
-        captured["count"] = {"data_plane_url": data_plane_url, "ticket_bytes": ticket_bytes}
-        return 41
-
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, expected_rows):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["stream"] = {
             "conn": conn,
             "data_plane_url": data_plane_url,
             "ticket_bytes": ticket_bytes,
             "relation": relation,
-            "expected_rows": expected_rows,
+            "require_drained": require_drained,
         }
         yield relation
 
@@ -574,7 +570,6 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "count_masked_reads", fake_count)
     monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
@@ -590,12 +585,8 @@ async def test_open_read_masked_stream_composes_ticket_and_stream(monkeypatch):
     assert captured["stream"]["data_plane_url"] == "grpc://dp.test:50051"
     assert captured["stream"]["ticket_bytes"] == b"signed-read-masked-ticket"
     assert captured["stream"]["relation"] == "masked_reads"
-    # The count is asked under the ticket the stream uses, and checked by the stream.
-    assert captured["count"] == {
-        "data_plane_url": "grpc://dp.test:50051",
-        "ticket_bytes": b"signed-read-masked-ticket",
-    }
-    assert captured["stream"]["expected_rows"] == 41
+    # The aligner's output cannot show a read it never saw, so every row must be read.
+    assert captured["stream"]["require_drained"] is True
 
 
 async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch):
@@ -608,17 +599,12 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
         yield object()
 
     async def fake_fetch(*, http, prep_sample_idx, mask_idx, columns):
-        captured.setdefault("fetched", []).append(columns)
-        return b"projected" if columns is not None else b"unprojected"
-
-    def fake_count(*, data_plane_url, ticket_bytes):
-        captured["count_ticket"] = ticket_bytes
-        return 3
+        captured["columns"] = columns
+        return b"t"
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, expected_rows):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         captured["relation"] = relation
-        captured["stream_ticket"] = ticket_bytes
         yield relation
 
     class _Settings:
@@ -626,7 +612,6 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
 
     monkeypatch.setattr(dpc, "make_cp_client", fake_make_cp_client)
     monkeypatch.setattr(dpc, "fetch_read_masked_doget_ticket", fake_fetch)
-    monkeypatch.setattr(dpc, "count_masked_reads", fake_count)
     monkeypatch.setattr(dpc, "open_doget_stream", fake_stream)
     monkeypatch.setattr(dpc, "get_settings", lambda: _Settings())
 
@@ -640,11 +625,7 @@ async def test_open_read_masked_stream_relation_name_is_overridable(monkeypatch)
         assert rel == "denovo_reads"
 
     assert captured["relation"] == "denovo_reads"
-    # `count_masked` refuses a projected ticket: the projection streams, and an
-    # unprojected ticket for the same pair is what is counted.
-    assert captured["fetched"] == [["read_id", "sequence_idx"], None]
-    assert captured["stream_ticket"] == b"projected"
-    assert captured["count_ticket"] == b"unprojected"
+    assert captured["columns"] == ["read_id", "sequence_idx"]
 
 
 async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monkeypatch):
@@ -668,7 +649,7 @@ async def test_open_read_masked_stream_mint_failure_never_opens_the_stream(monke
         )
 
     @contextmanager
-    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, expected_rows):
+    def fake_stream(conn, *, data_plane_url, ticket_bytes, relation, require_drained=False):
         opened.append(relation)
         raise AssertionError("stream opened despite a refused mint")
 
@@ -713,7 +694,7 @@ def test_registered_counted_refuses_a_stream_that_ends_short():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 5 rows.* counts 7"):
+        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 5 rows.*counts 7"):
             with dpc.registered_counted(conn, "r", _int_reader(5), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
@@ -722,20 +703,39 @@ def test_registered_counted_refuses_a_stream_longer_than_counted():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 8 rows.* counts 7"):
+        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 8 rows.*counts 7"):
             with dpc.registered_counted(conn, "r", _int_reader(8), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
 
-def test_registered_counted_refuses_a_body_that_does_not_drain():
-    """The count is of rows that left the reader, so a body reading part of the
-    relation fails the check rather than passing on the rows it skipped."""
+def test_registered_counted_counts_the_rows_a_body_left_unread():
+    """A body need not read every row (a join whose other side is empty may stop
+    scanning this one); the rest is drained and counted, so a whole stream passes."""
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with pytest.raises(dpc.StreamRowCountMismatch):
+        with dpc.registered_counted(conn, "r", _int_reader(30_000), expected_rows=30_000) as rel:
+            conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
+
+
+def test_registered_counted_still_refuses_a_short_stream_a_body_left_unread():
+    import duckdb  # noqa: PLC0415
+
+    with duckdb.connect() as conn:
+        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 29999 rows"):
             with dpc.registered_counted(
-                conn, "r", _int_reader(30_000), expected_rows=30_000
+                conn, "r", _int_reader(29_999), expected_rows=30_000
+            ) as rel:
+                conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
+
+
+def test_registered_counted_require_drained_refuses_a_body_that_left_rows():
+    import duckdb  # noqa: PLC0415
+
+    with duckdb.connect() as conn:
+        with pytest.raises(dpc.StreamRowCountMismatch, match="must read them all"):
+            with dpc.registered_counted(
+                conn, "r", _int_reader(30_000), expected_rows=30_000, require_drained=True
             ) as rel:
                 conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
 
@@ -749,3 +749,55 @@ def test_registered_counted_lets_the_body_exception_through():
         with pytest.raises(ValueError, match="from the body"):
             with dpc.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
                 raise ValueError("from the body")
+
+
+class _CountingFlightServer:
+    """An in-process Flight server whose DoGet streams `rows` rows and whose
+    `count_doget` answers `counted`, so a test can give the two different answers."""
+
+    def __init__(self, *, rows: int, counted: int):
+        import pyarrow as pa  # noqa: PLC0415
+        import pyarrow.flight as flight  # noqa: PLC0415
+
+        table = pa.table({"sequence_idx": pa.array(range(rows), pa.int64())})
+        self.actions: list[tuple[str, bytes]] = []
+        outer = self
+
+        class _Server(flight.FlightServerBase):
+            def do_get(self, context, ticket):
+                return flight.RecordBatchStream(table)
+
+            def do_action(self, context, action):
+                outer.actions.append((action.type, action.body.to_pybytes()))
+                yield flight.Result(json.dumps({"count": counted}).encode())
+
+        self.server = _Server("grpc://127.0.0.1:0")
+        self.url = f"grpc://127.0.0.1:{self.server.port}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+
+
+def test_open_doget_stream_counts_under_the_same_ticket_and_passes_a_whole_stream():
+    import duckdb  # noqa: PLC0415
+
+    with _CountingFlightServer(rows=5000, counted=5000) as server, duckdb.connect() as conn:
+        with dpc.open_doget_stream(
+            conn, data_plane_url=server.url, ticket_bytes=b"signed", relation="r"
+        ) as rel:
+            assert conn.execute(f"SELECT count(*) FROM {rel}").fetchone() == (5000,)
+        assert server.actions == [("count_doget", b"signed")]
+
+
+def test_open_doget_stream_refuses_a_stream_shorter_than_the_count():
+    import duckdb  # noqa: PLC0415
+
+    with _CountingFlightServer(rows=4000, counted=5000) as server, duckdb.connect() as conn:
+        with pytest.raises(dpc.StreamRowCountMismatch, match="delivered 4000 rows.*counts 5000"):
+            with dpc.open_doget_stream(
+                conn, data_plane_url=server.url, ticket_bytes=b"signed", relation="r"
+            ) as rel:
+                conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")

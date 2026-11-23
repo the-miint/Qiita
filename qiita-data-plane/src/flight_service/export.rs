@@ -1,4 +1,4 @@
-//! The `export_read`, `count_masked` and `mask_metrics` DoActions.
+//! The `export_read`, `count_masked`, `count_doget` and `mask_metrics` DoActions.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,7 @@ use tonic::{Response, Status};
 
 use crate::auth;
 
-use super::query::{single_i64_filter, EXPORT_READ_COLUMNS};
+use super::query::{build_query, single_i64_filter, ALLOWED_TABLES, EXPORT_READ_COLUMNS};
 use super::QiitaFlightService;
 
 impl QiitaFlightService {
@@ -77,6 +77,42 @@ impl QiitaFlightService {
             })
             .await?;
 
+        Self::action_response(&serde_json::json!({ "count": count }))
+    }
+
+    /// How many rows a DoGet of the same signed ticket streams: `count(*)` over the
+    /// query `do_get` would run, from the same `build_query`, so the two cannot
+    /// select different rows. A consumer compares it with the rows it received, which
+    /// is how a stream that ends short without an error is caught.
+    ///
+    /// The DoGet ticket is the authorization, as for `count_masked`: a count of the
+    /// rows a ticket selects reveals no more than streaming them.
+    pub(super) async fn count_doget_action(
+        &self,
+        action: &Action,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let payload = auth::verify_ticket(&action.body, &self.flight_public_key)
+            .map_err(|e| Status::unauthenticated(e.to_string()))?;
+        if !ALLOWED_TABLES.contains(&payload.table.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "unknown table: {:?}",
+                payload.table
+            )));
+        }
+        let (sql, table) = build_query(
+            &payload.table,
+            &payload.filter,
+            &payload.members,
+            &payload.columns,
+        )?;
+        let count: i64 = self
+            .blocking_lake("count_doget", move |conn| {
+                conn.query_row(&format!("SELECT count(*) FROM ({sql})"), [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| Status::internal(format!("count_doget failed for {table}: {e}")))
+            })
+            .await?;
         Self::action_response(&serde_json::json!({ "count": count }))
     }
 
