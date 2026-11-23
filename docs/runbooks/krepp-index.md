@@ -14,9 +14,6 @@ same folder overwritten.
   loaded before the loader numbered trees needs
   `POST /api/v1/reference/18/phylogeny/mint-edge-id` first (registration refuses an
   unnumbered tree and says so).
-- The build was written by the krepp the staged miint links. Registration compares the
-  `krepp version` in the build's `metadata-*.txt` with the `krepp-version` row of
-  `miint_versions()` and refuses a mismatch.
 - `PATH_NODE_LOCAL` is set in `compute-orchestrator.env` (e.g. `/scratch/qiita-miint`);
   the orchestrator does not start on SLURM without it.
 
@@ -41,7 +38,7 @@ qiita ticket submit --action-id reference-index-register --action-version 1.0.0 
   --context-json '{"build_label": "w43_r0-25"}'
 ```
 
-The job checks the folder, the krepp version and the trees, then hashes every file and
+The job checks the folder and the trees, then hashes every file and
 writes `README.md`, `manifest.json`, `verify.sh` and `SHA256SUMS`. The new row is
 `registered`, and is not served until it is activated. Its row, from `GET /api/v1/reference/18/index`
 (`reference:read`), has the `reference_index_idx` and, in `params.sha256sums_sha256`,

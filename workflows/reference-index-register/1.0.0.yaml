@@ -7,8 +7,8 @@ description: >
   reference. The build is placed by hand at
   `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` (`index/` with the
   krepp files, `jest/` with JEST's labelled tree and null), and this workflow checks
-  it — the folder is a krepp build, written by the krepp the staged miint links, over
-  the reference's own tree with its edge numbers — writes README.md, manifest.json,
+  it — its settings and tree can be read, the tree is the reference's own with its
+  edge numbers, and it holds no symlinks — writes README.md, manifest.json,
   verify.sh and SHA256SUMS into it, and records it in qiita.reference_index as
   `registered`. A registered build is not used: the cluster admins copy the folder to
   every node's PATH_NODE_LOCAL, and `reference-index-activate` makes it the

@@ -6,7 +6,7 @@ description: >
   Make a registered krepp build the reference's active one, once the cluster admins
   have copied it to every compute node (docs/runbooks/krepp-index.md). On whichever
   node SLURM picks, the job checks that node's copy against the registered
-  SHA256SUMS hash and the linked krepp version, then places one 30 kb piece of up to
+  SHA256SUMS hash, then places one 30 kb piece of up to
   100 backbone tips with it and reports the share whose best edge is the tip's own.
   The activate step makes the build active, retiring the reference's previous active
   build, when that share is at least `min_own_edge_share`, and records the result in

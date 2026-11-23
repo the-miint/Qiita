@@ -46,15 +46,11 @@ MANIFEST_FORMAT = 1
 
 # The metadata keys Qiita reads from every `metadata-*.txt` in `index/`: all are
 # recorded in the manifest and README, all but `frac` in reference_index.params, and
-# `krepp version` is checked against the linked krepp.
+# `krepp version` is compared with the linked krepp by the readiness probe, which
+# warns on a difference (krepp indexes are read across krepp versions).
 RECORDED_METADATA_KEYS = ("krepp version", "k", "w", "h", "m", "frac")
 
 _HASH_CHUNK = 8 << 20
-
-
-# The `check` of a KreppBuildInvalid raised because the build's krepp is not the linked
-# one. The readiness probe fails on it rather than warning, so it is compared by name.
-CHECK_KREPP_VERSION = "krepp-version"
 
 
 class KreppBuildInvalid(ValueError):
@@ -268,18 +264,12 @@ def _parse_sums(text: str) -> dict[str, str]:
     return out
 
 
-def verify_build(
-    folder: Path,
-    expected_sums_sha256: str,
-    *,
-    linked_krepp_version: str | None,
-) -> dict:
+def verify_build(folder: Path, expected_sums_sha256: str) -> dict:
     """The per-job check of one copy, cheap enough to run before every placement:
     SHA256SUMS is the registered one; the folder holds exactly the files it lists
     and no symlink;
     every size matches the manifest; the small files (manifest, README, verify.sh,
-    every metadata text and the tree) match their hashes; and the build's krepp
-    version is the one miint links, when the caller passes it. The large index files
+    every metadata text and the tree) match their hashes. The large index files
     are checked by size only; ``verify.sh`` hashes everything.
 
     Returns the manifest. Raises KreppBuildInvalid. A missing folder and one this
@@ -315,31 +305,15 @@ def verify_build(
     for rel in small:
         if sha256_file(folder / rel) != listed[rel]:
             raise KreppBuildInvalid("hash", f"{rel} does not match SHA256SUMS")
-    if linked_krepp_version is not None:
-        check_krepp_version(manifest["settings"]["krepp version"], linked_krepp_version)
     return manifest
 
 
-def check_krepp_version(built: str, linked: str) -> None:
-    """Raise KreppBuildInvalid (`CHECK_KREPP_VERSION`) when the build's krepp version is
-    not the one the loaded miint links."""
-    if built != linked:
-        raise KreppBuildInvalid(
-            CHECK_KREPP_VERSION,
-            f"the build was written by krepp {built}; the loaded miint links {linked}",
-        )
-
-
-def linked_krepp_version(conn) -> str:
+def linked_krepp_version(conn) -> str | None:
     """krepp's own version string, as the loaded miint reports it: the `krepp-version`
     row of `miint_versions()`, the string an index records as `krepp version:`
-    (https://the-miint.github.io/duckdb-miint/utilities/)."""
+    (https://the-miint.github.io/duckdb-miint/utilities/). None when the loaded miint
+    has no such row."""
     row = conn.execute(
         "SELECT version FROM miint_versions() WHERE library = 'krepp-version'"
     ).fetchone()
-    if row is None:
-        raise RuntimeError(
-            "the loaded miint reports no krepp-version row: built without krepp,"
-            " or older than duckdb-miint#475"
-        )
-    return row[0]
+    return row[0] if row else None

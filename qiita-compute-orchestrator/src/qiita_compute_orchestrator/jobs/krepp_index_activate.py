@@ -28,7 +28,7 @@ from qiita_common.krepp import (
 from ..config import get_settings
 from ..data_plane_client import open_reference_chunk_stream, open_reference_phylogeny_stream
 from ..derived_store import KREPP_INDEX_SUBDIR, node_relative_path
-from ..krepp_build import linked_krepp_version, verify_build
+from ..krepp_build import verify_build
 from ..miint import (
     apply_duckdb_settings,
     duckdb_tmp_dir,
@@ -80,9 +80,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ),
             threads=_DUCKDB_THREADS,
         )
-        verify_build(
-            folder, record.sha256sums_sha256, linked_krepp_version=linked_krepp_version(conn)
-        )
+        verify_build(folder, record.sha256sums_sha256)
         async with open_reference_phylogeny_stream(conn, reference_idx=inputs.reference_idx) as rel:
             conn.execute(
                 "CREATE TEMP TABLE tip AS"

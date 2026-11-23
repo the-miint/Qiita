@@ -20,7 +20,6 @@ import pytest
 from helpers import krepp_recorded_version
 
 from qiita_compute_orchestrator.krepp_build import (
-    CHECK_KREPP_VERSION,
     JEST_LABELLED_TREE,
     JEST_NULL,
     MANIFEST,
@@ -135,7 +134,7 @@ def test_verify_accepts_the_registered_copy(build):
     sums, _ = _register(build)
     copy = build.parent / "node-copy"
     shutil.copytree(build, copy)
-    manifest = verify_build(copy, sums, linked_krepp_version=None)
+    manifest = verify_build(copy, sums)
     assert manifest["build_label"] == build.name
 
 
@@ -154,7 +153,7 @@ def test_verify_refuses_a_changed_copy(build, edit, check):
     sums, _ = _register(build)
     edit(build)
     with pytest.raises(KreppBuildInvalid) as exc:
-        verify_build(build, sums, linked_krepp_version=None)
+        verify_build(build, sums)
     assert exc.value.check == check
 
 
@@ -167,19 +166,19 @@ def _same_size_edit(path: Path) -> None:
 def test_verify_refuses_another_build(build):
     _register(build)
     with pytest.raises(KreppBuildInvalid) as exc:
-        verify_build(build, "0" * 64, linked_krepp_version=None)
+        verify_build(build, "0" * 64)
     assert exc.value.check == "sha256sums"
 
 
 def test_verify_tells_missing_from_unreadable(build, tmp_path):
     sums, _ = _register(build)
     with pytest.raises(KreppBuildInvalid) as exc:
-        verify_build(tmp_path / "absent", sums, linked_krepp_version=None)
+        verify_build(tmp_path / "absent", sums)
     assert exc.value.check == "missing"
     (build / SHA256SUMS).chmod(0)
     try:
         with pytest.raises(KreppBuildInvalid) as exc:
-            verify_build(build, sums, linked_krepp_version=None)
+            verify_build(build, sums)
         assert exc.value.check == "unreadable"
     finally:
         (build / SHA256SUMS).chmod(0o644)
@@ -196,7 +195,7 @@ def test_an_unreadable_subdirectory_is_refused_not_skipped(build):
     try:
         for attempt in (
             lambda: _register(build),
-            lambda: verify_build(build, sums, linked_krepp_version=None),
+            lambda: verify_build(build, sums),
         ):
             with pytest.raises(KreppBuildInvalid) as exc:
                 attempt()
@@ -205,17 +204,8 @@ def test_an_unreadable_subdirectory_is_refused_not_skipped(build):
         stray.chmod(0o755)
 
 
-def test_verify_refuses_a_build_from_another_krepp(build):
-    sums, manifest = _register(build)
-    built = manifest["settings"]["krepp version"]
-    assert verify_build(build, sums, linked_krepp_version=built)
-    with pytest.raises(KreppBuildInvalid) as exc:
-        verify_build(build, sums, linked_krepp_version=built + "-other")
-    assert exc.value.check == CHECK_KREPP_VERSION
-
-
 def test_linked_version_is_the_one_an_index_records(krepp_built_index):
-    """The version the per-job check compares against is the string the same miint
+    """The version the readiness probe compares against is the string the same miint
     writes into an index it builds."""
     conn = open_miint_conn()
     try:

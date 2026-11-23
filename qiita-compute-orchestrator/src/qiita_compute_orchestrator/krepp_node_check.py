@@ -9,14 +9,17 @@ It asks the control plane for every reference's active build
 (`krepp_build.verify_build`) on this node's copy of each, as the activation job does.
 The exit code is the row's status, so the probe script can tell them apart:
 
-- 0 `ok`: every active build's copy here passes;
+- 0 `ok`: every active build's copy here passes, and was written by the krepp the
+  loaded miint links;
 - 3 `skip`: no reference has an active krepp build;
-- 4 `warn`: a copy here is missing or does not pass. This is one node: a krepp job
-  that lands here fails, and the cluster admins re-copy the folder and run its
-  verify.sh (docs/runbooks/krepp-index.md). It does not fail the deploy;
-- 1 `fail`: PATH_NODE_LOCAL is not in the job env, the control plane cannot be
-  asked, or a build was written by a krepp other than the one the staged miint
-  links, which fails every krepp job on every node.
+- 4 `warn`: a copy here is missing or does not pass, or a build was written by a
+  krepp other than the one the loaded miint links (or miint reports no
+  `krepp-version` row to compare). A bad copy is one node: a krepp job that lands
+  here fails, and the cluster admins re-copy the folder and run its verify.sh
+  (docs/runbooks/krepp-index.md). A version difference does not stop placement;
+  krepp reads indexes across versions. Neither fails the deploy;
+- 1 `fail`: PATH_NODE_LOCAL is not in the job env, or the control plane cannot be
+  asked.
 
 One line on stdout says which build and why.
 """
@@ -34,7 +37,7 @@ from qiita_common.krepp import KreppBuildRecord
 from .config import get_settings
 from .cp_client import make_cp_client
 from .derived_store import node_relative_path
-from .krepp_build import CHECK_KREPP_VERSION, KreppBuildInvalid, linked_krepp_version, verify_build
+from .krepp_build import KreppBuildInvalid, linked_krepp_version, verify_build
 from .miint import open_miint_conn
 from .native_import_check import MAX_DETAIL
 
@@ -48,7 +51,9 @@ async def _active_builds() -> list[KreppBuildRecord]:
         return [KreppBuildRecord.model_validate(b) for b in resp.json()]
 
 
-def check(builds: list[KreppBuildRecord], node_root: str | None, linked: str) -> tuple[int, str]:
+def check(
+    builds: list[KreppBuildRecord], node_root: str | None, linked: str | None
+) -> tuple[int, str]:
     """The row's exit code and its one-line detail."""
     if not builds:
         return EXIT_SKIP, "no active krepp build"
@@ -57,15 +62,21 @@ def check(builds: list[KreppBuildRecord], node_root: str | None, linked: str) ->
     bad: list[str] = []
     for b in builds:
         try:
-            verify_build(
-                node_relative_path(node_root, b.fs_path),
-                b.sha256sums_sha256,
-                linked_krepp_version=linked,
-            )
+            manifest = verify_build(node_relative_path(node_root, b.fs_path), b.sha256sums_sha256)
         except KreppBuildInvalid as exc:
-            if exc.check == CHECK_KREPP_VERSION:
-                return EXIT_FAIL, f"build {b.reference_index_idx}: {exc.detail}"
             bad.append(f"build {b.reference_index_idx} ({b.fs_path}): {exc.check}: {exc.detail}")
+            continue
+        built = manifest["settings"]["krepp version"]
+        if linked is None:
+            bad.append(
+                f"build {b.reference_index_idx}: written by krepp {built}; the loaded miint"
+                " reports no krepp-version row to compare"
+            )
+        elif built != linked:
+            bad.append(
+                f"build {b.reference_index_idx}: written by krepp {built};"
+                f" the loaded miint links {linked}"
+            )
     if bad:
         return EXIT_WARN, "; ".join(bad)
     return EXIT_OK, f"{len(builds)} active build(s) pass"

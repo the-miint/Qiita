@@ -11,7 +11,6 @@ reference's active build.
 Checks, cheapest first, before any file is hashed:
 
 - its settings and tree can be read (``krepp_build.inventory_index``);
-- it was written by the krepp the staged miint links (``linked_krepp_version``);
 - its tree is the reference's tree as a placement sees it
   (``_phylogeny.tree_difference``): every edge number, parent edge number, branch
   length and tip name, for the reason docs/architecture/reference-data.md "Edge
@@ -39,9 +38,7 @@ from ..derived_store import KREPP_INDEX_SUBDIR, krepp_build_relpath, node_relati
 from ..krepp_build import (
     JEST_LABELLED_TREE,
     KreppBuildInvalid,
-    check_krepp_version,
     inventory_index,
-    linked_krepp_version,
     write_build_files,
 )
 from ..miint import open_miint_conn
@@ -109,7 +106,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     inventory = inventory_index(folder / KREPP_INDEX_SUBDIR)
     conn = open_miint_conn()
     try:
-        check_krepp_version(inventory.settings["krepp version"], linked_krepp_version(conn))
         await check_trees(conn, inputs.reference_idx, folder, inventory.tree_file)
     finally:
         conn.close()

@@ -10,7 +10,7 @@ import types
 from contextlib import asynccontextmanager
 
 import pytest
-from helpers import KREPP_TREE_NEWICK, krepp_genomes, krepp_recorded_version
+from helpers import KREPP_TREE_NEWICK, krepp_genomes
 from qiita_common.krepp import KreppActivationReport, KreppBuildRecord
 
 from qiita_compute_orchestrator.derived_store import krepp_build_relpath
@@ -70,8 +70,6 @@ def node(krepp_built_index, tmp_path, monkeypatch):
     monkeypatch.setattr(
         f"{_JOB}.get_settings", lambda: types.SimpleNamespace(path_node_local=node_root)
     )
-    built = krepp_recorded_version(master / "index")
-    monkeypatch.setattr(f"{_JOB}.linked_krepp_version", lambda _conn: built)
     return types.SimpleNamespace(record=record, state=state, copy=node_root / rel)
 
 

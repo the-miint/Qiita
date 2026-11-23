@@ -51,7 +51,19 @@ def test_warn_on_a_missing_copy(node, tmp_path):
     assert code == kc.EXIT_WARN and "missing" in detail
 
 
-def test_fail_on_another_krepp_and_without_the_tier(node):
+def test_warn_on_another_krepp_naming_both_versions(node):
+    root, _copy, build, version = node
+    code, detail = kc.check([build], str(root), "v0.0.0")
+    assert code == kc.EXIT_WARN
+    assert f"written by krepp {version}" in detail and "links v0.0.0" in detail
+
+
+def test_warn_when_miint_reports_no_krepp_version(node):
     root, _copy, build, _version = node
-    assert kc.check([build], str(root), "v0.0.0")[0] == kc.EXIT_FAIL
-    assert kc.check([build], None, "v0.0.0")[0] == kc.EXIT_FAIL
+    code, detail = kc.check([build], str(root), None)
+    assert code == kc.EXIT_WARN and "no krepp-version row" in detail
+
+
+def test_fail_without_the_tier(node):
+    _root, _copy, build, version = node
+    assert kc.check([build], None, version)[0] == kc.EXIT_FAIL

@@ -17,7 +17,6 @@ from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
 from qiita_compute_orchestrator.derived_store import krepp_build_relpath
 from qiita_compute_orchestrator.jobs import krepp_index_register as job
 from qiita_compute_orchestrator.krepp_build import (
-    CHECK_KREPP_VERSION,
     JEST_LABELLED_TREE,
     JEST_NULL,
     KreppBuildInvalid,
@@ -31,8 +30,7 @@ _LABELLED = "((g0:1{0},g1:1{1}):1{2},(g2:1{3},g3:1{4}):1{5}){6};\n"
 def derived(krepp_built_index, tmp_path, monkeypatch):
     """PATH_DERIVED holding build `t1` of reference 18, and a hook to set the tree the
     data plane would stream for the reference (default: the build's own, numbered
-    edge_id = node_index). `linked` is what `miint_versions()` would report; it
-    defaults to the build's krepp version."""
+    edge_id = node_index)."""
     root = tmp_path / "derived"
     folder = root / krepp_build_relpath(18, "t1")
     shutil.copytree(krepp_built_index, folder / "index")
@@ -42,7 +40,6 @@ def derived(krepp_built_index, tmp_path, monkeypatch):
     monkeypatch.setattr(f"{_JOB}.get_settings", lambda: types.SimpleNamespace(path_derived=root))
     state = {
         "lake_sql": "SELECT * REPLACE (node_index AS edge_id) FROM read_newick('{nwk}')",
-        "linked": krepp_recorded_version(folder / "index"),
     }
     nwk = tmp_path / "lake.nwk"
     nwk.write_text(KREPP_TREE_NEWICK)
@@ -56,7 +53,6 @@ def derived(krepp_built_index, tmp_path, monkeypatch):
         yield relation
 
     monkeypatch.setattr(f"{_JOB}.open_reference_phylogeny_stream", _stream)
-    monkeypatch.setattr(f"{_JOB}.linked_krepp_version", lambda _conn: state["linked"])
     return types.SimpleNamespace(folder=folder, state=state)
 
 
@@ -101,8 +97,6 @@ async def test_refuses_a_jest_tree_with_other_edges(derived, tmp_path):
         await _run(tmp_path)
 
 
-async def test_refuses_a_build_from_another_krepp(derived, tmp_path):
-    derived.state["linked"] = "v0.0.0"
-    with pytest.raises(KreppBuildInvalid) as exc:
-        await _run(tmp_path)
-    assert exc.value.check == CHECK_KREPP_VERSION
+async def test_records_the_builds_krepp_version(derived, tmp_path):
+    meta = await _run(tmp_path)
+    assert meta["params"]["krepp_version"] == krepp_recorded_version(derived.folder / "index")

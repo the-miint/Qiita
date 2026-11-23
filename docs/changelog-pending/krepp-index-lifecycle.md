@@ -3,16 +3,15 @@
 - **krepp placement index builds can be registered onto a reference, checked on a node,
   activated and removed (#TBD).** A build made outside Qiita is placed at
   `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/`. The
-  `reference-index-register` workflow checks it (written by the krepp the staged miint
-  links, over the reference's own tree and edge numbers, no symlinks), writes
+  `reference-index-register` workflow checks it (over the reference's own tree and edge numbers, no symlinks), writes
   `README.md`, `manifest.json`, `verify.sh` and `SHA256SUMS` into it and records it
   `registered`. After the cluster admins copy it to every compute node, the
   `reference-index-activate` workflow checks a node's copy, places pieces of up to 100
   backbone tips with it, and makes it the reference's active build when enough land on
   their own edge, retiring the previous one. `qiita-admin krepp-index remove` marks a
   registered or retired build removed. No workflow places contigs with a build. The
-  krepp version check reads `miint_versions()`'s `krepp-version` row (duckdb-miint#473,
-  added by duckdb-miint#475), so it needs a miint that has it.
+  build's krepp version is recorded, not required to match the linked krepp's: krepp
+  reads indexes across versions.
 - **`qiita.reference_index` rows carry `state` (`registered`, `active`, `retired`,
   `removed`) and `fs_path_root` (#TBD).** Every existing row is `active` and `absolute`;
   a krepp row's `fs_path` is relative to `PATH_NODE_LOCAL` (and to `PATH_DERIVED` for
@@ -26,9 +25,10 @@
   node's own disk with the same content on every node. The orchestrator requires it,
   absolute, at SLURM boot and forwards it into every job.
 - **compute-readiness `krepp-index` row and a `warn` status (#TBD).** The probe checks
-  its node's copy of every active krepp build: `warn` for a missing or changed copy on
-  that node, which does not fail the deploy; `fail` for a build written by a krepp other
-  than the linked one.
+  its node's copy of every active krepp build and `warn`s, without failing the deploy,
+  for a missing or changed copy on that node or a build written by a krepp other than
+  the one miint links (`miint_versions()`'s `krepp-version` row, duckdb-miint#473 /
+  #475).
 
 ### Changed
 
