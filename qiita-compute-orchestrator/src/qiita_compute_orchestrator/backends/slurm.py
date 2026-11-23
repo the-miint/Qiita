@@ -28,7 +28,13 @@ import signal
 from datetime import timedelta
 from pathlib import Path
 
-from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_OUTPUT_SUBDIR, BaselineResources
+from qiita_common.actions import (
+    STEP_LOGS_SUBDIR,
+    STEP_OUTPUT_SUBDIR,
+    STEP_STDERR_FILENAME,
+    STEP_STDOUT_FILENAME,
+    BaselineResources,
+)
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
@@ -151,7 +157,7 @@ def _scan_slurm_kill_state(stderr_path: Path) -> TerminalSlurmState | None:
 
 def _read_stderr_tail(logs_path: Path) -> str:
     text, _ = read_text_tail(
-        logs_path / "stderr",
+        logs_path / STEP_STDERR_FILENAME,
         max_lines=_FAILURE_REASON_TAIL_LINES,
         max_bytes=_FAILURE_REASON_TAIL_BYTES,
     )
@@ -589,8 +595,8 @@ class SlurmBackend(ComputeBackend):
             input_path=input_path,
             output_path=output_path,
             workspace=workspace,
-            log_stdout=logs_path / "stdout",
-            log_stderr=logs_path / "stderr",
+            log_stdout=logs_path / STEP_STDOUT_FILENAME,
+            log_stderr=logs_path / STEP_STDERR_FILENAME,
             partition=self._partition,
             account=self._account,
             native_python=self._native_python,
@@ -649,7 +655,7 @@ class SlurmBackend(ComputeBackend):
                     f"[Errno {exc.errno}] {exc.strerror}",
                 ) from exc
             if manifest_absent:
-                kill_state = _scan_slurm_kill_state(handle.logs_path / "stderr")
+                kill_state = _scan_slurm_kill_state(handle.logs_path / STEP_STDERR_FILENAME)
                 status = StepStatusInfo(
                     status=StepStatus.FAILED,
                     raw_state=kill_state.value if kill_state else PURGED_RAW_STATE,
@@ -712,7 +718,7 @@ class SlurmBackend(ComputeBackend):
         # the step route serializes it with the no-data header and the runner
         # transitions the ticket to NO_DATA, never FAILED. Only if no no-data
         # line is present do we fall through to failure classification.
-        no_data = parse_launcher_no_data(handle.logs_path / "stderr")
+        no_data = parse_launcher_no_data(handle.logs_path / STEP_STDERR_FILENAME)
         if no_data is not None:
             raise StepNoData(step_name=no_data.step_name, reason=no_data.reason)
 
@@ -724,7 +730,7 @@ class SlurmBackend(ComputeBackend):
         # steps and infra-killed jobs (NODE_FAIL, OOM, ...) won't have
         # the line; in those cases parse_launcher_failure returns None
         # and the state-based classification stands.
-        launcher_failure = parse_launcher_failure(handle.logs_path / "stderr")
+        launcher_failure = parse_launcher_failure(handle.logs_path / STEP_STDERR_FILENAME)
         if launcher_failure is not None:
             raise BackendFailure(
                 kind=launcher_failure.kind,
