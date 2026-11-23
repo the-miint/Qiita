@@ -105,7 +105,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#929) `make migrate` applies `20261120000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 - `[operator]` (#854) Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate) and `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers). No out-of-band setup; applies with the standard migrate step.
 
-- `20261119000000_krepp_index_lifecycle` adds `state` (existing rows `active`) and `fs_path_root` (existing rows `absolute`) to `qiita.reference_index`, admits `krepp` in its `index_type` CHECK with a one-active-krepp-build-per-reference unique index and CHECKs that keep every non-krepp row `active` and `absolute` and every krepp row `node_local` (no existing row can fail them), and adds a nullable `reference_index_idx` to `qiita.work_ticket`; no other row changes. `dbmate` applies it. (#TBD)
+- `20261123000000_krepp_index_lifecycle` adds `state` (existing rows `active`) and `fs_path_root` (existing rows `absolute`) to `qiita.reference_index`, admits `krepp` in its `index_type` CHECK with a one-active-krepp-build-per-reference unique index and CHECKs that keep every non-krepp row `active` and `absolute` and every krepp row `node_local` (no existing row can fail them), and adds a nullable `reference_index_idx` to `qiita.work_ticket`; no other row changes. `dbmate` applies it. (#TBD)
 
 ### 4. Deploy
 
