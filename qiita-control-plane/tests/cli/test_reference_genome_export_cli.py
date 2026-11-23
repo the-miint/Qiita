@@ -132,8 +132,9 @@ def _no_chunks():
 
 
 class _FakeFlightClient:
-    def __init__(self, reader):
+    def __init__(self, reader, counted=None):
         self._table = reader.read_all()
+        self._counted = counted
         self.tickets = []
 
     def do_get(self, ticket, *options):
@@ -147,7 +148,7 @@ class _FakeFlightClient:
         import pyarrow.flight as flight  # noqa: PLC0415
 
         assert action.type == "count_doget"
-        rows = self._table.num_rows
+        rows = self._table.num_rows if self._counted is None else self._counted
         return [flight.Result(json.dumps({"count": rows}).encode())]
 
 
@@ -164,12 +165,14 @@ def test_export_one_genome_dispatch_parquet(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ref,
         "_write_genome_parquet",
-        lambda reader, target: calls.update(parquet=(reader, target)) or 1,
+        lambda reader, target, verify=None: calls.update(parquet=(reader, target)) or 1,
     )
     monkeypatch.setattr(
         ref,
         "_write_genome_fasta",
-        lambda reader, acc, target, con: calls.update(fasta=(reader, acc, target, con)) or 1,
+        lambda reader, acc, target, con, verify=None: (
+            calls.update(fasta=(reader, acc, target, con)) or 1
+        ),
     )
     fc = _FakeFlightClient(_no_chunks())
 
@@ -199,12 +202,14 @@ def test_export_one_genome_dispatch_fasta(monkeypatch, tmp_path):
     monkeypatch.setattr(
         ref,
         "_write_genome_parquet",
-        lambda reader, target: calls.update(parquet=(reader, target)) or 2,
+        lambda reader, target, verify=None: calls.update(parquet=(reader, target)) or 2,
     )
     monkeypatch.setattr(
         ref,
         "_write_genome_fasta",
-        lambda reader, acc, target, con: calls.update(fasta=(reader, acc, target, con)) or 2,
+        lambda reader, acc, target, con, verify=None: (
+            calls.update(fasta=(reader, acc, target, con)) or 2
+        ),
     )
     sentinel_con = object()
     fc = _FakeFlightClient(_no_chunks())
@@ -244,7 +249,7 @@ def test_export_one_genome_raises_and_removes_file_on_short_export(monkeypatch, 
 
     target = tmp_path / "5.10.parquet"
 
-    def _short_writer(reader, tgt):
+    def _short_writer(reader, tgt, verify=None):
         tgt.write_bytes(b"incomplete")  # the committed-but-short file
         return 2  # only 2 of 3 members had chunks in DuckLake
 
@@ -369,3 +374,38 @@ def test_parser_export_rejects_missing_required():
 
     with pytest.raises(SystemExit):
         parser.parse_args(["reference", "export", "--genome-idx", "10"])  # no --reference-idx
+
+
+def test_export_one_genome_leaves_no_file_when_the_stream_is_short(monkeypatch, tmp_path):
+    """The data plane counts one row more than the stream delivers: the real writer
+    writes its partial, the count check fails before the rename, and neither the
+    target nor the partial is left."""
+    import pytest
+    from qiita_common.flight_stream import StreamRowCountMismatch
+
+    members = [{"feature_idx": 10, "accession": "a"}]
+    monkeypatch.setattr(ref, "_resolve_genome_members", lambda *a, **k: members)
+    monkeypatch.setattr(ref, "_create_chunks_doget_ticket", lambda *a, **k: b"tkt")
+    chunks = pa.table(
+        {
+            "feature_idx": pa.array([10], pa.int64()),
+            "chunk_index": pa.array([0], pa.int64()),
+            "chunk_data": pa.array(["ACGT"], pa.string()),
+        }
+    )
+    fc = _FakeFlightClient(chunks.to_reader(), counted=2)
+
+    with pytest.raises(
+        StreamRowCountMismatch, match="delivered 1 rows, but the data plane counted 2"
+    ):
+        ref._export_one_genome(
+            base_url="http://cp",
+            token="tok",
+            flight_client=fc,
+            con=None,
+            reference_idx=5,
+            genome_idx=10,
+            fmt="parquet",
+            output_dir=tmp_path,
+        )
+    assert list(tmp_path.iterdir()) == []

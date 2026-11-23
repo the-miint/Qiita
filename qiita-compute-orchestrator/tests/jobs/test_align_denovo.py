@@ -24,7 +24,7 @@ import pyarrow as pa
 import pytest
 from qiita_common.analytic import MAX_SECONDARY
 from qiita_common.duckdb_relation import registered
-from qiita_common.flight_stream import StreamRowCountMismatch, registered_counted
+from qiita_common.flight_stream import StreamRowCountMismatch, counted_reader
 from qiita_common.testing.bounded import run_bounded
 
 from qiita_compute_orchestrator.jobs import align_denovo
@@ -127,7 +127,7 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None, delivered
 
     `contigs` / `reads` override what the corresponding stream carries, for the cases
     that need an empty or reduced one. The read stream is registered through
-    `registered_counted`, the production seam's count check, with the data plane's
+    `counted_reader`, the check `open_read_masked_stream` applies, with the data plane's
     count taken as every read; `delivered` keeps only that many of them on the wire,
     a stream that ends early without an error.
     """
@@ -165,12 +165,14 @@ def _install_streams(monkeypatch, genome, *, contigs=None, reads=None, delivered
     @asynccontextmanager
     async def _reads(conn, *, prep_sample_idx, mask_idx, relation="masked_reads"):
         assert (prep_sample_idx, mask_idx) == (_PREP_SAMPLE_IDX, _MASK_IDX)
-        with registered_counted(
-            conn,
-            relation,
-            _reader(_READ_SCHEMA, on_wire),
-            expected_rows=len(read_rows),
-            require_drained=True,
+        with (
+            counted_reader(
+                _reader(_READ_SCHEMA, on_wire),
+                expected_rows=len(read_rows),
+                name=relation,
+                require_drained=True,
+            ) as counted,
+            registered(conn, relation, counted),
         ):
             yield relation
 

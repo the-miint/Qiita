@@ -3420,3 +3420,60 @@ def test_alignment_abandon_plan_posts_and_summarises(monkeypatch, capsys):
 
     assert cli.main(["alignment", "abandon-plan", "7", "--allow-rearmed"]) == 0
     assert captured["json"] == {"allow_rearmed": True}
+
+
+@pytest.mark.parametrize("fmt", ["parquet", "fastq"])
+def test_masked_read_export_leaves_no_file_when_the_stream_is_short(
+    monkeypatch, tmp_path, capsys, fmt
+):
+    """The data plane counts one row more than sample 42's stream delivers. The
+    count check runs before the partials are renamed, so no file of that sample is
+    left under any name, and the command reports it and exits 1."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    tables = {
+        42: pa.table(
+            {
+                "sequence_idx": pa.array([1, 2], pa.int64()),
+                "read_id": ["rA0", "rA1"],
+                "sequence1": ["ACGT", "TTGG"],
+                "qual1": pa.array([[30] * 4, [30] * 4], pa.list_(pa.uint8())),
+                "sequence2": pa.array([None, None], pa.string()),
+                "qual2": pa.array([None, None], pa.list_(pa.uint8())),
+            }
+        )
+    }
+    monkeypatch.setattr(
+        "pyarrow.flight.FlightClient", _fake_flight_client_class(tables, counts_by_prep={42: 3})
+    )
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            fmt,
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    assert "delivered 2 rows, but the data plane counted 3" in capsys.readouterr().err
+    assert [p.name for p in out_dir.iterdir() if "SAMN_A" in p.name] == []

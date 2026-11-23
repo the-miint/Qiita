@@ -1,21 +1,30 @@
 """Tests for qiita_common.flight_stream: the row-count check on a DoGet stream.
 
-Run on a plain DuckDB connection over an in-memory reader: what is under test is the
-count of rows the consumer pulls, not the transport. The Flight half (`count_doget`,
-`counted_doget`) runs against an in-process Flight server below.
+The check runs on a plain DuckDB connection over an in-memory reader: what is under
+test is the count of rows the consumer pulls, not the transport. The Flight half
+(`count_doget`, `counted_doget`) runs against an in-process Flight server below.
 """
 
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 
 import pytest
 
 import qiita_common.flight_stream as fs
+from qiita_common.duckdb_relation import registered
 
-# `registered_counted` — `counted_reader`'s check, registered on DuckDB. Run on
-# a plain DuckDB connection over an in-memory reader: what is under test is the count
-# of rows DuckDB pulls, not the transport.
+
+@contextmanager
+def _registered_counted(conn, relation, reader, **kwargs):
+    """`counted_reader` registered on DuckDB, as the orchestrator's stream opener
+    composes it."""
+    with (
+        fs.counted_reader(reader, name=relation, **kwargs) as counted,
+        registered(conn, relation, counted),
+    ):
+        yield relation
 
 
 def _int_reader(n: int, *, batch: int = 3):
@@ -25,16 +34,16 @@ def _int_reader(n: int, *, batch: int = 3):
     return pa.RecordBatchReader.from_batches(table.schema, table.to_batches(max_chunksize=batch))
 
 
-def test_registered_counted_passes_a_stream_drained_in_full():
+def test_counted_reader_passes_a_stream_drained_in_full():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with fs.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
+        with _registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
             conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
         assert conn.execute("SELECT count(*) FROM t").fetchone() == (7,)
 
 
-def test_registered_counted_refuses_a_stream_that_ends_short():
+def test_counted_reader_refuses_a_stream_that_ends_short():
     """Seven rows counted, five on the wire, and the stream ends without an error."""
     import duckdb  # noqa: PLC0415
 
@@ -42,63 +51,63 @@ def test_registered_counted_refuses_a_stream_that_ends_short():
         with pytest.raises(
             fs.StreamRowCountMismatch, match="delivered 5 rows, but the data plane counted 7"
         ):
-            with fs.registered_counted(conn, "r", _int_reader(5), expected_rows=7) as rel:
+            with _registered_counted(conn, "r", _int_reader(5), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
 
-def test_registered_counted_refuses_a_stream_longer_than_counted():
+def test_counted_reader_refuses_a_stream_longer_than_counted():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
         with pytest.raises(
             fs.StreamRowCountMismatch, match="delivered 8 rows, but the data plane counted 7"
         ):
-            with fs.registered_counted(conn, "r", _int_reader(8), expected_rows=7) as rel:
+            with _registered_counted(conn, "r", _int_reader(8), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
 
 
-def test_registered_counted_counts_the_rows_a_body_left_unread():
+def test_counted_reader_counts_the_rows_a_body_left_unread():
     """A body need not read every row (a join whose other side is empty may stop
     scanning this one); the rest is drained and counted, so a whole stream passes."""
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
-        with fs.registered_counted(conn, "r", _int_reader(30_000), expected_rows=30_000) as rel:
+        with _registered_counted(conn, "r", _int_reader(30_000), expected_rows=30_000) as rel:
             conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
 
 
-def test_registered_counted_still_refuses_a_short_stream_a_body_left_unread():
+def test_counted_reader_still_refuses_a_short_stream_a_body_left_unread():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
         with pytest.raises(fs.StreamRowCountMismatch, match="delivered 29999 rows"):
-            with fs.registered_counted(conn, "r", _int_reader(29_999), expected_rows=30_000) as rel:
+            with _registered_counted(conn, "r", _int_reader(29_999), expected_rows=30_000) as rel:
                 conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
 
 
-def test_registered_counted_require_drained_refuses_a_body_that_left_rows():
+def test_counted_reader_require_drained_refuses_a_body_that_left_rows():
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
         with pytest.raises(fs.StreamRowCountMismatch, match="must read every row"):
-            with fs.registered_counted(
+            with _registered_counted(
                 conn, "r", _int_reader(30_000), expected_rows=30_000, require_drained=True
             ) as rel:
                 conn.execute(f"SELECT * FROM {rel} LIMIT 1").fetchall()
 
 
-def test_registered_counted_lets_the_body_exception_through():
+def test_counted_reader_lets_the_body_exception_through():
     """A body that raises is not checked: its own exception reaches the caller, not a
     count mismatch over the rows it never read."""
     import duckdb  # noqa: PLC0415
 
     with duckdb.connect() as conn:
         with pytest.raises(ValueError, match="from the body"):
-            with fs.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
+            with _registered_counted(conn, "r", _int_reader(7), expected_rows=7):
                 raise ValueError("from the body")
 
 
-def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog):
+def test_counted_reader_logs_how_long_the_body_left_the_stream_unread(caplog):
     """The numbers nginx's `send_timeout` has to cover, in the job's step log. The
     body here holds the stream 0.3 s before its first ask."""
     import time  # noqa: PLC0415
@@ -106,7 +115,7 @@ def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog
     import duckdb  # noqa: PLC0415
 
     with caplog.at_level("INFO", logger=fs.__name__), duckdb.connect() as conn:
-        with fs.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
+        with _registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
             time.sleep(0.3)
             conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
     [line] = [r.getMessage() for r in caplog.records if r.name == fs.__name__]
@@ -114,25 +123,25 @@ def test_registered_counted_logs_how_long_the_body_left_the_stream_unread(caplog
     assert float(line.split("asked for ")[1].split(" s")[0]) >= 0.3
 
 
-def test_registered_counted_logs_the_timing_when_the_body_raises(caplog):
+def test_counted_reader_logs_the_timing_when_the_body_raises(caplog):
     """A cut stream raises in the body, which is the case the timing line is for."""
     import duckdb  # noqa: PLC0415
 
     with caplog.at_level("INFO", logger=fs.__name__), duckdb.connect() as conn:
         with pytest.raises(ValueError, match="cut"):
-            with fs.registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
+            with _registered_counted(conn, "r", _int_reader(7), expected_rows=7) as rel:
                 conn.execute(f"CREATE TABLE t AS SELECT * FROM {rel}")
                 raise ValueError("cut")
     [line] = [r.getMessage() for r in caplog.records if r.name == fs.__name__]
     assert line.startswith("stream r: 7 rows read; first batch asked for ")
 
 
-def test_registered_counted_says_never_when_no_batch_was_asked_for(caplog):
+def test_counted_reader_says_never_when_no_batch_was_asked_for(caplog):
     import duckdb  # noqa: PLC0415
 
     with caplog.at_level("INFO", logger=fs.__name__), duckdb.connect() as conn:
         with pytest.raises(ValueError):
-            with fs.registered_counted(conn, "r", _int_reader(7), expected_rows=7):
+            with _registered_counted(conn, "r", _int_reader(7), expected_rows=7):
                 raise ValueError("before any read")
     [line] = [r.getMessage() for r in caplog.records if r.name == fs.__name__]
     assert "first batch asked for never;" in line

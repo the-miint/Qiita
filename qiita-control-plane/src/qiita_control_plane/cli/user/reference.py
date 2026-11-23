@@ -20,7 +20,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_PREFIX,
 )
 from qiita_common.chunking import reassemble_chunks_expr
-from qiita_common.flight_stream import counted_doget
+from qiita_common.flight_stream import StreamRowCountMismatch, open_counted_stream
 from qiita_common.models import (
     ReferenceStatus,
     WorkTicketState,
@@ -253,14 +253,19 @@ def _create_chunks_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _atomic_write(target: Path, write_fn):
+def _atomic_write(target: Path, write_fn, verify=None):
     """Run `write_fn(partial)` then atomically rename the partial into place; on
     any failure remove the partial so a retry never finds a half-written file. No
     restrictive chmod — reference sequences are public reference data, unlike the
-    privacy-masked read export. Returns whatever `write_fn(partial)` returns."""
+    privacy-masked read export. Returns whatever `write_fn(partial)` returns.
+
+    `verify`, when given, runs between the write and the rename: a stream whose row
+    count check fails leaves no file under `target`."""
     partial = target.parent / f"{target.name}.partial"
     try:
         result = write_fn(partial)
+        if verify is not None:
+            verify()
         os.replace(partial, target)
         return result
     except BaseException:
@@ -269,7 +274,7 @@ def _atomic_write(target: Path, write_fn):
         raise
 
 
-def _write_genome_parquet(reader, target: Path) -> int:
+def _write_genome_parquet(reader, target: Path, verify=None) -> int:
     """Stream the DoGet chunk reader straight to a zstd Parquet (the raw
     `reference_sequence_chunks` rows: feature_idx, chunk_index, chunk_data). No
     DuckDB hop, so the bulk sequence bytes are never materialized into DuckDB
@@ -308,10 +313,12 @@ def _write_genome_parquet(reader, target: Path) -> int:
             writer.close()
         return len(seen)
 
-    return _atomic_write(target, _write)
+    return _atomic_write(target, _write, verify)
 
 
-def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Path, con) -> int:
+def _write_genome_fasta(
+    reader, accession_map: dict[int, str | None], target: Path, con, verify=None
+) -> int:
     """Reassemble each feature's sequence from the DoGet chunk stream and write a
     gzipped FASTA via miint's FORMAT FASTA writer, using the reference's accession
     as each record header. `con` is a shared miint DuckDB connection. Returns the
@@ -359,7 +366,7 @@ def _write_genome_fasta(reader, accession_map: dict[int, str | None], target: Pa
             ).fetchone()
             return count
 
-        return _atomic_write(target, _write)
+        return _atomic_write(target, _write, verify)
     finally:
         con.unregister("chunks")
         con.unregister("accession_map")
@@ -408,8 +415,8 @@ def _export_one_genome(
         # Parquet streams straight to a ParquetWriter (no Acero), keeping the bulk
         # chunk buffers zero-copy — so no buffer realignment is needed.
         target = output_dir / f"{reference_idx}.{genome_idx}.parquet"
-        with counted_doget(flight_client, ticket, name=target.name) as reader:
-            written = _write_genome_parquet(reader, target)
+        with open_counted_stream(flight_client, ticket, name=target.name) as stream:
+            written = _write_genome_parquet(stream.reader, target, verify=stream.verify)
     else:
         # The FASTA path registers the reader into DuckDB (miint FORMAT FASTA via
         # Acero), so ask the Flight reader to realign each buffer on receive —
@@ -422,8 +429,12 @@ def _export_one_genome(
         )
         target = output_dir / f"{reference_idx}.{genome_idx}.fasta.gz"
         accession_map = {m["feature_idx"]: m["accession"] for m in members}
-        with counted_doget(flight_client, ticket, name=target.name, options=read_opts) as reader:
-            written = _write_genome_fasta(reader, accession_map, target, con)
+        with open_counted_stream(
+            flight_client, ticket, name=target.name, options=read_opts
+        ) as stream:
+            written = _write_genome_fasta(
+                stream.reader, accession_map, target, con, verify=stream.verify
+            )
     expected = len(feature_idxs)
     if written < expected:
         with contextlib.suppress(FileNotFoundError):
@@ -498,7 +509,7 @@ def _handle_reference_genome_export(
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
         return 1
-    except _IncompleteExportError as exc:
+    except (_IncompleteExportError, StreamRowCountMismatch) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
