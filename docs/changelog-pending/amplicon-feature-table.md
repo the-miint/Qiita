@@ -1,7 +1,7 @@
 ### Added
 
 - **A run feature table over REST.** `POST /feature-table/{sample,value,feature}`
-  answers one cohort request — one or more amplicon runs over a study's samples or a
+  answers one cohort request — one or more amplicon runs over a study's prep_samples or a
   named prep_sample list — with the table's columns (each processed sample under its
   public name), its values as sparse COO `(sample, feature, value)`, and its features
   `(feature, sequence, length, md5)`: each ASV under its exported-feature handle, mapped

@@ -1768,7 +1768,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ft_runs = p_feature_table_sub.add_parser(
         "runs",
         help=(
-            "Build a feature table from one or more amplicon runs over a study's samples"
+            "Build a feature table from one or more amplicon runs over a study's prep_samples"
             " or a named list, and write it with the map needed to read it"
         ),
     )
@@ -1784,7 +1784,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     runs_cohort = p_ft_runs.add_mutually_exclusive_group(required=True)
     runs_cohort.add_argument(
-        "--study-idx", type=int, help="Every sample of this study the runs processed."
+        "--study-idx", type=int, help="Every prep_sample of this study the runs processed."
     )
     runs_cohort.add_argument(
         "--prep-sample-idx",

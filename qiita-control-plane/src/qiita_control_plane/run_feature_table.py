@@ -230,7 +230,7 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
                 f" (prep_sample_idx {uncounted[:5]})",
             )
     if not processed:
-        raise CohortError(404, "these runs processed none of the named samples")
+        raise CohortError(404, "these runs processed none of the cohort's prep_samples")
     if any(r["biosample"] is None for r in processed):
         raise RuntimeError("a processed sample's biosample has no accession and no QB")
 
