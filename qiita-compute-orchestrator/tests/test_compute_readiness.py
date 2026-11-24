@@ -731,7 +731,9 @@ def test_probe_script_maps_the_node_cache_probe_exit_codes():
     (the module failing) fails."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "run_module_probe qiita_compute_orchestrator.node_cache" in script
-    for code, value in ((0, "ok"), (3, "skip"), (4, "warn")):
+    from qiita_compute_orchestrator import node_cache as nc
+
+    for code, value in ((nc.PROBE_OK, "ok"), (nc.PROBE_SKIP, "skip"), (nc.PROBE_WARN, "warn")):
         assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} node-cache={value}' in script
     assert '*) echo "' + cr._PROBE_LINE_PREFIX + " node-cache=fail" in script
     assert cr._classify_probe_pair("node-cache", "warn") == "warn"

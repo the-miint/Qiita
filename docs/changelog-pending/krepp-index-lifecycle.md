@@ -14,8 +14,9 @@
 - **A node cache for sealed folders, `PATH_NODE_LOCAL` (#937).** Optional: a directory
   on each compute node's own disk, writable by the job user. A job that reads a sealed
   folder (a krepp build) copies it there on first use on that node, under a per-folder
-  lock, checking every file's hash and the free space first; later jobs on the node
-  check the copy and use it. Copies of removed builds are deleted by the next job.
+  lock: it checks the free space, then hashes every file as it copies it; later jobs
+  on the node check the copy and use it. The next `reference-index-activate` job on a
+  node deletes that node's copies of removed builds.
   Unset, jobs read from `PATH_DERIVED`. Nothing is copied at deploy or by hand.
 - **`qiita.reference_index.state` (`registered`, `active`, `retired`, `removed`)
   (#937).** Every existing row is `active`; a krepp row's `fs_path` is relative to

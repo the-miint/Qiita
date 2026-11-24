@@ -208,14 +208,44 @@ def test_jobs_on_one_node_copy_once(world, monkeypatch):
     assert copies == [1] and results == [world.copy, world.copy]
 
 
-def test_evict_deletes_the_named_copies_first(world):
-    """A removed folder's copy (and any partial of it) goes before this one is copied."""
+def test_evict_runs_before_the_copy_so_its_space_counts(world, monkeypatch):
+    """A removed folder's copy (and any partial of it) goes before this one is copied:
+    the free space is enough only once the evicted copy is gone."""
     other = "references/18/thing/v2"
     shutil.copytree(world.master, world.settings.path_derived / other)
     nc.materialize(other, world.sums)
     (world.node / "references/18/thing/.v2.partial").mkdir()
+    real = nc.shutil.disk_usage
+    evicted = world.node / other
+
+    def _free(path):
+        free = real(path).free if not evicted.exists() else 0
+        return types.SimpleNamespace(free=free)
+
+    monkeypatch.setattr(nc.shutil, "disk_usage", _free)
     nc.materialize(REL, world.sums, evict_first=[other])
     assert sorted(p.name for p in world.copy.parent.iterdir()) == ["v1"]
+
+
+def test_evict_raises_on_a_copy_it_cannot_look_up(world):
+    """A copy behind a directory without search permission is not taken as absent."""
+    nc.materialize(REL, world.sums)
+    hidden = world.node / "references"
+    hidden.chmod(0o600)
+    try:
+        with pytest.raises(PermissionError):
+            nc.evict([REL])
+    finally:
+        hidden.chmod(0o755)
+    assert world.copy.exists()
+
+
+def test_a_master_with_an_unlisted_file_is_refused_with_the_cache_too(world):
+    """The two read modes accept the same masters."""
+    (world.master / "extra").write_text("x")
+    with pytest.raises(nc.SealedFolderInvalid) as exc:
+        nc.materialize(REL, world.sums)
+    assert exc.value.check == "files" and not world.copy.exists()
 
 
 def test_an_unwritable_root_fails_by_name(world):

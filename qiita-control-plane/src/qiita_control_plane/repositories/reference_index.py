@@ -18,6 +18,7 @@ being removed.
 from dataclasses import dataclass
 
 import asyncpg
+from qiita_common.krepp import REFERENCE_INDEX_IDX_BINDING
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
     NON_TERMINAL_WORK_TICKET_STATES,
@@ -123,13 +124,19 @@ async def activate_krepp_build(
 
 
 async def tickets_running_on_build(conn: asyncpg.Connection, reference_index_idx: int) -> list[int]:
-    """The non-terminal tickets fixed to the build, oldest first."""
+    """The tickets that may still have a job reading the build, oldest first: fixed to
+    it or naming it in their context (an activation ticket), and non-terminal or with
+    a cancel's reap of their SLURM jobs still pending. A node's copy of a removed build
+    is deleted by the next job that evicts on that node (node_cache.evict), so removal
+    waits for every such job."""
     rows = await conn.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
-        " WHERE reference_index_idx = $1 AND state = ANY($2::qiita.work_ticket_state[])"
+        " WHERE (reference_index_idx = $1 OR action_context->>$3 = $1::text)"
+        "   AND (state = ANY($2::qiita.work_ticket_state[]) OR reap_pending_since IS NOT NULL)"
         " ORDER BY work_ticket_idx",
         reference_index_idx,
         list(NON_TERMINAL_WORK_TICKET_STATES),
+        REFERENCE_INDEX_IDX_BINDING,
     )
     return [r["work_ticket_idx"] for r in rows]
 
@@ -138,10 +145,11 @@ async def remove_krepp_build(
     conn: asyncpg.Connection, reference_index_idx: int
 ) -> KreppBuildChange:
     """Mark a `registered` or `retired` build `removed`. Refused for the active build
-    (activate another first) and while a non-terminal ticket is fixed to the build.
+    (activate another first) and while a ticket may still read it
+    (`tickets_running_on_build`).
     Finished tickets keep their `reference_index_idx`; `/run` refuses to restart one
     whose build is removed. Removing a removed build returns without a change. The
-    files are deleted by the operator afterwards (docs/runbooks/krepp-index.md)."""
+    master is deleted by the operator afterwards (docs/runbooks/krepp-index.md)."""
     require_transaction(conn)
     row = await _lock_reference_builds(conn, reference_index_idx)
     state = ReferenceIndexState(row["state"])

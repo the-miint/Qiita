@@ -25,7 +25,7 @@ class KreppBuildRecord(BaseModel):
     """What `export-krepp-build` tells the job about the build it checks: where it is
     (`fs_path`, relative to PATH_DERIVED and to the node cache), the hash its
     SHA256SUMS must have, and `node_cache_evict`: the paths of every removed build,
-    whose node copies the job deletes before it copies this one."""
+    whose copies on its node the job deletes before it reads this one."""
 
     model_config = ConfigDict(extra="forbid")
 

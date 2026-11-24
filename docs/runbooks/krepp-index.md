@@ -78,7 +78,8 @@ the krepp version that wrote the build and the one miint links.
 qiita-admin krepp-index remove --reference-idx 18 --reference-index-idx <idx>
 ```
 
-Only a `registered` or `retired` build, and only when no ticket fixed to it is running.
-Then delete its master folder. Each node's copy is deleted by the next job on that node
-that reads a krepp build through the node cache. A finished ticket fixed to a removed build cannot be restarted with `/run`; submit it
+Only a `registered` or `retired` build, and only when no ticket fixed to it or activating
+it is running or still has a cancel's reap pending.
+Then delete its master folder. Each node's copy is deleted by the next
+`reference-index-activate` job on that node. A finished ticket fixed to a removed build cannot be restarted with `/run`; submit it
 again. A reference cannot be deleted while it has a krepp build that is not removed.

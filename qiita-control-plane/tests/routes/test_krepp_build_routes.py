@@ -1,7 +1,6 @@
-"""The krepp build routes: `POST /reference/{idx}/index/{idx}/remove`, `GET
-/reference/krepp-build/active`, and `POST /work-ticket/{idx}/run` refusing a ticket whose
-build was removed while letting one whose build is retired run
-(repositories.reference_index)."""
+"""The krepp build routes: `POST /reference/{idx}/index/{idx}/remove`, and `POST
+/work-ticket/{idx}/run` refusing a ticket whose build was removed while letting one whose
+build is retired run (repositories.reference_index)."""
 
 import secrets
 

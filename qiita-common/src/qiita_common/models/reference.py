@@ -305,6 +305,8 @@ INDEX_TYPE_KREPP = "krepp"
 # Index types whose `fs_path` is relative to PATH_DERIVED and names a sealed folder
 # (SHA256SUMS + manifest.json) that jobs read through the orchestrator's node cache
 # (qiita_compute_orchestrator.node_cache). Every other type's `fs_path` is a host path.
+# The krepp_index_lifecycle migration's reference_index_krepp_path_is_relative CHECK
+# enforces the relative path for krepp; a type added here needs that CHECK extended.
 NODE_CACHED_INDEX_TYPES = frozenset({INDEX_TYPE_KREPP})
 
 

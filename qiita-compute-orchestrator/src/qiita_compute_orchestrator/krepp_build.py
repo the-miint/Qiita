@@ -89,7 +89,8 @@ def inventory_index(index_dir: Path) -> Inventory:
     """Read `index/` for what registration records. Whether the files make a complete
     krepp index is krepp's to say; Qiita reads the settings it records and picks the
     tree it compares with the reference's, and refuses `tree-*` files that differ,
-    since it compares only one. Raises KreppBuildInvalid."""
+    since it compares only one. Raises KreppBuildInvalid, or SealedFolderInvalid
+    (`link`, `unreadable`) from listing the files."""
     if not index_dir.is_dir():
         raise KreppBuildInvalid("inventory", f"{index_dir} is not a directory")
     names = all_files(index_dir)

@@ -8,7 +8,7 @@ import uuid
 
 import asyncpg
 import pytest
-from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
+from qiita_common.krepp import REFERENCE_INDEX_IDX_BINDING, SHA256SUMS_SHA256_PARAM
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
     ReferenceIndexState,
@@ -342,6 +342,37 @@ async def test_remove_allows_finished_tickets_and_keeps_their_build(world, ticke
         assert await removed_build_of_ticket(conn, ticket) == a
 
 
+async def test_remove_refuses_while_a_cancelled_tickets_reap_is_pending(world):
+    """A cancelled ticket's SLURM jobs may still be reading the build until the reap
+    that scancels them finishes."""
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    ticket = await _ticket(world, a, "cancelled")
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET reap_pending_since = now(), reap_note = 'reaping'"
+        " WHERE work_ticket_idx = $1",
+        ticket,
+    )
+    with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
+        await _remove(pool, a)
+
+
+async def test_remove_refuses_while_an_activation_of_the_build_runs(world):
+    """An activation ticket names the build in its context, not in reference_index_idx."""
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    ticket = await _ticket(world, None, "processing")
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET action_context = jsonb_build_object($2::text, $3::bigint)"
+        " WHERE work_ticket_idx = $1",
+        ticket,
+        REFERENCE_INDEX_IDX_BINDING,
+        a,
+    )
+    with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
+        await _remove(pool, a)
+
+
 async def test_remove_a_registered_build_that_was_never_activated(world):
     a = await _register(world, "a")
     change = await _remove(world["pool"], a)
@@ -412,17 +443,21 @@ async def test_export_names_removed_builds_for_eviction(world, tmp_path):
 
     from qiita_control_plane.actions.library import export_krepp_build
 
+    pool = world["pool"]
+    retired = await _register(world, "retired", "b" * 64)
+    active = await _register(world, "active", "c" * 64)
+    await _activate(pool, retired)
+    await _activate(pool, active)
     a = await _register(world, "a", "d" * 64)
     gone = await _register(world, "gone", "e" * 64)
-    await world["pool"].execute(
-        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
-        gone,
-        ReferenceIndexState.REMOVED,
-    )
-    path = await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
+    await _remove(pool, gone)
+    path = await export_krepp_build(pool, world["reference_idx"], a, tmp_path)
     record = KreppBuildRecord.model_validate_json(path.read_text())
-    assert f"references/{world['reference_idx']}/krepp/gone" in record.node_cache_evict
-    assert record.fs_path not in record.node_cache_evict
+    mine = [
+        p for p in record.node_cache_evict if p.startswith(f"references/{world['reference_idx']}/")
+    ]
+    # Only the removed build: a retired one still serves the tickets fixed to it.
+    assert mine == [f"references/{world['reference_idx']}/krepp/gone"]
 
 
 async def test_export_refuses_another_reference_and_a_retired_build(world, tmp_path):

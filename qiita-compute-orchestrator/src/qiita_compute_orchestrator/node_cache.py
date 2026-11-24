@@ -13,16 +13,20 @@ reads a sealed folder from:
 - ``PATH_NODE_LOCAL`` unset: the master copy under ``PATH_DERIVED``, after
   ``verify_sealed``.
 - set: the node's copy at the same relative path, made on first use. Jobs on one node
-  take a per-folder ``flock`` in turn. The first copies into a hidden ``.partial``
-  folder, hashing every file against ``SHA256SUMS`` as it writes it, copies
-  ``manifest.json`` last and renames the folder into place; a job that waited finds
-  the copy and runs ``verify_sealed`` on it. Before copying it checks the free space
-  against the manifest's sizes, and a disk that fills during the copy fails the job
-  the same way.
+  take a per-folder ``flock`` in turn. The first checks the master's file list as
+  ``verify_sealed`` does, checks the free space against the manifest's sizes, copies
+  into a hidden ``.partial`` folder while hashing every file against ``SHA256SUMS``,
+  copies ``manifest.json`` last and renames the folder into place, so a folder at
+  the target path was always written whole. A job that waited finds the copy and
+  runs ``verify_sealed`` on it. A disk that fills during the copy fails the job as a
+  lack of space before it does.
 
-``evict`` deletes node copies the caller names (a build that was removed). The
-cluster admins only create ``PATH_NODE_LOCAL`` on each node, writable by the job user;
-nothing is copied by hand.
+``evict`` deletes node copies the caller names (folders whose build was removed).
+The lock covers making a copy, not reading it: a copy is safe to delete only once no
+job can still read it, which the control plane holds for a removed build
+(``repositories.reference_index.tickets_running_on_build``). The cluster admins only
+create ``PATH_NODE_LOCAL`` on each node, writable by the job user; nothing is copied
+by hand.
 """
 
 from __future__ import annotations
@@ -48,6 +52,11 @@ MANIFEST = "manifest.json"
 LOCK_DIR = ".locks"
 _PARTIAL_SUFFIX = ".partial"
 _CHUNK = 8 << 20
+
+# `probe`'s exit codes; the readiness probe script maps each to the node-cache row.
+PROBE_OK = 0
+PROBE_SKIP = 3
+PROBE_WARN = 4
 
 
 class SealedFolderInvalid(ValueError):
@@ -167,18 +176,34 @@ def _read_sums(folder: Path, expected_sums_sha256: str) -> dict[str, str]:
     return _parse_sums(text)
 
 
-def verify_sealed(folder: Path, expected_sums_sha256: str) -> dict:
-    """The cheap check of a copy: SHA256SUMS is the recorded one, the folder holds
-    exactly the files it lists, manifest.json matches its hash, and every size matches
-    the manifest. Large files are not re-hashed; `materialize` hashes every file when
-    it copies. Returns the manifest. Raises SealedFolderInvalid."""
-    listed = _read_sums(folder, expected_sums_sha256)
+def _check_file_list(folder: Path, listed: dict[str, str]) -> None:
+    """The folder holds exactly the files SHA256SUMS lists, and no symlink."""
     present = set(all_files(folder)) - {SHA256SUMS}
     if present != set(listed):
         raise SealedFolderInvalid(
             "files",
             f"missing {sorted(set(listed) - present)}, not listed {sorted(present - set(listed))}",
         )
+
+
+def _present(path: Path) -> bool:
+    """Whether `path` exists. Unlike Path.exists, a path that cannot be looked up
+    (a directory above it without search permission) raises instead of reading as
+    absent."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def verify_sealed(folder: Path, expected_sums_sha256: str) -> dict:
+    """The cheap check of a copy: SHA256SUMS is the recorded one, the folder holds
+    exactly the files it lists, manifest.json matches its hash, and every size matches
+    the manifest. Large files are not re-hashed; `materialize` hashes every file when
+    it copies. Returns the manifest. Raises SealedFolderInvalid."""
+    listed = _read_sums(folder, expected_sums_sha256)
+    _check_file_list(folder, listed)
     if sha256_file(folder / MANIFEST) != listed[MANIFEST]:
         raise SealedFolderInvalid("manifest", f"{MANIFEST} does not match {SHA256SUMS}")
     manifest = json.loads((folder / MANIFEST).read_text())
@@ -229,13 +254,14 @@ def _copy_hashed(src: Path, dst: Path, want: str) -> None:
 
 def _copy(master: Path, target: Path, expected_sums_sha256: str, threads: int) -> None:
     listed = _read_sums(master, expected_sums_sha256)
+    _check_file_list(master, listed)
     manifest = json.loads((master / MANIFEST).read_text())
     files = [rel for rel in listed if rel != MANIFEST]
     need = sum(manifest["files"].values()) + sum(
         (master / n).stat().st_size for n in (MANIFEST, SHA256SUMS)
     )
     partial = _partial(target)
-    if partial.exists():
+    if _present(partial):
         _log(f"deleting {partial}, left by a job that stopped while copying")
         shutil.rmtree(partial)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -249,11 +275,17 @@ def _copy(master: Path, target: Path, expected_sums_sha256: str, threads: int) -
         partial.mkdir()
         for d in sorted({str(Path(rel).parent) for rel in files} - {"."}):
             (partial / d).mkdir(parents=True, exist_ok=True)
-        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
-            list(pool.map(lambda r: _copy_hashed(master / r, partial / r, listed[r]), files))
+        pool = ThreadPoolExecutor(max_workers=max(1, threads))
+        try:
+            futures = [pool.submit(_copy_hashed, master / r, partial / r, listed[r]) for r in files]
+            for future in futures:
+                future.result()
+        finally:
+            # On the first failure, files not yet started are not copied.
+            pool.shutdown(cancel_futures=True)
         shutil.copyfile(master / SHA256SUMS, partial / SHA256SUMS)
-        # manifest.json last: a folder holding it is a complete copy.
         _copy_hashed(master / MANIFEST, partial / MANIFEST, listed[MANIFEST])
+        # The folder appears at its path only here, after every file is written.
         partial.rename(target)
     except OSError as exc:
         shutil.rmtree(partial, ignore_errors=True)
@@ -282,8 +314,9 @@ def _node_root() -> Path | None:
 
 
 def evict(relpaths: Iterable[str]) -> None:
-    """Delete this node's copies of `relpaths` (folders whose master was removed),
-    each under its lock. A no-op without PATH_NODE_LOCAL."""
+    """Delete this node's copies of `relpaths` (folders whose build was removed),
+    each under its lock. A no-op without PATH_NODE_LOCAL. Safe only for a folder no
+    job can still read (the module docstring says who holds that)."""
     root = _node_root()
     if root is None:
         return
@@ -291,7 +324,7 @@ def evict(relpaths: Iterable[str]) -> None:
         target = node_relative_path(root, relpath)
         with _locked(root, relpath):
             for path in (target, _partial(target)):
-                if path.exists():
+                if _present(path):
                     _log(f"deleting {path}")
                     shutil.rmtree(path)
 
@@ -316,7 +349,7 @@ def materialize(
     evict(evict_first)
     target = node_relative_path(root, relpath)
     with _locked(root, relpath):
-        if target.exists():
+        if _present(target):
             try:
                 verify_sealed(target, expected_sums_sha256)
                 return target
@@ -324,23 +357,22 @@ def materialize(
                 _log(f"{target} is not the recorded copy ({exc}); copying it again")
                 shutil.rmtree(target)
         _copy(master, target, expected_sums_sha256, threads or default_threads())
-        verify_sealed(target, expected_sums_sha256)
     return target
 
 
 def probe() -> tuple[int, str]:
     """The compute-readiness `node-cache` row for this node: (exit code, detail).
-    0 ok, 3 skip (PATH_NODE_LOCAL unset: jobs read from PATH_DERIVED), 4 warn (set
-    but not a writable directory here: every job that reads through the cache fails
-    on this node)."""
+    PROBE_OK, PROBE_SKIP (PATH_NODE_LOCAL unset: jobs read from PATH_DERIVED),
+    PROBE_WARN (set but not a writable directory here: every job that reads through
+    the cache fails on this node)."""
     raw = get_settings().path_node_local
     if not raw:
-        return 3, "PATH_NODE_LOCAL is not set; jobs read sealed folders from PATH_DERIVED"
+        return PROBE_SKIP, "PATH_NODE_LOCAL is not set; jobs read sealed folders from PATH_DERIVED"
     try:
         root = _node_root()
     except NodeCacheError as exc:
-        return 4, exc.detail
-    return 0, f"{root} writable, {shutil.disk_usage(root).free} bytes free"
+        return PROBE_WARN, exc.detail
+    return PROBE_OK, f"{root} writable, {shutil.disk_usage(root).free} bytes free"
 
 
 if __name__ == "__main__":

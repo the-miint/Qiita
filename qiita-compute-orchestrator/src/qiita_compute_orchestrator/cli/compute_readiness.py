@@ -71,6 +71,7 @@ from ..config import (
     node_local_job_env,
 )
 from ..native_import_check import MAX_DETAIL
+from ..node_cache import PROBE_OK, PROBE_SKIP, PROBE_WARN
 from ..slurm.client import (
     SlurmrestdClient,
     SlurmrestdError,
@@ -588,9 +589,9 @@ fi
 # (qiita_compute_orchestrator.node_cache.probe).
 run_module_probe qiita_compute_orchestrator.node_cache
 case "$MODULE_PROBE_RC" in
-    0) echo "{_PROBE_LINE_PREFIX} node-cache=ok detail=$MODULE_PROBE_ERR" ;;
-    3) echo "{_PROBE_LINE_PREFIX} node-cache=skip detail=$MODULE_PROBE_ERR" ;;
-    4) echo "{_PROBE_LINE_PREFIX} node-cache=warn err=$MODULE_PROBE_ERR" ;;
+    {PROBE_OK}) echo "{_PROBE_LINE_PREFIX} node-cache=ok detail=$MODULE_PROBE_ERR" ;;
+    {PROBE_SKIP}) echo "{_PROBE_LINE_PREFIX} node-cache=skip detail=$MODULE_PROBE_ERR" ;;
+    {PROBE_WARN}) echo "{_PROBE_LINE_PREFIX} node-cache=warn err=$MODULE_PROBE_ERR" ;;
     *) echo "{_PROBE_LINE_PREFIX} node-cache=fail err=$MODULE_PROBE_ERR" ;;
 esac
 
