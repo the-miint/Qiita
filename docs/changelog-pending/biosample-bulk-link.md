@@ -1,7 +1,7 @@
 ### Added
 
 - **`POST /study/{study_idx}/biosample/bulk-link` links many existing biosamples into a
-  study at once (#N).** The body names one identifier kind (`export_entity_id`, `idx`,
+  study at once (#939).** The body names one identifier kind (`export_entity_id`, `idx`,
   `biosample_accession`, `ena_sample_accession` or `matrix_tube_id`) and up to 2,000 values
   of it, none repeated. Access is that of
   `POST /study/{study_idx}/biosample/{biosample_idx}/link`, applied to every biosample. The
@@ -12,7 +12,7 @@
   A 503 with `Retry-After` means that a named biosample's identifier changed while the
   request ran; nothing was linked, and the identical request can be resent.
 - **`qiita biosample bulk-link` links into a study every biosample that a TSV file's
-  column names (#N).** `--key` names the identifier kind (`export_entity_id` by default),
+  column names (#939).** `--key` names the identifier kind (`export_entity_id` by default),
   and the file's column with that exact header holds the values; other columns are
   ignored. A blank cell, a repeated value, or more than 2,000 values is refused before
   anything is sent. The command prints which values were linked and which were already
@@ -21,10 +21,10 @@
 ### Changed
 
 - **`POST /study/{study_idx}/biosample/{biosample_idx}/link` answers 403 for a biosample
-  that the caller does not own, and 200 for a link that already exists (#N).** A caller who
+  that the caller does not own, and 200 for a link that already exists (#939).** A caller who
   passes the study check but does not own a live biosample now gets 403 instead of 404; one
   who does not own a retired biosample still gets 404. When the pair is already actively
   linked, the route answers 200 with that link, as first created, instead of 409; a retired
   link for the pair is still refused with 409.
-- **`qiita biosample link` says on stderr when the link already existed (#N).** Its JSON
+- **`qiita biosample link` says on stderr when the link already existed (#939).** Its JSON
   output is unchanged.
