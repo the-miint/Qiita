@@ -1,9 +1,9 @@
-"""A biosample's public name, as everything that shows a sample names it.
+"""A biosample's public name as one SQL expression.
 
 The BioSample accession, else the ENA sample accession, else the QB Qiita minted
-when the biosample was created (`qiita.exported_entity`). One SQL expression so
-the amplicon feature table and anything else that names a sample agree; it needs
-the biosample aliased `b` and `BIOSAMPLE_NAME_JOIN` in the FROM clause.
+when the biosample was created (`qiita.exported_entity`). Kept in one place so a
+caller naming a sample does not re-spell the precedence; it needs the biosample
+aliased `b` and `BIOSAMPLE_NAME_JOIN` in the FROM clause.
 """
 
 BIOSAMPLE_NAME_SQL = "COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"

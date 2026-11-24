@@ -967,28 +967,24 @@ class _Companion(NamedTuple):
     alone, since it runs before anything has been computed, and `_write_bundle` needs the
     writers — so a member cannot be reserved a path and then not written, and adding one
     is a line here rather than a third positional index at each site.
+
+    `flag_gated` is the default: a member a `--flag` asks for. The amplicon `sequences`
+    member is not — it is always written by its own path — so it is excluded from the
+    flag lookup (`_requested_companions`) rather than masked out of it.
     """
 
     name: str
     suffix: str
     copy_sql: Callable[..., str]
+    flag_gated: bool = True
 
 
-# In write order. Each suffix is derived from the caller's name for the reason the
-# identifier map's is, and named for what it holds rather than for the reference it came
-# from: a reference name is not ours to compose into a filename either.
-class SequencesClearance(NamedTuple):
-    """Proof the amplicon sequences relation was built from the features the table
-    names, which is what makes that companion writable."""
-
-    features: int
-
-
-def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
+def _amplicon_sequences_copy_sql(path: Path, *, clearance: object = None) -> str:
     """COPY the handle -> (sequence, md5) mapping to Parquet: each published feature's
     `QF`, its ASV sequence, and the reproducible-from-sequence md5. SEMI JOIN to the
     published set (not `IN`) and unordered, like `write.taxonomy_copy_sql`: the reader
-    joins on the id."""
+    joins on the id. `clearance` is accepted for the uniform companion dispatch; this
+    companion has no relabel gate to clear."""
     del clearance
     return (
         f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length, f.md5"
@@ -1001,8 +997,8 @@ def _amplicon_sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
-    # The amplicon table's (`qiita feature-table runs`).
-    _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql),
+    # The amplicon table's (`qiita feature-table runs`), not flag-gated.
+    _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql, flag_gated=False),
 )
 
 
@@ -1226,11 +1222,11 @@ def _manifest_payload(
 
 
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
-    """The flag-gated companions these flags ask for, in write order. `_COMPANIONS` also
-    holds the amplicon `sequences` companion, which is not flag-gated and is written by its
-    own path; `.get(..., False)` leaves it — and any member absent from `asked` — out here."""
+    """The flag-gated companions these flags ask for, in write order. Spelled out per
+    member rather than read off the namespace, so a renamed flag is a signature change
+    here instead of a silently absent file."""
     asked = {"taxonomy": taxonomy, "tree": tree}
-    return tuple(companion for companion in _COMPANIONS if asked.get(companion.name, False))
+    return tuple(c for c in _COMPANIONS if c.flag_gated and asked[c.name])
 
 
 # Written INTO the map as well as printed, because a warning that lives only in a

@@ -67,17 +67,15 @@ class Source:
     merge_keys: tuple[str, ...]
     # What a run counts, for refusals ("these runs' ASVs ...").
     noun: str
+    # What a feature id is, for the bundle manifest.
+    feature_id_note: str
 
 
 # The registry of methods this endpoint can answer. A method belongs here when its
-# values are a persisted per-cell COO — one stored value per (sample, feature). The
-# metagenomic OGU table is cohort-pooled compute over alignment data rather than a
-# stored COO (served separately by `feature-table build`), so it is not one here; the
-# two are expected to converge behind this request shape, a `Source` carrying how it
-# produces its COO (a lake selection or a compute job) and `value_kind` widening past
-# "count", once the compute path can answer under this route.
-# Keyed on the `processing.workflow` value `_source_of` reads off each run, so a key
-# is a workflow name.
+# values are a persisted per-cell COO — one stored value per (sample, feature); the
+# metagenomic OGU table is cohort-pooled compute (served separately by
+# `feature-table build`), so it is not one here. Keyed on the `processing.workflow`
+# value `_source_of` reads off each run, so a key is a workflow name.
 SOURCES: dict[str, Source] = {
     # The trim length is the ASV's length, and orientation decides which strand it
     # is read on: ASVs from runs differing in these are different features, so
@@ -92,6 +90,7 @@ SOURCES: dict[str, Source] = {
         sequences_table=AMPLICON_SEQUENCE_TABLE,
         merge_keys=("trim", "orient_primer"),
         noun="ASVs",
+        feature_id_note="exported-feature handle (QF); the sequence companion maps it to md5",
     ),
 }
 
@@ -405,6 +404,8 @@ def build_values(cohort: Cohort, values: pa.Table, labels: pa.Table) -> pa.Table
         stage_values(
             duck, source=cohort.source, names="names", values="run_values", labels="labels"
         )
+        # Ordered so the dictionary-encoded `sample`/`feature` codes are assigned in a
+        # stable order, making the stream reproducible.
         table = duck.sql(
             f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature"
         ).to_arrow_table()
@@ -420,8 +421,7 @@ def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.
         duck.register("labels", labels)
         stage_features(duck, labels="labels", sequences="sequences")
         table = duck.sql(
-            f"SELECT f.feature, f.sequence, f.length, f.md5"
-            f" FROM {FEATURE_RELATION} f ORDER BY f.feature"
+            f"SELECT f.feature, f.sequence, f.length, f.md5 FROM {FEATURE_RELATION} f"
         ).to_arrow_table()
     return table.cast(FEATURES_SCHEMA)
 

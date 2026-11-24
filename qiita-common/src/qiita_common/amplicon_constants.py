@@ -7,12 +7,11 @@ reader of the same lake tables share one spelling without seeing each other's
 code.
 """
 
-# One row per (prep_sample_idx, processing_idx, feature_idx) with its count.
-# This is the WRITE target (register-files). Reads go through the exclusion-aware
-# view below, never this base table — a blocked ASV must not reach a feature table.
+# One row per (prep_sample_idx, processing_idx, feature_idx) with its count. The
+# WRITE target (register-files); reads use the exclusion-aware view below.
 AMPLICON_MEMBERSHIP_TABLE = "amplicon_membership"
-# The read surface: `amplicon_membership` ANTI JOIN the resolved blocklist on
-# feature_idx (data plane `ensure_exclusion_tables`), mirroring `alignment_visible`.
+# The read surface: `amplicon_membership` with blocked features excluded (data plane
+# `ensure_exclusion_tables`), mirroring `alignment_visible`.
 AMPLICON_MEMBERSHIP_VISIBLE_TABLE = "amplicon_membership_visible"
 # One row per ASV feature_idx: its sequence hash, length, and the sequence itself.
 # An ASV is short (a single 64 KB chunk at most), so its bytes are stored inline here

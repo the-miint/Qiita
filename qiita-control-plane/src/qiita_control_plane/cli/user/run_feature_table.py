@@ -30,11 +30,10 @@ from qiita_common.api_paths import (
 from qiita_common.duckdb_relation import registered
 from qiita_common.models.run_feature_table import FeatureTableRequest
 
-from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION
+from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
 from .. import _common
 from .feature_table import (
     IDENTIFIER_MAP_NOTE,
-    SequencesClearance,
     _bundle_targets,
     _tool_versions,
     _write_bundle,
@@ -46,12 +45,6 @@ MANIFEST_NOTE = (
     " over a different cohort yield a different table — which is why this record is"
     " part of the bundle."
 )
-
-# What each method's feature ids are, for the manifest. Keyed by workflow name,
-# like `run_feature_table.SOURCES`.
-_FEATURE_ID = {
-    "amplicon": "exported-feature handle (QF); the sequence companion maps it to md5",
-}
 
 
 def _request(args: argparse.Namespace) -> FeatureTableRequest:
@@ -121,14 +114,14 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             strict=True,
         )
     )
-    clearances: dict[str, Any] = {"sequences": SequencesClearance(features=sizes["features"])}
+    clearances: dict[str, Any] = {"sequences": None}
 
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
             "note": MANIFEST_NOTE,
             "kind": method,
             "value_kind": columns["value_kind"],
-            "feature_id": _FEATURE_ID[method],
+            "feature_id": SOURCES[method].feature_id_note,
             # The cohort as public handles — each column's QM, sorted so the record
             # does not depend on the order the samples came back in. The request names
             # internal idxs (processing_idx, prep_sample_idx); a published manifest
