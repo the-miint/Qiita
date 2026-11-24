@@ -299,14 +299,16 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
 # A krepp phylogenetic-placement index, built outside Qiita and registered onto an
-# existing reference. The only type with a lifecycle (ReferenceIndexState).
+# existing reference. Not a host-filter index (HOST_FILTER_REQUIRED_INDEX_TYPES);
+# mirrors the index_type CHECK allow-list. Its state moves through ReferenceIndexState;
+# the reference_index_lifecycle_is_krepp CHECK keeps every other type `active`.
 INDEX_TYPE_KREPP = "krepp"
 
 # Index types whose `fs_path` is relative to PATH_DERIVED and names a sealed folder
 # (SHA256SUMS + manifest.json) that jobs read through the orchestrator's node cache
 # (qiita_compute_orchestrator.node_cache). Every other type's `fs_path` is a host path.
-# The krepp_index_lifecycle migration's reference_index_krepp_path_is_relative CHECK
-# enforces the relative path for krepp; a type added here needs that CHECK extended.
+# The reference_index_krepp_path_is_relative CHECK enforces the relative path; a type
+# added here needs that CHECK extended (a test checks every type here).
 NODE_CACHED_INDEX_TYPES = frozenset({INDEX_TYPE_KREPP})
 
 
@@ -314,11 +316,11 @@ class ReferenceIndexState(StrEnum):
     """`qiita.reference_index.state` (TEXT + CHECK, no Postgres ENUM).
 
     Every index type but krepp is written `active` and stays there. A krepp build is
-    written `registered`, becomes `active` when activation passes
-    (retiring the reference's previous active build in the same transaction), and is
-    `removed` once no running ticket uses it. A retired build stays usable by the
-    tickets already fixed to it (work_ticket.reference_index_idx); a removed one is
-    refused to them."""
+    written `registered`, becomes `active` when it is activated (retiring the
+    reference's previous active build in the same transaction), and is marked `removed`
+    by an admin, which is refused while a ticket fixed to it may still read it. A
+    retired build stays usable by the tickets already fixed to it
+    (work_ticket.reference_index_idx); a removed one is refused to them."""
 
     REGISTERED = "registered"
     ACTIVE = "active"

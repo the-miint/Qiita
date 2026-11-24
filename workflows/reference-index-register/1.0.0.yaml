@@ -6,7 +6,7 @@ description: >
   Register a krepp placement index that was built outside Qiita onto an existing
   reference. The build is placed by hand at
   `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` (`index/` with the
-  krepp files, `jest/` with JEST's labelled tree and null), and this workflow checks
+  krepp files, `jest/` with JEST's labeled tree and its null distribution), and this workflow checks
   it — its settings and tree can be read, the tree is the reference's own with its
   edge numbers, and it holds no symlinks — seals it (writes manifest.json and
   SHA256SUMS into it), and records it in qiita.reference_index as `registered`. A

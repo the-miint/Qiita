@@ -11,8 +11,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
-from helpers import KREPP_TREE_NEWICK, krepp_recorded_version
+from helpers import KREPP_TREE_NEWICK
 from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
+from qiita_common.models import INDEX_TYPE_KREPP, ReferenceIndexState
 
 from qiita_compute_orchestrator.derived_store import krepp_build_relpath
 from qiita_compute_orchestrator.jobs import krepp_index_register as job
@@ -21,6 +22,7 @@ from qiita_compute_orchestrator.krepp_build import (
     JEST_NULL,
     KreppBuildInvalid,
 )
+from qiita_compute_orchestrator.miint import open_miint_conn
 
 _JOB = "qiita_compute_orchestrator.jobs.krepp_index_register"
 _LABELLED = "((g0:1{0},g1:1{1}):1{2},(g2:1{3},g3:1{4}):1{5}){6};\n"
@@ -65,9 +67,9 @@ async def _run(tmp_path: Path) -> dict:
 
 async def test_registers_a_build_whose_tree_is_the_references(derived, tmp_path):
     meta = await _run(tmp_path)
-    assert meta["index_type"] == "krepp"
+    assert meta["index_type"] == INDEX_TYPE_KREPP
     assert meta["fs_path"] == "references/18/krepp/t1"
-    assert meta["state"] == "registered"
+    assert meta["state"] == ReferenceIndexState.REGISTERED
     assert meta["params"]["m"] == 4
     assert len(meta["params"][SHA256SUMS_SHA256_PARAM]) == 64
     assert (derived.folder / "SHA256SUMS").is_file()
@@ -93,10 +95,16 @@ async def test_refuses_a_reference_tree_without_edge_numbers(derived, tmp_path):
 
 async def test_refuses_a_jest_tree_with_other_edges(derived, tmp_path):
     (derived.folder / JEST_LABELLED_TREE).write_text(_LABELLED.replace("{6}", "{9}"))
-    with pytest.raises(KreppBuildInvalid, match="JEST's labelled tree"):
+    with pytest.raises(KreppBuildInvalid, match="JEST's labeled tree"):
         await _run(tmp_path)
 
 
 async def test_records_the_builds_krepp_version(derived, tmp_path):
+    """The fixture index was built by the staged miint, so the version recorded is the
+    one that miint reports for the krepp it links."""
     meta = await _run(tmp_path)
-    assert meta["params"]["krepp_version"] == krepp_recorded_version(derived.folder / "index")
+    with open_miint_conn() as conn:
+        (linked,) = conn.execute(
+            "SELECT version FROM miint_versions() WHERE library = 'krepp-version'"
+        ).fetchone()
+    assert meta["params"]["krepp_version"] == linked

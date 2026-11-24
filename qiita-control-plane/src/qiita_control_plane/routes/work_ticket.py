@@ -1001,7 +1001,7 @@ async def run_work_ticket(
                     detail=(
                         f"work_ticket {work_ticket_idx} is fixed to krepp build"
                         f" {removed_build}, which was removed; it is not redriven."
-                        " Submit the work again to run it on the active build"
+                        " Submit the work again"
                     ),
                 )
             # Locked so an abandon-plan, which locks the block too, either commits

@@ -287,11 +287,11 @@ def test_an_unwritable_root_fails_by_name(world):
 
 def test_probe_statuses(world):
     code, detail = nc.probe()
-    assert code == 0 and "writable" in detail
+    assert code == nc.PROBE_OK and "writable" in detail
     world.node.chmod(0o555)
     try:
-        assert nc.probe()[0] == 4
+        assert nc.probe()[0] == nc.PROBE_FAIL
     finally:
         world.node.chmod(0o755)
     world.settings.path_node_local = None
-    assert nc.probe()[0] == 3
+    assert nc.probe()[0] == nc.PROBE_SKIP

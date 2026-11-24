@@ -3,14 +3,14 @@ the krepp_index_lifecycle migration adds, `register_index`'s krepp refusals, the
 state changes in `repositories.reference_index`, and the reference-delete gate."""
 
 import asyncio
-import json
 import uuid
 
 import asyncpg
 import pytest
-from qiita_common.krepp import REFERENCE_INDEX_IDX_BINDING, SHA256SUMS_SHA256_PARAM
+from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
+    NODE_CACHED_INDEX_TYPES,
     ReferenceIndexState,
 )
 
@@ -148,15 +148,35 @@ async def test_existing_index_types_default_to_active(world):
     assert state == ReferenceIndexState.ACTIVE
 
 
-async def test_a_krepp_path_is_relative(world):
-    """A krepp row's fs_path is relative to PATH_DERIVED (NODE_CACHED_INDEX_TYPES)."""
+async def test_two_krepp_rows_cannot_name_one_folder(world):
+    """Node-cache copies are deleted by path, so a second row naming the same folder
+    would let removing one delete the other's copies."""
+    pool = world["pool"]
+    await _register(world, "a", "a" * 64)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await pool.execute(
+            "INSERT INTO qiita.reference_index"
+            " (reference_idx, index_type, fs_path, params, state)"
+            " VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+            world["reference_idx"],
+            INDEX_TYPE_KREPP,
+            f"references/{world['reference_idx']}/krepp/a",
+            ReferenceIndexState.REGISTERED,
+        )
+
+
+@pytest.mark.parametrize("index_type", sorted(NODE_CACHED_INDEX_TYPES))
+async def test_a_node_cached_path_is_relative(world, index_type):
+    """Every NODE_CACHED_INDEX_TYPES row's fs_path is relative to PATH_DERIVED; the
+    CHECK must cover each type listed there."""
     with pytest.raises(asyncpg.CheckViolationError):
         await world["pool"].execute(
             "INSERT INTO qiita.reference_index"
             " (reference_idx, index_type, fs_path, params, state)"
-            " VALUES ($1, $2, '/srv/krepp/a', '{}'::jsonb, 'registered')",
+            " VALUES ($1, $2, '/srv/x/a', '{}'::jsonb, $3)",
             world["reference_idx"],
-            INDEX_TYPE_KREPP,
+            index_type,
+            ReferenceIndexState.REGISTERED,
         )
 
 
@@ -357,63 +377,13 @@ async def test_remove_refuses_while_a_cancelled_tickets_reap_is_pending(world):
         await _remove(pool, a)
 
 
-async def test_remove_refuses_while_an_activation_of_the_build_runs(world):
-    """An activation ticket names the build in its context, not in reference_index_idx."""
+async def test_remove_ignores_a_cancelled_ticket_whose_reap_finished(world):
+    """The other side of the gate: a cancelled ticket with no reap pending, fixed to
+    the build, does not hold it."""
     pool = world["pool"]
     a = await _register(world, "a", "a" * 64)
-    ticket = await _ticket(world, None, "processing")
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET action_context = jsonb_build_object($2::text, $3::bigint)"
-        " WHERE work_ticket_idx = $1",
-        ticket,
-        REFERENCE_INDEX_IDX_BINDING,
-        a,
-    )
-    with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
-        await _remove(pool, a)
-
-
-async def _name_in_context(pool, ticket: int, value) -> None:
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET action_context = jsonb_build_object($2::text, $3::numeric)"
-        " WHERE work_ticket_idx = $1",
-        ticket,
-        REFERENCE_INDEX_IDX_BINDING,
-        value,
-    )
-
-
-async def test_remove_counts_an_activation_whose_context_spells_the_idx_as_a_float(world):
-    pool = world["pool"]
-    a = await _register(world, "a", "a" * 64)
-    ticket = await _ticket(world, None, "processing")
-    await _name_in_context(pool, ticket, f"{a}.0")
-    with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
-        await _remove(pool, a)
-
-
-async def test_remove_ignores_tickets_that_cannot_read_the_build(world):
-    """The other side of the gate: an activation of another build, and a cancelled
-    ticket whose reap finished, do not hold the build."""
-    pool = world["pool"]
-    a = await _register(world, "a", "a" * 64)
-    b = await _register(world, "b", "b" * 64)
-    other = await _ticket(world, None, "processing")
-    await _name_in_context(pool, other, b)
     await _ticket(world, a, "cancelled")
     assert (await _remove(pool, a)).state is ReferenceIndexState.REMOVED
-
-
-async def test_removed_build_of_ticket_sees_an_activation_ticket(world):
-    pool = world["pool"]
-    a = await _register(world, "a", "a" * 64)
-    ticket = await _ticket(world, None, "failed")
-    await _name_in_context(pool, ticket, a)
-    async with pool.acquire() as conn, conn.transaction():
-        assert await removed_build_of_ticket(conn, ticket) is None
-    await _remove(pool, a)
-    async with pool.acquire() as conn, conn.transaction():
-        assert await removed_build_of_ticket(conn, ticket) == a
 
 
 async def test_remove_a_registered_build_that_was_never_activated(world):
@@ -448,104 +418,29 @@ async def test_reference_delete_allowed_once_every_build_is_removed(world):
     await assert_reference_deletable(world["pool"], world["reference_idx"], force=True)
 
 
-# --- export-krepp-build / activate-krepp-build ------------------------------------
+# --- activate-krepp-build ---------------------------------------------------------
 
 
-def _report(reference_index_idx: int, own: int, minimum: float = 0.9) -> str:
-    from qiita_common.krepp import KreppActivationReport
-
-    return KreppActivationReport(
-        reference_index_idx=reference_index_idx,
-        node="b-cn-01",
-        tips=100,
-        placed=100,
-        own_edge=own,
-        own_edge_share=own / 100,
-        min_own_edge_share=minimum,
-        passed=own / 100 >= minimum,
-        build_krepp_version="v0.10.0",
-        linked_krepp_version="v0.12.3",
-    ).model_dump_json()
-
-
-async def test_export_writes_the_build_record(world, tmp_path):
-    from qiita_common.krepp import KreppBuildRecord
-
-    from qiita_control_plane.actions.library import export_krepp_build
+async def test_the_activate_action_activates_a_build_of_the_ticket_reference(world):
+    from qiita_control_plane.actions.library import activate_krepp_build_of_reference
 
     a = await _register(world, "a", "d" * 64)
-    path = await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
-    record = KreppBuildRecord.model_validate_json(path.read_text())
-    assert record.fs_path == f"references/{world['reference_idx']}/krepp/a"
-    assert record.sha256sums_sha256 == "d" * 64
-    assert record.node_cache_evict == []
+    await activate_krepp_build_of_reference(world["pool"], world["reference_idx"], a)
+    assert await _state(world["pool"], a) == ReferenceIndexState.ACTIVE
 
 
-async def test_export_names_removed_builds_for_eviction(world, tmp_path):
-    from qiita_common.krepp import KreppBuildRecord
-
-    from qiita_control_plane.actions.library import export_krepp_build
+async def test_the_activate_action_refuses_another_reference_and_a_non_krepp_row(world):
+    from qiita_control_plane.actions.library import activate_krepp_build_of_reference
 
     pool = world["pool"]
-    retired = await _register(world, "retired", "b" * 64)
-    active = await _register(world, "active", "c" * 64)
-    await _activate(pool, retired)
-    await _activate(pool, active)
     a = await _register(world, "a", "d" * 64)
-    gone = await _register(world, "gone", "e" * 64)
-    await _remove(pool, gone)
-    path = await export_krepp_build(pool, world["reference_idx"], a, tmp_path)
-    record = KreppBuildRecord.model_validate_json(path.read_text())
-    mine = [
-        p for p in record.node_cache_evict if p.startswith(f"references/{world['reference_idx']}/")
-    ]
-    # Only the removed build: a retired one still serves the tickets fixed to it.
-    assert mine == [f"references/{world['reference_idx']}/krepp/gone"]
-
-
-async def test_export_refuses_another_reference_and_a_retired_build(world, tmp_path):
-    from qiita_control_plane.actions.library import export_krepp_build
-
-    a = await _register(world, "a")
     with pytest.raises(ValueError, match="belongs to reference"):
-        await export_krepp_build(world["pool"], world["reference_idx"] + 1000, a, tmp_path)
-    await world["pool"].execute(
-        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
-        a,
-        ReferenceIndexState.RETIRED,
+        await activate_krepp_build_of_reference(pool, world["reference_idx"] + 1000, a)
+    rype = await pool.fetchval(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " VALUES ($1, 'rype', '/srv/y.ryxdi', '{}'::jsonb) RETURNING reference_index_idx",
+        world["reference_idx"],
     )
-    with pytest.raises(ValueError, match="retired"):
-        await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
-
-
-async def test_activate_from_a_passing_report_records_it(world, tmp_path):
-    from qiita_control_plane.actions.library import activate_krepp_build_from_report
-
-    a = await _register(world, "a")
-    report = tmp_path / "report.json"
-    report.write_text(_report(a, own=97))
-    await activate_krepp_build_from_report(world["pool"], a, report)
-    row = await world["pool"].fetchrow(
-        "SELECT state, params FROM qiita.reference_index WHERE reference_index_idx = $1", a
-    )
-    assert row["state"] == ReferenceIndexState.ACTIVE
-    activation = json.loads(row["params"])["activation"]
-    assert activation["own_edge_share"] == 0.97 and activation["node"] == "b-cn-01"
-    assert (activation["build_krepp_version"], activation["linked_krepp_version"]) == (
-        "v0.10.0",
-        "v0.12.3",
-    )
-
-
-async def test_activate_refuses_a_failing_or_foreign_report(world, tmp_path):
-    from qiita_control_plane.actions.library import activate_krepp_build_from_report
-
-    a = await _register(world, "a")
-    report = tmp_path / "report.json"
-    report.write_text(_report(a, own=3))
-    with pytest.raises(ValueError, match="did not pass"):
-        await activate_krepp_build_from_report(world["pool"], a, report)
-    report.write_text(_report(a + 1, own=97))
-    with pytest.raises(ValueError, match="is for krepp build"):
-        await activate_krepp_build_from_report(world["pool"], a, report)
-    assert await _state(world["pool"], a) == ReferenceIndexState.REGISTERED
+    with pytest.raises(ValueError, match="is not a krepp build"):
+        await activate_krepp_build_of_reference(pool, world["reference_idx"], rype)
+    assert await _state(pool, a) == ReferenceIndexState.REGISTERED

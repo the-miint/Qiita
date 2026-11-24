@@ -218,8 +218,7 @@ async def open_reference_phylogeny_stream(
 ) -> AsyncIterator[str]:
     """Mint a whole-reference `reference_phylogeny` DoGet ticket (CO→CP) and stream
     the reference's tree rows (`read_newick`'s shape plus `reference_idx` and
-    `feature_idx`) into `conn` as `relation`. The krepp registration job compares
-    them with the tree a build carries."""
+    `feature_idx`) into `conn` as `relation`."""
 
     async def _mint(http: httpx.AsyncClient) -> bytes:
         return await fetch_reference_doget_ticket(

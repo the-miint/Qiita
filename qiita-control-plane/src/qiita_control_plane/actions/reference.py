@@ -93,8 +93,8 @@ class ReferenceDeleteBlocked(Exception):
             reason = (
                 f"{krepp_builds} krepp build(s) of it are not removed; the delete would "
                 "take the master copy under PATH_DERIVED with it, and Qiita cannot rebuild "
-                "a krepp index. Remove each build first (`qiita-admin krepp-index remove`), "
-                "with or without force"
+                "a krepp index. Force does not override this; remove each build first "
+                "(`qiita-admin krepp-index remove`)"
             )
         elif in_flight:
             reason = (

@@ -169,7 +169,6 @@ class LibraryPrimitive(StrEnum):
     EXPORT_SUBJECT_GENOME_MAP = "export-subject-genome-map"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
-    EXPORT_KREPP_BUILD = "export-krepp-build"
     ACTIVATE_KREPP_BUILD = "activate-krepp-build"
     # Reference sharding: assign a reference's genome-bearing features to N
     # lineage-sorted shards (reference_membership.shard_id). A CP-side primitive

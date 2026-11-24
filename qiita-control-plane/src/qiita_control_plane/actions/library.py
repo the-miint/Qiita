@@ -45,16 +45,9 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.flight_stream import counted_doget
-from qiita_common.krepp import (
-    KREPP_BUILD_RECORD_BASENAME,
-    SHA256SUMS_SHA256_PARAM,
-    KreppActivationReport,
-    KreppBuildRecord,
-)
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
     INDEX_TYPE_RYPE_ROUTER,
-    NODE_CACHED_INDEX_TYPES,
     FeatureHashEntry,
     GenomeSource,
     QcCheckResult,
@@ -2069,88 +2062,27 @@ async def register_index(
     return existing["reference_index_idx"]
 
 
-async def export_krepp_build(
-    pool: asyncpg.Pool, reference_idx: int, reference_index_idx: int, output_dir: Path
-) -> Path:
-    """The krepp build a `reference-index-activate` ticket checks, as a
-    `KreppBuildRecord` JSON under `KREPP_BUILD_RECORD_BASENAME`: how the job, which
-    has no database access, finds the build and the hash it must match, and which
-    removed builds' node copies it deletes first (every removed row of a
-    NODE_CACHED_INDEX_TYPES type, any reference).
-
-    Raises when the row is not a krepp build of the ticket's reference, or is retired
-    or removed (activation applies to a registered build; an active one is checked
-    again and left active)."""
-    row = await pool.fetchrow(
-        "SELECT reference_idx, index_type, fs_path, state, params->>$2 AS sha256sums_sha256"
-        " FROM qiita.reference_index WHERE reference_index_idx = $1",
-        reference_index_idx,
-        SHA256SUMS_SHA256_PARAM,
-    )
-    if row is None or row["index_type"] != INDEX_TYPE_KREPP:
-        raise ValueError(f"reference_index_idx {reference_index_idx} is not a krepp build")
-    if row["reference_idx"] != reference_idx:
-        raise ValueError(
-            f"krepp build {reference_index_idx} belongs to reference {row['reference_idx']},"
-            f" not {reference_idx}"
-        )
-    if row["state"] not in (ReferenceIndexState.REGISTERED, ReferenceIndexState.ACTIVE):
-        raise ValueError(f"krepp build {reference_index_idx} is {row['state']}")
-    removed = await pool.fetch(
-        "SELECT fs_path FROM qiita.reference_index"
-        " WHERE index_type = ANY($1::text[]) AND state = $2 ORDER BY fs_path",
-        sorted(NODE_CACHED_INDEX_TYPES),
-        ReferenceIndexState.REMOVED.value,
-    )
-    record = KreppBuildRecord(
-        reference_index_idx=reference_index_idx,
-        reference_idx=reference_idx,
-        fs_path=row["fs_path"],
-        sha256sums_sha256=row["sha256sums_sha256"],
-        node_cache_evict=[r["fs_path"] for r in removed],
-    )
-    out = output_dir / KREPP_BUILD_RECORD_BASENAME
-    out.write_text(record.model_dump_json())
-    return out
-
-
-async def activate_krepp_build_from_report(
-    pool: asyncpg.Pool, reference_index_idx: int, report_path: Path
+async def activate_krepp_build_of_reference(
+    pool: asyncpg.Pool, reference_idx: int, reference_index_idx: int
 ) -> None:
-    """Make the build the reference's active one when the activation job's report
-    (`KreppActivationReport`) says the build passed, recording the report's
-    known-answer result and both krepp versions in the build's params. Raises when
-    the report is for another build or did not pass;
-    `repositories.reference_index.activate_krepp_build` says what else is refused."""
-    report = KreppActivationReport.model_validate_json(report_path.read_text())
-    if report.reference_index_idx != reference_index_idx:
-        raise ValueError(
-            f"activation report is for krepp build {report.reference_index_idx},"
-            f" not {reference_index_idx}"
-        )
-    if not report.passed:
-        raise ValueError(
-            f"krepp build {reference_index_idx} did not pass on {report.node}:"
-            f" {report.own_edge} of {report.tips} backbone tips placed on their own edge"
-            f" ({report.own_edge_share:.3f}), below the {report.min_own_edge_share} asked for"
-        )
-    known_answer = {
-        "own_edge_share": report.own_edge_share,
-        "min_own_edge_share": report.min_own_edge_share,
-        "tips": report.tips,
-        "node": report.node,
-        "build_krepp_version": report.build_krepp_version,
-        "linked_krepp_version": report.linked_krepp_version,
-    }
+    """Make a registered krepp build of the ticket's reference its active build
+    (`repositories.reference_index.activate_krepp_build` says what is refused and how
+    the previous active build is retired). Raises when the row is not a krepp build of
+    this reference."""
     async with pool.acquire() as conn, conn.transaction():
-        await activate_krepp_build(conn, reference_index_idx)
-        await conn.execute(
-            "UPDATE qiita.reference_index"
-            " SET params = params || jsonb_build_object('activation', $2::jsonb)"
+        row = await conn.fetchrow(
+            "SELECT reference_idx, index_type FROM qiita.reference_index"
             " WHERE reference_index_idx = $1",
             reference_index_idx,
-            json.dumps(known_answer),
         )
+        if row is None or row["index_type"] != INDEX_TYPE_KREPP:
+            raise ValueError(f"reference_index_idx {reference_index_idx} is not a krepp build")
+        if row["reference_idx"] != reference_idx:
+            raise ValueError(
+                f"krepp build {reference_index_idx} belongs to reference {row['reference_idx']},"
+                f" not {reference_idx}"
+            )
+        await activate_krepp_build(conn, reference_index_idx)
 
 
 async def finalize_shard(
@@ -3771,8 +3703,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.MINT_GENE_FEATURES: mint_gene_features,
     LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP: export_subject_genome_map,
-    LibraryPrimitive.EXPORT_KREPP_BUILD: export_krepp_build,
-    LibraryPrimitive.ACTIVATE_KREPP_BUILD: activate_krepp_build_from_report,
+    LibraryPrimitive.ACTIVATE_KREPP_BUILD: activate_krepp_build_of_reference,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PLAN_SHARDS: plan_shards,

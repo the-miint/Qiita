@@ -231,8 +231,8 @@ def _resolve_path_node_local() -> str | None:
 
 def node_local_job_env(path_node_local: str | None) -> dict[str, str]:
     """The job-env entry that carries PATH_NODE_LOCAL to a compute node (the
-    slurmrestd env is an allowlist). Shared by SlurmBackend and the readiness probe
-    so the two cannot forward different values. Empty when it is unset."""
+    slurmrestd env is an allowlist). Every job submission uses it, so no two can
+    forward different values. Empty when it is unset."""
     return {"PATH_NODE_LOCAL": path_node_local} if path_node_local else {}
 
 

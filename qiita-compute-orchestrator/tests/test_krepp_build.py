@@ -16,7 +16,6 @@ import shutil
 from pathlib import Path
 
 import pytest
-from helpers import krepp_recorded_version
 
 from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
@@ -24,10 +23,8 @@ from qiita_compute_orchestrator.krepp_build import (
     RECORDED_METADATA_KEYS,
     KreppBuildInvalid,
     inventory_index,
-    linked_krepp_version,
     write_build_files,
 )
-from qiita_compute_orchestrator.miint import open_miint_conn
 from qiita_compute_orchestrator.node_cache import (
     MANIFEST,
     SHA256SUMS,
@@ -130,14 +127,3 @@ def test_registration_refuses_differing_trees(build):
     with pytest.raises(KreppBuildInvalid) as exc:
         _register(build)
     assert exc.value.check == "tree"
-
-
-def test_linked_version_is_the_one_an_index_records(krepp_built_index):
-    """The version the activation report records beside the build's is the string the
-    same miint writes into an index it builds."""
-    conn = open_miint_conn()
-    try:
-        linked = linked_krepp_version(conn)
-    finally:
-        conn.close()
-    assert linked == krepp_recorded_version(krepp_built_index)

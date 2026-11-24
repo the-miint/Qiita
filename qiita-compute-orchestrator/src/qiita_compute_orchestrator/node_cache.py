@@ -21,9 +21,8 @@ reads a sealed folder from:
   runs ``verify_sealed`` on it. A disk that fills during the copy fails the job
   with the same ``space`` error as the check before the copy.
 
-``evict`` deletes node copies the caller names (folders whose build was removed).
-The lock covers making a copy, not reading it; what makes eviction safe is at
-``repositories.reference_index.tickets_running_on_build``. The cluster admins only
+``evict`` deletes the node copies the caller names. The lock covers making a copy,
+not reading it, so the caller names only folders no job can still read. The cluster admins only
 create ``PATH_NODE_LOCAL`` on each node, writable by the job user; nothing is copied
 by hand.
 """
@@ -43,7 +42,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .config import get_settings
-from .derived_store import node_relative_path
+from .derived_store import relative_path_under
 
 SHA256SUMS = "SHA256SUMS"
 MANIFEST = "manifest.json"
@@ -54,8 +53,8 @@ _CHUNK = 8 << 20
 
 # `probe`'s exit codes; the readiness probe script maps each to the node-cache row.
 PROBE_OK = 0
+PROBE_FAIL = 1
 PROBE_SKIP = 3
-PROBE_WARN = 4
 
 
 class SealedFolderInvalid(ValueError):
@@ -313,13 +312,13 @@ def _node_root() -> Path | None:
 
 def evict(relpaths: Iterable[str]) -> None:
     """Delete this node's copies of `relpaths` (folders whose build was removed),
-    each under its lock. A no-op without PATH_NODE_LOCAL. Safe only for a folder no
-    job can still read (the module docstring says who holds that)."""
+    each under its lock. A no-op without PATH_NODE_LOCAL. The caller makes sure no job
+    on any node still reads them; the lock does not."""
     root = _node_root()
     if root is None:
         return
     for relpath in relpaths:
-        target = node_relative_path(root, relpath)
+        target = relative_path_under(root, relpath)
         with _locked(root, relpath):
             for path in (target, _partial(target)):
                 if _present(path):
@@ -339,13 +338,13 @@ def materialize(
     removed folder's space is free for this one. Raises SealedFolderInvalid when the
     master or a copy is not the recorded folder, NodeCacheError when the node cannot
     hold it."""
-    master = node_relative_path(get_settings().path_derived, relpath)
+    master = relative_path_under(get_settings().path_derived, relpath)
     root = _node_root()
     if root is None:
         verify_sealed(master, expected_sums_sha256)
         return master
     evict(evict_first)
-    target = node_relative_path(root, relpath)
+    target = relative_path_under(root, relpath)
     with _locked(root, relpath):
         if _present(target):
             try:
@@ -361,15 +360,15 @@ def materialize(
 def probe() -> tuple[int, str]:
     """The compute-readiness `node-cache` row for this node: (exit code, detail).
     PROBE_OK, PROBE_SKIP (PATH_NODE_LOCAL unset: jobs read from PATH_DERIVED),
-    PROBE_WARN (set but not a writable directory here: every job that reads through
-    the cache fails on this node)."""
+    PROBE_FAIL (set but not a writable directory here: every job that reads through
+    the cache would fail on this node)."""
     raw = get_settings().path_node_local
     if not raw:
         return PROBE_SKIP, "PATH_NODE_LOCAL is not set; jobs read sealed folders from PATH_DERIVED"
     try:
         root = _node_root()
     except NodeCacheError as exc:
-        return PROBE_WARN, exc.detail
+        return PROBE_FAIL, exc.detail
     return PROBE_OK, f"{root} writable, {shutil.disk_usage(root).free} bytes free"
 
 

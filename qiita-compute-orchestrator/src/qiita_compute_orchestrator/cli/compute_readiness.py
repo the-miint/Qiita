@@ -71,7 +71,7 @@ from ..config import (
     node_local_job_env,
 )
 from ..native_import_check import MAX_DETAIL
-from ..node_cache import PROBE_OK, PROBE_SKIP, PROBE_WARN
+from ..node_cache import PROBE_OK, PROBE_SKIP
 from ..slurm.client import (
     SlurmrestdClient,
     SlurmrestdError,
@@ -104,26 +104,18 @@ _PROBE_LINE_PREFIX = "compute-readiness:"
 
 @dataclass(frozen=True)
 class CheckResult:
-    """One row in the report. `status` is "pass" | "fail" | "skip" | "warn"; the
+    """One row in the report. `status` is "pass" | "fail" | "skip"; the
     aggregate exit code is 1 iff any row is "fail" (skip is non-fatal —
     a skipped CP check on a host with no CP_URL is informational, not
-    broken; warn is non-fatal too — a finding about the one node the probe
-    ran on, which the operator acts on without the deploy failing)."""
+    broken)."""
 
     name: str
     status: str
     detail: str
 
     def render(self) -> str:
-        return f"  {_GLYPHS[self.status]} {self.name}: {self.detail}"
-
-
-# Every row status, with its glyph; the summary counts each.
-_GLYPHS = {"pass": "✓", "fail": "✗", "skip": "·", "warn": "!"}
-
-
-def _summary(results: list[CheckResult]) -> dict[str, int]:
-    return {status: sum(1 for r in results if r.status == status) for status in _GLYPHS}
+        glyph = {"pass": "✓", "fail": "✗", "skip": "·"}[self.status]
+        return f"  {glyph} {self.name}: {self.detail}"
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +583,6 @@ run_module_probe qiita_compute_orchestrator.node_cache
 case "$MODULE_PROBE_RC" in
     {PROBE_OK}) echo "{_PROBE_LINE_PREFIX} node-cache=ok detail=$MODULE_PROBE_ERR" ;;
     {PROBE_SKIP}) echo "{_PROBE_LINE_PREFIX} node-cache=skip detail=$MODULE_PROBE_ERR" ;;
-    {PROBE_WARN}) echo "{_PROBE_LINE_PREFIX} node-cache=warn err=$MODULE_PROBE_ERR" ;;
     *) echo "{_PROBE_LINE_PREFIX} node-cache=fail err=$MODULE_PROBE_ERR" ;;
 esac
 
@@ -788,7 +779,7 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
       - shared-fs-visible=yes/no           → pass / fail
       - shared-fs-writable=yes/no          → pass / fail
       - cp-from-compute=ok/fail/skip       → pass / fail / skip
-      - node-cache=ok/fail/skip/warn       → pass / fail / skip / warn
+      - node-cache=ok/fail/skip            → pass / fail / skip
       - hostname / uid / user              → informational (pass with detail)
     """
     results: list[CheckResult] = []
@@ -821,7 +812,6 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
 _PROBE_PASS_VALUES = {"ok"}
 _PROBE_FAIL_VALUES = {"fail"}
 _PROBE_SKIP_VALUES = {"skip"}
-_PROBE_WARN_VALUES = {"warn"}
 # `hostname`, `uid`, `user` are informational — never a fail condition;
 # the operator reads the actual value to confirm the job ran as the
 # expected SLURM user.
@@ -851,8 +841,6 @@ def _classify_probe_pair(key: str, value: str) -> str:
         return "pass"
     if value in _PROBE_SKIP_VALUES:
         return "skip"
-    if value in _PROBE_WARN_VALUES:
-        return "warn"
     # `_PROBE_FAIL_VALUES` and any unknown value collapse here: an
     # unrecognized probe line is contract drift and the operator
     # should see the row as a failure.
@@ -938,9 +926,10 @@ def _render_human(results: list[CheckResult]) -> str:
     lines = ["compute-readiness report:"]
     for r in results:
         lines.append(r.render())
-    lines.append(
-        "summary: " + ", ".join(f"{n} {status}" for status, n in _summary(results).items())
-    )
+    n_fail = sum(1 for r in results if r.status == "fail")
+    n_pass = sum(1 for r in results if r.status == "pass")
+    n_skip = sum(1 for r in results if r.status == "skip")
+    lines.append(f"summary: {n_pass} pass, {n_fail} fail, {n_skip} skip")
     return "\n".join(lines)
 
 
@@ -948,7 +937,11 @@ def _render_json(results: list[CheckResult]) -> str:
     return json.dumps(
         {
             "results": [asdict(r) for r in results],
-            "summary": _summary(results),
+            "summary": {
+                "pass": sum(1 for r in results if r.status == "pass"),
+                "fail": sum(1 for r in results if r.status == "fail"),
+                "skip": sum(1 for r in results if r.status == "skip"),
+            },
         },
         indent=2,
     )

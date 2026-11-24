@@ -33,6 +33,12 @@ ALTER TABLE qiita.reference_index
     ADD CONSTRAINT reference_index_krepp_path_is_relative
     CHECK (index_type <> 'krepp' OR fs_path NOT LIKE '/%');
 
+-- A krepp build's fs_path names its folder, and node-cache copies are deleted by it,
+-- so two rows never name one folder.
+CREATE UNIQUE INDEX reference_index_one_row_per_krepp_folder
+    ON qiita.reference_index (fs_path)
+    WHERE index_type = 'krepp';
+
 -- At most one active krepp build per reference: activation retires the previous
 -- one before activating the next, in one transaction.
 CREATE UNIQUE INDEX reference_index_one_active_krepp
@@ -70,6 +76,7 @@ $$;
 DROP INDEX IF EXISTS qiita.work_ticket_reference_index_idx;
 ALTER TABLE qiita.work_ticket DROP COLUMN IF EXISTS reference_index_idx;
 DROP INDEX IF EXISTS qiita.reference_index_one_active_krepp;
+DROP INDEX IF EXISTS qiita.reference_index_one_row_per_krepp_folder;
 ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_krepp_path_is_relative;
 ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_lifecycle_is_krepp;
 ALTER TABLE qiita.reference_index DROP COLUMN IF EXISTS state;

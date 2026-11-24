@@ -2,7 +2,7 @@
 
 Goes through `POST /reference/{reference_idx}/index/{reference_index_idx}/remove`
 (`reference:delete`, system_admin) so the route's refusals apply: the active build,
-and a build a running ticket is fixed to, are not removed. Registering and activating
+and a build a ticket fixed to it may still read, are not removed. Registering and activating
 a build are workflows (`reference-index-register`, `reference-index-activate`);
 docs/runbooks/krepp-index.md has the whole procedure.
 """
@@ -39,8 +39,7 @@ def add_krepp_index_subparsers(sub) -> None:
         help=(
             "Mark a registered or retired krepp build removed (system_admin,"
             " reference:delete). Refused for the active build and while a ticket fixed"
-            " to the build runs. Delete its files afterwards, per"
-            " docs/runbooks/krepp-index.md."
+            " to the build may still read it. See docs/runbooks/krepp-index.md."
         ),
     )
     p_remove.add_argument("--reference-idx", type=int, required=True)

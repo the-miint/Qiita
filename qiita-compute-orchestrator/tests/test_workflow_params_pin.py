@@ -205,19 +205,6 @@ def test_align_denovo_cpu_pins_duckdb_threads():
         )
 
 
-def test_krepp_index_activate_cpu_pins_duckdb_threads():
-    """`reference-index-activate`'s baseline `cpu:` must equal
-    `krepp_index_activate._DUCKDB_THREADS`: place_krepp's threads are DuckDB's."""
-    mod = importlib.import_module("qiita_compute_orchestrator.jobs.krepp_index_activate")
-    for where, cpu in _baseline_cpu_every_version(
-        "reference-index-activate", "krepp_index_activate"
-    ):
-        assert cpu == mod._DUCKDB_THREADS, (
-            f"{where} baseline cpu={cpu} but"
-            f" krepp_index_activate._DUCKDB_THREADS={mod._DUCKDB_THREADS}"
-        )
-
-
 def test_assembly_coverage_cpu_pins_duckdb_threads():
     """`long-read-assembly`'s `assembly_coverage` step: baseline `cpu:` must equal
     `assembly_coverage._DUCKDB_THREADS`, for the reason stated on `align_denovo`'s pin.

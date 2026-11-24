@@ -7,10 +7,9 @@ makes the third one explicit:
   * the orchestrator owns the **per-attempt scratch workspace**
     (``$QIITA_OUTPUT_PATH`` / scratch — one per step attempt, not durable storage);
   * the orchestrator *also* owns **derived storage** — the persistent
-    host-filter indexes under ``PATH_DERIVED``. These are per-reference and
-    durable (they outlive the work ticket and are consumed at host-filter
-    time), but they are produced, read, and deleted entirely on the compute
-    side.
+    per-reference indexes under ``PATH_DERIVED``. These are durable (they outlive
+    the work ticket), and read and deleted on the compute side; the indexes Qiita
+    builds are also produced there.
 
 Every touch point of derived storage is an orchestrator concern:
 
@@ -24,7 +23,7 @@ Every touch point of derived storage is an orchestrator concern:
 
 A krepp build's row holds a path relative to ``PATH_DERIVED``; ``node_cache`` copies
 it to the same relative path under ``PATH_NODE_LOCAL`` (on each compute node's own
-disk). ``node_relative_path`` resolves it under either, so the node cache shares this
+disk). ``relative_path_under`` resolves it under either, so the node cache shares this
 module's layout rather than having one of its own.
 
 Before this module the ``{PATH_DERIVED}/references/{idx}/...`` layout was
@@ -53,7 +52,7 @@ __all__ = [
     "KREPP_INDEX_SUBDIR",
     "bowtie2_index_path",
     "krepp_build_relpath",
-    "node_relative_path",
+    "relative_path_under",
     "minimap2_index_path",
     "reference_derived_dir",
     "rype_index_path",
@@ -184,7 +183,7 @@ def krepp_build_relpath(reference_idx: int, build_label: str) -> str:
     return f"references/{reference_idx}/krepp/{build_label}"
 
 
-def node_relative_path(root: Path | str, relpath: str) -> Path:
+def relative_path_under(root: Path | str, relpath: str) -> Path:
     """``root / relpath`` for a relative ``fs_path`` (NODE_CACHED_INDEX_TYPES).
     Raises ValueError when ``relpath`` is absolute or has a ``..`` or empty segment,
     so a row can only name a folder below the root it is resolved against."""
@@ -192,5 +191,5 @@ def node_relative_path(root: Path | str, relpath: str) -> Path:
     # before they could be refused.
     parts = relpath.split("/")
     if PurePosixPath(relpath).is_absolute() or any(p in ("..", ".", "") for p in parts):
-        raise ValueError(f"node-relative path {relpath!r} must be relative with no '..'")
+        raise ValueError(f"path {relpath!r} must be relative, with no '..', '.' or empty segment")
     return Path(root).joinpath(*parts)

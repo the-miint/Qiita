@@ -212,7 +212,7 @@ elif [ -r "$CO_ENV" ]; then
         source /etc/qiita/compute-orchestrator.env; set +a
         exec '${ORCHESTRATOR_VENV}/bin/python' -m qiita_compute_orchestrator.cli.compute_readiness ${probe_flag}
     "; then
-        pass "compute-readiness" "no failed check (run as $QIITA_ORCH_USER); a ! warn row above is non-fatal and still needs acting on"
+        pass "compute-readiness" "all checks passed (run as $QIITA_ORCH_USER)"
     else
         fail "compute-readiness" "reported failures (see rows above); re-run as shown in docs/runbooks/redeploy.md §7"
     fi

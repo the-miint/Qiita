@@ -134,14 +134,3 @@ def write_build_files(
         "tree_file": inventory.tree_file,
     }
     return seal(folder, fields, threads=threads)
-
-
-def linked_krepp_version(conn) -> str | None:
-    """krepp's own version string, as the loaded miint reports it: the `krepp-version`
-    row of `miint_versions()`, the string an index records as `krepp version:`
-    (https://the-miint.github.io/duckdb-miint/utilities/). None when the loaded miint
-    has no such row."""
-    row = conn.execute(
-        "SELECT version FROM miint_versions() WHERE library = 'krepp-version'"
-    ).fetchone()
-    return row[0] if row else None

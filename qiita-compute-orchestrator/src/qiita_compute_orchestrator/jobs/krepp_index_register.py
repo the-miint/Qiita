@@ -4,18 +4,19 @@ The build is a folder at ``PATH_DERIVED/references/{reference_idx}/krepp/{build_
 (``derived_store.krepp_build_relpath``) holding ``index/`` and ``jest/``
 (``krepp_build``). This step checks it and writes Qiita's files into it; the
 ``register-index`` action that follows records it `registered`. Nothing serves a
-registered build: the ``reference-index-activate`` workflow checks it and makes it
-the reference's active build.
+registered build: the ``reference-index-activate`` workflow makes it the
+reference's active build.
 
 Checks, cheapest first, before any file is hashed:
 
 - its settings and tree can be read (``krepp_build.inventory_index``);
 - its tree is the reference's tree as a placement sees it
   (``_phylogeny.tree_difference``): every edge number, parent edge number, branch
-  length and tip name, for the reason docs/architecture/reference-data.md "Edge
-  numbering" gives. The reference's tree must be fully numbered
+  length and tip name (``_phylogeny`` says why each counts). The reference's tree
+  must be fully numbered
   (``POST /reference/{idx}/phylogeny/mint-edge-id``);
-- JEST's tree (``labelled.nwk``) carries the same edges (branch lengths not compared).
+- JEST's tree (``labelled.nwk``) carries the same edges. Its branch lengths are not
+  compared: JEST reads the file for its edge numbers and clade labels.
 
 Then the folder is sealed: every file hashed once, manifest.json and SHA256SUMS
 written (``write_build_files``).
@@ -33,18 +34,28 @@ from qiita_common.models import INDEX_TYPE_KREPP, ReferenceIndexState
 
 from ..config import get_settings
 from ..data_plane_client import open_reference_phylogeny_stream
-from ..derived_store import KREPP_INDEX_SUBDIR, krepp_build_relpath, node_relative_path
+from ..derived_store import KREPP_INDEX_SUBDIR, krepp_build_relpath, relative_path_under
 from ..krepp_build import (
     JEST_LABELLED_TREE,
     KreppBuildInvalid,
     inventory_index,
     write_build_files,
 )
-from ..miint import open_miint_conn
+from ..miint import (
+    apply_duckdb_settings,
+    duckdb_tmp_dir,
+    open_miint_conn,
+    resolve_duckdb_memory_gb,
+)
 from ..node_cache import default_threads
 from ._phylogeny import tree_difference
 
 _TREE_COLUMNS = "node_index, parent_index, edge_id, branch_length, is_tip, name"
+
+# DuckDB's memory_limit for the tree comparison, under SLURM sized to the step's
+# allocation by resolve_duckdb_memory_gb; this is the off-SLURM ceiling, the step's
+# `mem_gb`.
+_DUCKDB_MEMORY_GB = 8
 
 
 class Inputs(BaseModel):
@@ -84,7 +95,7 @@ async def check_trees(
         )
     for table, what, lengths in (
         ("krepp_tree", f"the build's tree ({tree_file})", True),
-        ("jest_tree", f"JEST's labelled tree ({JEST_LABELLED_TREE})", False),
+        ("jest_tree", f"JEST's labeled tree ({JEST_LABELLED_TREE})", False),
     ):
         diff = tree_difference(conn, "lake_tree", table, compare_lengths=lengths)
         if not diff.same:
@@ -98,18 +109,22 @@ async def check_trees(
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     relpath = krepp_build_relpath(inputs.reference_idx, inputs.build_label)
-    folder = node_relative_path(get_settings().path_derived, relpath)
+    folder = relative_path_under(get_settings().path_derived, relpath)
     inventory = inventory_index(folder / KREPP_INDEX_SUBDIR)
-    conn = open_miint_conn()
-    try:
+    threads = default_threads()
+    with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
+        apply_duckdb_settings(
+            conn,
+            duckdb_tmp,
+            memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=threads),
+            threads=threads,
+        )
         await check_trees(conn, inputs.reference_idx, folder, inventory.tree_file)
-    finally:
-        conn.close()
     sums_sha256, manifest = write_build_files(
         folder,
         reference_idx=inputs.reference_idx,
         build_label=inputs.build_label,
-        threads=default_threads(),
+        threads=threads,
     )
     settings = manifest["settings"]
     meta = {

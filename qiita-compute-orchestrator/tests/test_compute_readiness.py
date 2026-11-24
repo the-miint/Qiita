@@ -239,7 +239,7 @@ compute-readiness: ena-from-compute=fail err=URLError: no route to host
 def test_probe_script_emits_only_known_values():
     """Script-vs-parser contract test. The bash probe script's emitted
     `<key>=<value>` literals must all be drawn from the parser's known
-    alphabet (pass / fail / skip / warn), otherwise the parser would reject
+    alphabet (pass / fail / skip), otherwise the parser would reject
     them as contract drift and the report would silently show every
     drifted line as `fail`.
 
@@ -251,12 +251,7 @@ def test_probe_script_emits_only_known_values():
     import re
 
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
-    known = (
-        cr._PROBE_PASS_VALUES
-        | cr._PROBE_FAIL_VALUES
-        | cr._PROBE_SKIP_VALUES
-        | cr._PROBE_WARN_VALUES
-    )
+    known = cr._PROBE_PASS_VALUES | cr._PROBE_FAIL_VALUES | cr._PROBE_SKIP_VALUES
     # Match `<prefix> <key>=<value>` where value is a bare word (no
     # `$(...)`, no quotes, no shell expansion). Informational lines
     # like `hostname=$(hostname)` are deliberately excluded by the
@@ -651,29 +646,18 @@ def test_render_human_summary():
         cr.CheckResult("a", "pass", "ok"),
         cr.CheckResult("b", "fail", "bad"),
         cr.CheckResult("c", "skip", "n/a"),
-        cr.CheckResult("d", "warn", "copy missing"),
     ]
     text = cr._render_human(results)
     assert "✓ a: ok" in text
     assert "✗ b: bad" in text
     assert "· c: n/a" in text
-    assert "! d: copy missing" in text
-    assert "1 pass, 1 fail, 1 skip, 1 warn" in text
-
-
-def test_summary_counts_every_row():
-    results = [
-        cr.CheckResult(str(i), s, "") for i, s in enumerate(["pass", "warn", "warn", "skip"])
-    ]
-    summary = json.loads(cr._render_json(results))["summary"]
-    assert sum(summary.values()) == len(results)
-    assert summary["warn"] == 2
+    assert "1 pass, 1 fail, 1 skip" in text
 
 
 def test_render_json_shape():
     results = [cr.CheckResult("a", "pass", "ok"), cr.CheckResult("b", "fail", "bad")]
     parsed = json.loads(cr._render_json(results))
-    assert parsed["summary"] == {"pass": 1, "fail": 1, "skip": 0, "warn": 0}
+    assert parsed["summary"] == {"pass": 1, "fail": 1, "skip": 0}
     assert parsed["results"][0] == {"name": "a", "status": "pass", "detail": "ok"}
 
 
@@ -726,14 +710,14 @@ def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
 
 
 def test_probe_script_maps_the_node_cache_probe_exit_codes():
-    """node_cache.probe's exit code is the node-cache row's status: unset skips, a
-    root that is not a writable directory on the probe's node warns, anything else
-    (the module failing) fails."""
-    script = cr.build_probe_script(path_scratch="/scratch/qiita")
-    assert "run_module_probe qiita_compute_orchestrator.node_cache" in script
+    """node_cache.probe's exit code is the node-cache row's status: unset skips; a
+    root that is not a writable directory on the probe's node, or the module
+    failing, fails the deploy."""
     from qiita_compute_orchestrator import node_cache as nc
 
-    for code, value in ((nc.PROBE_OK, "ok"), (nc.PROBE_SKIP, "skip"), (nc.PROBE_WARN, "warn")):
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "run_module_probe qiita_compute_orchestrator.node_cache" in script
+    for code, value in ((nc.PROBE_OK, "ok"), (nc.PROBE_SKIP, "skip")):
         assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} node-cache={value}' in script
     assert '*) echo "' + cr._PROBE_LINE_PREFIX + " node-cache=fail" in script
-    assert cr._classify_probe_pair("node-cache", "warn") == "warn"
+    assert nc.PROBE_FAIL not in (nc.PROBE_OK, nc.PROBE_SKIP)

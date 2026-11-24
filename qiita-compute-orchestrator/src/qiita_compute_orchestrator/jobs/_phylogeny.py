@@ -4,7 +4,9 @@ Both tables have `read_newick`'s row shape (`node_index`, `parent_index`,
 `edge_id`, `branch_length`, `is_tip`, `name`). A placement names an edge by its
 number, so two trees are the same tree for placement when every node has the same
 edge number, the same parent edge number, the same branch length and, at a tip, the
-same name. Internal labels and the order of a node's children are not compared; a
+same name: the same topology numbered another way joins placements to the wrong
+edges, and a placement's `distal_length` is a position along its edge, computed on
+those lengths. Internal labels and the order of a node's children are not compared; a
 placement's meaning does not depend on them.
 """
 
@@ -45,8 +47,7 @@ def tree_difference(
 ) -> TreeDifference:
     """Compare the trees in tables `expected` and `actual`. With equal node counts, no
     missing node means the two multisets of node shapes are equal. `compare_lengths`
-    False leaves branch lengths out, for a tree whose lengths are not the placement's
-    (JEST's `labelled.nwk` is read for its edge numbers)."""
+    False leaves branch lengths out."""
     length = "c.branch_length" if compare_lengths else "NULL::DOUBLE AS branch_length"
     diff = (
         f"{_SHAPE.format(t=expected, length=length)}"
