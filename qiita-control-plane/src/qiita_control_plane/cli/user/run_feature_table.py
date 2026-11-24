@@ -176,9 +176,6 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
     except _common.httpx.RequestError as exc:
         _common.print_request_error(exc)
         return 1
-    except _common.SlowResponseError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
     except duckdb.Error as exc:
         print(f"error: building the table failed on this machine: {exc}", file=sys.stderr)
         return 1
@@ -188,7 +185,7 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
 
     table_path, map_path, manifest_path, *companions = written
     print(
-        f"wrote {sizes['samples']} sample(s) x {sizes['features']} feature(s),"
+        f"wrote {sizes['samples']} column(s) x {sizes['features']} feature(s),"
         f" {sizes['observations']} observation(s), to {table_path} ({args.format})"
     )
     print(f"and the map needed to read it: {map_path}")

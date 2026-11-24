@@ -14,6 +14,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
 
+from qiita_control_plane.cli.user.run_feature_table import MAP_NOTE
 from qiita_control_plane.run_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
     FEATURES_SCHEMA,
@@ -116,9 +117,9 @@ def test_an_amplicon_bundle_maps_each_handle_to_sequence_and_md5(monkeypatch, tm
     assert not out.with_name("table.taxonomy.parquet").exists()
 
 
-def test_the_identifier_map_says_what_it_carries(monkeypatch, tmp_path, capsys):
+def test_the_identifier_map_says_what_it_carries(monkeypatch, tmp_path):
     """The map holds each column's QM and biosample name, no internal idx, so its note
-    must not warn of one."""
+    describes those rather than warning of one."""
     out = _run(
         monkeypatch,
         tmp_path,
@@ -128,8 +129,7 @@ def test_the_identifier_map_says_what_it_carries(monkeypatch, tmp_path, capsys):
     )
     payload = json.loads(out.with_name("table.exported-identifier.json").read_text())
     assert payload["identifiers"] == _SAMPLES
-    assert "_idx" not in payload["note"]
-    assert "_idx" not in capsys.readouterr().out
+    assert payload["note"] == MAP_NOTE
 
 
 def test_a_stale_scope_403_asks_for_a_fresh_login(monkeypatch, tmp_path, capsys):

@@ -369,6 +369,21 @@ async def test_an_unreadable_study_403s_before_it_is_resolved(
     assert run["fetched"] == []
 
 
+async def test_a_readable_study_with_a_prep_sample_linked_elsewhere_403s(
+    role_keyed_clients, amplicon_run
+):
+    """Passing the study's own gate is not enough: ps_e is linked to study_1 (readable)
+    and study_2 (not), so the resolved cohort is refused whole, before any read."""
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    shared = await _mint_run(db, run["owner_idx"], [run["ps_a"], run["ps_e"]])
+    run["runs"].append(shared)
+    resp = await role_keyed_clients["user"].post(
+        URL_FEATURE_TABLE_VALUE, json=_body([shared], study_idx=run["study_1"])
+    )
+    assert resp.status_code == 403, resp.text
+    assert run["fetched"] == []
+
+
 @pytest.mark.parametrize(
     "body",
     [

@@ -1,7 +1,7 @@
 """The run feature table over REST: one cohort request, three answers.
 
 `POST /feature-table/{sample,value,feature}` all take the same body
-(`FeatureTableRequest`: runs, and a study or a sample list) and answer:
+(`FeatureTableRequest`: runs, and a study or a prep_sample list) and answer:
 
   * samples — the table's columns as JSON: each processed sample's column name,
     its QM, and its biosample's public name (to join to metadata); with the runs'
@@ -15,9 +15,9 @@ What a feature table is, which runs it can merge, and why COO, is in
 for the web UI and the CLI alike.
 
 Access is all-or-nothing over the cohort, at the tier the other cohort reads use,
-checked before the cohort is resolved and before anything is read from the data
-plane. The data plane serves exactly the cohort the ticket carries, so that gate
-is the authorization boundary.
+checked before anything is read from the data plane (`_authorized_cohort`). The
+data plane serves exactly the cohort the ticket carries, so that gate is the
+authorization boundary.
 """
 
 import asyncio
@@ -67,8 +67,8 @@ async def _authorized_cohort(
     # Authorize what the request names before resolving it: resolve_cohort's
     # refusals describe the cohort (which named prep_samples the runs did not
     # process, how many prep_samples a study holds), so a caller who may not read it
-    # is refused first. A study's resolved prep_samples are then authorized too, as
-    # the cohort the tickets will carry.
+    # is refused first. A study cohort's prep_samples are authorized again once
+    # resolved, because one may also be linked to a study the caller cannot read.
     if request.study_idx is not None:
         await require_caller_has_tier_on_all_studies(
             pool, caller=caller, study_idxs=[request.study_idx], min_tier=COHORT_MIN_TIER
@@ -148,8 +148,7 @@ async def feature_table_features(
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
     """Every feature the values name, `(feature, sequence, length, md5)`, an Arrow IPC
-    stream — the published handle mapped to its sequence and md5. Reads the ASV
-    sequences: the ticket already scopes them to the ASVs the cohort observed."""
+    stream — the published handle mapped to its sequence and md5."""
     cohort = await _authorized_cohort(pool, caller, request)
     sequences = await _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key)
     labels = await mint_feature_labels(

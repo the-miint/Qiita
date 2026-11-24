@@ -1,7 +1,7 @@
 """A run feature table: a query over a cohort, answered as sparse COO.
 
 A feature table is not a run's artifact. It is a selection — one or more amplicon
-runs, over a study's samples or a named list — of the ASV counts the lake already
+runs, over a study's prep_samples or a named list — of the ASV counts the lake already
 holds as COO rows, one per processed sample and feature. ASVs are content-deduped
 into one feature space, so the same sequence found by two runs is one feature,
 named by its exported-feature handle (a `QF<n>`, minted like a genome's), with the
