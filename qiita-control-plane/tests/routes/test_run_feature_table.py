@@ -16,11 +16,16 @@ import uuid
 import pyarrow as pa
 import pyarrow.flight as flight
 import pytest
+from qiita_common.amplicon_constants import (
+    AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
+    AMPLICON_SEQUENCE_TABLE,
+)
 from qiita_common.api_paths import (
     URL_FEATURE_TABLE_FEATURE,
     URL_FEATURE_TABLE_SAMPLE,
     URL_FEATURE_TABLE_VALUE,
 )
+from qiita_common.flight_stream import StreamRowCountMismatch
 from qiita_common.models.run_feature_table import MAX_FEATURE_TABLE_RUNS
 
 from qiita_control_plane.repositories.processing import mint_processing
@@ -57,13 +62,15 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
     cohort = [seed["ps_a"], seed["ps_b"], seed["ps_c"]]
     processing_idx = await _mint_run(db, seed["owner_idx"], cohort)
     runs = [processing_idx]
-    fetched: list[tuple[list[int], list[int]]] = []
+    fetched: list[tuple[str, list[int], list[int]]] = []
 
-    def _fetch(*, data_plane_url, signing_key, cohort, values=True):
+    def _fetch(*, data_plane_url, signing_key, cohort, table):
         processing_idxs, prep_sample_idxs = cohort.runs, cohort.prep_sample_idxs
-        fetched.append((list(processing_idxs), list(prep_sample_idxs)))
+        fetched.append((table, list(processing_idxs), list(prep_sample_idxs)))
+        if table == AMPLICON_SEQUENCE_TABLE:
+            return _sequences()
         rows = [(r, p) for r in processing_idxs for p in prep_sample_idxs]
-        observed = pa.table(
+        return pa.table(
             {
                 "prep_sample_idx": pa.array([p for _, p in rows], pa.int64()),
                 "processing_idx": pa.array([r for r, _ in rows], pa.int64()),
@@ -71,15 +78,6 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
                 "count": pa.array(range(1, len(rows) + 1), pa.int64()),
             }
         )
-        sequences = pa.table(
-            {
-                "feature_idx": pa.array([77], pa.int64()),
-                "sequence_hash": pa.array([hashlib.md5(ASV.encode()).hexdigest()], pa.string()),
-                "sequence_length_bp": pa.array([len(ASV)], pa.int64()),
-                "sequence": pa.array([ASV], pa.string()),
-            }
-        )
-        return (observed if values else None), sequences
 
     async def _labels(pool, *, created_by_idx, features):
         # Stand in for the exported-feature mint (tested separately): a deterministic
@@ -92,7 +90,7 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
             }
         )
 
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_table", _fetch)
     monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.mint_feature_labels", _labels)
     yield {"processing_idx": processing_idx, "runs": runs, "fetched": fetched, **seed}
     await db.execute(
@@ -128,6 +126,17 @@ async def _set_accession(db, prep_sample_idx, accession):
     )
 
 
+def _sequences() -> pa.Table:
+    return pa.table(
+        {
+            "feature_idx": pa.array([77], pa.int64()),
+            "sequence_hash": pa.array([hashlib.md5(ASV.encode()).hexdigest()], pa.string()),
+            "sequence_length_bp": pa.array([len(ASV)], pa.int64()),
+            "sequence": pa.array([ASV], pa.string()),
+        }
+    )
+
+
 def _arrow(resp) -> pa.Table:
     assert resp.headers["content-type"] == "application/vnd.apache.arrow.stream"
     return pa.ipc.open_stream(resp.content).read_all()
@@ -156,7 +165,7 @@ async def test_counts_are_coo_named_by_qm_and_handle(role_keyed_clients, amplico
     assert sorted(zip(*table.to_pydict().values(), strict=True)) == sorted(
         (qm, "QF77", float(i + 1)) for i, qm in enumerate(qms)
     )
-    assert run["fetched"] == [([run["processing_idx"]], cohort)]
+    assert run["fetched"] == [(AMPLICON_MEMBERSHIP_VISIBLE_TABLE, [run["processing_idx"]], cohort)]
 
 
 async def test_features_map_each_handle_to_sequence_and_md5(role_keyed_clients, amplicon_run):
@@ -228,7 +237,13 @@ async def test_one_biosample_in_two_runs_is_two_columns_by_qm(role_keyed_clients
             await _qm(db, run["processing_idx"], run["ps_a"]),
             await _qm(db, second, run["ps_a"]),
         }
-        assert run["fetched"] == [(sorted([run["processing_idx"], second]), [run["ps_a"]])]
+        assert run["fetched"] == [
+            (
+                AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
+                sorted([run["processing_idx"], second]),
+                [run["ps_a"]],
+            )
+        ]
     finally:
         await _set_accession(db, run["ps_a"], None)
 
@@ -338,6 +353,22 @@ async def test_a_study_cohort_over_the_cap_413s(role_keyed_clients, amplicon_run
     assert run["fetched"] == []
 
 
+async def test_an_unreadable_study_403s_before_it_is_resolved(
+    role_keyed_clients, amplicon_run, monkeypatch
+):
+    """A study cohort is authorized before it is resolved, so a caller who may not
+    read the study learns nothing of its cohort — not its size (the 413) and not
+    whether the runs processed any of it (the 404)."""
+    monkeypatch.setattr("qiita_control_plane.run_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 0)
+    run = amplicon_run
+    resp = await role_keyed_clients["user"].post(
+        URL_FEATURE_TABLE_VALUE,
+        json=_body([run["processing_idx"]], study_idx=run["study_2"]),
+    )
+    assert resp.status_code == 403, resp.text
+    assert run["fetched"] == []
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -353,11 +384,21 @@ async def test_rejects_a_malformed_request(role_keyed_clients, amplicon_run, bod
     assert resp.status_code == 422, resp.text
 
 
-async def test_a_data_plane_failure_is_a_502(role_keyed_clients, amplicon_run, monkeypatch):
+@pytest.mark.parametrize(
+    "failure",
+    [
+        flight.FlightUnavailableError("data plane down"),
+        StreamRowCountMismatch("the stream ended early"),
+    ],
+    ids=["unavailable", "short stream"],
+)
+async def test_a_data_plane_failure_is_a_502(
+    role_keyed_clients, amplicon_run, monkeypatch, failure
+):
     def _fail(**_):
-        raise flight.FlightUnavailableError("data plane down")
+        raise failure
 
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fail)
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_table", _fail)
     resp = await role_keyed_clients["wet"].post(
         URL_FEATURE_TABLE_VALUE,
         json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),
@@ -378,25 +419,18 @@ async def test_requires_auth(role_keyed_clients, amplicon_run):
     assert resp.status_code == 401, resp.text
 
 
-async def test_features_read_no_observations(role_keyed_clients, amplicon_run, monkeypatch):
-    calls = []
-
-    def _fetch(*, data_plane_url, signing_key, cohort, values=True):
-        calls.append(values)
-        sequences = pa.table(
-            {
-                "feature_idx": pa.array([77], pa.int64()),
-                "sequence_hash": pa.array([hashlib.md5(ASV.encode()).hexdigest()], pa.string()),
-                "sequence_length_bp": pa.array([len(ASV)], pa.int64()),
-                "sequence": pa.array([ASV], pa.string()),
-            }
-        )
-        return None, sequences
-
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
+@pytest.mark.parametrize(
+    ("url", "table"),
+    [
+        (URL_FEATURE_TABLE_VALUE, AMPLICON_MEMBERSHIP_VISIBLE_TABLE),
+        (URL_FEATURE_TABLE_FEATURE, AMPLICON_SEQUENCE_TABLE),
+    ],
+    ids=["values", "features"],
+)
+async def test_each_route_reads_only_its_own_table(role_keyed_clients, amplicon_run, url, table):
+    run = amplicon_run
     resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_FEATURE,
-        json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),
+        url, json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]])
     )
     assert resp.status_code == 200, resp.text
-    assert calls == [False]
+    assert [t for t, _, _ in run["fetched"]] == [table]

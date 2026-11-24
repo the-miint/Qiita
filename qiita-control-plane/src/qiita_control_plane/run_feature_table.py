@@ -12,8 +12,7 @@ features compare (`Source.merge_keys` — one trim length and orientation). Thre
 steps, each testable alone:
   * `resolve_cohort` picks the processed samples (one run's view of one
     prep_sample) the request names and gives each a public column name;
-  * `cohort_tickets` signs the reads of their values and the ASV bytes, which
-    `fetch_runs` performs;
+  * `fetch_table` reads their values, or the ASV sequences, under one signed scope;
   * `mint_feature_labels` names each feature with its exported-feature handle, and
     `stage_values` / `stage_features` turn the reads into the values
     `(sample, feature, value)` and the feature mapping `(feature, sequence, length, md5)`,
@@ -38,6 +37,7 @@ from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
 )
+from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import MAX_COHORT_PREP_SAMPLE_IDX
 from qiita_common.models.run_feature_table import (
     FeatureTableRequest,
@@ -272,31 +272,14 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
     return cohort
 
 
-def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:
-    """The one ticket filter every read of `cohort` signs: its runs over its
-    prep_samples — the only two keys the data plane's DoGet scopes these tables by."""
-    return {"processing_idx": cohort.runs, "prep_sample_idx": cohort.prep_sample_idxs}
-
-
-def cohort_tickets(cohort: Cohort, signing_key: bytes) -> tuple[bytes, bytes]:
-    """Signed DoGet tickets for the cohort's values and its ASV sequences."""
-    scope = cohort_scope(cohort)
-    source = cohort.source
-    values = sign_ticket(table=source.values_table, filter=scope, secret=signing_key)
-    sequences = sign_ticket(table=source.sequences_table, filter=scope, secret=signing_key)
-    return values, sequences
-
-
-def fetch_runs(
-    *, data_plane_url: str, signing_key: bytes, cohort: Cohort, values: bool = True
-) -> tuple[pa.Table | None, pa.Table]:
-    """Read the cohort's values (unless `values` is False) and the ASV sequences they
-    name. Blocking (Flight is synchronous); callers run it off the event loop."""
-    values_ticket, sequences_ticket = cohort_tickets(cohort, signing_key)
+def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, table: str) -> pa.Table:
+    """Read `table` over the cohort's runs and prep_samples, the two keys the data
+    plane scopes these tables by. Blocking (Flight is synchronous); callers run it
+    off the event loop."""
+    scope = {"processing_idx": cohort.runs, "prep_sample_idx": cohort.prep_sample_idxs}
+    ticket = sign_ticket(table=table, filter=scope, secret=signing_key)
     with flight.FlightClient(data_plane_url) as client:
-        observed = client.do_get(flight.Ticket(values_ticket)).read_all() if values else None
-        sequences = client.do_get(flight.Ticket(sequences_ticket)).read_all()
-    return observed, sequences
+        return read_all_counted(client, ticket, name=table)
 
 
 # The relations `stage_values` creates on the caller's connection.

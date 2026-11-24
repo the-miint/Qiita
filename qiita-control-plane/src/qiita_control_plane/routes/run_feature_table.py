@@ -14,8 +14,8 @@ What a feature table is, which runs it can merge, and why COO, is in
 `run_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
 for the web UI and the CLI alike.
 
-Access is `authorize_prep_sample_cohort`, all-or-nothing over the cohort, at the
-tier the other cohort reads use, checked before anything is read from the data
+Access is all-or-nothing over the cohort, at the tier the other cohort reads use,
+checked before the cohort is resolved and before anything is read from the data
 plane. The data plane serves exactly the cohort the ticket carries, so that gate
 is the authorization boundary.
 """
@@ -34,9 +34,15 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_VALUE,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.flight_stream import StreamRowCountMismatch
 from qiita_common.models.run_feature_table import FeatureTableRequest, FeatureTableSamples
 
-from ..auth.guards import COHORT_MIN_TIER, require_complete_profile, require_scope
+from ..auth.guards import (
+    COHORT_MIN_TIER,
+    require_caller_has_tier_on_all_studies,
+    require_complete_profile,
+    require_scope,
+)
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..run_feature_table import (
@@ -46,7 +52,7 @@ from ..run_feature_table import (
     arrow_stream_bytes,
     build_features,
     build_values,
-    fetch_runs,
+    fetch_table,
     mint_feature_labels,
     resolve_cohort,
 )
@@ -58,12 +64,16 @@ router = APIRouter(prefix=PATH_FEATURE_TABLE_PREFIX, tags=["feature-table"])
 async def _authorized_cohort(
     pool: asyncpg.Pool, caller: HumanUser, request: FeatureTableRequest
 ) -> Cohort:
-    # When the caller names the prep_samples, authorize that named set BEFORE
-    # resolving: resolve_cohort's 404 enumerates which named prep_samples a run did
-    # not process, so a caller who may not read them must be refused first (403,
-    # anti-enumeration) rather than handed that list. A study cohort names no
-    # prep_samples — its set is known only after resolving, and is authorized then.
-    if request.prep_sample_idx is not None:
+    # Authorize what the request names before resolving it: resolve_cohort's
+    # refusals describe the cohort (which named prep_samples the runs did not
+    # process, how many prep_samples a study holds), so a caller who may not read it
+    # is refused first. A study's resolved prep_samples are then authorized too, as
+    # the cohort the tickets will carry.
+    if request.study_idx is not None:
+        await require_caller_has_tier_on_all_studies(
+            pool, caller=caller, study_idxs=[request.study_idx], min_tier=COHORT_MIN_TIER
+        )
+    else:
         await authorize_prep_sample_cohort(
             pool, caller=caller, prep_sample_idx=request.prep_sample_idx, min_tier=COHORT_MIN_TIER
         )
@@ -71,26 +81,24 @@ async def _authorized_cohort(
         cohort = await resolve_cohort(pool, request)
     except CohortError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-    if request.prep_sample_idx is None:
+    if request.study_idx is not None:
         await authorize_prep_sample_cohort(
             pool, caller=caller, prep_sample_idx=cohort.prep_sample_idxs, min_tier=COHORT_MIN_TIER
         )
     return cohort
 
 
-async def _read(
-    cohort: Cohort, data_plane_url: str, signing_key: bytes, *, values: bool
-) -> tuple[pa.Table | None, pa.Table]:
+async def _read(cohort: Cohort, table: str, data_plane_url: str, signing_key: bytes) -> pa.Table:
     try:
         return await asyncio.to_thread(
-            lambda: fetch_runs(
+            lambda: fetch_table(
                 data_plane_url=data_plane_url,
                 signing_key=signing_key,
                 cohort=cohort,
-                values=values,
+                table=table,
             )
         )
-    except flight.FlightError as exc:
+    except (flight.FlightError, StreamRowCountMismatch) as exc:
         raise HTTPException(
             status_code=502,
             detail=f"data plane read of the {cohort.source.method} runs failed: {exc}",
@@ -124,7 +132,7 @@ async def feature_table_values(
 ) -> Response:
     """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
     cohort = await _authorized_cohort(pool, caller, request)
-    values, _ = await _read(cohort, data_plane_url, signing_key, values=True)
+    values = await _read(cohort, cohort.source.values_table, data_plane_url, signing_key)
     labels = await mint_feature_labels(pool, created_by_idx=caller.principal_idx, features=values)
     table = build_values(cohort, values, labels)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
@@ -143,7 +151,7 @@ async def feature_table_features(
     stream — the published handle mapped to its sequence and md5. Reads the ASV
     sequences: the ticket already scopes them to the ASVs the cohort observed."""
     cohort = await _authorized_cohort(pool, caller, request)
-    _, sequences = await _read(cohort, data_plane_url, signing_key, values=False)
+    sequences = await _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key)
     labels = await mint_feature_labels(
         pool, created_by_idx=caller.principal_idx, features=sequences
     )
