@@ -5,7 +5,7 @@ target_kind: reference
 description: >
   Make a registered krepp build the reference's active one, retiring the reference's
   previous active build (docs/runbooks/krepp-index.md). The build was checked at
-  registration; no job reads it here.
+  registration.
 
   The reference itself does not change state, so the action carries no
   success_status or failure_status.

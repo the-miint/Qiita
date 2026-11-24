@@ -444,3 +444,50 @@ async def test_the_activate_action_refuses_another_reference_and_a_non_krepp_row
     with pytest.raises(ValueError, match="is not a krepp build"):
         await activate_krepp_build_of_reference(pool, world["reference_idx"], rype)
     assert await _state(pool, a) == ReferenceIndexState.REGISTERED
+
+
+async def test_an_activate_ticket_runs_to_completed_through_the_runner(world, tmp_path):
+    """The shipped `reference-index-activate` workflow has no job step: the runner walks
+    its one action and completes the ticket without touching a compute backend."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions.loader import load_actions
+    from qiita_control_plane.actions.sync import sync_actions
+    from qiita_control_plane.runner import run_workflow
+
+    pool = world["pool"]
+    workflows_dir = Path(__file__).resolve().parents[2] / "workflows"
+    (action,) = [
+        a
+        for a in load_actions(workflows_dir)
+        if (a.action_id, a.version) == ("reference-index-activate", "1.0.0")
+    ]
+    async with pool.acquire() as conn:
+        await sync_actions(conn, [action])
+    a = await _register(world, "a", "d" * 64)
+    ticket = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
+        " scope_target_kind, reference_idx, action_context, state)"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::jsonb, 'pending')"
+        " RETURNING work_ticket_idx",
+        action.action_id,
+        action.version,
+        world["principal_idx"],
+        world["reference_idx"],
+        f'{{"reference_index_idx": {a}}}',
+    )
+    await run_workflow(
+        ticket,
+        pool,
+        object(),  # type: ignore[arg-type]  # an attribute read on it fails the test
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://unused:0",
+        work_ticket_workspace_root=tmp_path / "ws",
+        upload_staging_root=tmp_path / "uploads",
+        poll_interval_seconds=0,
+    )
+    state = await pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
+    )
+    assert state == "completed"
+    assert await _state(pool, a) == ReferenceIndexState.ACTIVE

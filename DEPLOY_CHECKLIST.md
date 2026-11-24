@@ -24,8 +24,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[admin]` Optional, not needed for this deploy: once the cluster admins have created
   `/scratch/qiita-miint` on every compute node, writable by the SLURM job user, set
   `PATH_NODE_LOCAL` in `/etc/qiita/compute-orchestrator.env` (absolute; the orchestrator refuses a
-  relative one at boot) and restart the orchestrator. Jobs then copy krepp builds to each node's
-  disk on first use; unset, they read them from `PATH_DERIVED`. (#937)
+  relative one at boot) and restart the orchestrator. It turns on the node cache; no workflow
+  reads through it in this deploy. (#937)
   ```bash
   sudo bash -c 'grep -q "^PATH_NODE_LOCAL=" /etc/qiita/compute-orchestrator.env || echo "PATH_NODE_LOCAL=/scratch/qiita-miint" >> /etc/qiita/compute-orchestrator.env'
   ```

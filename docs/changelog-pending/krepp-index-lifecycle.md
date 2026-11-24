@@ -10,11 +10,13 @@
   `qiita-admin krepp-index remove` marks a registered or retired build removed. No
   workflow places contigs with a build.
 - **A node cache for sealed folders, `PATH_NODE_LOCAL` (#937).** Optional: a directory
-  on each compute node's own disk, writable by the job user. A job that reads a sealed
-  folder (a krepp build) copies it there on first use on that node, under a per-folder
-  lock: it checks the free space, then hashes every file as it copies it; later jobs
-  on the node check the copy and use it. Copies of removed builds are not deleted yet
-  (#942). Unset, jobs read from `PATH_DERIVED`. Nothing is copied at deploy or by hand.
+  on each compute node's own disk, writable by the job user. `node_cache.materialize`
+  copies a sealed folder (a krepp build) there the first time a job on that node asks
+  for it, under a per-folder lock: it checks the free space, then hashes every file as
+  it copies it; later jobs on the node check the copy and use it. Unset, it returns the
+  folder under `PATH_DERIVED`. Nothing is copied at deploy or by hand. No workflow
+  reads through it. Node copies of removed builds are not deleted
+  (#942).
 - **`qiita.reference_index.state` (`registered`, `active`, `retired`, `removed`)
   (#937).** Every existing row is `active`; a krepp row's `fs_path` is relative to
   `PATH_DERIVED`. `GET /reference/{reference_idx}/index` returns it.

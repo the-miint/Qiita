@@ -2,9 +2,9 @@
 
 A build is made outside Qiita and placed, by hand, at its master path under
 PATH_DERIVED (``derived_store.krepp_build_relpath``). Registration
-(``jobs.krepp_index_register``) inventories it and seals it (``node_cache.seal``):
-jobs read it through ``node_cache.materialize``, which copies it to the node's
-PATH_NODE_LOCAL on first use when that is set.
+(``jobs.krepp_index_register``) inventories it and seals it (``node_cache.seal``),
+so a job can read it through ``node_cache.materialize``, which copies it to the
+node's PATH_NODE_LOCAL on first use when that is set.
 
 Layout::
 

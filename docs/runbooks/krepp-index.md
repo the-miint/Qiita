@@ -14,9 +14,10 @@ same folder overwritten.
   `POST /api/v1/reference/18/phylogeny/mint-edge-id` first (registration refuses an
   unnumbered tree and says so).
 - Optional: `PATH_NODE_LOCAL` in `compute-orchestrator.env` (e.g. `/scratch/qiita-miint`,
-  created by the cluster admins on every node, writable by the job user). Jobs then
-  copy the build to each node's disk the first time they need it there
-  ([storage](../architecture/storage.md)); unset, they read it from `PATH_DERIVED`.
+  created by the cluster admins on every node, writable by the job user): the node
+  cache ([storage](../architecture/storage.md)). The deploy's readiness check fails
+  when it is set but not a writable directory. No workflow reads a krepp build
+  through it.
 
 ## 1. Place the build at its master path
 
@@ -55,9 +56,8 @@ qiita ticket submit --action-id reference-index-activate --action-version 1.0.0 
 ```
 
 The build becomes `active`; the reference's previous active build, if any, becomes
-`retired` and is still served to the tickets already fixed to it. No job reads the
-build here; with `PATH_NODE_LOCAL` set, each node gets its copy when a job first needs
-the build there.
+`retired`; a ticket fixed to a retired build may still read it. Nothing is copied
+to the nodes.
 
 ## 4. Remove a build no longer needed
 
@@ -67,6 +67,6 @@ qiita-admin krepp-index remove --reference-idx 18 --reference-index-idx <idx>
 
 Only a `registered` or `retired` build, and only when no ticket fixed to it is running
 or still has a cancel's reap pending. Then delete its master folder if it will not be
-reused. Node copies of a removed build are not deleted yet (#942). A finished ticket
+reused. Node copies of a removed build are not deleted (#942). A finished ticket
 fixed to a removed build cannot be restarted with `/run`; submit it again. A reference
 cannot be deleted while it has a krepp build that is not removed.

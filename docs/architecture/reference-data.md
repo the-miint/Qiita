@@ -177,14 +177,14 @@ This `PATH_DERIVED` tree is **derived storage**, the orchestrator's third storag
 
 ## krepp placement index builds
 
-A krepp index is built outside Qiita and registered onto an existing reference whose tree is in the lake. Its `qiita.reference_index.state` changes after it is recorded (registered → active → retired → removed; the `reference_index_lifecycle_is_krepp` CHECK keeps every other type `active`), and jobs read it through the node cache (`NODE_CACHED_INDEX_TYPES`, [storage](storage.md)):
+A krepp index is built outside Qiita and registered onto an existing reference whose tree is in the lake. Its `qiita.reference_index.state` changes after it is recorded (registered → active → retired → removed; the `reference_index_lifecycle_is_krepp` CHECK keeps every other type `active`), and it is a sealed folder the node cache can serve (`NODE_CACHED_INDEX_TYPES`, [storage](storage.md)):
 
 1. The build is placed by hand at `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` — `index/` with krepp's files, `jest/` with the two files JEST reads: `labelled.nwk`, the backbone tree with its clade labels, and `null.txt`, its null distribution.
 2. `reference-index-register` checks it, seals it (`manifest.json` and `SHA256SUMS`, `node_cache.seal`) and records it `registered` (`jobs/krepp_index_register.py` says what it checks). Its tree must be the reference's tree by edge number, parent edge, branch length and tip name (`jobs/_phylogeny.py` says why each counts). The row's `fs_path` is relative to `PATH_DERIVED`, and its `params` carry the hash of `SHA256SUMS`.
 3. `reference-index-activate` makes the build `active`, retiring the reference's previous active build in the same transaction. At most one krepp build per reference is active.
 4. `qiita-admin krepp-index remove` marks a registered or retired build `removed`, refused while a ticket fixed to it may still read it (`repositories.reference_index.tickets_running_on_build`). A reference with a build not yet removed cannot be deleted.
 
-`work_ticket.reference_index_idx` is the build a ticket is fixed to; `/run` refuses a ticket whose build is removed. `repositories/reference_index.py` says under which lock a writer sets it. A job reads the build through `node_cache.materialize`, which checks the recorded `SHA256SUMS` hash, the file list and the sizes, and hashes every file when it copies the build to a node. [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) is the operator procedure.
+`work_ticket.reference_index_idx` is the build a ticket is fixed to; `/run` refuses a ticket whose build is removed. No workflow sets it or reads a krepp build; `repositories/reference_index.py` says under which lock a writer must set it. A job that reads a build is to read it through `node_cache.materialize`, which checks the recorded `SHA256SUMS` hash, the file list and the sizes, and hashes every file when it copies the build to a node. [`docs/runbooks/krepp-index.md`](../runbooks/krepp-index.md) is the operator procedure.
 
 ## Shard planner
 

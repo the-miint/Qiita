@@ -6,9 +6,9 @@ removed once no ticket may still read it (`remove_krepp_build`). Each change loc
 reference's krepp rows `FOR UPDATE` first, so two changes to one reference's builds
 serialize. `/run` refuses a ticket whose build is removed (`removed_build_of_ticket`).
 
-`work_ticket.reference_index_idx` is the build a ticket is fixed to. Code that writes it
-holds the build row `FOR SHARE`, re-reads under that lock that the build is `active`,
-and keeps the lock until it commits the ticket's column: `remove_krepp_build` counts the
+`work_ticket.reference_index_idx` is the build a ticket is fixed to. A writer of it must
+hold the build row `FOR SHARE`, re-read under that lock that the build is `active`,
+and keep the lock until it commits the ticket's column: `remove_krepp_build` counts the
 tickets that may read a build under `FOR UPDATE` of the same row, and a write made
 outside that lock could fix a ticket to a build being removed.
 """
@@ -123,9 +123,9 @@ async def activate_krepp_build(
 async def tickets_running_on_build(conn: asyncpg.Connection, reference_index_idx: int) -> list[int]:
     """The tickets fixed to the build that may still have a job reading it, oldest
     first: non-terminal, or cancelled with the reap of their SLURM jobs still pending.
-    Removal waits for every such ticket because a job on a node deletes that node's
-    copy of a removed build (`node_cache.evict`) whether or not another job there is
-    still reading it."""
+    Removal waits for every such ticket because the runbook then has the master folder
+    deleted, and `node_cache.evict` deletes a node's copy whether or not another job
+    there is still reading it."""
     rows = await conn.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
         " WHERE reference_index_idx = $1"
