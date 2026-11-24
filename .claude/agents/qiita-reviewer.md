@@ -147,6 +147,14 @@ Only rules whose trigger appears in the diff can fire.
 | A new file, moved code, a helper in a feature-specific module, feature- or platform-specific naming, a one-shot script | R10 |
 | A private (`_`-prefixed) name imported into, or listed in `__all__` of, a package `__init__.py` | R10 |
 | A new parameter on a function under `runner/` | R10 |
+| A lake table definition in `qiita-data-plane/src/ducklake.rs` (`ensure_*`) | R3 |
+| A size cap on a request field; a route that reads a whole stream or result set into one response | R4 |
+| A check of an artifact that runs a tool on a known answer, or compares two copies of the same data structurally | R4 |
+| A `CHECK` constraint, `Field` bound or validator that rules out zero, NULL or an empty set | R5 |
+| A new member of a family the Sibling-registries PR-level check names | R9 |
+| A new index type, feature source or public-identifier format; a route, table or module named for one data type | R9, R6, R10 |
+| A query result fetched only to test whether it is empty | R8 |
+| A registration path, step or runbook line in which an admin creates, copies, places or removes something Qiita later reads | R9 |
 | An external tool's behaviour that correctness depends on | Outside the rule set |
 
 ## PR-level checks
@@ -160,9 +168,10 @@ Always run, in this order.
 
    File under **R6**, one grouped finding. A site you could not settle after the lookup goes to the handoff, stating what you searched.
 2. **Docs follow the code.** For every name, command, Make target, env var, path, route constant, table or column, scope, CLI flag, workflow, job module or documented behaviour the diff adds, renames, removes or changes, `grep` the tracked Markdown: `CLAUDE.md`, `CHANGELOG.md`, `README*`, `docs/**`, component READMEs, `.claude/**`. Skip the provenance logs (`docs/changelog-pending/`, `docs/changelog-archive/`, `docs/deploy-archive/`). Flag a doc that still describes the old state, a new instance of something a doc enumerates with no entry, and a miint workaround added or removed without its "Open upstream gaps" row changing. File under **R2**, `[verified]` with the `grep`.
-3. **Duplication.** Scan the diff for a new block near-identical to an existing one (**R9**), a constant or literal defined a second time (**R1**), and a comment or doc restating `CLAUDE.md` or a sibling (**R2**). One grouped finding per owning rule.
-4. **Documented toil.** When the diff documents a manual workaround (copy this file first, run this by hand), ask whether an issue exists to remove the need. A question, not a blocker.
-5. **CI gates the diff must satisfy**, each described in `CLAUDE.md`: `changelog-check`, `deploy-note-check`, `review-loop-check`, and the REST path-constant parity test.
+3. **Sibling registries.** For every new member of a family the diff adds (a gate table, an `exported_identifier` or definition kind, a lake table, an index type, a feature source), `grep` the code, not only the docs, for each place an existing sibling of it is named: a delete or force-delete clear list, a no-data or failure arm in the runner, a handle or lock map, a Flight table allowlist, a parity or registration list. Flag each place the new member is missing from and nothing says why. File under **R9**, `[verified]` with the `grep`.
+4. **Duplication.** Scan the diff for a new block near-identical to an existing one (**R9**), a constant or literal defined a second time (**R1**), and a comment or doc restating `CLAUDE.md` or a sibling (**R2**). One grouped finding per owning rule.
+5. **Documented toil.** When the diff documents a manual workaround (copy this file first, run this by hand), ask whether an issue exists to remove the need. A question, not a blocker. A manual step of the kind R9 "Qiita manages the artifacts it reads" describes is that bullet instead.
+6. **CI gates the diff must satisfy**, each described in `CLAUDE.md`: `changelog-check`, `deploy-note-check`, `review-loop-check`, and the REST path-constant parity test.
 
 ## Rules
 
@@ -184,7 +193,8 @@ Flag in new code:
 Flag:
 - **Development-process narration:** phase or milestone labels, test counts, status language ("ready to merge"), "this ticket", "a follow-up".
 - **Forward-looking or historical narration:** what a future migration will do, what the code used to do, what an earlier draft called something. Git carries history.
-- **A docstring that enumerates current consumers** or explains a general capability through one caller, or that describes what another layer does with its result (a repository function narrating its route, a helper naming the reads that call it). Describe what the thing is and does.
+- **A docstring that enumerates current consumers** or explains a general capability through one caller, or that describes what another layer does with its result (a repository function narrating its route, a helper naming the reads that call it, a one-query function carrying its callers' reasons for wanting the rows). Describe what the thing is and does, and put a caller's reason at that caller.
+- **Code explained by another feature's code.** A docstring that describes one feature's helper by a sibling from an unrelated domain (an amplicon gate described through the assembly gate's behavior). Describe the behavior on its own terms.
 - **Prose a reader cannot parse on first read:**
   - an object relative clause without "that" ("the row the trigger updates");
   - a noun pressed into service as a verb ("floors the value at member");
@@ -206,7 +216,7 @@ Flag:
 - **User-facing text that says what a thing does not do and never what it does.** Help text, error bodies and flag descriptions state the effect and when to use it.
 - **Docs that teach a policy violation because the code permits it**, or print the value the reader must not pick.
 - **A removed audience statement**, and a new runbook that does not say who it is for and whether it applies to everyone.
-- **A definition that would be equally true of the parent object**, an unqualified generalization that holds for only some kinds, a dangling pronoun, troubleshooting placed away from the step that fails.
+- **A definition that would be equally true of the parent object**, an unqualified generalization that holds for only some kinds, a uniqueness claim ("the one X with Y") that the reader cannot check and that implies something about the other kinds, a dangling pronoun, troubleshooting placed away from the step that fails.
 - **Comments naming a test file, a migration filename, an upstream source symbol, a distant module's internals, or an issue number of this repo.** State the invariant in words. A pointer to the one module or doc that holds a rationale is fine (`CLAUDE.md`, "State a rationale once"); so is a qualified external issue (`duckdb-miint#173`).
 - **One rationale stated at several sites**, one piece of usage guidance repeated across a docstring, a migration comment and a doc, or a comment restating `CLAUDE.md`. One home; the rest point at it.
 - **A `TODO` in a shipped doc** [soft]: ask whether an issue tracks it.
@@ -214,10 +224,12 @@ Flag:
 
 If removing a sentence would not confuse a future reader, it does not belong.
 
-### R3 — Migration discipline [strong]
+### R3 — Migration and lake-schema discipline [strong]
 
 - **Timestamps are unique and ordered.** dbmate keys on the leading version. A file whose version another file already holds is never run on a database that recorded that version, as the live one has, and `dbmate status` lists it as applied; `tests/test_migration_version.py` fails the unit tier on it. A new migration also sorts after every migration on main: one that sorts before a migration it depends on fails on a fresh database. Its version is held by no open PR either (`gh pr list`, then each PR's files): git merges two such files without a conflict, and an open PR's CI does not rerun when main moves, so the clash first fails main's CI.
 - **An applied migration is not edited** (`CLAUDE.md`, "Database migrations"). Within one unmerged branch, prefer fixing the original `CREATE` over stacking an `ALTER` on a table the same branch creates.
+- **A `migrate:down` runs on a database that holds the rows its `up` made possible.** A down block that re-adds a constraint before removing the rows or column that would violate it fails once the new kind of row exists. Order the down block so it removes those rows first.
+- **A lake table change reaches the live lake.** The data plane's `ensure_*` functions (`qiita-data-plane/src/ducklake.rs`) create lake tables with `CREATE TABLE IF NOT EXISTS`, which leaves a table the deployed lake already holds unchanged. A column added or changed there also needs the `ALTER TABLE … ADD COLUMN IF NOT EXISTS` (or matching `ALTER`) that the same file uses for existing tables, a `DEPLOY_CHECKLIST.md` step when existing rows need a backfill or a table is left with no reader, and a test that starts from the old table shape.
 
 ### R4 — Make the guarded path the explicit one [strong]
 
@@ -241,6 +253,8 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **A flag is trusted only as far as every path maintains it.** A decision keyed on a flag that summarizes a state (held, released, dirty) names every path that changes the state, and each one must set or clear the flag. Where one does not, decide on the state itself, or on the flag and the state together. The test drives the path that leaves the flag stale, then the decision.
 - **Proof from history is the newest record's, not any record's.** A query that opens a gate or writes a state because some past ticket ended a certain way must say whether a newer one supersedes it. A later attempt that failed, was cancelled or is still running usually does.
 - **Cause, not aftermath** [soft]. For a fix that removes bad state after it lands, ask whether the state can be refused where it is created.
+- **A bound on one form of an input bounds every form.** When a request can name its population in more than one way (an explicit list, or a study that resolves to one), a cap on the list applies to the resolved population too, and a route that reads a whole stream into one response has a cap that bounds it. The test sends the uncapped form over the cap.
+- **A check of an artifact is as deep as its siblings' checks and takes the cheapest form that settles the question** [soft]. Ask before a functional check (running the tool on a known answer, a structural comparison of two trees) where sibling artifacts get none, or where a checksum, a magic value or comparing two files' digests answers the same question. A check of data the system already holds is "Mirror — don't over-guard" below; a check repeated on every use is R9 "Per-invocation setup that belongs once".
 - **Mirror — don't over-guard.** A guard for an unreachable state, re-validation of data the system already owns, handling for output a tool does not emit, and a test fixture modelling an input no producer can emit [soft: ask which producer emits it] all mask an upstream bug or pin nothing. For miint specifically: no presence-probe or fallback for a missing function in a request or job path. `CLAUDE.md` ("miint is a core dependency") makes its absence a hard failure and names the boot, deploy and staged-directory checks this does not cover.
 
 ### R5 — Schema-design questions [strong, asked as questions]
@@ -255,7 +269,8 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - Column names that need a comment to tell apart need work. The same name must not mean different things in different tables, and the same thing takes the same name: a column holding the row's own id is named as its sibling tables name it, not as a parent.
 - Row granularity is stated in `COMMENT ON TABLE`.
 - Nullable columns: are they all nullable? A nullable set with no co-population check?
-- **What does persisting this buy?** A column nothing reads, or one that repeats a value held elsewhere, is a question. Conversely, when a table stores data selected by a filter, persist the filter.
+- **What does persisting this buy?** A column nothing reads, or one that repeats a value held elsewhere, is a question. A count or measure that the data plane can compute from the lake, copied into a control-plane column, is this case; R6 "Don't persist cheap deterministic results" says where it goes instead, so file it here only. Conversely, when a table stores data selected by a filter, persist the filter.
+- **A constraint admits every state the domain can produce.** A `CHECK`, `Field` bound or validator that rules out zero, NULL or an empty set: ask which real case it excludes (a prep_sample with reads and no ASVs).
 - **Validation reflects the real value's shape**, and a declared cap has a boundary test.
 
 ### R6 — Use the core tools and existing capabilities; stream, don't materialize [strong]
@@ -263,7 +278,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **miint and DuckDB first.** Read FASTA / FASTQ with `read_fastx`, alignments with `read_alignments`; write with `COPY … (FORMAT …)`; parse CSV / TSV with DuckDB. Use miint's scalar and table functions for flags, identity, coverage and sequence transforms. A hand-rolled parser, writer, complement table or flag test is the finding. The miint-first PR-level check owns the procedure.
 - **This binds test code.** An oracle that re-implements a production expression is a second implementation that drifts while the test keeps passing. The opposite failure is an oracle built by calling the same reader or helper that the code under test calls: a lookup made from the reader's own output cannot fail to match it. Derive expected values from the raw input, or from the producer that wrote it. Call the same primitive and make the fixtures discriminate (a non-palindromic sequence, a lowercase one). Test data is read with the core tools and committed compressed when its reader takes it compressed. Fixtures are built from this system's own artifacts, not a predecessor system's.
 - **Underusing a tool is reinventing it.** Check whether the tool already does the expensive thing (list inputs, globs, built-in parallelism, a documented pivot) before building around it.
-- **Reuse existing capabilities.** Before a new Flight action, payload type, export path or job, check for an existing one and extend it.
+- **Reuse existing capabilities.** Before a new Flight action, payload type, export path, route or job, check for an existing one and extend it. A route named for one data type that answers what an existing route answers for another (a feature table) is this case.
 - **Stream; don't materialize to a path.** The data plane writing to a path is close to an anti-pattern. Don't re-materialize a read an existing export already streams. Inputs come from the data plane, not from a fixed path.
 - **Don't persist cheap deterministic results.** Compute on demand, or cache in the derived store.
 - **Don't rename columns or parameters in transit**, and don't change a wrapped reader's semantics.
@@ -282,9 +297,10 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 ### R8 — Query and model shaping
 
 - **A cast on a JOIN key** usually means the two sides are stored as different types. Align them. [soft]
-- **A cast in a projection** [soft]: ask which side is not already that type. A bare literal and a bare `NULL` are the cases where the engine picks the type.
-- **Sort keys match the consumer's lookup key, or the sort is dropped.** Ask what the ordering is for. [soft]
-- **What does this clause change?** [soft] Ask it of a `DISTINCT` on a one-to-one join, a predicate an upstream table already implies, an alias that renames nothing, a secondary sort key. Ask; such a clause is sometimes a distinct gate that needs a comment instead.
+- **A cast in a projection** [strong]: a cast of a column that is already that type is the finding; delete it. Where the type cannot be read from the code, ask which side is not already that type. A bare literal and a bare `NULL` are the cases where the engine picks the type.
+- **Sort keys match the consumer's lookup key, or the sort is dropped.** [strong] A producer `ORDER BY` names the consumer that reads the order (a binary search, a stable representative row, a sorted output contract) in a comment beside it, or it is removed. When the order only picks a sample, ask whether an order on the key itself would do.
+- **An alias that renames nothing** [strong] is removed, unless a function or a reader requires the column by that name; then a comment says which.
+- **What does this clause change?** [soft] Ask it of a `DISTINCT` on a one-to-one join, a predicate an upstream table already implies, a secondary sort key, a query result fetched only to test whether it is empty (ask whether `EXISTS` does). Ask; such a clause is sometimes a distinct gate that needs a comment instead.
 - **Filter by a join, and chain by a CTE** (`CLAUDE.md`, "Writing DuckDB SQL"). [soft] Ask whether a `SEMI` / `ANTI JOIN` in the building query replaces an `IN (SELECT …)` / `NOT IN (SELECT …)`, or a DELETE trimming a table the previous statement built. Ask whether a temp table only the next statement reads is a CTE.
 - **A join key is a column, not an expression.** [soft] A predicate rebuilding a key from parts (concatenation, a split, a parse) on a table the code itself creates: ask whether that table can carry the key from creation.
 - **Compute an expression once** (a CTE) when the same call appears in two projected columns. [soft]
@@ -304,7 +320,10 @@ When two similar code paths solve the same problem differently, factor out the s
 - **Per-invocation setup that belongs once**: an install or version check on every call moves to deploy time; per-connection settings repeated at call sites belong in the shared connect helper [soft].
 - **Code that says it does what another site does mirrors every guard of that site.** A re-implementation "as X does" (a container script redone in a job, a check redone in another component) that copies some of X's refusals and not the others diverges without a test noticing. Name the guarded set once where both can read it, or point at X's set beside the copy, and test each refusal on the copy.
 - **New native jobs converge with their siblings**: failure-path cleanup of temp files and of declared outputs (a partial output must not be promoted), path validation through the shared validator, intermediate tables that are temporary.
-- **New sequence-bearing storage follows the reference-data pattern**: chunked, hashed, deduplicated, keyed on a minted idx.
+- **New sequence-bearing storage follows the reference-data pattern**: hashed, deduplicated, keyed on a minted idx, and chunked only when a sequence can exceed one chunk (`CHUNK_SIZE`, `qiita_common/chunking.py`). Sequences that always fit in one chunk (an ASV) are stored inline; chunking them adds a split and a reassembly that change nothing.
+- **A new instance of an existing kind uses that kind's mechanisms** [strong, asked as a question]. A new index type, feature source, data type or public identifier follows how the existing ones work: its parameters are recorded where its siblings' are (`reference_index.params`, not a file beside the build), and its features are named through `exported_feature` rather than a format of their own. Ask for the reason for a deviation when the PR does not give one. A new route for the same data is R6 "Reuse existing capabilities"; a name taken from one data type is R10.
+- **A new family member is registered wherever its siblings are.** A new member of a family the Sibling-registries PR-level check names is added to each list, map or arm that names its siblings, or a comment says why it is left out. That check owns the family list and the procedure.
+- **Qiita manages the artifacts it reads** [strong, asked as a question]. When the design has an admin create, copy, place or remove something Qiita reads (an index copied to node-local disk, a build registered from a path Qiita did not write), ask whether Qiita can do it itself. One form, for a node-local copy: a job checks for the copy when it uses it and copies it from `PATH_DERIVED` when it is absent, so the code also works on a node without one.
 - **Keep a raw transform separate from a reference-relative product**, so a reference change does not force reprocessing, and do not store per-reference copies of reference-independent data.
 - **The system owns the lifecycle from what our instruments write.** A workflow for instrument data that starts from a hand-converted input diverges from its siblings. Uploads and public-archive imports legitimately start from FASTQ.
 - **Multi-fetch read consistency**: related reads from two or more sources use one connection or transaction.
@@ -318,7 +337,7 @@ When two similar code paths solve the same problem differently, factor out the s
 
 ### R10 — Generality and placement [soft]
 
-- **General code does not live under, or take its name from, one feature or platform.** Name and scope by what the code does.
+- **General code does not live under, or take its name from, one feature, platform or data type.** [strong] Name and scope by what the code does. A query with no feature-specific predicate (the prep_samples of a pool) lives in the repository of the table it reads; a check of node-local storage is not named for the one index that uses it first.
 - **A container or table is not named for a subset of what it holds.**
 - **A method lives in the module whose responsibility it matches.** A non-route helper does not live under `routes/`; a generic runner does not carry one feature's special case.
 - **A one-shot or backfill script is not a permanent module**; ask whether it should be committed at all.
