@@ -1,10 +1,10 @@
 """Amplicon constants shared across components.
 
 The amplicon workflow's `amplicon_load` job (compute orchestrator) stages the
-DuckLake tables under these names; the control plane reads the staged membership
-back to mint the run's public identifiers, and reads the registered tables to
-serve a feature table. Neither side can see the other's code, so the names live
-here.
+DuckLake tables under these names; register-files then loads each into the lake
+under its file stem. The names live here so the writer and any control-plane
+reader of the same lake tables share one spelling without seeing each other's
+code.
 """
 
 # One row per (prep_sample_idx, processing_idx, feature_idx) with its count.

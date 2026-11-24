@@ -11,8 +11,9 @@
 
 ### Changed
 
-- The amplicon denoise step refuses `orient_primer: true`; 1.0.0 keeps loading and binds
-  the step unchanged, but orienting is no longer performed.
+- The amplicon denoise step refuses `orient_primer: true`: a 1.0.0 run that asks for
+  primer orienting now fails at the step (submit 1.1.0, which drops the knob). 1.0.0 still
+  loads and binds the step for a run that did not orient.
 - ASV sequences are stored inline rather than chunked — an ASV is shorter than one 64 KB
   chunk, so chunking is pure overhead. The `amplicon_deblur` step emits each ASV's bytes
   inline (`asv_sequences`) instead of a chunk directory the `amplicon_load` step
