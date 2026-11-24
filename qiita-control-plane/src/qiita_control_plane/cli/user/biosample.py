@@ -131,6 +131,23 @@ def _read_tsv_with_column(
     return tsv_rows
 
 
+def _refuse_rows_off_their_lines(
+    tsv_rows: list[dict[str, str]], tsv_file: Path, parser: argparse.ArgumentParser
+) -> None:
+    """Exit through `parser.error` unless each data line of `tsv_file` is one of
+    `tsv_rows`, so that a row can be named by its line and an output row pasted
+    beside its line."""
+    # The reader skips an empty line in a file of several columns and joins a quoted
+    # cell that spans lines.
+    data_line_count = count_data_lines(tsv_file)
+    if data_line_count != len(tsv_rows):
+        parser.error(
+            f"{_TSV_FILE_FLAG} {tsv_file} has {data_line_count} data line(s) but"
+            f" {len(tsv_rows)} row(s), so its rows cannot be matched to its lines:"
+            " remove any empty line between rows and any line break inside a cell"
+        )
+
+
 def _refuse_blank_cells(
     tsv_rows: list[dict[str, str]], column: str, tsv_file: Path, parser: argparse.ArgumentParser
 ) -> None:
@@ -301,17 +318,7 @@ def _lookup_column_to_tsv(
     # Check the output, read the file, and build the request before any request is sent.
     _require_new_output(args.output, parser)
     tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=column_flag)
-
-    # The output pastes beside the file only when each data line is one row; the
-    # reader skips an empty line in a file of several columns and joins a quoted cell
-    # that spans lines.
-    data_line_count = count_data_lines(args.tsv_file)
-    if data_line_count != len(tsv_rows):
-        parser.error(
-            f"{_TSV_FILE_FLAG} {args.tsv_file} has {data_line_count} data line(s) but"
-            f" {len(tsv_rows)} row(s), so the output would not line up with the file:"
-            " remove any empty line between rows and any line break inside a cell"
-        )
+    _refuse_rows_off_their_lines(tsv_rows, args.tsv_file, parser)
     _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
     lookup_request = _build_values_request(build_request, tsv_rows, column, args.tsv_file, parser)
 
@@ -385,6 +392,7 @@ def _handle_biosample_bulk_link(args: argparse.Namespace, parser: argparse.Argum
     # Read the file and build the request before any request is sent.
     column = args.key
     tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=_KEY_FLAG)
+    _refuse_rows_off_their_lines(tsv_rows, args.tsv_file, parser)
     _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
 
     def _build_request(values: list[str]) -> BiosampleBulkLinkRequest:

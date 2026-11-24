@@ -1060,8 +1060,20 @@ def test__handle_biosample_bulk_link_unavailable(monkeypatch, tmp_path, capsys):
         ),
         ("sample_id\nS-1\n", (), "no 'export_entity_id' column"),
         ("matrix_tube_id\nX\n", ("--key", "matrix_tube_id"), "must match ^[0-9]{10}$: ['X']"),
+        (
+            "export_entity_id\tnote\nQB1\ta\n\nQB2\tb\n\tc\n",
+            (),
+            "4 data line(s) but 3 row(s)",
+        ),
     ],
-    ids=["blank-cell", "repeat", "over-cap", "missing-column", "invalid-value"],
+    ids=[
+        "blank-cell",
+        "repeat",
+        "over-cap",
+        "missing-column",
+        "invalid-value",
+        "empty-line-in-multi-column-file",
+    ],
 )
 def test__handle_biosample_bulk_link_refuses_before_request(
     monkeypatch, tmp_path, capsys, tsv_text, flags, message

@@ -4111,12 +4111,9 @@ async def test_link_biosamples_bulk_refuses_every_problem(ctx):
     assert outcome == (422, {"detail": expected_detail}, None)
 
 
-async def test_link_biosamples_bulk_refused_request_inserts_nothing(ctx, monkeypatch):
-    """Tests the case where a value's biosample is not the caller's, so the request is
-    refused before any link is written: no link insert is attempted, not even for
-    the biosample that the caller may link, which a request naming it alone does
-    insert.
-    """
+def _record_link_inserts(monkeypatch) -> list[int]:
+    """Make the route's link inserts also append each entity_idx to the returned
+    list, in the order they are attempted."""
     inserted_idxs: list[int] = []
     real_insert = routes_biosample.insert_entity_to_study
 
@@ -4125,6 +4122,16 @@ async def test_link_biosamples_bulk_refused_request_inserts_nothing(ctx, monkeyp
         return await real_insert(*args, **kwargs)
 
     monkeypatch.setattr(routes_biosample, "insert_entity_to_study", _recording_insert)
+    return inserted_idxs
+
+
+async def test_link_biosamples_bulk_refused_request_inserts_nothing(ctx, monkeypatch):
+    """Tests the case where a value's biosample is not the caller's, so the request is
+    refused before any link is written: no link insert is attempted, not even for
+    the biosample that the caller may link, which a request naming it alone does
+    insert.
+    """
+    inserted_idxs = _record_link_inserts(monkeypatch)
     user_idx = ctx["user_session"]["principal_idx"]
     study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-no-writes")
     linkable_idx = await _seed_biosample_owned_by(ctx, "user")
@@ -4138,6 +4145,35 @@ async def test_link_biosamples_bulk_refused_request_inserts_nothing(ctx, monkeyp
 
     outcome = (refused.status_code, inserted_when_refused, accepted.status_code, inserted_idxs)
     assert outcome == (422, [], 201, [linkable_idx])
+
+
+async def test_link_biosamples_bulk_refused_after_insert_rolls_back(ctx, monkeypatch):
+    """Tests the case where every biosample may be linked, so the links are inserted,
+    and one pair's existing link then turns out to be retired: the request is
+    refused with a 422, and the link inserted for the other biosample is rolled
+    back.
+    """
+    inserted_idxs = _record_link_inserts(monkeypatch)
+    user_idx = ctx["user_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=user_idx, suffix="bulk-link-rollback")
+    linkable_idx = await _seed_biosample_owned_by(ctx, "user")
+    retired_link_idx = await _seed_biosample_owned_by(ctx, "user")
+    await seed_biosample_to_study_link(
+        ctx["pool"], biosample_idx=retired_link_idx, study_idx=study_idx, created_by_idx=user_idx
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"], biosample_idx=retired_link_idx, study_idx=study_idx, retired_by_idx=user_idx
+    )
+
+    resp = await _post_bulk_link(
+        ctx["user"], study_idx, IDX_KEY, [str(linkable_idx), str(retired_link_idx)]
+    )
+
+    linkable_row = await _fetch_link_row(
+        ctx["pool"], biosample_idx=linkable_idx, study_idx=study_idx
+    )
+    outcome = (resp.status_code, inserted_idxs, linkable_row)
+    assert outcome == (422, [linkable_idx, retired_link_idx], None)
 
 
 async def test_link_biosamples_bulk_unknown_value(ctx):

@@ -701,9 +701,13 @@ class BiosampleLookupRequest(NaturalKeyLookupRequest):
         return self
 
 
-# The kinds of identifier that a study-scoped biosample lookup accepts: the
-# natural keys, the biosample's idx, and a unique-in-study field of the study.
-BiosampleStudyLookupKey = Literal[*get_args(BiosampleLookupKey), "idx", "unique_field"]
+# The kinds of identifier that name a biosample whatever study it is in: the natural
+# keys and the biosample's idx.
+BiosampleIdentifierKey = Literal[*get_args(BiosampleLookupKey), "idx"]
+
+# The kinds of identifier that a study-scoped biosample lookup accepts: those that
+# name a biosample in any study, and a unique-in-study field of the study.
+BiosampleStudyLookupKey = Literal[*get_args(BiosampleIdentifierKey), "unique_field"]
 
 
 class BiosampleStudyLookupRequest(BiosampleLookupRequest):
@@ -726,10 +730,6 @@ class BiosampleStudyLookupRequest(BiosampleLookupRequest):
             raise ValueError("unique_field_display_name is allowed only when key is unique_field")
         return self
 
-
-# The kinds of identifier that name a biosample whatever study it is in: the natural
-# keys and the biosample's idx.
-BiosampleIdentifierKey = Literal[*get_args(BiosampleLookupKey), "idx"]
 
 BIOSAMPLE_BULK_LINK_MAX_VALUES = 2_000
 

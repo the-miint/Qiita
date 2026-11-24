@@ -1150,7 +1150,13 @@ def _biosample_named_by(key: str, value: str) -> str:
     return f"biosample with {key} {value!r}"
 
 
-@router.post(PATH_BIOSAMPLE_BULK_LINK_BY_STUDY, status_code=201)
+@router.post(
+    PATH_BIOSAMPLE_BULK_LINK_BY_STUDY,
+    status_code=201,
+    responses={
+        422: {"description": "Values that could not be linked; detail is an AllOrNothingFailure"}
+    },
+)
 async def link_biosamples_bulk(
     study_idx: Annotated[int, Field(gt=0)],
     body: BiosampleBulkLinkRequest,
