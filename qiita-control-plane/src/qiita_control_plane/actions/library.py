@@ -44,6 +44,7 @@ from qiita_common.assembly_constants import (
     register_contig_attribute_table,
 )
 from qiita_common.data_plane_errors import is_data_plane_busy
+from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
@@ -1333,8 +1334,10 @@ def _do_get_reference_taxonomy(data_plane_url: str, ticket_bytes: bytes, out_pat
     fully materializes in memory. The writer is created from the stream schema
     up front, so an empty stream still writes a valid, correctly-typed Parquet
     (a reference with no taxonomy loaded → every genome sorts as unclassified)."""
-    with _flight.FlightClient(data_plane_url) as client:
-        reader = client.do_get(_flight.Ticket(ticket_bytes)).to_reader()
+    with (
+        _flight.FlightClient(data_plane_url) as client,
+        counted_doget(client, ticket_bytes, name=out_path.name) as reader,
+    ):
         writer = pq.ParquetWriter(
             str(out_path), reader.schema, compression=PARQUET_COMPRESSION_INTERMEDIATE
         )

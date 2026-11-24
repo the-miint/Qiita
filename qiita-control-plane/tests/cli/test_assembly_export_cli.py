@@ -9,6 +9,7 @@ is exercised. The live data plane path is `tests/integration/test_assembly_expor
 
 import argparse
 import csv
+import json
 import random
 
 import pyarrow as pa
@@ -133,6 +134,16 @@ class _FakeFlight:
         ps, table = ticket.ticket.decode().split(":")
         self.served.append((int(ps), table))
         return _Stream(self._tables[(int(ps), table)])
+
+    def do_action(self, action, *options):
+        """The `count_doget` the stream is checked against: the rows the DoGet of
+        the same ticket serves."""
+        import pyarrow.flight as flight  # noqa: PLC0415
+
+        assert action.type == "count_doget"
+        ps, table = action.body.to_pybytes().decode().split(":")
+        rows = self._tables[(int(ps), table)].num_rows
+        return [flight.Result(json.dumps({"count": rows}).encode())]
 
 
 def _sample(ps: int, accession: str | None = "SAMEA1", state: str = "completed") -> dict:

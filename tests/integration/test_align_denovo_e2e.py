@@ -322,7 +322,11 @@ def _install_real_streams(monkeypatch, denovo):
             denovo["data_plane"]["secret"],
         )
         with data_plane_client.open_doget_stream(
-            conn, data_plane_url=url, ticket_bytes=ticket, relation=relation
+            conn,
+            data_plane_url=url,
+            ticket_bytes=ticket,
+            relation=relation,
+            require_drained=True,
         ) as rel:
             yield rel
 

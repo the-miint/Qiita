@@ -43,6 +43,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_TABLE,
 )
 from qiita_common.duckdb_relation import registered
+from qiita_common.flight_stream import counted_doget
 
 from .config import get_settings
 from .cp_client import make_cp_client
@@ -56,6 +57,7 @@ from .cp_client import make_cp_client
 # handling policy to `ignore` to silence it; operators can override via the
 # env var if they want the paranoid `reallocate` behaviour.
 os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
+
 
 if TYPE_CHECKING:
     import duckdb
@@ -102,6 +104,7 @@ def open_doget_stream(
     data_plane_url: str,
     ticket_bytes: bytes,
     relation: str = "reference_chunks",
+    require_drained: bool = False,
 ) -> Iterator[str]:
     """Stream a signed DoGet ticket into `conn` as `relation`.
 
@@ -120,13 +123,21 @@ def open_doget_stream(
     lazily-consumed reader); both are torn down and the relation unregistered on
     exit. `ticket_bytes` is the raw signed ticket from a `fetch_*_doget_ticket` call
     (already base64-decoded).
+
+    The stream is checked against the data plane's count of its rows
+    (`qiita_common.flight_stream.CountedStream`, which also says what
+    `require_drained` adds).
     """
     import pyarrow.flight as flight  # noqa: PLC0415
 
     client = flight.FlightClient(data_plane_url)
     try:
-        reader = client.do_get(flight.Ticket(ticket_bytes)).to_reader()
-        with registered(conn, relation, reader):
+        with (
+            counted_doget(
+                client, ticket_bytes, name=relation, require_drained=require_drained
+            ) as reader,
+            registered(conn, relation, reader),
+        ):
             yield relation
     finally:
         client.close()
@@ -138,6 +149,7 @@ async def _open_ticket_stream(
     *,
     mint: Callable[[httpx.AsyncClient], Awaitable[bytes]],
     relation: str,
+    require_drained: bool = False,
 ) -> AsyncIterator[str]:
     """Compose the two seams every public opener shares: mint a signed DoGet ticket
     (CO→CP) then stream it (CO→DP Flight) into `conn` as `relation`.
@@ -157,6 +169,7 @@ async def _open_ticket_stream(
         data_plane_url=get_settings().data_plane_url,
         ticket_bytes=ticket,
         relation=relation,
+        require_drained=require_drained,
     ) as rel:
         yield rel
 
@@ -348,6 +361,11 @@ async def open_read_masked_stream(
     and a zero-row Arrow stream still carries its schema, so a caller materializes a
     valid empty table and runs to a clean no-op.
 
+    **The body must read every row** (`require_drained`, see
+    `qiita_common.flight_stream.CountedStream`): an aligner emits no row for a read
+    it never saw, so its output cannot show one went missing, and the count is the
+    only place a lost read shows.
+
     Rides the shared `_open_ticket_stream`, so the CP client is closed as soon as
     the ticket is minted; only the Flight client/stream stays open for the body's
     duration. `data_plane_url` resolves from `get_settings()`.
@@ -358,7 +376,9 @@ async def open_read_masked_stream(
             http=http, prep_sample_idx=prep_sample_idx, mask_idx=mask_idx, columns=columns
         )
 
-    async with _open_ticket_stream(conn, mint=_mint, relation=relation) as rel:
+    async with _open_ticket_stream(
+        conn, mint=_mint, relation=relation, require_drained=True
+    ) as rel:
         yield rel
 
 

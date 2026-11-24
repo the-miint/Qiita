@@ -644,6 +644,7 @@ source = { directory = "../../qiita-common" }
 dependencies = [
     { name = "duckdb" },
     { name = "httpx" },
+    { name = "pyarrow" },
     { name = "pydantic", extra = ["email"] },
     { name = "pyyaml" },
 ]
@@ -652,6 +653,7 @@ dependencies = [
 requires-dist = [
     { name = "duckdb", specifier = "==2.0.0" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "pyarrow", specifier = ">=19" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]

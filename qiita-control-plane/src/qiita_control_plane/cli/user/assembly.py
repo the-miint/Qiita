@@ -46,6 +46,7 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.chunking import reassemble_chunks_expr
 from qiita_common.duckdb_relation import registered
+from qiita_common.flight_stream import counted_doget
 from qiita_common.models import AssemblySampleState
 from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.sql import sql_string_literal
@@ -146,8 +147,10 @@ def _stage_run_table(con, flight_client, ticket: bytes, *, relation: str, table_
     options = flight.FlightCallOptions(
         read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
     )
-    reader = flight_client.do_get(flight.Ticket(ticket), options).to_reader()
-    with registered(con, relation, reader) as source:
+    with (
+        counted_doget(flight_client, ticket, name=relation, options=options) as reader,
+        registered(con, relation, reader) as source,
+    ):
         con.execute(table_sql(source))
 
 

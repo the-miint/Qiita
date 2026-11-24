@@ -356,6 +356,25 @@ pub(super) fn doget_fixture(
     (service, ticket, tmp)
 }
 
+/// A service over the test catalog, for a test that seeds its own rows. The
+/// returned `TempDir` owns the staging and scratch roots, as for `doget_fixture`.
+#[cfg(feature = "integration")]
+pub(super) fn lake_service() -> (QiitaFlightService, tempfile::TempDir) {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let tmp = tempfile::tempdir().unwrap();
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let service = QiitaFlightService::new(
+        test_vk(),
+        test_pool(&connstr, &data_path),
+        2,
+        staging,
+        tmp.path().to_path_buf(),
+    );
+    (service, tmp)
+}
+
 /// The projection the feature-table consumer signs. Mirrors
 /// `_ALIGNMENT_COLUMNS` in `estimate_feature_table.py`; used by the
 /// compression tests, which care about the stream, not the column set.

@@ -214,6 +214,17 @@ class _FakeFlightClient:
         self.tickets.append(ticket.ticket)
         return _FakeStream(self._readers[ticket.ticket]())
 
+    def do_action(self, action, *options):
+        """The `count_doget` the stream is checked against: the rows the DoGet of
+        the same ticket serves."""
+        import pyarrow.flight as flight  # noqa: PLC0415
+
+        assert action.type == "count_doget"
+        factory = self._readers[action.body.to_pybytes()]
+        counter = getattr(factory, "count", None)
+        rows = counter() if counter is not None else factory().read_all().num_rows
+        return [flight.Result(json.dumps({"count": rows}).encode())]
+
     def close(self):
         self.closed = True
 
@@ -1965,7 +1976,14 @@ _TWO_POOL_RESOLVE = {
 
 
 def _patched_two_pools(
-    monkeypatch, *, resolve=None, listings=None, denovo_map=None, alignment=None
+    monkeypatch,
+    *,
+    resolve=None,
+    listings=None,
+    denovo_map=None,
+    alignment=None,
+    overcounted=None,
+    reshaped=None,
 ):
     """`_patched` over the two pools above, with an alignment ticket per alignment and
     the de novo seams keyed by `(prep_sample_idx, processing_idx)`. Records each
@@ -2072,6 +2090,9 @@ def _patched_two_pools(
 
             return pa.RecordBatchReader.from_batches(inner.schema, batches())
 
+        # The fake's `count_doget` answer, counted without draining a reader: a drain
+        # here would record a "drained" event at count time, before the real one.
+        reader.count = lambda: sum(r[0] in rec["tickets"][alignment_idx] for r in rows)
         return reader
 
     rows = _ALIGNMENT if alignment is None else alignment
@@ -2083,6 +2104,33 @@ def _patched_two_pools(
         _LENGTHS_TICKET: _lengths_reader,
         _DENOVO_LENGTHS_TICKET: lambda: _lengths_reader_rows(_DENOVO_LENGTHS),
     }
+    if overcounted is not None:
+        # The data plane counts one row more than this ticket's stream delivers.
+        short = readers[overcounted]
+        counted = short.count
+
+        def overcount():
+            return counted() + 1
+
+        def factory():
+            return short()
+
+        factory.count = overcount
+        readers[overcounted] = factory
+    if reshaped is not None:
+        # This ticket's stream carries its columns under other names.
+        original = readers[reshaped]
+
+        def renamed():
+            inner = original()
+            names = [f"renamed_{n}" for n in inner.schema.names]
+            schema = pa.schema([f.with_name(n) for f, n in zip(inner.schema, names, strict=True)])
+            return pa.RecordBatchReader.from_batches(
+                schema, (batch.rename_columns(names) for batch in inner)
+            )
+
+        renamed.count = original.count
+        readers[reshaped] = renamed
     monkeypatch.setattr("pyarrow.flight.FlightClient", lambda url: _FakeFlightClient(url, readers))
     return rec
 
@@ -3033,3 +3081,30 @@ def test_an_exact_read_names_its_deprecated_upstream_as_read_under_include_depre
     assert "alignment 3 reads mask 6, which is deprecated" in err
     assert err.rstrip().endswith(f"read under {INCLUDE_DEPRECATED_FLAG}")
     assert INCLUDE_DEPRECATED_UPSTREAM_FLAG not in err
+
+
+def test_a_short_later_part_is_reported_as_a_short_stream(monkeypatch, tmp_path, capsys):
+    """Part 2's stream ends one row short of the data plane's count. Its check fails
+    inside DuckDB's scan, which DuckDB reports as its own error; the build reports the
+    short stream, not the analytic failing."""
+    _patched_two_pools(monkeypatch, overcounted=b"alignment-13")
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "error: the stream" in err
+    assert "stream 2 of 2" in err
+    assert "the analytic failed" not in err
+
+
+def test_a_later_part_of_another_schema_is_reported_as_such(monkeypatch, tmp_path, capsys):
+    """Part 2's stream carries columns the first does not. The refusal is raised
+    inside DuckDB's scan, which DuckDB reports as its own error; the build reports
+    the schema, not the analytic failing."""
+    _patched_two_pools(monkeypatch, reshaped=b"alignment-13")
+    args = _two_pool_args(tmp_path, prep_sample_idx=[1, 2])
+
+    assert ftc._handle_feature_table_build(args, parser=None) == 1
+    err = capsys.readouterr().err
+    assert "stream 2 of 2 has schema" in err
+    assert "the analytic failed" not in err

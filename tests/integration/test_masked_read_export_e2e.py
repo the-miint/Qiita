@@ -379,12 +379,12 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
 async def test_masked_read_export_e2e_parquet_idempotent_recount(
     data_plane, seeded, postgres_pool, tmp_path, monkeypatch, capsys
 ):
-    """Re-export idempotency over the REAL count_masked DoAction: a second run with
-    nothing changed skips (the data plane's read_mask count matches the on-disk
-    parquet record count); after a pass read is added, the next run sees the higher
-    count and overwrites. Proves the cheap count(*) probe and the skip/overwrite
-    decision end to end against the live data plane — the piece the faked CLI unit
-    tests can't reach (they stub the count response)."""
+    """Re-export idempotency over the REAL count_doget DoAction: a second run with
+    nothing changed skips (the data plane's count of the ticket's rows matches the
+    on-disk parquet record count); after a pass read is added, the next run sees the
+    higher count and overwrites. Proves the count and the skip/overwrite decision end
+    to end against the live data plane — the piece the faked CLI unit tests can't
+    reach (they stub the count response)."""
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
@@ -459,7 +459,7 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
     assert "exported 0 prep_sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
     assert _rows() == 2
 
-    # Add a third pass read so the live count_masked now returns 3, not 2.
+    # Add a third pass read so the live count_doget now returns 3, not 2.
     conn = ducklake_connect(data_plane["data_path"])
     try:
         conn.execute(

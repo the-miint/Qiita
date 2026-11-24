@@ -13,7 +13,8 @@
 //!   SQL for each ticket surface, including the block-read filter helpers.
 //! - `doput`: the staging path an upload lands at, and staging an uploaded Arrow
 //!   stream as Parquet.
-//! - `export`: the `export_read`, `count_masked` and `mask_metrics` DoActions.
+//! - `export`: the `export_read`, `count_masked`, `count_doget` and `mask_metrics`
+//!   DoActions.
 //! - `registration`: the `register_files` DoAction, the lake commit retry, which
 //!   lake locks a registration takes, and placing files in lake storage.
 //! - `lake_edit`: the DoActions that change the lake other than registration: the
@@ -47,7 +48,7 @@ mod registration;
 mod test_support;
 
 use doget::{requested_ipc_codec, stream_ducklake_batches};
-use query::{build_query, ALLOWED_TABLES};
+use query::ticket_query;
 
 /// The qiita data plane Flight service.
 pub struct QiitaFlightService {
@@ -210,7 +211,7 @@ impl QiitaFlightService {
 ///   exports that used to sit beside it are gone: block-scoped compute now
 ///   STREAMS its reads over the `read_block` / `read_masked_block` DoGet
 ///   selectors, which are read-only and need no replay classification.)
-/// - `count_masked` / `mask_metrics` — read-only aggregates.
+/// - `count_masked` / `count_doget` / `mask_metrics` — read-only aggregates.
 /// - `sync_reference_exclusion` — full-replace of the `reference_exclusion`
 ///   mirror from the CP's resolved blocklist Parquet (one DELETE + INSERT
 ///   transaction); a replay reloads the same authoritative set, so the table
@@ -236,6 +237,7 @@ const REPLAY_SAFE_ACTIONS: &[&str] = &[
     "delete_alignment_sample",
     "export_read",
     "count_masked",
+    "count_doget",
     "mask_metrics",
     "sync_reference_exclusion",
     "mint_phylogeny_edge_id",
@@ -263,25 +265,9 @@ impl FlightService for QiitaFlightService {
         let codec = requested_ipc_codec(request.metadata())?;
         let ticket_bytes = &request.into_inner().ticket;
 
-        // Verify Ed25519 signature, expiry, and parse payload
         let payload = auth::verify_ticket(ticket_bytes, &self.flight_public_key)
             .map_err(|e| Status::unauthenticated(e.to_string()))?;
-
-        // Validate table name
-        if !ALLOWED_TABLES.contains(&payload.table.as_str()) {
-            return Err(Status::invalid_argument(format!(
-                "unknown table: {:?}",
-                payload.table
-            )));
-        }
-
-        // Build query from filter
-        let (sql, table) = build_query(
-            &payload.table,
-            &payload.filter,
-            &payload.members,
-            &payload.columns,
-        )?;
+        let (sql, table) = ticket_query(&payload)?;
 
         // Stream the result incrementally, from an instance borrowed for the
         // life of the stream: a blocking task feeds RecordBatches through a
@@ -401,6 +387,7 @@ impl FlightService for QiitaFlightService {
             "delete_alignment_sample" => self.delete_alignment_sample_action(&action).await,
             "export_read" => self.export_read_action(&action).await,
             "count_masked" => self.count_masked_action(&action).await,
+            "count_doget" => self.count_doget_action(&action).await,
             "mask_metrics" => self.mask_metrics_action(&action).await,
             "sync_reference_exclusion" => self.sync_reference_exclusion_action(&action).await,
             "mint_phylogeny_edge_id" => self.mint_phylogeny_edge_id_action(&action).await,

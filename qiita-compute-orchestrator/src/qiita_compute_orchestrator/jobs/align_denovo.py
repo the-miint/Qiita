@@ -377,8 +377,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # The query, and the ONE reference to the read stream. A VIEW carrying
             # exactly what `align_minimap2` reads: `sequence_idx` as the read identity,
             # and no `sequence2` — its mere presence would put the aligner in
-            # paired-end mode. The CREATE TABLE below drains it.
-            #
+            # paired-end mode. The CREATE TABLE below drains it, and
+            # `open_read_masked_stream` checks on exit that it read every row.
             async with open_read_masked_stream(
                 conn,
                 prep_sample_idx=inputs.prep_sample_idx,

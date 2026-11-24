@@ -35,6 +35,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.data_plane_errors import is_data_plane_transient
 from qiita_common.flight_constants import ipc_compression_headers
+from qiita_common.flight_stream import StreamRowCountMismatch, count_doget, counted_stream
 from qiita_common.models import (
     MaskedReadExportSample,
     SampleResolution,
@@ -171,7 +172,9 @@ def _peek_paired(reader):
     return paired, stream
 
 
-def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> list[str]:
+def _write_masked_sample(
+    reader, stem: str, output_dir: Path, fmt: str, con, verify=None
+) -> list[str]:
     """Write one sample's streamed masked reads under output_dir, atomically (via
     a `.partial` sibling renamed into place) and chmod 0600, and return the names
     of the files committed. Both formats stream the Arrow `reader` (bounded memory,
@@ -194,7 +197,16 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
                 `<stem>.R2.fastq.gz` via miint's `{ORIENTATION}` placeholder
                 (paired rows into a single path are a hard error in the writer;
                 should the per-sample SE/PE uniformity ever break, a misdetected
-                single-end COPY hits that error and fails loudly)."""
+                single-end COPY hits that error and fails loudly).
+
+    `verify`, when given, runs after the write and before the `.partial` files are
+    renamed into place: a stream whose row count check fails leaves no file."""
+
+    def _then_verify(write) -> None:
+        write()
+        if verify is not None:
+            verify()
+
     if fmt == "parquet":
         import pyarrow as pa  # noqa: PLC0415
         import pyarrow.parquet as pq  # noqa: PLC0415
@@ -232,7 +244,9 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
             finally:
                 writer.close()
 
-        _commit_partials(_write_parquet, [(partial, output_dir / f"{stem}.parquet")])
+        _commit_partials(
+            lambda: _then_verify(_write_parquet), [(partial, output_dir / f"{stem}.parquet")]
+        )
         return [f"{stem}.parquet"]
     if fmt == "fastq":
         paired, stream = _peek_paired(reader)
@@ -248,9 +262,11 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
         else:
             target = pairs[0][0]
         _commit_partials(
-            lambda: con.execute(
-                f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
-                f"TO {sql_string_literal(target)} (FORMAT FASTQ, COMPRESSION 'gzip')"
+            lambda: _then_verify(
+                lambda: con.execute(
+                    f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
+                    f"TO {sql_string_literal(target)} (FORMAT FASTQ, COMPRESSION 'gzip')"
+                )
             ),
             pairs,
         )
@@ -317,20 +333,6 @@ def _parquet_row_count(path: Path) -> int:
     import pyarrow.parquet as pq  # noqa: PLC0415
 
     return pq.ParquetFile(path).metadata.num_rows
-
-
-def _count_masked(flight_client, ticket_bytes: bytes) -> int:
-    """How many masked reads the signed ticket selects, via the data plane's
-    ``count_masked`` DoAction — a cheap ``count(*)`` against the light ``read_mask``
-    table that never streams or materializes the read sequences. Reuses the very
-    ticket the export streams with: counting is strictly less than reading, so the
-    ticket's ``(prep_sample_idx, mask_idx)`` authorization already covers it."""
-    import pyarrow.flight as flight  # noqa: PLC0415
-
-    results = list(flight_client.do_action(flight.Action("count_masked", ticket_bytes)))
-    if not results:
-        raise RuntimeError("count_masked DoAction returned no result")
-    return json.loads(results[0].body.to_pybytes())["count"]
 
 
 # The output directory's record of which prep_sample and which mask each exported file
@@ -821,19 +823,25 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                     },
                 )
                 ticket_bytes = base64.b64decode(ticket_resp["ticket"])
-                # Idempotent parquet re-export: only probe the data plane's count
-                # when a recorded output file already exists (a first export pays
-                # nothing), then skip on a match (nothing changed) and fall through
-                # to overwrite on a mismatch. An adopted file is always rewritten, and
-                # fastq took the all-or-nothing existence check above, so both export.
+                # Idempotent parquet re-export: skip a recorded output file whose row
+                # count matches (nothing changed), and fall through to overwrite on a
+                # mismatch. An adopted file is always rewritten, and fastq took the
+                # all-or-nothing existence check above, so both export.
+                # The data plane's count of the ticket's rows, taken once: it is what an
+                # existing file is compared with, and what the stream is checked against.
+                expected_rows = count_doget(flight_client, ticket_bytes)
                 if args.format == "parquet" and not rewrite:
                     target = output_dir / f"{stem}.parquet"
-                    if target.exists() and _parquet_row_count(target) == _count_masked(
-                        flight_client, ticket_bytes
-                    ):
+                    if target.exists() and _parquet_row_count(target) == expected_rows:
                         return [target.name], False
-                reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
-                return _write_masked_sample(reader, stem, output_dir, args.format, con), True
+                stream = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts)
+                with counted_stream(
+                    stream.to_reader(), expected_rows=expected_rows, name=stem
+                ) as counted:
+                    written = _write_masked_sample(
+                        counted.reader, stem, output_dir, args.format, con, verify=counted.verify
+                    )
+                return written, True
 
             try:
                 names, written = _with_retry(export_one, prep, args.retry_seconds)
@@ -874,7 +882,13 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     except flight.FlightError as exc:
         print(f"flight error: {exc}", file=sys.stderr)
         return 1
-    except (duckdb.Error, OSError, pa.ArrowInvalid, pa.ArrowKeyError) as exc:
+    except (
+        duckdb.Error,
+        OSError,
+        pa.ArrowInvalid,
+        pa.ArrowKeyError,
+        StreamRowCountMismatch,
+    ) as exc:
         # The types the environment raises at these sites; a plain ValueError or
         # RuntimeError from a bug still ends in a traceback. A data plane failure
         # after the first batch lands here rather than above: the parquet path's
@@ -882,6 +896,8 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         # ArrowInvalid and ArrowKeyError are pyarrow refusing an input, among
         # them --data-plane-url (unparseable, or a scheme with no Flight
         # transport, such as http) and an existing parquet target it cannot read.
+        # StreamRowCountMismatch is a stream that delivered a different number of
+        # rows than the data plane counted for its ticket.
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:

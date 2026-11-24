@@ -482,6 +482,25 @@ fn is_bin_quality_surface(table: &str) -> bool {
     table == "bin_quality"
 }
 
+/// The query a verified DoGet ticket selects: what `do_get` streams and what
+/// `count_doget` counts, from one path so the two cannot select different rows.
+/// Each caller verifies the ticket itself, mapping a failure to `unauthenticated`.
+/// Returns `(sql, table)` as `build_query` does.
+pub(super) fn ticket_query(payload: &auth::TicketPayload) -> Result<(String, String), Status> {
+    if !ALLOWED_TABLES.contains(&payload.table.as_str()) {
+        return Err(Status::invalid_argument(format!(
+            "unknown table: {:?}",
+            payload.table
+        )));
+    }
+    build_query(
+        &payload.table,
+        &payload.filter,
+        &payload.members,
+        &payload.columns,
+    )
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
