@@ -18,6 +18,11 @@ AMPLICON_MEMBERSHIP_VISIBLE_TABLE = "amplicon_membership_visible"
 # rather than in a separate chunk table — unlike a reference genome, which is chunked.
 AMPLICON_SEQUENCE_TABLE = "amplicon_sequence"
 
+# action_context keys of two amplicon knobs: the processing params hash them, and
+# a run feature table merges runs only where they agree.
+TRIM_BINDING = "trim"
+ORIENT_PRIMER_BINDING = "orient_primer"
+
 # register-files names a staged table after its file stem.
 AMPLICON_MEMBERSHIP_BASENAME = f"{AMPLICON_MEMBERSHIP_TABLE}.parquet"
 AMPLICON_SEQUENCE_BASENAME = f"{AMPLICON_SEQUENCE_TABLE}.parquet"

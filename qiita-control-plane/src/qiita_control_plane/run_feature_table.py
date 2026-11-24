@@ -36,6 +36,8 @@ from qiita_common import analytic as ft
 from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
+    ORIENT_PRIMER_BINDING,
+    TRIM_BINDING,
 )
 from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import MAX_COHORT_PREP_SAMPLE_IDX
@@ -88,7 +90,7 @@ SOURCES: dict[str, Source] = {
         values_table=AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
         value_column="count",
         sequences_table=AMPLICON_SEQUENCE_TABLE,
-        merge_keys=("trim", "orient_primer"),
+        merge_keys=(TRIM_BINDING, ORIENT_PRIMER_BINDING),
         noun="ASVs",
         feature_id_note="exported-feature handle (QF); the sequence companion maps it to md5",
     ),

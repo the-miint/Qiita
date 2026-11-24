@@ -10,8 +10,7 @@ from qiita_common.models._base import PrepSampleCohort
 
 PositiveIdx = Annotated[int, Field(gt=0)]
 
-# The most runs one feature-table request may merge; the data plane bounds its
-# tickets the same way.
+# The most runs one feature-table request may merge.
 MAX_FEATURE_TABLE_RUNS = 32
 
 # What a table's values are: reads counted per feature (amplicon ASVs).
