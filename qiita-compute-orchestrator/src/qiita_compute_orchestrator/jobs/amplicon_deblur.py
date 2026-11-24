@@ -154,7 +154,7 @@ def _kept(conn, table: str, stage: str, before: list[int]) -> list[int]:
     """Log what a stage left in `table` (sample_id, sequence1, abundance), warn on
     the samples it dropped from `before`, and return the samples it kept."""
     per_sample = conn.execute(
-        f"SELECT sample_id::BIGINT, sum(abundance)::BIGINT FROM {table} GROUP BY 1 ORDER BY 1"
+        f"SELECT sample_id, sum(abundance)::BIGINT FROM {table} GROUP BY 1 ORDER BY 1"
     ).fetchall()
     unique = conn.execute(f"SELECT count(DISTINCT sequence1) FROM {table}").fetchone()[0]
     kept = [sample for sample, _ in per_sample]
@@ -212,7 +212,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             work_ticket_idx=inputs.work_ticket_idx,
             workspace=duckdb_tmp,
         ) as reads_rel:
-            # _inputs(sample_id, sequence_index, sequence1); sample_id is prep_sample_idx.
+            # _inputs(sample_id, sequence_index, sequence1). The miint table functions
+            # below (align_mafft, detect_chimera_uchime_denovo, deblur) key on a column
+            # literally named `sample_id`, so prep_sample_idx is aliased to it here and
+            # aliased back on the way out (the asv table).
             conn.execute(
                 "CREATE OR REPLACE VIEW _inputs AS "
                 "SELECT prep_sample_idx AS sample_id, sequence_idx AS sequence_index, sequence1 "
@@ -220,10 +223,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             reads_in = conn.execute("SELECT count(*) FROM _inputs").fetchone()[0]
             samples_in = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT DISTINCT sample_id::BIGINT FROM _inputs ORDER BY 1"
-                ).fetchall()
+                row[0] for row in conn.execute("SELECT DISTINCT sample_id FROM _inputs").fetchall()
             ]
             _LOG.info("input: %d reads over %d samples", reads_in, len(samples_in))
             started = time.monotonic()
@@ -253,7 +253,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             canon = canonical_sequence_hash_expr("sequence1")
             conn.execute(
                 f"CREATE OR REPLACE TABLE asv AS "
-                f"SELECT sample_id::BIGINT AS prep_sample_idx, {canon} AS sequence_hash, "
+                f"SELECT sample_id AS prep_sample_idx, {canon} AS sequence_hash, "
                 f"       SUM(abundance)::BIGINT AS count "
                 f"FROM deblurred GROUP BY prep_sample_idx, sequence_hash"
             )
@@ -266,7 +266,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute(
                 f"CREATE OR REPLACE TABLE asv_seq AS "
                 f"SELECT DISTINCT ON (sequence_hash) sequence_hash, sequence1, "
-                f"       length(sequence1)::BIGINT AS sequence_length_bp "
+                f"       length(sequence1) AS sequence_length_bp "
                 f"FROM (SELECT {canon} AS sequence_hash, sequence1 FROM deblurred) "
                 f"ORDER BY sequence_hash, sequence1"
             )

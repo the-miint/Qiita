@@ -171,7 +171,7 @@ def _write_amplicon_sequences(
     conn.execute(
         "COPY ("
         "  SELECT fm.feature_idx, s.sequence_hash,"
-        "         length(s.sequence)::BIGINT AS sequence_length_bp,"
+        "         length(s.sequence) AS sequence_length_bp,"
         "         s.sequence"
         "  FROM read_parquet(?) s JOIN feature_map fm ON s.sequence_hash = fm.sequence_hash"
         "  ORDER BY fm.feature_idx"
