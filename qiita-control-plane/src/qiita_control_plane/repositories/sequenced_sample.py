@@ -524,6 +524,23 @@ async def fetch_sequenced_pool_item_prep_sample_idxs(
     return {r["sequenced_pool_item_id"]: r["prep_sample_idx"] for r in rows}
 
 
+async def fetch_pool_prep_sample_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> list[int]:
+    """Every prep_sample of a pool, via its 1:1 sequenced_sample. The pool's RAW
+    membership — retired and ena_status-flagged samples included, unlike
+    `fetch_sequenced_pool_item_prep_sample_idxs`, which keeps only the active
+    roster. sequenced_sample ↔ prep_sample is 1:1 and each sequenced_sample is in
+    exactly one pool, so this set is exclusive to the pool."""
+    return [
+        r["prep_sample_idx"]
+        for r in await pool_or_conn.fetch(
+            "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
+            sequenced_pool_idx,
+        )
+    ]
+
+
 async def fetch_pool_members(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
 ) -> list[tuple[int, int, int]]:
