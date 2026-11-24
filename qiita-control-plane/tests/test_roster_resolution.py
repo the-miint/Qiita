@@ -10,7 +10,7 @@ import pytest
 from qiita_common.models import (
     BiosampleLookupKey,
     BiosampleRef,
-    RosterProblem,
+    RequestItemProblem,
     RosterResolvedRow,
     RosterResolveRow,
     SequencedSampleCreateRequest,
@@ -151,7 +151,7 @@ def test_classify_roster_each_identifier_alone(biosample, primary):
 def test_classify_roster_each_identifier_miss(biosample, primary, message):
     """Tests the case where the only identifier given for an entity names nothing."""
     result = classify_roster([_row(biosample=biosample, primary=primary)], _facts())
-    assert result == ([], [RosterProblem(item_id="1", message=message)])
+    assert result == ([], [RequestItemProblem(item_id="1", message=message)])
 
 
 def test_classify_roster_all_identifiers_agree():
@@ -180,7 +180,9 @@ def test_classify_roster_miss_alongside_hit():
     names nothing: the miss refuses the row."""
     row = _row(biosample={"export_entity_id": "QB21", "biosample_accession": "SAMN404"})
     result = classify_roster([row], _facts())
-    expected = RosterProblem(item_id="1", message="no biosample has biosample_accession 'SAMN404'")
+    expected = RequestItemProblem(
+        item_id="1", message="no biosample has biosample_accession 'SAMN404'"
+    )
     assert result == ([], [expected])
 
 
@@ -204,13 +206,13 @@ def test_classify_roster_miss_alongside_hit():
 def test_classify_roster_identifiers_disagree(biosample, primary, message):
     """Tests the case where two identifiers given for one entity name different ones."""
     result = classify_roster([_row(biosample=biosample, primary=primary)], _facts())
-    assert result == ([], [RosterProblem(item_id="1", message=message)])
+    assert result == ([], [RequestItemProblem(item_id="1", message=message)])
 
 
 def test_classify_roster_malformed_tube():
     """Tests the case where the tube is not a matrix tube id at all."""
     result = classify_roster([_row(biosample={"matrix_tube_id": "800805.001.V1.Plasma"})], _facts())
-    expected = RosterProblem(
+    expected = RequestItemProblem(
         item_id="1", message="'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"
     )
     assert result == ([], [expected])
@@ -232,7 +234,7 @@ def test_classify_roster_primary_not_linked():
         biosample={"biosample_accession": "SAMN2"}, primary={"bioproject_accession": "PRJNA2"}
     )
     result = classify_roster([row], _facts())
-    expected = RosterProblem(
+    expected = RequestItemProblem(
         item_id="1",
         message="the biosample with biosample_accession 'SAMN2' is not in the study"
         " with bioproject_accession 'PRJNA2'",
@@ -244,7 +246,7 @@ def test_classify_roster_secondary_not_linked():
     """Tests the case where one secondary study is linked and another is not."""
     row = _row(secondaries=({"bioproject_accession": "PRJNA2"}, {"bioproject_accession": "PRJNA3"}))
     result = classify_roster([row], _facts())
-    expected = RosterProblem(
+    expected = RequestItemProblem(
         item_id="1",
         message="the biosample with biosample_accession 'SAMN1' is not in the study"
         " with bioproject_accession 'PRJNA3'",
@@ -257,7 +259,7 @@ def test_classify_roster_secondary_is_primary():
     resolves to the primary's study: the row is refused rather than resolved."""
     row = _row(secondaries=({"export_entity_id": "QS101"},))
     result = classify_roster([row], _facts())
-    expected = RosterProblem(
+    expected = RequestItemProblem(
         item_id="1",
         message="the study with export_entity_id 'QS101' is also the primary project",
     )
@@ -301,7 +303,7 @@ def test_classify_roster_request_order():
     ]
     result = classify_roster(rows, _facts())
     expected_problems = [
-        RosterProblem(item_id="bad1", message="no biosample has export_entity_id 'QB404'"),
-        RosterProblem(item_id="bad2", message="no study has export_entity_id 'QS404'"),
+        RequestItemProblem(item_id="bad1", message="no biosample has export_entity_id 'QB404'"),
+        RequestItemProblem(item_id="bad2", message="no study has export_entity_id 'QS404'"),
     ]
     assert result == ([_resolved("ok1", 21), _resolved("ok2", 22)], expected_problems)

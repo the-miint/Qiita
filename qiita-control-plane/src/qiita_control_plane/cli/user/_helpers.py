@@ -3,6 +3,7 @@
 import argparse
 import math
 import sqlite3
+import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -270,17 +271,24 @@ def _handle_study_scoped_call(args: argparse.Namespace, parser: argparse.Argumen
     and the names of any repeatable KEY=VALUE flags. Both the fold and the
     body construction precede the token read, so invalid flags exit 2
     without a request going out. A study named by its export id is resolved
-    to its idx before the path is filled.
+    to its idx before the path is filled. A command may also supply
+    `study_call_reuse_note`, a template filled like the path, which is printed to
+    stderr when the route answers 200.
     """
     _fold_flag_values(args, parser, args.study_call_kv_flags, _common.parse_kv_pairs)
     model = args.study_call_model
     body = None if model is None else _build_body(model, args, parser)
     method = args.study_call_method
+    reuse_note = getattr(args, "study_call_reuse_note", None)
 
     def _run(token: str) -> dict | list:
         _common.resolve_study_idx(args, parser, args.base_url, token)
         path = args.study_call_path.format(**vars(args))
-        response = _common.call(method, args.base_url, token, path, json=body)
+        response, status_code = _common.call_with_status(
+            method, args.base_url, token, path, json=body
+        )
+        if reuse_note is not None and status_code == 200:
+            print(reuse_note.format(**vars(args)), file=sys.stderr)
         return response
 
     return _common.run_http_subcommand(_run)

@@ -23,6 +23,7 @@ from qiita_common.models._base import (
     IDX_KEY,
     MAX_NATURAL_KEY_LOOKUP_VALUES,
     AccessionText,
+    AllOrNothingFailure,
     MetadataRequestModel,
     NaturalKeyLookupRequest,
     NaturalKeyLookupResponse,
@@ -30,6 +31,8 @@ from qiita_common.models._base import (
     NonBlankText,
     PatchRequestModel,
     ReadCounts,
+    RequestItemProblem,
+    check_no_repeats,
 )
 from qiita_common.models.host_filter_profile import HostFilterResolution
 from qiita_common.models.reference import FieldDataType
@@ -140,8 +143,7 @@ class BiosampleImportResponse(BaseModel):
 
 
 class BiosampleStudyLinkResponse(BaseModel):
-    """One qiita.biosample_to_study row, as created by POST
-    /api/v1/study/{study_idx}/biosample/{biosample_idx}/link."""
+    """One qiita.biosample_to_study row."""
 
     biosample_idx: Annotated[int, Field(gt=0)]
     study_idx: Annotated[int, Field(gt=0)]
@@ -674,6 +676,17 @@ BiosampleLookupKey = Literal[
 ]
 
 
+def _check_lookup_value_pattern(key: str, values: list[str]) -> None:
+    """Raise ValueError naming every one of `values` that does not match the
+    pattern that `key`'s values must match; a key with no pattern accepts any."""
+    pattern = _LOOKUP_VALUE_PATTERNS.get(key)
+    if pattern is None:
+        return
+    malformed = [value for value in values if re.fullmatch(pattern, value) is None]
+    if malformed:
+        raise ValueError(f"{key} values must match {pattern}: {malformed}")
+
+
 class BiosampleLookupRequest(NaturalKeyLookupRequest):
     """Resolves a list of values of the biosample natural key named by `key`,
     each to the biosample identifier that `return_key` names. Under
@@ -684,18 +697,17 @@ class BiosampleLookupRequest(NaturalKeyLookupRequest):
 
     @model_validator(mode="after")
     def _check_value_pattern(self) -> BiosampleLookupRequest:
-        pattern = _LOOKUP_VALUE_PATTERNS.get(self.key)
-        if pattern is None:
-            return self
-        malformed = [value for value in self.values if re.fullmatch(pattern, value) is None]
-        if malformed:
-            raise ValueError(f"{self.key} values must match {pattern}: {malformed}")
+        _check_lookup_value_pattern(self.key, self.values)
         return self
 
 
-# The kinds of identifier that a study-scoped biosample lookup accepts: the
-# natural keys, the biosample's idx, and a unique-in-study field of the study.
-BiosampleStudyLookupKey = Literal[*get_args(BiosampleLookupKey), "idx", "unique_field"]
+# The kinds of identifier that name a biosample whatever study it is in: the natural
+# keys and the biosample's idx.
+BiosampleIdentifierKey = Literal[*get_args(BiosampleLookupKey), "idx"]
+
+# The kinds of identifier that a study-scoped biosample lookup accepts: those that
+# name a biosample in any study, and a unique-in-study field of the study.
+BiosampleStudyLookupKey = Literal[*get_args(BiosampleIdentifierKey), "unique_field"]
 
 
 class BiosampleStudyLookupRequest(BiosampleLookupRequest):
@@ -717,6 +729,38 @@ class BiosampleStudyLookupRequest(BiosampleLookupRequest):
         if self.key != UNIQUE_FIELD_KEY and named:
             raise ValueError("unique_field_display_name is allowed only when key is unique_field")
         return self
+
+
+BIOSAMPLE_BULK_LINK_MAX_VALUES = 2_000
+
+
+class BiosampleBulkLinkRequest(BaseModel):
+    """Links the biosamples named by `values`, each a value of the identifier
+    kind that `key` names, into one study. No value may repeat. Under
+    `matrix_tube_id`, every value must be a matrix tube id; under `idx`, a
+    positive whole number that fits an idx.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: BiosampleIdentifierKey
+    values: list[NonBlankText] = Field(min_length=1, max_length=BIOSAMPLE_BULK_LINK_MAX_VALUES)
+
+    @model_validator(mode="after")
+    def _check_values(self) -> BiosampleBulkLinkRequest:
+        _check_lookup_value_pattern(self.key, self.values)
+        check_no_repeats(self.values, field="values")
+        return self
+
+
+class BiosampleBulkLinkResponse(BaseModel):
+    """The values of a bulk biosample link, by outcome: `linked` names a biosample
+    that the request linked, `already_linked` one whose link already existed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    linked: list[str]
+    already_linked: list[str]
 
 
 class BiosampleLookupByAccessionRequest(BaseModel):
@@ -890,23 +934,9 @@ class RosterResolveResponse(BaseModel):
     rows: list[RosterResolvedRow]
 
 
-class RosterProblem(BaseModel):
-    """Why one roster row did not resolve, as a message for the submitter."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    item_id: str
-    message: str
-
-
-class RosterResolveFailure(BaseModel):
-    """The 422 `detail` of POST /api/v1/biosample/resolve-roster: every
-    problem across the roster, so one round trip names them all."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    message: str
-    problems: list[RosterProblem] = Field(min_length=1)
+# Roster-specific names for the shared all-or-nothing models.
+RosterProblem = RequestItemProblem
+RosterResolveFailure = AllOrNothingFailure
 
 
 class BiosamplePatchRequest(PatchRequestModel):

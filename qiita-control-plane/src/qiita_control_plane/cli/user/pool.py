@@ -1,7 +1,4 @@
-"""qiita user CLI — bcl-convert and pool-masking operator gestures.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — bcl-convert and pool-masking operator gestures."""
 
 import argparse
 import base64
@@ -49,7 +46,6 @@ from qiita_common.models import (
     Platform,
     ReferenceStatus,
     RosterResolvedRow,
-    RosterResolveFailure,
     RosterResolveRequest,
     RosterResolveResponse,
     RosterResolveRow,
@@ -159,29 +155,16 @@ def _resolve_roster(
             for row in preflight_rows
         ]
     ).model_dump(mode="json", exclude_none=True)
-    try:
-        resp = _common.call(
-            "POST",
-            base_url,
-            token,
-            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
-            json=body,
-        )
-    except httpx.HTTPStatusError as exc:
-        try:
-            body_json = exc.response.json() if exc.response.status_code == 422 else None
-        except ValueError:
-            body_json = None  # a non-JSON 422 (e.g. from a proxy) is not a roster verdict
-        detail = body_json.get("detail") if isinstance(body_json, dict) else None
-        if not isinstance(detail, dict) or "problems" not in detail:
-            raise  # not a roster verdict (e.g. a request-shape 422)
-        failure = RosterResolveFailure.model_validate(detail)
-        label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
-        lines = [f"error: {failure.message}:"]
-        lines += [f"  - {label_by_item[p.item_id]}: {p.message}" for p in failure.problems]
-        lines.append("fix the registry or the preflight and re-run.")
-        print("\n".join(lines), file=sys.stderr)
-        raise SystemExit(1) from exc
+    label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
+    resp = _common.call_all_or_nothing(
+        "POST",
+        base_url,
+        token,
+        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
+        json=body,
+        label_for=label_by_item.__getitem__,
+        advice="fix the registry or the preflight and re-run.",
+    )
     return {r.item_id: r for r in RosterResolveResponse.model_validate(resp).rows}
 
 

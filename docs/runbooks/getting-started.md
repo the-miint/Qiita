@@ -313,8 +313,25 @@ qiita biosample link --study-export-id "$OTHER_STUDY_EXPORT_ID" --biosample-idx 
 
 `OTHER_STUDY_EXPORT_ID` is the other study's `export_entity_id`, kept from its
 `qiita study create` output as in step 2; `--study-idx` takes its `study_idx` instead.
+A link that already exists is reported and left as it is.
 
-Linking needs `admin` access on that study and ownership of the biosample; a
+To link many biosamples into a study at once, list them in a column of a TSV file,
+headed by the identifier kind (`export_entity_id` unless `--key` names another):
+
+```bash
+qiita biosample bulk-link \
+    --study-export-id "$OTHER_STUDY_EXPORT_ID" \
+    --tsv-file controls.tsv
+```
+
+The request is all or nothing: if any value cannot be linked, the command lists every
+such value and links none; fix those values before running it again. An
+`http error 503` also links none, but its cause is temporary, not a problem with the
+file: for example, someone changed a named biosample's identifier while the command
+ran, so Qiita could not be sure that each value still named the biosample it had
+looked up. Run the same command again, unchanged.
+
+Linking needs `admin` access on that study and ownership of each biosample linked; a
 `wet_lab_admin` needs neither.
 
 Each biosample and project needs at least one of its identifiers. Every one that

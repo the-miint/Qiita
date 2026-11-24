@@ -1,13 +1,11 @@
-"""Shared base types cross-referenced by multiple model submodules.
+"""Shared base types and checks that the model submodules import.
 
-Holds the genuinely shared foundation — the runtime-selection check, the
-scope-target discriminated union, the two enums the step wire contract and the
-work-ticket models both reference (ComputeTarget, StepStatus), and the PATCH
-base model — so the domain submodules can import FROM here without forming an
-import cycle. No submodule imports back from `models/__init__`.
+They live here so that a submodule can import them without forming an import
+cycle; no submodule imports back from `models/__init__`.
 """
 
 import re
+from collections import Counter
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import Annotated, Any, ClassVar, Literal
@@ -231,6 +229,16 @@ def check_withdrawal_reason(
             raise ValueError(f"reason is required when {field} is {value!r}")
     elif reason is not None:
         raise ValueError(f"reason is only accepted when {field} is {value!r}")
+
+
+def check_no_repeats(values: Iterable[str], *, field: str) -> None:
+    """Refuse a list whose entries repeat: raise ValueError naming each value that
+    appears more than once, once each, in the order of its first appearance.
+    `field` names the list in the message."""
+    counts = Counter(values)
+    repeated = [value for value, count in counts.items() if count > 1]
+    if repeated:
+        raise ValueError(f"{field} must not repeat: {repeated}")
 
 
 def check_derived_inputs(
@@ -508,3 +516,23 @@ class NaturalKeyLookupResponse(BaseModel):
 
     resolved: dict[str, Annotated[int, Field(gt=0)] | str]
     missing: list[str]
+
+
+class RequestItemProblem(BaseModel):
+    """One problem with one item of a request, as a message for the caller.
+    `item_id` is the caller's own identifier for the item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    message: str
+
+
+class AllOrNothingFailure(BaseModel):
+    """Every problem across a request that is refused whole when any item has a
+    problem, so one round trip names them all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    problems: list[RequestItemProblem] = Field(min_length=1)

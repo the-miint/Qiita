@@ -27,6 +27,7 @@ from qiita_common.models import (
     EXPORT_ENTITY_ID,
     FieldDataType,
     MissingReasonRef,
+    RequestItemProblem,
     TerminologyTermRef,
 )
 
@@ -43,8 +44,10 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.routes._helpers import (
     SAMPLE_METADATA_WRITE_ERRORS,
     detail_for_biosample_link_rejection,
+    detail_for_retired_link,
     detail_for_slot_collision,
     parse_kv_detail,
+    raise_all_or_nothing_failure,
     raise_for_transient_write_race,
     raise_http_for_sample_metadata_write_error,
     resolve_natural_keys,
@@ -526,6 +529,38 @@ def test_raise_for_transient_write_race():
 
 
 # ---------------------------------------------------------------------------
+# raise_all_or_nothing_failure -> 422 listing every problem
+# ---------------------------------------------------------------------------
+
+
+def test_raise_all_or_nothing_failure():
+    """Tests the case where the problems span several items and one item has two:
+    one 422 lists every problem in order, and its summary counts each item once.
+    """
+    problems = [
+        RequestItemProblem(item_id="a", message="first problem with a"),
+        RequestItemProblem(item_id="a", message="second problem with a"),
+        RequestItemProblem(item_id="c", message="the problem with c"),
+    ]
+    with pytest.raises(HTTPException) as excinfo:
+        raise_all_or_nothing_failure(problems, item_count=4, outcome="things went wrong")
+
+    raised = excinfo.value
+    expected = (
+        422,
+        {
+            "message": "2 of 4 things went wrong",
+            "problems": [
+                {"item_id": "a", "message": "first problem with a"},
+                {"item_id": "a", "message": "second problem with a"},
+                {"item_id": "c", "message": "the problem with c"},
+            ],
+        },
+    )
+    assert (raised.status_code, raised.detail) == expected
+
+
+# ---------------------------------------------------------------------------
 # parse_kv_detail -> structured key=value parsing of a Postgres DETAIL
 # ---------------------------------------------------------------------------
 
@@ -558,6 +593,13 @@ def test_parse_kv_detail_skips_chunks_without_equals():
 # ---------------------------------------------------------------------------
 # detail_for_biosample_link_rejection -> 422 wording naming the failing study
 # ---------------------------------------------------------------------------
+
+
+def test_detail_for_retired_link():
+    """Tests the case where an entity's link to a study is retired: the detail
+    names the entity and the study."""
+    detail = detail_for_retired_link(subject="biosample 42", study_idx=7)
+    assert detail == "biosample 42 has a retired link to study 7"
 
 
 def test_detail_for_biosample_link_rejection_names_the_study():

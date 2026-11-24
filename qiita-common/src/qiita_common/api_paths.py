@@ -979,6 +979,9 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
 # Bulk import: a sheet's biosamples in one all-or-nothing POST.
 PATH_BIOSAMPLE_BULK_BY_STUDY = "/{study_idx}/biosample/bulk"
+# Bulk link: existing biosamples, named by the identifier kind that the body names,
+# linked into the study in one all-or-nothing POST.
+PATH_BIOSAMPLE_BULK_LINK_BY_STUDY = "/{study_idx}/biosample/bulk-link"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # Bulk lookup of the study's biosamples by the identifier kind that the body names;
 # POST for the reason PATH_STUDY_LOOKUP gives.
@@ -1031,6 +1034,7 @@ PATH_BIOSAMPLE_RESOLVE_ROSTER = "/resolve-roster"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_BULK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_BY_STUDY}"
+URL_BIOSAMPLE_BULK_LINK_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_LINK_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_LOOKUP_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_STUDY}"
 URL_BIOSAMPLE_BY_STUDY_AND_IDX = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_AND_IDX}"

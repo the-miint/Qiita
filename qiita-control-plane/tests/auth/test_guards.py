@@ -18,9 +18,13 @@ from qiita_common.models import StudyRecordView, Tier
 
 from qiita_control_plane.auth.guards import (
     _TIER_ORDER,
+    OwnedResourceRefusal,
     caller_effective_tier,
     caller_metadata_tiers,
     caller_tier_reaches,
+    classify_owned_resource_refusal,
+    raise_for_owned_resource_refusal,
+    resource_not_owned_detail,
     study_access_via,
     study_record_view,
     tier_at_least,
@@ -777,7 +781,7 @@ async def test_require_caller_owns_run_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    expected_detail = f"caller does not own sequencing_run {run_and_pool_ctx['run_idx']}"
+    expected_detail = resource_not_owned_detail("sequencing_run", run_and_pool_ctx["run_idx"])
     assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
@@ -864,7 +868,7 @@ async def test_require_caller_owns_pool_stranger_raises_403(run_and_pool_ctx):
             p=caller,
             pool=run_and_pool_ctx["pool"],
         )
-    expected_detail = f"caller does not own sequenced_pool {run_and_pool_ctx['pool_idx']}"
+    expected_detail = resource_not_owned_detail("sequenced_pool", run_and_pool_ctx["pool_idx"])
     assert (exc.value.status_code, exc.value.detail) == (403, expected_detail)
 
 
@@ -1317,3 +1321,64 @@ async def test_caller_metadata_tiers_service_account_reads_at_its_grants(study_a
         # Ahead of the sweep: the grant references the principal deleted next.
         await pool.execute("DELETE FROM qiita.study_access WHERE principal_idx = $1", service_idx)
         await delete_idxs(pool, "principal", service_idx)
+
+
+# ---------------------------------------------------------------------------
+# classify_owned_resource_refusal / raise_for_owned_resource_refusal (pure)
+# ---------------------------------------------------------------------------
+
+_CALLER_IDX = 7
+_OTHER_IDX = 8
+
+
+@pytest.mark.parametrize(
+    ("owner_idx", "retired", "bypasses_ownership", "expected"),
+    [
+        pytest.param(None, False, False, OwnedResourceRefusal.NOT_FOUND, id="missing"),
+        pytest.param(None, False, True, OwnedResourceRefusal.NOT_FOUND, id="missing-bypass"),
+        pytest.param(_CALLER_IDX, False, False, None, id="owned-live"),
+        pytest.param(_CALLER_IDX, True, False, OwnedResourceRefusal.RETIRED, id="owned-retired"),
+        pytest.param(_OTHER_IDX, False, False, OwnedResourceRefusal.NOT_OWNED, id="unowned-live"),
+        pytest.param(_OTHER_IDX, True, False, OwnedResourceRefusal.NOT_FOUND, id="unowned-retired"),
+        pytest.param(_OTHER_IDX, False, True, None, id="bypass-live"),
+        pytest.param(_OTHER_IDX, True, True, OwnedResourceRefusal.RETIRED, id="bypass-retired"),
+    ],
+)
+def test_classify_owned_resource_refusal(owner_idx, retired, bypasses_ownership, expected):
+    """Tests the case where each combination of existence, ownership, retirement
+    and bypass is classified: a missing resource is not found, an unowned live one
+    not owned, an unowned retired one not found, a retired one the caller may act
+    on retired, and anything else may be acted on."""
+    refusal = classify_owned_resource_refusal(
+        owner_idx,
+        retired=retired,
+        caller_idx=_CALLER_IDX,
+        bypasses_ownership=bypasses_ownership,
+    )
+
+    assert refusal is expected
+
+
+@pytest.mark.parametrize(
+    ("refusal", "expected"),
+    [
+        (OwnedResourceRefusal.NOT_FOUND, (404, "widget 42 not found")),
+        (OwnedResourceRefusal.NOT_OWNED, (403, "caller does not own widget 42")),
+        (OwnedResourceRefusal.RETIRED, (409, "widget 42 is retired")),
+    ],
+    ids=["not-found", "not-owned", "retired"],
+)
+def test_raise_for_owned_resource_refusal(refusal, expected):
+    """Tests the case where each refusal is raised: its status, with the detail
+    naming the resource by its label and idx."""
+    with pytest.raises(HTTPException) as exc_info:
+        raise_for_owned_resource_refusal(refusal, resource_label="widget", resource_idx=42)
+
+    assert (exc_info.value.status_code, exc_info.value.detail) == expected
+
+
+def test_raise_for_owned_resource_refusal_none():
+    """Tests the case where there is no refusal: nothing is raised."""
+    raised = raise_for_owned_resource_refusal(None, resource_label="widget", resource_idx=42)
+
+    assert raised is None

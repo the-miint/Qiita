@@ -20,6 +20,7 @@ from qiita_common.models import (
     NOT_SETTABLE_ON_LINKED_FIELD,
     STUDY_FIELD_IDX_ATTR,
     AlignmentDefinitionStatus,
+    AllOrNothingFailure,
     DefinitionGroupRefusal,
     DefinitionKind,
     DeprecatedUpstream,
@@ -31,6 +32,7 @@ from qiita_common.models import (
     MetadataFieldWriteResult,
     MissingReasonRef,
     NaturalKeyLookupResponse,
+    RequestItemProblem,
     SampleGlobalFieldResponse,
     SampleMetadataWriteResponse,
     SampleResolution,
@@ -527,6 +529,17 @@ def detail_for_unlinked_entity(*, noun: str, entity_idx: int, study_idx: int) ->
     wraps it in HTTPException with status 404.
     """
     return f"{noun} {entity_idx} is not linked to study {study_idx}"
+
+
+def detail_for_retired_link(*, subject: str, study_idx: int) -> str:
+    """Build the detail for a link write refused because the entity's link to
+    the study exists and is retired.
+
+    `subject` names the entity the way the caller named it: by its idx when the
+    caller sent the idx, otherwise by the identifier the caller sent, so the
+    detail never reports an idx the caller did not send. Returns the bare string.
+    """
+    return f"{subject} has a retired link to study {study_idx}"
 
 
 def _unique_field_pair_clause(*, noun: str, study_idx: int, display_name: str, value: str) -> str:
@@ -1962,6 +1975,22 @@ def raise_transient_retry(detail: str) -> None:
         detail=detail,
         headers={"Retry-After": _TRANSIENT_RETRY_AFTER},
     )
+
+
+def raise_all_or_nothing_failure(
+    problems: list[RequestItemProblem], *, item_count: int, outcome: str
+) -> NoReturn:
+    """Refuse the whole request with a 422 whose `detail` is an
+    `AllOrNothingFailure` listing every one of `problems`, summarized as
+    "<items with a problem> of <item_count> <outcome>".
+
+    `problems` must not be empty; an item with several problems is counted once.
+    """
+    failing_item_count = len({problem.item_id for problem in problems})
+    failure = AllOrNothingFailure(
+        message=f"{failing_item_count} of {item_count} {outcome}", problems=problems
+    )
+    raise HTTPException(status_code=422, detail=failure.model_dump(mode="json"))
 
 
 def equivalence_refused_http(exc: EquivalenceRefused) -> HTTPException:

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BULK_BY_STUDY,
+    PATH_BIOSAMPLE_BULK_LINK_BY_STUDY,
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY_AND_IDX,
@@ -44,6 +45,8 @@ from qiita_common.models import (
     UNIQUE_FIELD_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
+    BiosampleBulkLinkRequest,
+    BiosampleBulkLinkResponse,
     BiosampleGlobalFieldResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
@@ -62,7 +65,7 @@ from qiita_common.models import (
     MetadataChecklistRef,
     MetadataEntry,
     NaturalKeyLookupResponse,
-    RosterResolveFailure,
+    RequestItemProblem,
     RosterResolveRequest,
     RosterResolveResponse,
     SampleFieldExceptionPutRequest,
@@ -80,10 +83,12 @@ from qiita_common.models import (
 
 from ..auth.guards import (
     METADATA_BYPASS_ROLE,
+    OwnedResourceRefusal,
     caller_bypasses_ownership,
     caller_metadata_tiers,
+    classify_owned_resource_refusal,
+    raise_for_owned_resource_refusal,
     require_biosample_exists,
-    require_caller_owns,
     require_complete_profile,
     require_eligible_owner,
     require_human,
@@ -91,7 +96,6 @@ from ..auth.guards import (
     require_scope,
     require_study_access,
     require_study_exists,
-    resource_not_found_detail,
     resource_retired_detail,
 )
 from ..auth.principal import HumanUser, Principal
@@ -104,6 +108,7 @@ from ..repositories._sample_helpers import (
     UniqueInStudyViolation,
     classify_unique_in_study_violation,
     fetch_active_studies_for_entity,
+    fetch_entity_to_study_links_by_entity_idxs,
     fetch_global_fields,
     fetch_global_metadata,
     fetch_study_fields_for_study,
@@ -116,6 +121,7 @@ from ..repositories.biosample import (
     fetch_biosample,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
+    fetch_biosamples_by_idxs,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
     update_biosample,
@@ -145,6 +151,7 @@ from ._helpers import (
     build_idxs_list_response,
     cap_rows,
     create_and_map_study_field,
+    detail_for_retired_link,
     detail_for_retired_unique_field_entity,
     detail_for_unique_field_miss,
     etag_for_updated_at,
@@ -152,6 +159,7 @@ from ._helpers import (
     map_study_field_row,
     metadata_entries_from_rows,
     patch_and_map_study_field,
+    raise_all_or_nothing_failure,
     raise_for_unique_violation,
     raise_http_for_sample_metadata_write_error,
     raise_transient_retry,
@@ -177,6 +185,13 @@ _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
 # link let through, so the wet lab can link a plate's controls into every study
 # that shared the plate.
 _BIOSAMPLE_LINK_BYPASS_ROLE = SystemRole.WET_LAB_ADMIN
+# Each refusal of one value of a bulk link, worded around the phrase that names its
+# biosample by that value.
+_BULK_LINK_REFUSAL_MESSAGES: dict[OwnedResourceRefusal, str] = {
+    OwnedResourceRefusal.NOT_FOUND: "there is no {biosample}",
+    OwnedResourceRefusal.NOT_OWNED: "caller does not own the {biosample}",
+    OwnedResourceRefusal.RETIRED: "the {biosample} is retired",
+}
 
 # Map of biosample-level constraint names import_biosample_from_owner_biosample_id
 # can trip. The owner-id field's own uniqueness index is the same exception class
@@ -1049,6 +1064,7 @@ async def get_biosample_in_study(
 async def create_biosample_study_link(
     study_idx: Annotated[int, Field(gt=0)],
     biosample_idx: Annotated[int, Field(gt=0)],
+    response: Response,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
@@ -1060,63 +1076,208 @@ async def create_biosample_study_link(
     """Link an existing biosample into the path's study.
 
     The caller needs Tier.ADMIN on the study (study owner included) and must own
-    the biosample; a wet_lab_admin+ needs neither. 403 below the tier; 404 on a
-    missing study, and the same 404 for a missing biosample and for one that the
-    caller does not own; 409 on a retired biosample or on any existing link for
-    the pair, retired or not.
+    the biosample; a wet_lab_admin+ needs neither. 201 with the new link; 200
+    with the existing link when the pair is already actively linked. 403 below
+    the tier or on a live biosample the caller does not own; 404 on a missing
+    study or biosample, and on a retired one the caller does not own; 409 on a
+    retired biosample, or on a retired link for the pair.
     """
     async with tx() as conn:
         # The share lock holds from the ownership check through commit, so an
         # owner change or retirement cannot land between the check and the
         # insert; it leaves other inserts that reference the biosample unblocked.
         row = await fetch_biosample(conn, biosample_idx, lock="share")
-        if not caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE):
-            owner_idx = None if row is None else row["owner_idx"]
-            require_caller_owns(
-                owner_idx,
-                caller_idx=user.principal_idx,
-                resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
-                resource_idx=biosample_idx,
-                hide_unowned=True,
-            )
 
-        # A bypass caller skipped the ownership check, so existence is checked
-        # here too.
-        if row is None:
-            raise HTTPException(
-                status_code=404,
-                detail=resource_not_found_detail(
-                    BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx
-                ),
-            )
-        if row["retired"]:
-            raise HTTPException(
-                status_code=409,
-                detail=resource_retired_detail(BIOSAMPLE_METADATA_SPEC.entity_kind, biosample_idx),
-            )
+        # Refuse a missing, unowned or retired biosample
+        refusal = classify_owned_resource_refusal(
+            None if row is None else row["owner_idx"],
+            retired=row is not None and row["retired"],
+            caller_idx=user.principal_idx,
+            bypasses_ownership=caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE),
+        )
+        raise_for_owned_resource_refusal(
+            refusal,
+            resource_label=BIOSAMPLE_METADATA_SPEC.entity_kind,
+            resource_idx=biosample_idx,
+        )
 
-        # The primary key is the link table's only unique constraint.
-        try:
-            created_at = await insert_entity_to_study(
+        # Insert the link; when the pair already has one, the insert does nothing
+        # and returns None
+        created_by_idx = user.principal_idx
+        created_at = await insert_entity_to_study(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=biosample_idx,
+            study_idx=study_idx,
+            created_by_idx=created_by_idx,
+            on_conflict="ignore",
+        )
+
+        # An existing link is returned as it is when active, and refused when retired
+        if created_at is None:
+            links = await fetch_entity_to_study_links_by_entity_idxs(
                 conn,
                 spec=BIOSAMPLE_METADATA_SPEC,
-                entity_idx=biosample_idx,
                 study_idx=study_idx,
-                created_by_idx=user.principal_idx,
+                entity_idxs=[biosample_idx],
             )
-        except asyncpg.UniqueViolationError as exc:
-            raise_for_unique_violation(
-                exc,
-                constraint_messages={},
-                generic=f"{BIOSAMPLE_METADATA_SPEC.entity_kind} {biosample_idx} is already linked to study {study_idx} (the link may be retired)",  # noqa: E501
-            )
+            existing = links[biosample_idx]
+            if existing["retired"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=detail_for_retired_link(
+                        subject=f"{BIOSAMPLE_METADATA_SPEC.entity_kind} {biosample_idx}",
+                        study_idx=study_idx,
+                    ),
+                )
+            created_at = existing["created_at"]
+            created_by_idx = existing["created_by_idx"]
+            response.status_code = 200
 
     link_response = BiosampleStudyLinkResponse(
         biosample_idx=biosample_idx,
         study_idx=study_idx,
-        created_by_idx=user.principal_idx,
+        created_by_idx=created_by_idx,
         created_at=created_at,
     )
+    return link_response
+
+
+def _biosample_named_by(key: str, value: str) -> str:
+    """The phrase naming a biosample by a value of the identifier kind `key` that
+    the caller sent, shared by every answer about it so that the answers differ
+    only in what they say about the biosample, never in how they name it."""
+    return f"biosample with {key} {value!r}"
+
+
+@router.post(
+    PATH_BIOSAMPLE_BULK_LINK_BY_STUDY,
+    status_code=201,
+    responses={
+        422: {"description": "Values that could not be linked; detail is an AllOrNothingFailure"}
+    },
+)
+async def link_biosamples_bulk(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: BiosampleBulkLinkRequest,
+    response: Response,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=_BIOSAMPLE_LINK_BYPASS_ROLE)
+    ),
+) -> BiosampleBulkLinkResponse:
+    """Link existing biosamples into the path's study, all or nothing.
+
+    Each value names one biosample by the identifier kind that `body.key` names.
+    Access is that of the single link, applied to every biosample. 201 when any
+    link was created; 200 when every biosample was already actively linked. A
+    value that names no biosample, one that the caller does not own, a retired
+    biosample, or one whose link to the study is retired refuses the whole
+    request with a 422 listing every such value in request order, and nothing is
+    linked. A retryable 503 when a named biosample's identifier changed while the
+    request ran.
+    """
+    async with tx() as conn:
+        # Resolve every value to the idx of the biosample it names, if any
+        tiers = await caller_metadata_tiers(conn, user)
+        idx_by_value = await resolve_biosample_idxs_by_kind(
+            conn,
+            study_idx=study_idx,
+            key=body.key,
+            values=body.values,
+            unique_field_display_name=None,
+            tiers=tiers,
+        )
+
+        # Share-lock the named biosamples, as the single link does
+        rows = await fetch_biosamples_by_idxs(conn, list(set(idx_by_value.values())), lock="share")
+
+        # The lookup took no lock, so refuse the whole request when a locked row no
+        # longer carries the value that resolved it; the retry resolves the values again
+        if any(
+            biosample_idx in rows and str(rows[biosample_idx][body.key]) != value
+            for value, biosample_idx in idx_by_value.items()
+        ):
+            raise_transient_retry(
+                f"a biosample's {body.key} changed while this request ran; nothing was linked — resubmit the identical request"  # noqa: E501
+            )
+
+        # Refuse each value whose biosample is missing, not the caller's, or retired
+        bypasses_ownership = caller_bypasses_ownership(user, _BIOSAMPLE_LINK_BYPASS_ROLE)
+        problem_by_value: dict[str, str] = {}
+        linkable_idx_by_value: dict[str, int] = {}
+        for value in body.values:
+            biosample_idx = idx_by_value.get(value)
+            row = None if biosample_idx is None else rows.get(biosample_idx)
+            refusal = classify_owned_resource_refusal(
+                None if row is None else row["owner_idx"],
+                retired=row is not None and row["retired"],
+                caller_idx=user.principal_idx,
+                bypasses_ownership=bypasses_ownership,
+            )
+            if refusal is None:
+                linkable_idx_by_value[value] = row["idx"]
+            else:
+                problem_by_value[value] = _BULK_LINK_REFUSAL_MESSAGES[refusal].format(
+                    biosample=_biosample_named_by(body.key, value)
+                )
+
+        # Insert each link in idx order, unless the request is already refused, so a
+        # request known to be refused attempts no insert; a pair already linked is skipped
+        linked_values: set[str] = set()
+        if not problem_by_value:
+            for value, biosample_idx in sorted(linkable_idx_by_value.items(), key=lambda kv: kv[1]):
+                created_at = await insert_entity_to_study(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=biosample_idx,
+                    study_idx=study_idx,
+                    created_by_idx=user.principal_idx,
+                    on_conflict="ignore",
+                )
+                if created_at is not None:
+                    linked_values.add(value)
+
+        # Of the values not linked just now, one whose existing link is active is
+        # already linked, and one whose link is retired is refused
+        unlinked_values = [value for value in linkable_idx_by_value if value not in linked_values]
+        existing_links = await fetch_entity_to_study_links_by_entity_idxs(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            study_idx=study_idx,
+            entity_idxs=[linkable_idx_by_value[value] for value in unlinked_values],
+        )
+        for value in unlinked_values:
+            existing_link = existing_links.get(linkable_idx_by_value[value])
+            if existing_link is not None and existing_link["retired"]:
+                problem_by_value[value] = detail_for_retired_link(
+                    subject=f"the {_biosample_named_by(body.key, value)}", study_idx=study_idx
+                )
+
+        # Refuse the whole request if any value has a problem
+        if problem_by_value:
+            problems = [
+                RequestItemProblem(item_id=value, message=problem_by_value[value])
+                for value in body.values
+                if value in problem_by_value
+            ]
+            raise_all_or_nothing_failure(
+                problems, item_count=len(body.values), outcome="values could not be linked"
+            )
+
+    # List each value under its outcome, in request order; 200 when nothing was created
+    linked = [value for value in body.values if value in linked_values]
+    already_linked = [
+        value
+        for value in body.values
+        if value in linkable_idx_by_value and value not in linked_values
+    ]
+    if not linked:
+        response.status_code = 200
+    link_response = BiosampleBulkLinkResponse(linked=linked, already_linked=already_linked)
     return link_response
 
 
@@ -1662,7 +1823,7 @@ async def lookup_biosample_by_matrix_tube_id(
 
 @biosample_router.post(
     PATH_BIOSAMPLE_RESOLVE_ROSTER,
-    responses={422: {"description": "Rows that did not resolve; detail is a RosterResolveFailure"}},
+    responses={422: {"description": "Rows that did not resolve; detail is an AllOrNothingFailure"}},
 )
 async def resolve_biosample_roster(
     body: RosterResolveRequest,
@@ -1676,7 +1837,7 @@ async def resolve_biosample_roster(
 
     The rules live in `roster_resolution`; this route gathers the facts and
     maps the outcome. Any unresolved row refuses the whole roster with a 422
-    whose `detail` is a `RosterResolveFailure` naming every problem, so a
+    whose `detail` is an `AllOrNothingFailure` naming every problem, so a
     submitter fixes the sheet once rather than one miss per attempt.
 
     Auth: `biosample:read` and `study:read`, since the answer names both. No
@@ -1690,12 +1851,9 @@ async def resolve_biosample_roster(
         facts = await fetch_roster_facts(conn, body.rows)
     resolved, problems = classify_roster(body.rows, facts)
     if problems:
-        unresolved = len({p.item_id for p in problems})
-        failure = RosterResolveFailure(
-            message=f"{unresolved} of {len(body.rows)} roster rows did not resolve",
-            problems=problems,
+        raise_all_or_nothing_failure(
+            problems, item_count=len(body.rows), outcome="roster rows did not resolve"
         )
-        raise HTTPException(status_code=422, detail=failure.model_dump(mode="json"))
     return RosterResolveResponse(rows=resolved)
 
 

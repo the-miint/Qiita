@@ -40,6 +40,7 @@ import urllib.parse
 import webbrowser
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import NoReturn
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -60,6 +61,7 @@ from qiita_common.models import (
     EXPORT_ENTITY_ID,
     IDX_KEY,
     INCLUDE_DEPRECATED_FLAG,
+    AllOrNothingFailure,
     DefinitionKind,
     NaturalKeyLookupResponse,
     PrincipalLookupRequest,
@@ -725,6 +727,62 @@ def print_http_status_error(resp: httpx.Response) -> None:
         )
         return
     print(f"http error {resp.status_code}: {resp.text}", file=sys.stderr)
+
+
+def all_or_nothing_failure_from(exc: httpx.HTTPStatusError) -> AllOrNothingFailure | None:
+    """The `AllOrNothingFailure` that `exc` carries when it is a 422 whose `detail`
+    is one, else None."""
+    # Only a JSON 422 can carry the failure; a proxy's 422 may not be JSON at all
+    if exc.response.status_code != 422:
+        return None
+    try:
+        body = exc.response.json()
+    except ValueError:
+        return None
+
+    # A request-shape 422 carries a list of validation errors instead
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, dict) or "problems" not in detail:
+        return None
+    failure = AllOrNothingFailure.model_validate(detail)
+    return failure
+
+
+def exit_with_all_or_nothing_failure(
+    failure: AllOrNothingFailure, *, label_for: Callable[[str], str], advice: str
+) -> NoReturn:
+    """Print `failure`'s message, each problem against `label_for(item_id)`, and
+    `advice` to stderr, then exit 1."""
+    lines = [f"error: {failure.message}:"]
+    lines += [f"  - {label_for(p.item_id)}: {p.message}" for p in failure.problems]
+    lines.append(advice)
+    print("\n".join(lines), file=sys.stderr)
+    sys.exit(1)
+
+
+def call_all_or_nothing(
+    method: str,
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    json: dict,
+    label_for: Callable[[str], str],
+    advice: str,
+) -> dict | list:
+    """Call a route that refuses a request whole, returning the decoded body.
+    A refusal that lists its problems exits as `exit_with_all_or_nothing_failure`
+    does, with `label_for` and `advice`; any other non-2xx status raises
+    httpx.HTTPStatusError, as `call` does."""
+    try:
+        body = call(method, base_url, token, path, json=json)
+    except httpx.HTTPStatusError as exc:
+        failure = all_or_nothing_failure_from(exc)
+        # An error that lists no problems (e.g. a request-shape 422) is not a refusal
+        if failure is None:
+            raise
+        exit_with_all_or_nothing_failure(failure, label_for=label_for, advice=advice)
+    return body
 
 
 def validation_messages(exc: ValidationError) -> str:

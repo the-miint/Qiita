@@ -1008,7 +1008,38 @@ def test_biosample_link_posts_without_body(monkeypatch, capsys):
         f"https://q.example.test{URL_BIOSAMPLE_STUDY_LINK.format(study_idx=7, biosample_idx=9)}"
     )
     assert (rc, sent) == (0, [("POST", expected_url, None, None)])
-    assert json.loads(capsys.readouterr().out) == link_response
+    printed = capsys.readouterr()
+    assert (json.loads(printed.out), printed.err) == (link_response, "")
+
+
+def test_biosample_link_already_linked(monkeypatch, capsys):
+    """Tests the case where the pair is already linked and the route answers 200:
+    the existing link is printed as JSON, and a note on stderr says that it
+    already existed."""
+    link_response = {
+        "biosample_idx": 9,
+        "study_idx": 7,
+        "created_by_idx": 42,
+        "created_at": "2026-11-01T12:00:00Z",
+    }
+    _stub_post(monkeypatch, {}, response_json=link_response, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "link",
+            "--study-idx",
+            "7",
+            "--biosample-idx",
+            "9",
+        ]
+    )
+
+    printed = capsys.readouterr()
+    expected_err = "biosample 9 was already linked to the study\n"
+    assert (rc, json.loads(printed.out), printed.err) == (0, link_response, expected_err)
 
 
 def test_biosample_link_by_study_export_id(monkeypatch, capsys):
