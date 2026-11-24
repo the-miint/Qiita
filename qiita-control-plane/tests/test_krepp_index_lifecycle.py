@@ -12,6 +12,8 @@ from qiita_common.models import (
     INDEX_TYPE_KREPP,
     NODE_CACHED_INDEX_TYPES,
     ReferenceIndexState,
+    ScopeTargetKind,
+    WorkTicketState,
 )
 
 from qiita_control_plane.actions.library import register_index
@@ -47,12 +49,13 @@ async def world(postgres_pool):
         "INSERT INTO qiita.action"
         " (action_id, version, target_kind, scopes, audience, context_schema, steps,"
         "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status)"
-        " VALUES ($1, $2, 'reference', '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
+        " VALUES ($1, $2, $4, '{}'::text[], $3::jsonb, '{}'::jsonb, '[]'::jsonb,"
         "         1, 1, '1 minute', NULL, NULL)"
         " ON CONFLICT (action_id, version) DO NOTHING",
         _ACTION_ID,
         _VERSION,
         '{"service": false, "human_roles": ["system_admin"]}',
+        ScopeTargetKind.REFERENCE,
     )
     yield {"pool": pool, "principal_idx": principal_idx, "reference_idx": reference_idx}
     await pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", reference_idx)
@@ -110,14 +113,14 @@ async def _remove(pool, reference_index_idx: int):
         return await remove_krepp_build(conn, reference_index_idx)
 
 
-async def _ticket(world, reference_index_idx: int, state: str) -> int:
+async def _ticket(world, reference_index_idx: int, state: WorkTicketState) -> int:
     # A failed ticket carries its failure columns (work_ticket_failure_consistent).
-    failed = state == "failed"
+    failed = state == WorkTicketState.FAILED
     return await world["pool"].fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
         " scope_target_kind, reference_idx, action_context, state, reference_index_idx,"
         " failure_type, failure_stage, failure_reason)"
-        " VALUES ($1, $2, $3, 'reference', $4, '{}'::jsonb, $5, $6,"
+        " VALUES ($1, $2, $3, $10, $4, '{}'::jsonb, $5, $6,"
         " $7::qiita.failure_type, $8::qiita.work_ticket_failure_stage, $9)"
         " RETURNING work_ticket_idx",
         _ACTION_ID,
@@ -129,6 +132,7 @@ async def _ticket(world, reference_index_idx: int, state: str) -> int:
         "permanent" if failed else None,
         "submission" if failed else None,
         "test" if failed else None,
+        ScopeTargetKind.REFERENCE,
     )
 
 
@@ -226,7 +230,7 @@ async def test_one_active_krepp_build_per_reference(world):
 async def test_deleting_a_build_row_detaches_its_tickets(world):
     pool = world["pool"]
     build = await _register(world, "a")
-    ticket = await _ticket(world, build, "completed")
+    ticket = await _ticket(world, build, WorkTicketState.COMPLETED)
     await pool.execute("DELETE FROM qiita.reference_index WHERE reference_index_idx = $1", build)
     assert (
         await pool.fetchval(
@@ -329,7 +333,10 @@ async def test_remove_refuses_the_active_build(world):
         await _remove(world["pool"], a)
 
 
-@pytest.mark.parametrize("ticket_state", ["pending", "queued", "processing"])
+@pytest.mark.parametrize(
+    "ticket_state",
+    [WorkTicketState.PENDING, WorkTicketState.QUEUED, WorkTicketState.PROCESSING],
+)
 async def test_remove_refuses_while_a_ticket_runs_on_the_build(world, ticket_state):
     pool = world["pool"]
     a = await _register(world, "a", "a" * 64)
@@ -342,7 +349,15 @@ async def test_remove_refuses_while_a_ticket_runs_on_the_build(world, ticket_sta
     assert await _state(pool, a) == ReferenceIndexState.RETIRED
 
 
-@pytest.mark.parametrize("ticket_state", ["completed", "failed", "cancelled", "no_data"])
+@pytest.mark.parametrize(
+    "ticket_state",
+    [
+        WorkTicketState.COMPLETED,
+        WorkTicketState.FAILED,
+        WorkTicketState.CANCELLED,
+        WorkTicketState.NO_DATA,
+    ],
+)
 async def test_remove_allows_finished_tickets_and_keeps_their_build(world, ticket_state):
     pool = world["pool"]
     a = await _register(world, "a", "a" * 64)
@@ -367,7 +382,7 @@ async def test_remove_refuses_while_a_cancelled_tickets_reap_is_pending(world):
     that scancels them finishes."""
     pool = world["pool"]
     a = await _register(world, "a", "a" * 64)
-    ticket = await _ticket(world, a, "cancelled")
+    ticket = await _ticket(world, a, WorkTicketState.CANCELLED)
     await pool.execute(
         "UPDATE qiita.work_ticket SET reap_pending_since = now(), reap_note = 'reaping'"
         " WHERE work_ticket_idx = $1",
@@ -382,7 +397,7 @@ async def test_remove_ignores_a_cancelled_ticket_whose_reap_finished(world):
     the build, does not hold it."""
     pool = world["pool"]
     a = await _register(world, "a", "a" * 64)
-    await _ticket(world, a, "cancelled")
+    await _ticket(world, a, WorkTicketState.CANCELLED)
     assert (await _remove(pool, a)).state is ReferenceIndexState.REMOVED
 
 
@@ -468,13 +483,15 @@ async def test_an_activate_ticket_runs_to_completed_through_the_runner(world, tm
     ticket = await pool.fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
         " scope_target_kind, reference_idx, action_context, state)"
-        " VALUES ($1, $2, $3, 'reference', $4, $5::jsonb, 'pending')"
+        " VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)"
         " RETURNING work_ticket_idx",
         action.action_id,
         action.version,
         world["principal_idx"],
+        ScopeTargetKind.REFERENCE,
         world["reference_idx"],
         f'{{"reference_index_idx": {a}}}',
+        WorkTicketState.PENDING,
     )
     await run_workflow(
         ticket,
@@ -489,5 +506,5 @@ async def test_an_activate_ticket_runs_to_completed_through_the_runner(world, tm
     state = await pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket
     )
-    assert state == "completed"
+    assert state == WorkTicketState.COMPLETED
     assert await _state(pool, a) == ReferenceIndexState.ACTIVE

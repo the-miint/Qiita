@@ -123,9 +123,8 @@ async def activate_krepp_build(
 async def tickets_running_on_build(conn: asyncpg.Connection, reference_index_idx: int) -> list[int]:
     """The tickets fixed to the build that may still have a job reading it, oldest
     first: non-terminal, or cancelled with the reap of their SLURM jobs still pending.
-    Removal waits for every such ticket because the runbook then has the master folder
-    deleted, and `node_cache.evict` deletes a node's copy whether or not another job
-    there is still reading it."""
+    Removal waits for every such ticket because a removed build's files, the master or a
+    node's copy, may be deleted while a job still reads them."""
     rows = await conn.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
         " WHERE reference_index_idx = $1"

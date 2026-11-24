@@ -15,8 +15,7 @@
   for it, under a per-folder lock: it checks the free space, then hashes every file as
   it copies it; later jobs on the node check the copy and use it. Unset, it returns the
   folder under `PATH_DERIVED`. Nothing is copied at deploy or by hand. No workflow
-  reads through it. Node copies of removed builds are not deleted
-  (#942).
+  reads through it. Node copies of removed builds are not deleted (#942).
 - **`qiita.reference_index.state` (`registered`, `active`, `retired`, `removed`)
   (#937).** Every existing row is `active`; a krepp row's `fs_path` is relative to
   `PATH_DERIVED`. `GET /reference/{reference_idx}/index` returns it.

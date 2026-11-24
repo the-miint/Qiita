@@ -16,7 +16,7 @@ same folder overwritten.
 - Optional: `PATH_NODE_LOCAL` in `compute-orchestrator.env` (e.g. `/scratch/qiita-miint`,
   created by the cluster admins on every node, writable by the job user): the node
   cache ([storage](../architecture/storage.md)). The deploy's readiness check fails
-  when it is set but not a writable directory. No workflow reads a krepp build
+  when it is set but not a writable directory on the node the probe ran on. No workflow reads a krepp build
   through it.
 
 ## 1. Place the build at its master path
