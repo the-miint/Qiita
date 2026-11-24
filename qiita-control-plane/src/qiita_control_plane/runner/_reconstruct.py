@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from qiita_common.models import (
     StepStatusWire,
     WorkTicketFailureStage,
 )
+from qiita_common.step_log import COMPLETED_KIND, capture_to, receipt, summarize, write_receipt
 
 from .. import step_progress
 from ..actions.library import (
@@ -44,6 +47,7 @@ from ..actions.library import (
 )
 from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
+from ..repositories.sequenced_sample import fetch_pool_prep_sample_idxs
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     BUILD_SHARD_INDEX_ACTION_VERSION,
@@ -67,6 +71,8 @@ from ._read_ingest import (
     SHARD_MAPPING_BINDING,
     _stage_shard_mapping,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # =============================================================================
 # Restart-recovery output reconstruction
@@ -358,6 +364,14 @@ def _register_files_payload(attempt_dir: Path, staging_dir: Path) -> dict[str, s
     return staged
 
 
+def _closed(completed: int, no_data: int) -> None:
+    """Log and summarize how a finalize action closed its samples."""
+    _LOG.info(
+        "closed %d samples: %d completed, %d no data", completed + no_data, completed, no_data
+    )
+    summarize(completed=completed, no_data=no_data)
+
+
 async def _dispatch_action(
     ctx: RunContext,
     entry: WorkflowAction,
@@ -390,48 +404,54 @@ async def _dispatch_action(
         step_name=entry.name,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
-    try:
-        outputs = await _run_action_primitive(ctx, entry, bound, workspace)
-    except BackendFailure as exc:
+    # No scheduler captures an in-process action's output, so its step log
+    # (`qiita_common.step_log`) is written here, into the same files a SLURM
+    # step's logs land in. Every path that returns or raises an Exception writes
+    # one receipt; a BaseException (e.g. cancellation) leaves none — a cancelled
+    # step has no terminal outcome.
+    logs_dir = step_logs_dir(workspace)
+    started = time.monotonic()
+
+    async def _record_failure(kind: str, reason: str) -> None:
+        # One failure path for all three arms: the receipt carries the full reason,
+        # the progress row the 2000-char-bounded copy. The progress row is the
+        # authoritative outcome; the receipt is the ticket-log display.
+        _LOG.error("failed after %.0fs: %s", time.monotonic() - started, reason)
+        write_receipt(logs_dir, receipt(kind, entry.name, reason=reason))
         await _best_effort_record_failed(
             ctx.pool,
             work_ticket_idx=ctx.work_ticket_idx,
             step_index=step_index,
             attempt=attempt,
-            failure_kind=exc.kind.value,
-            failure_reason=exc.reason[:2000],
+            failure_kind=kind,
+            failure_reason=reason[:2000],
         )
-        raise
-    except Exception as exc:
-        if _action_failure_is_retriable(exc):
-            failure = BackendFailure(
-                kind=FailureKind.DATA_PLANE_TRANSIENT,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=entry.name,
-                reason=f"{type(exc).__name__}: {exc!s}"[:2000],
-            )
-            await _best_effort_record_failed(
-                ctx.pool,
-                work_ticket_idx=ctx.work_ticket_idx,
-                step_index=step_index,
-                attempt=attempt,
-                failure_kind=failure.kind.value,
-                failure_reason=failure.reason,
-            )
-            raise failure from exc
-        # Plain Python from a LIBRARY primitive (untyped failure / bug), or a
-        # data-plane failure this entry is not re-run on. The outer run_workflow
-        # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
-        # row, then re-raise unchanged.
-        await _best_effort_record_failed(
-            ctx.pool,
-            work_ticket_idx=ctx.work_ticket_idx,
-            step_index=step_index,
-            attempt=attempt,
-            failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
-            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
-        )
-        raise
+
+    with capture_to(logs_dir, entry.name) as scope:
+        _LOG.info("started: %s on the control plane", entry.name)
+        try:
+            outputs = await _run_action_primitive(ctx, entry, bound, workspace)
+        except BackendFailure as exc:
+            await _record_failure(exc.kind.value, exc.reason)
+            raise
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc!s}"
+            if _action_failure_is_retriable(exc):
+                await _record_failure(FailureKind.DATA_PLANE_TRANSIENT.value, reason)
+                raise BackendFailure(
+                    kind=FailureKind.DATA_PLANE_TRANSIENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=entry.name,
+                    reason=reason[:2000],
+                ) from exc
+            # Plain Python from a LIBRARY primitive (untyped failure / bug), or a
+            # data-plane failure this entry is not re-run on. The outer run_workflow
+            # handler classifies it UNKNOWN_PERMANENT; record the same on the progress
+            # row, then re-raise unchanged.
+            await _record_failure(FailureKind.UNKNOWN_PERMANENT.value, reason)
+            raise
+        _LOG.info("completed in %.0fs", time.monotonic() - started)
+        write_receipt(logs_dir, receipt(COMPLETED_KIND, entry.name, summary=scope.summary))
     await step_progress.record_completed(
         ctx.pool, work_ticket_idx=ctx.work_ticket_idx, step_index=step_index, attempt=attempt
     )
@@ -517,13 +537,15 @@ async def _run_action_primitive(
         # from `bound` so a ticket whose action_context carries it picks up
         # genome-association writes for free.
         genome_map = bound.get("genome_map_path")
-        feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        feature_map_path, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             ctx.pool,
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
             scope=f"work_ticket {ctx.work_ticket_idx}",
         )
+        _LOG.info("%d features: %d new, %d already known", minted + reused, minted, reused)
+        summarize(features_new=minted, features_known=reused)
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}
 
@@ -611,6 +633,13 @@ async def _run_action_primitive(
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
         files = _register_files_payload(workspace, staging_dir)
+        tables: dict[str, int] = {}
+        for table in files.values():
+            tables[table] = tables.get(table, 0) + 1
+        _LOG.info(
+            "registering %s",
+            ", ".join(f"{t} ({n} file{'s' if n > 1 else ''})" for t, n in tables.items()),
+        )
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
@@ -618,6 +647,55 @@ async def _run_action_primitive(
             signing_key=ctx.signing_key,
             data_plane_url=ctx.data_plane_url,
         )
+        summarize(tables=tables)
+        return {}
+
+    if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
+        # After register-files (so an identifier never names data that did not
+        # land) and after finalize-amplicon-sample (so the mint refuses any sample
+        # the gate still holds 'pending'). processing_idx from `bound`, the run
+        # identity the runner minted before the loop; created_by is the ticket's
+        # originator, the person the identifiers are minted for.
+        if set(entry.inputs) != {"asv_counts"}:
+            raise RuntimeError(
+                f"mint-amplicon-identifiers expects inputs [asv_counts]; got {entry.inputs!r}"
+            )
+        originator_idx = await ctx.pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            ctx.work_ticket_idx,
+        )
+        if originator_idx is None:
+            raise RuntimeError(f"work_ticket {ctx.work_ticket_idx} not found")
+        samples = await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
+            ctx.pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            asv_counts_path=Path(bound["asv_counts"]),
+            created_by_idx=originator_idx,
+        )
+        _LOG.info("identifiers for %d processed samples", samples)
+        summarize(samples=samples)
+        return {}
+
+    if entry.name == LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE:
+        # After register-files; processing_idx from `bound`, the run identity the
+        # runner minted (and materialized the pool's 'pending' rows under) before
+        # the loop. Closes only this pool's rows: the identity spans pools.
+        if set(entry.inputs) != {"asv_counts"}:
+            raise RuntimeError(
+                f"finalize-amplicon-sample expects inputs [asv_counts]; got {entry.inputs!r}"
+            )
+        completed, no_data = await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
+            ctx.pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            # The pool's RAW membership, not the filtered `list_pool_prep_sample_idxs`:
+            # a sample retired mid-run got a 'pending' row at submit, and the filtered
+            # list drops it, which would strand that row at 'pending' forever.
+            prep_sample_idxs=await fetch_pool_prep_sample_idxs(
+                ctx.pool, ctx.scope_target["sequenced_pool_idx"]
+            ),
+            asv_counts_path=Path(bound["asv_counts"]),
+        )
+        _closed(completed, no_data)
         return {}
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:

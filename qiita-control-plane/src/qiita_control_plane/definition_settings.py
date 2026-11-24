@@ -23,8 +23,9 @@ groups are computed from):
      they skip a deprecated definition, and a deprecated one's settings are locked too;
   2b. no public handle that is not retired cites it (`published`): an
      `exported_processing` row naming it or an `exported_identifier` minted under it.
-     A published manifest cites the settings it was built under. Only masks and
-     alignments have handles; a processing has none;
+     A published manifest cites the settings it was built under. Masks and alignments
+     are cited by both; a processing (amplicon) is cited by `exported_identifier`
+     alone — it has no `exported_processing` row;
   3. the edit changes something, and no other definition of the kind has the new
      params (`SettingsEditRefused`, `no_change` / `params_taken`; a concurrent mint
      of the same params that the check misses hits the `params_hash` UNIQUE
@@ -209,7 +210,7 @@ async def edit_definition_settings(
 _HANDLE_TABLES = {
     DefinitionKind.MASK: ("exported_processing", "exported_identifier"),
     DefinitionKind.ALIGNMENT: ("exported_processing", "exported_identifier"),
-    DefinitionKind.PROCESSING: (),
+    DefinitionKind.PROCESSING: ("exported_identifier",),
 }
 
 

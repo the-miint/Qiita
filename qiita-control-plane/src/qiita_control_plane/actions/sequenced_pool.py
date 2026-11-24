@@ -27,6 +27,8 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
+from ..repositories.sequenced_sample import fetch_pool_prep_sample_idxs
+
 logger = logging.getLogger(__name__)
 
 # Work-ticket states that block a pool delete. In-flight states block
@@ -164,23 +166,6 @@ def _rowcount(status: str) -> int:
         return 0
 
 
-async def _pool_prep_sample_idxs(
-    conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
-) -> list[int]:
-    """The prep_sample idxs reachable from a pool, via its sequenced_samples.
-
-    sequenced_sample ↔ prep_sample is 1:1 and each sequenced_sample belongs to
-    exactly one pool, so this set is exclusive to the pool — no prep_sample
-    here is shared with another pool."""
-    return [
-        r["prep_sample_idx"]
-        for r in await conn.fetch(
-            "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
-            sequenced_pool_idx,
-        )
-    ]
-
-
 async def _pool_work_ticket_state_counts(
     conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
 ) -> tuple[list[int], dict[str, int]]:
@@ -202,7 +187,7 @@ async def _pool_work_ticket_state_counts(
     if exists is None:
         raise SequencedPoolNotFound(sequenced_pool_idx)
 
-    prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
+    prep_sample_idxs = await fetch_pool_prep_sample_idxs(conn, sequenced_pool_idx)
     rows = await conn.fetch(
         "SELECT state, count(*) AS n FROM qiita.work_ticket"
         " WHERE sequenced_pool_idx = $1 OR prep_sample_idx = ANY($2::bigint[])"
@@ -361,8 +346,8 @@ async def delete_sequenced_pool_cascade(
         above cannot reach them) then the blocks themselves (→ block_member
         CASCADEs; a block is planned per (pool, mask/alignment), so every block
         covering one of this pool's samples is this pool's) →
-      mask_sample + alignment_sample + assembly_sample
-        (per-(mask/alignment/assembly, prep_sample) completion gates) →
+      mask_sample + alignment_sample + assembly_sample + amplicon_sample
+        (per-(mask/alignment/assembly/amplicon, prep_sample) completion gates) →
       assembly_membership.genome_idx detach + the assembly genomes it pointed at →
       prep_sample (→ sequence_range and assembly_membership CASCADE) →
       sequenced_pool.
@@ -403,7 +388,7 @@ async def delete_sequenced_pool_cascade(
     deletes are not surfaced — gate rows, the block cover map, the assembly
     genome_idx detach and the genome delete itself: internal cleanup, not primary
     counts."""
-    prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
+    prep_sample_idxs = await fetch_pool_prep_sample_idxs(conn, sequenced_pool_idx)
 
     work_ticket_deleted = _rowcount(
         await conn.execute(
@@ -464,8 +449,8 @@ async def delete_sequenced_pool_cascade(
             "DELETE FROM qiita.block WHERE block_idx = ANY($1::bigint[])",
             block_idxs,
         )
-    # Per-(mask/alignment/assembly, prep_sample) completion gates. All three
-    # prep_sample_idx FKs are ON DELETE RESTRICT, so any live gate row would block
+    # Per-(mask/alignment/assembly/amplicon, prep_sample) completion gates. Each
+    # prep_sample_idx FK is ON DELETE RESTRICT, so any live gate row would block
     # the prep_sample delete below — an unhandled ForeignKeyViolationError out of a
     # force-delete that has already purged the pool's DuckLake rows, which the
     # Postgres rollback does not restore. Clear them here (after sequenced_sample,
@@ -480,6 +465,10 @@ async def delete_sequenced_pool_cascade(
     )
     await conn.execute(
         "DELETE FROM qiita.assembly_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
+    await conn.execute(
+        "DELETE FROM qiita.amplicon_sample WHERE prep_sample_idx = ANY($1::bigint[])",
         prep_sample_idxs,
     )
     # Detach before deleting the genomes: the FK is NO ACTION, so a genome with a

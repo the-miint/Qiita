@@ -52,6 +52,15 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'long-read-assembly' AND state IN ('pending','queued','processing')"
   ```
+- `[operator]` (#854) **Before the restart, no amplicon ticket may be in flight.** amplicon
+  now passes ASV sequences from `amplicon_deblur` to `amplicon_load` inline
+  (`asv_sequences`) rather than chunked (`asv_chunks`), a change to the shared modules
+  both 1.0.0 and 1.1.0 bind. A ticket past `amplicon_deblur` when the sync lands is
+  refused on resume (its recorded deblur output no longer matches what `amplicon_load`
+  reads) and has to be submitted again. Expect 0; otherwise wait for them to finish.
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM qiita.work_ticket WHERE action_id = 'amplicon' AND state IN ('pending','queued','processing')"
+  ```
 - `[operator]` **Do not run `qiita-admin scratch reclaim --execute` until this deploy is in.**
   The bucket-6 gene-call backfill reads the finished long-read-assembly tickets'
   workspaces, and the build deployed now does not know to keep them. From this deploy,
@@ -88,10 +97,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   (an index; the migration's comment gives its measured build time): plain `dbmate`, no setup. The bucket-6 WoL
   repair needs both. (#926)
 - `[operator]` (#929) `make migrate` applies `20261120000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
+- `[operator]` (#854) Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate) and `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers). No out-of-band setup; applies with the standard migrate step.
 
 ### 4. Deploy
 
 - `[admin]` **Data planes on other hosts run this build before jobs resume.** Native jobs, the control plane and the CLIs now call the data plane's new `count_doget` before every stream, and a data plane on the previous build refuses it, failing the call. If `QIITA_DATA_PLANE_PEERS` in `/etc/qiita/data-plane.env` names other hosts, deploy this build to them in the same window, since `activate.sh` does not restart peers. A native job that starts between the checkout update (step 1 of `make redeploy`) and the deploy's verify can fail the same way, or on importing the new `qiita_common` before the native venv is refreshed; after the deploy verifies, list failed tickets with `qiita ticket list --state failed --all --limit 500`, and re-run each one whose `updated_at` falls between the pull and the verify with `qiita ticket run <work_ticket_idx>`. **Also, before starting `make redeploy`, drain `align-denovo`**: ask the lab to submit no `align-denovo` until the deploy verifies, and wait until `qiita ticket list --active --all --action-id align-denovo` lists nothing. A job already running keeps the old code, without the count check, and bucket 6 selects only the samples completed before the restart. (#936)
+- `[operator]` (#854) The amplicon workflow gains version 1.1.0 (drops the primer-orient knobs; adds a per-sample completion gate and public sample identifiers). `actions sync` loads it on deploy and supersedes 1.0.0 for new runs; runs already recorded against 1.0.0 keep binding it.
+- `[operator]` (#854) 1.1.0 stores ASV sequences inline in the lake's `amplicon_sequence` table. The data plane widens that table on restart (`ALTER TABLE … ADD COLUMN IF NOT EXISTS sequence`), so a redeployed data plane is a precondition for any amplicon `register-files` under 1.1.0 — the standard deploy restart covers it, no manual step. The now-unused `amplicon_sequence_chunks` table is left in the lake with no reader (it holds only 1.0.0 ASV bytes); it can be dropped by hand once no 1.0.0 amplicon run needs reprocessing.
 
 ### 5. Verify
 

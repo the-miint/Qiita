@@ -233,6 +233,9 @@ the FORWARD PLAN comment in each is the copy to read before adding one.
 `20261116000002_exported_identifier_prep_sample_delete.sql` lets a prep_sample
 delete (a sequenced-pool delete) retire the `QM<n>` handles naming it, keeping the
 biosample's accession and public handle on the row.
+`20261121000000_exported_identifier_processing.sql` adds the processing kind
+(amplicon) to `exported_identifier`, a handle keyed on the processing run that
+produced the sample; unlike the mask kind it adds no `exported_processing` arm.
 
 **The exported identifier is the boundary where our identifiers stop.** A
 published table names its samples `QM<n>`, never `prep_sample_idx` — see the
