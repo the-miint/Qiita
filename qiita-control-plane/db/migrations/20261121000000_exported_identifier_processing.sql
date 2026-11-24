@@ -8,8 +8,8 @@
 --
 -- The two edits the FORWARD PLAN requires, plus the retirement trigger, which must
 -- learn the new column for its ON DELETE SET NULL to stay legal. The CHECK and the
--- trigger carry the alignment and mask kinds already present (20261113000001) and the
--- prep_sample arm (20261116000002); this adds the processing kind to each.
+-- trigger already carry the alignment and mask kinds and the prep_sample-delete arm;
+-- this adds the processing kind to each.
 ALTER TABLE qiita.exported_identifier
     ADD COLUMN processing_idx BIGINT
         REFERENCES qiita.processing(processing_idx) ON DELETE SET NULL;
@@ -89,9 +89,8 @@ COMMENT ON TABLE qiita.exported_identifier IS
 
 -- migrate:down
 
--- Restore the trigger and CHECK to their pre-processing state (alignment + mask +
--- prep_sample arms, the alignment/mask one_processing CHECK — 20261113000001 and
--- 20261116000002).
+-- Restore the trigger and CHECK to their pre-processing state: the alignment, mask
+-- and prep_sample-delete arms, and the alignment/mask one_processing CHECK.
 CREATE OR REPLACE FUNCTION qiita.retire_detached_exported_identifier()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
