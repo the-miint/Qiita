@@ -30,7 +30,6 @@ from ..repositories.alignment_definition import list_pool_prep_sample_idxs
 from ..repositories.amplicon import (
     close_amplicon_samples,
     create_amplicon_samples_pending,
-    pool_prep_sample_idxs,
 )
 from ..repositories.assembly import (
     create_assembly_sample_pending,
@@ -38,6 +37,7 @@ from ..repositories.assembly import (
 )
 from ..repositories.definition_hold import MintHoldExhausted, mint_and_hold
 from ..repositories.processing import ProcessingDeprecated, mint_processing
+from ..repositories.sequenced_sample import fetch_pool_prep_sample_idxs
 from ._base import _log, _workflow_declares_action
 from ._mask import MASK_IDX_BINDING
 from ._record import fail_exhausted_hold, record_minted
@@ -306,6 +306,6 @@ async def _record_amplicon_gate_no_data(
         await close_amplicon_samples(
             conn,
             processing_idx=processing_idx,
-            prep_sample_idxs=await pool_prep_sample_idxs(conn, sequenced_pool_idx),
+            prep_sample_idxs=await fetch_pool_prep_sample_idxs(conn, sequenced_pool_idx),
             completed_prep_sample_idxs=[],
         )

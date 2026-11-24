@@ -2,10 +2,9 @@
 
 One row per (processing_idx, prep_sample): 'pending' for the pool's population
 when the runner mints the run identity, then 'completed' or 'no_data' when the
-run's terminal `finalize-amplicon-sample` action closes it. The twin of
-`repositories.assembly`'s gate, written a pool at a time because an amplicon
-ticket covers a whole sequenced pool. How many ASVs a sample carries is a count
-over the lake's `amplicon_membership`, not kept here.
+run's terminal `finalize-amplicon-sample` action closes it. Written a pool at a
+time because an amplicon ticket covers a whole sequenced pool. How many ASVs a
+sample carries is a count over the lake's `amplicon_membership`, not kept here.
 """
 
 from __future__ import annotations
@@ -20,20 +19,43 @@ AMPLICON_SAMPLE_COMPLETED = gate_state_literal("completed", AmpliconSampleState)
 AMPLICON_SAMPLE_NO_DATA = gate_state_literal("no_data", AmpliconSampleState)
 
 
-async def pool_prep_sample_idxs(
-    conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
-) -> list[int]:
-    """Every prep_sample of a pool, by its 1:1 sequenced_sample — the raw membership
-    the gate closes over. Unlike `list_pool_prep_sample_idxs` it keeps retired and
-    ENA-flagged samples, so a 'pending' row for a sample retired mid-run is still
-    reached and closed, not stranded at 'pending' for a run that has ended."""
-    return [
+class AmpliconSampleNotCompleteError(RuntimeError):
+    """prep_samples whose `amplicon_sample` gate is not 'completed', ascending."""
+
+    def __init__(self, processing_idx: int, not_complete: list[int]) -> None:
+        self.processing_idx = processing_idx
+        self.not_complete = not_complete
+        super().__init__(
+            f"{len(not_complete)} prep_sample(s) are not completed under processing"
+            f" {processing_idx}: {not_complete}"
+        )
+
+
+async def assert_pool_samples_completed(
+    conn: asyncpg.Connection, *, processing_idx: int, prep_sample_idxs: list[int]
+) -> None:
+    """Raise `AmpliconSampleNotCompleteError` unless every `prep_sample_idxs` row is
+    'completed' under this run. Holds the processing row `FOR SHARE` so the gate
+    cannot move under a mint the caller runs next in the same transaction — the
+    mask kind guards its mint the same way (`mint_exported_mask_identifiers`)."""
+    require_transaction(conn)
+    cohort = sorted(set(prep_sample_idxs))
+    await conn.execute(
+        "SELECT 1 FROM qiita.processing WHERE processing_idx = $1 FOR SHARE", processing_idx
+    )
+    completed = {
         r["prep_sample_idx"]
         for r in await conn.fetch(
-            "SELECT prep_sample_idx FROM qiita.sequenced_sample WHERE sequenced_pool_idx = $1",
-            sequenced_pool_idx,
+            "SELECT prep_sample_idx FROM qiita.amplicon_sample"
+            " WHERE processing_idx = $1 AND prep_sample_idx = ANY($2::bigint[]) AND state = $3",
+            processing_idx,
+            cohort,
+            AMPLICON_SAMPLE_COMPLETED,
         )
-    ]
+    }
+    not_complete = [idx for idx in cohort if idx not in completed]
+    if not_complete:
+        raise AmpliconSampleNotCompleteError(processing_idx, not_complete)
 
 
 async def create_amplicon_samples_pending(
@@ -41,10 +63,10 @@ async def create_amplicon_samples_pending(
 ) -> None:
     """Materialize the run's gate rows at 'pending' for `prep_sample_idxs`.
 
-    Idempotent, and with `create_assembly_sample_pending`'s asymmetry: a row a
-    previous run of the same identity left 'no_data' reopens (this run has not
-    finished), one it left 'completed' stays — that run's ASVs are in the lake,
-    and a later run counting none for the sample does not remove them."""
+    Idempotent, and asymmetric on re-entry: a row a previous run of the same
+    identity left 'no_data' reopens to 'pending' (this run has not finished), while
+    one it left 'completed' stays — that run's ASVs are already in the lake, and a
+    later run counting none for the sample must not remove them."""
     require_transaction(conn)
     await conn.execute(
         "INSERT INTO qiita.amplicon_sample (processing_idx, prep_sample_idx, state)"

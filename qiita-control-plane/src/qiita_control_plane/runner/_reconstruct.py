@@ -45,9 +45,9 @@ from ..actions.library import (
     SUBJECT_GENOME_MAP_OUTPUT_BASENAME,
     QcProducer,
 )
-from ..repositories.amplicon import pool_prep_sample_idxs
 from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
+from ..repositories.sequenced_sample import fetch_pool_prep_sample_idxs
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
     BUILD_SHARD_INDEX_ACTION_VERSION,
@@ -687,10 +687,10 @@ async def _run_action_primitive(
         completed, no_data = await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
             ctx.pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
-            # The pool's RAW membership, not `list_pool_prep_sample_idxs`: a sample
-            # retired mid-run got a 'pending' row at submit, and the filtered list
-            # drops it, which would strand that row at 'pending' forever.
-            prep_sample_idxs=await pool_prep_sample_idxs(
+            # The pool's RAW membership, not the filtered `list_pool_prep_sample_idxs`:
+            # a sample retired mid-run got a 'pending' row at submit, and the filtered
+            # list drops it, which would strand that row at 'pending' forever.
+            prep_sample_idxs=await fetch_pool_prep_sample_idxs(
                 ctx.pool, ctx.scope_target["sequenced_pool_idx"]
             ),
             asv_counts_path=Path(bound["asv_counts"]),
