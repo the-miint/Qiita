@@ -2,14 +2,17 @@
 answers — an amplicon table's values, columns, and each feature's sequence and md5."""
 
 import hashlib
+import json
 
 import duckdb
+import httpx
 import pyarrow as pa
 from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_FEATURE,
     PATH_FEATURE_TABLE_PREFIX,
     PATH_FEATURE_TABLE_VALUE,
 )
+from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
 
 from qiita_control_plane.run_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
@@ -39,11 +42,12 @@ def _answers(method, values, features):
     return call, fetch_binary
 
 
-def _run(monkeypatch, tmp_path, method, values, features, extra=()):
+def _run(monkeypatch, tmp_path, method, values, features, extra=(), *, call=None, rc=0):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user._parser import _build_parser
 
-    call, fetch_binary = _answers(method, values, features)
+    answer, fetch_binary = _answers(method, values, features)
+    call = call or answer
     monkeypatch.setattr(_common, "read_token", lambda *a, **k: "qk_tok")
     monkeypatch.setattr(_common, "call", call)
     monkeypatch.setattr(_common, "fetch_binary", fetch_binary)
@@ -66,7 +70,7 @@ def _run(monkeypatch, tmp_path, method, values, features, extra=()):
             *extra,
         ]
     )
-    assert args.handler(args, parser) == 0
+    assert args.handler(args, parser) == rc
     return out
 
 
@@ -110,3 +114,29 @@ def test_an_amplicon_bundle_maps_each_handle_to_sequence_and_md5(monkeypatch, tm
     # Only the features the table names, handle -> (sequence, md5).
     assert mapping == [("QF1", "ACGT", hashlib.md5(b"ACGT").hexdigest())]
     assert not out.with_name("table.taxonomy.parquet").exists()
+
+
+def test_the_identifier_map_says_what_it_carries(monkeypatch, tmp_path, capsys):
+    """The map holds each column's QM and biosample name, no internal idx, so its note
+    must not warn of one."""
+    out = _run(
+        monkeypatch,
+        tmp_path,
+        "amplicon",
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT")]),
+    )
+    payload = json.loads(out.with_name("table.exported-identifier.json").read_text())
+    assert payload["identifiers"] == _SAMPLES
+    assert "_idx" not in payload["note"]
+    assert "_idx" not in capsys.readouterr().out
+
+
+def test_a_stale_scope_403_asks_for_a_fresh_login(monkeypatch, tmp_path, capsys):
+    def call(method_, base_url, token, path, json=None, params=None):
+        request = httpx.Request("POST", f"http://cp{path}")
+        response = httpx.Response(403, headers={STALE_TOKEN_SCOPE_HEADER: "1"}, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    _run(monkeypatch, tmp_path, "amplicon", None, None, call=call, rc=1)
+    assert "qiita login" in capsys.readouterr().err

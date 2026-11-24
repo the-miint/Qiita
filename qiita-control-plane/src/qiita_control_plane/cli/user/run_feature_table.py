@@ -33,7 +33,6 @@ from qiita_common.models.run_feature_table import FeatureTableRequest
 from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
 from .. import _common
 from .feature_table import (
-    IDENTIFIER_MAP_NOTE,
     _bundle_targets,
     _tool_versions,
     _write_bundle,
@@ -44,6 +43,10 @@ MANIFEST_NOTE = (
     " was built over. A feature table is a selection over the lake, so the same runs"
     " over a different cohort yield a different table — which is why this record is"
     " part of the bundle."
+)
+MAP_NOTE = (
+    "This file maps each column of the table beside it (sample) to its QM (export_id) and"
+    " its biosample's public name (biosample), the key to join your sample metadata."
 )
 
 
@@ -122,11 +125,9 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             "kind": method,
             "value_kind": columns["value_kind"],
             "feature_id": SOURCES[method].feature_id_note,
-            # The cohort as public handles — each column's QM, sorted so the record
-            # does not depend on the order the samples came back in. The request names
-            # internal idxs (processing_idx, prep_sample_idx); a published manifest
-            # carries only handles a reader can resolve. The identifier map beside the
-            # table is the one artifact that carries prep_sample_idx, and it says so.
+            # Each column's QM, not the request's idxs: a published manifest carries
+            # only handles a reader can resolve. Sorted so the record does not depend
+            # on the order the samples came back in.
             "cohort": sorted(s["export_id"] for s in columns["samples"]),
             **sizes,
             "files": [p.name for p in targets],
@@ -140,6 +141,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         identifiers=columns["samples"],
         manifest=manifest,
         clearances=clearances,
+        map_note=MAP_NOTE,
     )
     return written, sizes
 
@@ -166,17 +168,13 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
         with contextlib.closing(connect_with_miint()) as con:
             written, sizes = _build(args, token, con)
     except ValidationError as exc:
-        print(f"error: {exc.errors()[0]['msg']}", file=sys.stderr)
+        _common.print_validation_error(exc)
         return 1
     except _common.httpx.HTTPStatusError as exc:
-        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        _common.print_http_status_error(exc.response)
         return 1
     except _common.httpx.RequestError as exc:
-        print(
-            f"error: could not reach the control plane: {exc!r}. Check --base-url /"
-            " $QIITA_CONTROL_PLANE_URL.",
-            file=sys.stderr,
-        )
+        _common.print_request_error(exc)
         return 1
     except _common.SlowResponseError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -197,5 +195,4 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
     print(f"and the record of what produced it: {manifest_path}")
     for path in companions:
         print(f"and each feature's sequence: {path}")
-    print(IDENTIFIER_MAP_NOTE)
     return 0

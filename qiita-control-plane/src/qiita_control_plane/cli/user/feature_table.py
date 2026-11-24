@@ -1308,10 +1308,11 @@ def _write_bundle(
     identifiers: list[dict[str, Any]],
     manifest: Callable[[list[Path]], dict[str, Any]],
     clearances: dict[str, Any],
+    map_note: str = IDENTIFIER_MAP_NOTE,
 ) -> list[Path]:
     """Write the bundle — the relabelled table at `table_path`, the exported-identifier map
-    and the manifest beside it, and one file per companion in `clearances` — and return the
-    files written.
+    (led by `map_note`) and the manifest beside it, and one file per companion in
+    `clearances` — and return the files written.
 
     `clearances` is keyed by companion name, and holding the clearance is what makes a
     member writable: each companion's COPY takes one, so a file cannot be written without
@@ -1357,7 +1358,7 @@ def _write_bundle(
         else:
             con.execute(ft.biom_copy_sql(table_partial))
         payload = {
-            "note": IDENTIFIER_MAP_NOTE,
+            "note": map_note,
             "count": len(identifiers),
             "identifiers": identifiers,
         }
