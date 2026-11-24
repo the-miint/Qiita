@@ -1,11 +1,12 @@
-"""Check a node's copy of a registered krepp build before it is made active.
+"""Check a registered krepp build before it is made active.
 
-Runs on whichever compute node SLURM picks. It runs the per-job check
-(``krepp_build.verify_build``) on that node's copy under PATH_NODE_LOCAL, then a
-known-answer check: one piece of each of up to ``KNOWN_ANSWER_TIPS`` backbone tips is
-placed with the copy, and the share whose best edge is the tip's own edge is
-reported. A build over another edge numbering than the reference's tree places
-almost none on their own edge. The `activate-krepp-build` action that follows
+Runs once, on whichever compute node SLURM picks. It reads the build through the node
+cache (``node_cache.materialize``: that node's copy, made now if it has none, or the
+master under PATH_DERIVED when PATH_NODE_LOCAL is unset), then runs a known-answer
+check: one piece of each of up to ``KNOWN_ANSWER_TIPS`` backbone tips is placed with
+the build, and the share whose best edge is the tip's own edge is reported. A build
+over another edge numbering than the reference's tree places almost none on their own
+edge. The `activate-krepp-build` action that follows
 activates the build only when the share reaches ``min_own_edge_share``; with
 ``activate: false`` in the workflow context the report is the only result, which is
 how the share of a correctly numbered build is first measured.
@@ -13,6 +14,7 @@ how the share of a correctly numbered build is first measured.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 from pathlib import Path
@@ -25,16 +27,16 @@ from qiita_common.krepp import (
     KreppBuildRecord,
 )
 
-from ..config import get_settings
 from ..data_plane_client import open_reference_chunk_stream, open_reference_phylogeny_stream
-from ..derived_store import KREPP_INDEX_SUBDIR, node_relative_path
-from ..krepp_build import verify_build
+from ..derived_store import KREPP_INDEX_SUBDIR
+from ..krepp_build import linked_krepp_version
 from ..miint import (
     apply_duckdb_settings,
     duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ..node_cache import MANIFEST, materialize
 
 # Tips placed, chosen by md5 of their feature_idx so a re-run checks the same tips.
 KNOWN_ANSWER_TIPS = 100
@@ -58,19 +60,12 @@ class Inputs(BaseModel):
     min_own_edge_share: float = Field(ge=0, le=1)
 
 
-def _node_copy(record: KreppBuildRecord) -> Path:
-    root = get_settings().path_node_local
-    if not root:
-        raise RuntimeError(
-            "PATH_NODE_LOCAL is not set in this job's environment; the orchestrator"
-            " forwards it on SLURM (config.node_local_job_env)"
-        )
-    return node_relative_path(root, record.fs_path)
-
-
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     record = KreppBuildRecord.model_validate_json(inputs.krepp_build_record.read_text())
-    folder = _node_copy(record)
+    folder = materialize(
+        record.fs_path, record.sha256sums_sha256, evict_first=record.node_cache_evict
+    )
+    manifest = json.loads((folder / MANIFEST).read_text())
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(
             conn,
@@ -80,7 +75,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ),
             threads=_DUCKDB_THREADS,
         )
-        verify_build(folder, record.sha256sums_sha256)
+        linked = linked_krepp_version(conn)
         async with open_reference_phylogeny_stream(conn, reference_idx=inputs.reference_idx) as rel:
             conn.execute(
                 "CREATE TEMP TABLE tip AS"
@@ -127,6 +122,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         own_edge_share=share,
         min_own_edge_share=inputs.min_own_edge_share,
         passed=share >= inputs.min_own_edge_share,
+        build_krepp_version=manifest["settings"]["krepp version"],
+        linked_krepp_version=linked,
     )
     print(f"krepp_index_activate: {report.model_dump_json()}", flush=True)
     out = workspace / KREPP_ACTIVATION_REPORT_BASENAME

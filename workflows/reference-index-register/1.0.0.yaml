@@ -8,11 +8,11 @@ description: >
   `PATH_DERIVED/references/{reference_idx}/krepp/{build_label}/` (`index/` with the
   krepp files, `jest/` with JEST's labelled tree and null), and this workflow checks
   it — its settings and tree can be read, the tree is the reference's own with its
-  edge numbers, and it holds no symlinks — writes README.md, manifest.json,
-  verify.sh and SHA256SUMS into it, and records it in qiita.reference_index as
-  `registered`. A registered build is not used: the cluster admins copy the folder to
-  every node's PATH_NODE_LOCAL, and `reference-index-activate` makes it the
-  reference's active build. docs/runbooks/krepp-index.md has the whole procedure.
+  edge numbers, and it holds no symlinks — seals it (writes manifest.json and
+  SHA256SUMS into it), and records it in qiita.reference_index as `registered`. A
+  registered build is not used until `reference-index-activate` makes it the
+  reference's active build. Jobs read it through the node cache (PATH_NODE_LOCAL, when
+  set), which copies it to a node on first use. docs/runbooks/krepp-index.md has the whole procedure.
 
   The reference stays as it is (it must already be active, with its phylogeny in
   the lake), so the action carries no success_status or failure_status: an active

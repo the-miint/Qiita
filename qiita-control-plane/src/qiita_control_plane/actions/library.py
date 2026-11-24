@@ -54,9 +54,9 @@ from qiita_common.krepp import (
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
     INDEX_TYPE_RYPE_ROUTER,
+    NODE_CACHED_INDEX_TYPES,
     FeatureHashEntry,
     GenomeSource,
-    IndexPathRoot,
     QcCheckResult,
     ReadMaskBucket,
     ReadMaskReason,
@@ -1987,7 +1987,6 @@ async def register_index(
     params: dict[str, Any],
     shard_id: int | None = None,
     state: ReferenceIndexState = ReferenceIndexState.ACTIVE,
-    fs_path_root: IndexPathRoot = IndexPathRoot.ABSOLUTE,
 ) -> int:
     """Record a built search index (e.g. a rype `.ryxdi`) for a reference in
     qiita.reference_index. `fs_path` is the on-disk location; `params` is the
@@ -1998,10 +1997,9 @@ async def register_index(
     (host `rype`/`minimap2`), or the shard's index (0..N-1) for a sharded
     analysis index that writes one row per shard.
 
-    `state` and `fs_path_root` default to what every index type but krepp is: a
-    served index at a host path. A krepp build is registered
-    `ReferenceIndexState.REGISTERED` with a `IndexPathRoot.NODE_LOCAL` relative path
-    (the table's CHECK ties the two together), and only activation serves it.
+    `state` defaults to what every index type but krepp is: a served index. A krepp
+    build is registered `ReferenceIndexState.REGISTERED`, with a path relative to
+    PATH_DERIVED (NODE_CACHED_INDEX_TYPES), and only activation serves it.
 
     Returns the reference_index_idx. Idempotent on
     (reference_idx, index_type, fs_path): a workflow retried from the start
@@ -2031,8 +2029,8 @@ async def register_index(
         )
     row = await pool.fetchrow(
         "INSERT INTO qiita.reference_index"
-        " (reference_idx, index_type, fs_path, params, shard_id, state, fs_path_root)"
-        " SELECT $1, $2, $3, $4::jsonb, $5, $6, $7"
+        " (reference_idx, index_type, fs_path, params, shard_id, state)"
+        " SELECT $1, $2, $3, $4::jsonb, $5, $6"
         " WHERE NOT EXISTS ("
         "   SELECT 1 FROM qiita.reference_index"
         "   WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3)"
@@ -2043,7 +2041,6 @@ async def register_index(
         json.dumps(params),
         shard_id,
         state.value,
-        fs_path_root.value,
     )
     if row is not None:
         return row["reference_index_idx"]
@@ -2077,7 +2074,9 @@ async def export_krepp_build(
 ) -> Path:
     """The krepp build a `reference-index-activate` ticket checks, as a
     `KreppBuildRecord` JSON under `KREPP_BUILD_RECORD_BASENAME`: how the job, which
-    has no database access, finds the build's copy and the hash it must match.
+    has no database access, finds the build and the hash it must match, and which
+    removed builds' node copies it deletes first (every removed row of a
+    NODE_CACHED_INDEX_TYPES type, any reference).
 
     Raises when the row is not a krepp build of the ticket's reference, or is retired
     or removed (activation applies to a registered build; an active one is checked
@@ -2097,11 +2096,18 @@ async def export_krepp_build(
         )
     if row["state"] not in (ReferenceIndexState.REGISTERED, ReferenceIndexState.ACTIVE):
         raise ValueError(f"krepp build {reference_index_idx} is {row['state']}")
+    removed = await pool.fetch(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE index_type = ANY($1::text[]) AND state = $2 ORDER BY fs_path",
+        sorted(NODE_CACHED_INDEX_TYPES),
+        ReferenceIndexState.REMOVED.value,
+    )
     record = KreppBuildRecord(
         reference_index_idx=reference_index_idx,
         reference_idx=reference_idx,
         fs_path=row["fs_path"],
         sha256sums_sha256=row["sha256sums_sha256"],
+        node_cache_evict=[r["fs_path"] for r in removed],
     )
     out = output_dir / KREPP_BUILD_RECORD_BASENAME
     out.write_text(record.model_dump_json())
@@ -2112,10 +2118,10 @@ async def activate_krepp_build_from_report(
     pool: asyncpg.Pool, reference_index_idx: int, report_path: Path
 ) -> None:
     """Make the build the reference's active one when the activation job's report
-    (`KreppActivationReport`) says the node copy passed, recording the report's
-    known-answer result in the build's params. Raises when the report is for another
-    build or did not pass; `repositories.reference_index.activate_krepp_build` says
-    what else is refused."""
+    (`KreppActivationReport`) says the build passed, recording the report's
+    known-answer result and both krepp versions in the build's params. Raises when
+    the report is for another build or did not pass;
+    `repositories.reference_index.activate_krepp_build` says what else is refused."""
     report = KreppActivationReport.model_validate_json(report_path.read_text())
     if report.reference_index_idx != reference_index_idx:
         raise ValueError(
@@ -2133,6 +2139,8 @@ async def activate_krepp_build_from_report(
         "min_own_edge_share": report.min_own_edge_share,
         "tips": report.tips,
         "node": report.node,
+        "build_krepp_version": report.build_krepp_version,
+        "linked_krepp_version": report.linked_krepp_version,
     }
     async with pool.acquire() as conn, conn.transaction():
         await activate_krepp_build(conn, reference_index_idx)

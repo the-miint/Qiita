@@ -22,10 +22,10 @@ Every touch point of derived storage is an orchestrator concern:
   * the ``DELETE /reference-artifact/{idx}`` endpoint (``reference_artifact``)
     purges the whole per-reference subtree.
 
-A krepp build's row holds a path relative to two roots: its master copy under
-``PATH_DERIVED`` and the node copies under ``PATH_NODE_LOCAL`` (on each compute
-node's own disk). ``node_relative_path`` resolves it under either, so the
-node-local copies share this module's layout rather than having one of their own.
+A krepp build's row holds a path relative to ``PATH_DERIVED``; ``node_cache`` copies
+it to the same relative path under ``PATH_NODE_LOCAL`` (on each compute node's own
+disk). ``node_relative_path`` resolves it under either, so the node cache shares this
+module's layout rather than having one of its own.
 
 Before this module the ``{PATH_DERIVED}/references/{idx}/...`` layout was
 reconstructed by hand in each of those places; centralizing it here removes the
@@ -163,11 +163,9 @@ def shard_bowtie2_index_prefix(derived_root: Path | str, reference_idx: int, sha
 
 # --- krepp builds --------------------------------------------------------------
 #
-# A krepp build lives at the same RELATIVE path under two roots: the master copy
-# under PATH_DERIVED, which the registration job reads and the cluster admins copy
-# from, and a copy under every compute node's PATH_NODE_LOCAL, which placement reads.
-# `reference_index.fs_path` holds the relative path (fs_path_root 'node_local').
-# The folder carries README.md, SHA256SUMS, manifest.json and verify.sh at its top
+# A krepp build's master copy is at a RELATIVE path under PATH_DERIVED, which
+# `reference_index.fs_path` holds; `node_cache` copies it to the same relative path
+# under PATH_NODE_LOCAL. The folder carries SHA256SUMS and manifest.json at its top
 # level and the krepp files in KREPP_INDEX_SUBDIR, which is what `place_krepp` is
 # given as its index directory.
 
@@ -187,7 +185,7 @@ def krepp_build_relpath(reference_idx: int, build_label: str) -> str:
 
 
 def node_relative_path(root: Path | str, relpath: str) -> Path:
-    """``root / relpath`` for a relative ``fs_path`` (``fs_path_root`` node_local).
+    """``root / relpath`` for a relative ``fs_path`` (NODE_CACHED_INDEX_TYPES).
     Raises ValueError when ``relpath`` is absolute or has a ``..`` or empty segment,
     so a row can only name a folder below the root it is resolved against."""
     # Split the raw string: PurePosixPath would drop the "." and empty segments

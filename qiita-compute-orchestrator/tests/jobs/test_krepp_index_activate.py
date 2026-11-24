@@ -1,7 +1,7 @@
-"""jobs.krepp_index_activate against the small index from conftest, registered and
-copied to a stand-in PATH_NODE_LOCAL. The reference's tree and sequences, which the job
-streams from the data plane, are stubbed by local tables; tips g0..g3 carry
-feature_idx 10..13."""
+"""jobs.krepp_index_activate against the small index from conftest, registered under
+a stand-in PATH_DERIVED and read through the node cache (a stand-in PATH_NODE_LOCAL,
+or none). The reference's tree and sequences, which the job streams from the data
+plane, are stubbed by local tables; tips g0..g3 carry feature_idx 10..13."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ from qiita_compute_orchestrator.jobs import krepp_index_activate as job
 from qiita_compute_orchestrator.krepp_build import (
     JEST_LABELLED_TREE,
     JEST_NULL,
-    KreppBuildInvalid,
     write_build_files,
 )
+from qiita_compute_orchestrator.node_cache import SealedFolderInvalid
 
 _JOB = "qiita_compute_orchestrator.jobs.krepp_index_activate"
 
@@ -35,7 +35,7 @@ def node(krepp_built_index, tmp_path, monkeypatch):
     (master / JEST_NULL).write_text("0.1\n")
     sums, _ = write_build_files(master, reference_idx=18, build_label="t1")
     node_root = tmp_path / "node"
-    shutil.copytree(master, node_root / rel)
+    node_root.mkdir()
     record = tmp_path / "record.json"
     record.write_text(
         KreppBuildRecord(
@@ -67,10 +67,11 @@ def node(krepp_built_index, tmp_path, monkeypatch):
 
     monkeypatch.setattr(f"{_JOB}.open_reference_phylogeny_stream", _tree)
     monkeypatch.setattr(f"{_JOB}.open_reference_chunk_stream", _chunks)
-    monkeypatch.setattr(
-        f"{_JOB}.get_settings", lambda: types.SimpleNamespace(path_node_local=node_root)
+    settings = types.SimpleNamespace(path_derived=tmp_path / "derived", path_node_local=node_root)
+    monkeypatch.setattr("qiita_compute_orchestrator.node_cache.get_settings", lambda: settings)
+    return types.SimpleNamespace(
+        record=record, state=state, copy=node_root / rel, master=master, settings=settings
     )
-    return types.SimpleNamespace(record=record, state=state, copy=node_root / rel)
 
 
 async def _run(node, tmp_path, minimum=0.75) -> KreppActivationReport:
@@ -100,8 +101,18 @@ async def test_a_tree_numbered_another_way_fails_the_known_answer_check(node, tm
     assert not report.passed
 
 
-async def test_a_bad_node_copy_fails_before_placing(node, tmp_path):
-    (node.copy / "index" / "stray").write_text("x")
-    with pytest.raises(KreppBuildInvalid) as exc:
+async def test_the_node_copy_is_made_and_the_versions_recorded(node, tmp_path):
+    report = await _run(node, tmp_path)
+    assert (node.copy / "manifest.json").is_file()
+    assert report.build_krepp_version.startswith("v")
+    assert report.linked_krepp_version == report.build_krepp_version
+
+
+async def test_without_a_node_cache_the_master_is_read_and_checked(node, tmp_path):
+    node.settings.path_node_local = None
+    report = await _run(node, tmp_path)
+    assert report.passed and not node.copy.exists()
+    (node.master / "index" / "stray").write_text("x")
+    with pytest.raises(SealedFolderInvalid) as exc:
         await _run(node, tmp_path)
     assert exc.value.check == "files"

@@ -233,14 +233,13 @@ def test_resolve_slurm_settings_requires_miint_gpl_boundary_path(monkeypatch):
         _resolve_slurm_settings()
 
 
-def test_path_node_local_required_and_absolute_under_slurm(monkeypatch):
-    """PATH_NODE_LOCAL is required at SLURM boot, so a missing value stops the
-    orchestrator rather than failing a placement step after the steps before it."""
+def test_path_node_local_is_optional_and_absolute(monkeypatch):
+    """PATH_NODE_LOCAL is optional (unset, jobs read sealed folders from PATH_DERIVED);
+    a set value must be absolute, so a relative one stops the orchestrator at boot."""
     from qiita_compute_orchestrator.config import _resolve_path_node_local
 
     monkeypatch.delenv("PATH_NODE_LOCAL", raising=False)
-    with pytest.raises(RuntimeError, match="requires PATH_NODE_LOCAL"):
-        _resolve_path_node_local()
+    assert _resolve_path_node_local() is None
     monkeypatch.setenv("PATH_NODE_LOCAL", "scratch/qiita-miint")
     with pytest.raises(RuntimeError, match="must be absolute"):
         _resolve_path_node_local()

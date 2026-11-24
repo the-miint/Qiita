@@ -67,7 +67,7 @@ async def test_registers_a_build_whose_tree_is_the_references(derived, tmp_path)
     meta = await _run(tmp_path)
     assert meta["index_type"] == "krepp"
     assert meta["fs_path"] == "references/18/krepp/t1"
-    assert (meta["state"], meta["fs_path_root"]) == ("registered", "node_local")
+    assert meta["state"] == "registered" and "fs_path_root" not in meta
     assert meta["params"]["m"] == 4
     assert len(meta["params"][SHA256SUMS_SHA256_PARAM]) == 64
     assert (derived.folder / "SHA256SUMS").is_file()

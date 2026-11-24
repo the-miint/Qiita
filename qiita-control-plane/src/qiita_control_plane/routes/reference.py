@@ -34,7 +34,6 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_INDEX_REMOVE,
-    PATH_REFERENCE_KREPP_BUILD_ACTIVE,
     PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -47,9 +46,7 @@ from qiita_common.assembly_constants import (
     BIN_QUALITY_TABLE,
 )
 from qiita_common.auth_constants import Scope
-from qiita_common.krepp import SHA256SUMS_SHA256_PARAM, KreppBuildRecord
 from qiita_common.models import (
-    INDEX_TYPE_KREPP,
     DoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
@@ -62,7 +59,6 @@ from qiita_common.models import (
     ReferenceExclusionSyncResponse,
     ReferenceGenomeMember,
     ReferenceIndex,
-    ReferenceIndexState,
     ReferenceKind,
     ReferencePhylogenyEdgeIdMintResponse,
     ReferenceResponse,
@@ -213,27 +209,6 @@ async def list_references(
     return [ReferenceResponse(**dict(r)) for r in rows]
 
 
-@router.get(PATH_REFERENCE_KREPP_BUILD_ACTIVE)
-async def list_active_krepp_builds(
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    _scope: Principal = Depends(require_any_scope(Scope.REFERENCE_READ, Scope.TICKET_DOGET)),
-) -> list[KreppBuildRecord]:
-    """Every reference's active krepp build: where its copy is, relative to
-    PATH_NODE_LOCAL, and the SHA256SUMS hash a copy must have. The compute-readiness
-    probe checks each on the node it runs on. Accepts `reference:read` or
-    `ticket:doget`, as the reference DoGet route does, because the compute service
-    account holds the latter."""
-    rows = await pool.fetch(
-        "SELECT reference_index_idx, reference_idx, fs_path, params->>$3 AS sha256sums_sha256"
-        " FROM qiita.reference_index WHERE index_type = $1 AND state = $2"
-        " ORDER BY reference_idx",
-        INDEX_TYPE_KREPP,
-        ReferenceIndexState.ACTIVE.value,
-        SHA256SUMS_SHA256_PARAM,
-    )
-    return [KreppBuildRecord.model_validate(dict(r)) for r in rows]
-
-
 @router.post(PATH_REFERENCE_INDEX_REMOVE, status_code=200)
 async def remove_reference_krepp_build(
     reference_idx: Annotated[int, Field(gt=0)],
@@ -262,7 +237,7 @@ async def remove_reference_krepp_build(
     row = dict(
         await pool.fetchrow(
             "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
-            " shard_id, state, fs_path_root FROM qiita.reference_index"
+            " shard_id, state FROM qiita.reference_index"
             " WHERE reference_index_idx = $1",
             reference_index_idx,
         )
@@ -291,12 +266,12 @@ async def get_reference_index(
     reference metadata GETs — because fs_path exposes internal filesystem
     layout; reference:read is held by every human role and service account.
 
-    A krepp build's `fs_path` is relative (`fs_path_root` node_local): it names the
-    same folder under every compute node's PATH_NODE_LOCAL and under PATH_DERIVED."""
+    A krepp build's `fs_path` is relative to the orchestrator's PATH_DERIVED
+    (NODE_CACHED_INDEX_TYPES)."""
     await require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
-        " shard_id, state, fs_path_root"
+        " shard_id, state"
         " FROM qiita.reference_index WHERE reference_idx = $1"
         " ORDER BY created_at DESC, reference_index_idx DESC",
         reference_idx,

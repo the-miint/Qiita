@@ -1,9 +1,9 @@
 -- migrate:up
 
 -- A krepp placement index is built outside Qiita and registered onto an existing
--- reference. Unlike the index types before it, a krepp build is copied by the
--- cluster admins to every compute node's local disk, and it is not served until it
--- has been checked on a node and activated. This migration adds what that needs.
+-- reference. Unlike the index types before it, it is not served until it has been
+-- checked and activated, and a later build replaces it. This migration adds what
+-- that needs.
 
 -- 1. `krepp` joins the index_type allow-list (plain TEXT + CHECK;
 --    INDEX_TYPE_KREPP in qiita_common.models is the Python constant).
@@ -26,17 +26,12 @@ ALTER TABLE qiita.reference_index
     ADD CONSTRAINT reference_index_lifecycle_is_krepp
     CHECK (index_type = 'krepp' OR state = 'active');
 
--- 3. What fs_path is relative to. 'absolute': fs_path is a host path (every type
---    before krepp). 'node_local': fs_path is relative, and resolves under the
---    orchestrator's PATH_NODE_LOCAL on a compute node and under PATH_DERIVED for
---    the master copy, so one row names the same folder on every node.
+-- 3. A krepp build's fs_path is relative to the orchestrator's PATH_DERIVED, and
+--    names a sealed folder jobs read through the node cache
+--    (qiita_common.models.NODE_CACHED_INDEX_TYPES); every other type's is a host path.
 ALTER TABLE qiita.reference_index
-    ADD COLUMN fs_path_root TEXT NOT NULL DEFAULT 'absolute'
-        CONSTRAINT reference_index_fs_path_root_check
-        CHECK (fs_path_root IN ('absolute', 'node_local'));
-ALTER TABLE qiita.reference_index
-    ADD CONSTRAINT reference_index_krepp_is_node_local
-    CHECK ((index_type = 'krepp') = (fs_path_root = 'node_local'));
+    ADD CONSTRAINT reference_index_krepp_path_is_relative
+    CHECK (index_type <> 'krepp' OR fs_path NOT LIKE '/%');
 
 -- At most one active krepp build per reference: activation retires the previous
 -- one before activating the next, in one transaction.
@@ -75,9 +70,8 @@ $$;
 DROP INDEX IF EXISTS qiita.work_ticket_reference_index_idx;
 ALTER TABLE qiita.work_ticket DROP COLUMN IF EXISTS reference_index_idx;
 DROP INDEX IF EXISTS qiita.reference_index_one_active_krepp;
-ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_krepp_is_node_local;
+ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_krepp_path_is_relative;
 ALTER TABLE qiita.reference_index DROP CONSTRAINT IF EXISTS reference_index_lifecycle_is_krepp;
-ALTER TABLE qiita.reference_index DROP COLUMN IF EXISTS fs_path_root;
 ALTER TABLE qiita.reference_index DROP COLUMN IF EXISTS state;
 ALTER TABLE qiita.reference_index
     DROP CONSTRAINT IF EXISTS reference_index_index_type_check;

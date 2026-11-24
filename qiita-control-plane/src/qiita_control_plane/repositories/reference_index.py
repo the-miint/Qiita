@@ -1,7 +1,7 @@
 """State changes of a krepp build (`qiita.reference_index` rows with index_type krepp).
 
 A build is registered by `actions.library.register_index` (`registered`), activated
-once its node copies have passed the activation checks (`activate_krepp_build`), and
+once it has passed the activation checks (`activate_krepp_build`), and
 removed once no running ticket uses it (`remove_krepp_build`). Each change locks the
 reference's krepp rows `FOR UPDATE` first, so two changes to one reference's builds
 serialize. `/run` refuses a ticket whose build is removed (`removed_build_of_ticket`).

@@ -289,7 +289,7 @@ fi
 # test reads `<key>=<value>` out of this script's text.
 #
 # MODULE_PROBE_RC keeps the module's exit code for a probe whose codes mean more than
-# ok/fail (krepp-index), and MODULE_PROBE_ERR keeps its output on success too.
+# ok/fail (node-cache), and MODULE_PROBE_ERR keeps its output on success too.
 run_module_probe() {{
     MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"
     MODULE_PROBE_RC=$?
@@ -584,14 +584,14 @@ else
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 
-# This node's copies of the active krepp builds, checked as the activation job checks
-# them; the exit code is the row's status (qiita_compute_orchestrator.krepp_node_check).
-run_module_probe qiita_compute_orchestrator.krepp_node_check
+# The node cache root on this node; the exit code is the row's status
+# (qiita_compute_orchestrator.node_cache.probe).
+run_module_probe qiita_compute_orchestrator.node_cache
 case "$MODULE_PROBE_RC" in
-    0) echo "{_PROBE_LINE_PREFIX} krepp-index=ok detail=$MODULE_PROBE_ERR" ;;
-    3) echo "{_PROBE_LINE_PREFIX} krepp-index=skip detail=$MODULE_PROBE_ERR" ;;
-    4) echo "{_PROBE_LINE_PREFIX} krepp-index=warn err=$MODULE_PROBE_ERR" ;;
-    *) echo "{_PROBE_LINE_PREFIX} krepp-index=fail err=$MODULE_PROBE_ERR" ;;
+    0) echo "{_PROBE_LINE_PREFIX} node-cache=ok detail=$MODULE_PROBE_ERR" ;;
+    3) echo "{_PROBE_LINE_PREFIX} node-cache=skip detail=$MODULE_PROBE_ERR" ;;
+    4) echo "{_PROBE_LINE_PREFIX} node-cache=warn err=$MODULE_PROBE_ERR" ;;
+    *) echo "{_PROBE_LINE_PREFIX} node-cache=fail err=$MODULE_PROBE_ERR" ;;
 esac
 
 # Outbound HTTPS from this compute node to the ENA archives — why the deploy
@@ -787,7 +787,7 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
       - shared-fs-visible=yes/no           → pass / fail
       - shared-fs-writable=yes/no          → pass / fail
       - cp-from-compute=ok/fail/skip       → pass / fail / skip
-      - krepp-index=ok/fail/skip/warn      → pass / fail / skip / warn
+      - node-cache=ok/fail/skip/warn       → pass / fail / skip / warn
       - hostname / uid / user              → informational (pass with detail)
     """
     results: list[CheckResult] = []

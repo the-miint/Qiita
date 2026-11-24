@@ -3189,7 +3189,7 @@ def register_index_spy(monkeypatch):
     calls: list[tuple[str, dict]] = []
 
     async def register_index(
-        pool, *, reference_idx, index_type, fs_path, params, shard_id=None, state, fs_path_root
+        pool, *, reference_idx, index_type, fs_path, params, shard_id=None, state
     ):
         calls.append((index_type, params))
 

@@ -162,12 +162,12 @@ class Settings:
     # YAML's bare `container:` filename at submit time). None on the
     # launcher path and on LocalBackend-only deploys.
     path_derived_images: Path | None = None
-    # Node-local tier root (PATH_NODE_LOCAL): a path on every compute node's own
-    # disk that holds the same content on every node, copied there by the cluster
-    # admins (a krepp build: `{path_node_local}/references/{idx}/krepp/{label}/`).
-    # Required when backend_type=slurm (`_resolve_path_node_local`); its existence is
-    # not checked here, because it is not on the orchestrator's host. On the launcher
-    # path it is read from the job env, which `node_local_job_env` writes.
+    # Node cache root (PATH_NODE_LOCAL): a directory on each compute node's own disk
+    # that `node_cache` copies sealed folders into on first use. Optional; unset,
+    # jobs read them from PATH_DERIVED. Must be absolute when set
+    # (`_resolve_path_node_local`); its existence is not checked here, because it is
+    # not on the orchestrator's host. On the launcher path it is read from the job
+    # env, which `node_local_job_env` writes.
     path_node_local: str | None = None
 
     @classmethod
@@ -199,11 +199,7 @@ class Settings:
         path_derived_images = (
             _resolve_path_derived_images() if backend_type == BACKEND_SLURM else None
         )
-        path_node_local = (
-            _resolve_path_node_local()
-            if backend_type == BACKEND_SLURM
-            else os.environ.get("PATH_NODE_LOCAL") or None
-        )
+        path_node_local = _resolve_path_node_local()
         return cls(
             backend_type=backend_type,
             path_scratch=os.environ.get(
@@ -224,20 +220,11 @@ class Settings:
         )
 
 
-def _resolve_path_node_local() -> str:
-    """PATH_NODE_LOCAL, required and absolute under COMPUTE_BACKEND=slurm.
-
-    Fail-fast at boot: the krepp activation job and the readiness probe's
-    krepp-index row read a build's node copy from this tier, and an unset value would
-    otherwise surface only when one of them runs."""
-    raw = os.environ.get("PATH_NODE_LOCAL")
-    if not raw:
-        raise RuntimeError(
-            "orchestrator: COMPUTE_BACKEND=slurm requires PATH_NODE_LOCAL (the node-local"
-            " tier root on every compute node, e.g. /scratch/qiita-miint), where the"
-            " krepp index copies live"
-        )
-    if not Path(raw).is_absolute():
+def _resolve_path_node_local() -> str | None:
+    """PATH_NODE_LOCAL, or None when unset. A set value must be absolute: it names
+    the same directory on every compute node, whatever the job's working directory."""
+    raw = os.environ.get("PATH_NODE_LOCAL") or None
+    if raw is not None and not Path(raw).is_absolute():
         raise RuntimeError(f"orchestrator: PATH_NODE_LOCAL must be absolute, got {raw!r}")
     return raw
 
@@ -245,8 +232,7 @@ def _resolve_path_node_local() -> str:
 def node_local_job_env(path_node_local: str | None) -> dict[str, str]:
     """The job-env entry that carries PATH_NODE_LOCAL to a compute node (the
     slurmrestd env is an allowlist). Shared by SlurmBackend and the readiness probe
-    so the two cannot forward different values. Empty when it is unset, which
-    `Settings.from_env` allows only off SLURM."""
+    so the two cannot forward different values. Empty when it is unset."""
     return {"PATH_NODE_LOCAL": path_node_local} if path_node_local else {}
 
 

@@ -4,9 +4,8 @@ The build is a folder at ``PATH_DERIVED/references/{reference_idx}/krepp/{build_
 (``derived_store.krepp_build_relpath``) holding ``index/`` and ``jest/``
 (``krepp_build``). This step checks it and writes Qiita's files into it; the
 ``register-index`` action that follows records it `registered`. Nothing serves a
-registered build: the cluster admins copy the folder to every node, and the
-``reference-index-activate`` workflow checks a node copy and makes it the
-reference's active build.
+registered build: the ``reference-index-activate`` workflow checks it and makes it
+the reference's active build.
 
 Checks, cheapest first, before any file is hashed:
 
@@ -18,19 +17,19 @@ Checks, cheapest first, before any file is hashed:
   (``POST /reference/{idx}/phylogeny/mint-edge-id``);
 - JEST's tree (``labelled.nwk``) carries the same edges (branch lengths not compared).
 
-Then every file is hashed once and SHA256SUMS written (``write_build_files``).
+Then the folder is sealed: every file hashed once, manifest.json and SHA256SUMS
+written (``write_build_files``).
 """
 
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
 from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
-from qiita_common.models import INDEX_TYPE_KREPP, IndexPathRoot, ReferenceIndexState
+from qiita_common.models import INDEX_TYPE_KREPP, ReferenceIndexState
 
 from ..config import get_settings
 from ..data_plane_client import open_reference_phylogeny_stream
@@ -42,6 +41,7 @@ from ..krepp_build import (
     write_build_files,
 )
 from ..miint import open_miint_conn
+from ..node_cache import default_threads
 from ._phylogeny import tree_difference
 
 _TREE_COLUMNS = "node_index, parent_index, edge_id, branch_length, is_tip, name"
@@ -54,10 +54,6 @@ class Inputs(BaseModel):
     reference_idx: int
     work_ticket_idx: int
     build_label: str
-
-
-def _hash_threads() -> int:
-    return max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "0")) or (os.cpu_count() or 1))
 
 
 async def check_trees(
@@ -113,14 +109,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         folder,
         reference_idx=inputs.reference_idx,
         build_label=inputs.build_label,
-        threads=_hash_threads(),
+        threads=default_threads(),
     )
     settings = manifest["settings"]
     meta = {
         "index_type": INDEX_TYPE_KREPP,
         "fs_path": relpath,
         "state": ReferenceIndexState.REGISTERED.value,
-        "fs_path_root": IndexPathRoot.NODE_LOCAL.value,
         "params": {
             SHA256SUMS_SHA256_PARAM: sums_sha256,
             "build_label": inputs.build_label,

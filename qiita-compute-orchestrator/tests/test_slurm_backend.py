@@ -515,8 +515,8 @@ async def test_run_step_propagates_path_derived_into_job_env(jwt_path, baseline,
 
 @pytest.mark.asyncio
 async def test_run_step_propagates_path_node_local_into_job_env(jwt_path, baseline, tmp_path):
-    """A placement step reads its krepp index from PATH_NODE_LOCAL on the compute
-    node; the slurmrestd env is an allowlist, so the backend forwards it."""
+    """A job reads sealed folders through the node cache at PATH_NODE_LOCAL on the
+    compute node; the slurmrestd env is an allowlist, so the backend forwards it."""
     captured: dict[str, dict] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:

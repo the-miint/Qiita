@@ -1083,10 +1083,10 @@ sudo -u qiita-orch bash -lc '
 
 Expected: zero `✗ fail` rows; the summary line reads
 `N pass, 0 fail, M skip, W warn`. A `! warn` row is non-fatal too: it is
-a finding about the node the probe ran on (`krepp-index`: that node's copy
-of an active krepp build is missing or changed, or an active build was
-written by a krepp other than the one miint links), for the cluster admins to
-fix without failing the deploy. `skip` rows are non-fatal — they mean a
+a finding about the node the probe ran on (`node-cache`: `PATH_NODE_LOCAL`
+is set but is not a writable directory on that node, so every job that reads
+through the node cache fails there), for the cluster admins to fix without
+failing the deploy. `skip` rows are non-fatal — they mean a
 specific check didn't apply (e.g. `SLURM_NATIVE_PYTHON=python`
 skips the host-side native-python check because the path resolution
 depends on the compute node's PATH; missing `QIITA_CP_URL` skips the

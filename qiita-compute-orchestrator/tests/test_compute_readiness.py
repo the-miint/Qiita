@@ -295,7 +295,7 @@ def test_probe_script_checks_ena_reachability_from_compute():
 
 
 def test_probe_script_runs_every_module_probe_through_one_helper():
-    """native-import, ena-from-compute and krepp-index share one capture path, so they cannot
+    """native-import, ena-from-compute and node-cache share one capture path, so they cannot
     drift into different ideas of what reaches the operator's `err=` field. The
     row names stay literals at the call sites — `_parse_probe_log` and the
     script-vs-parser parity test both read them out of the script's text."""
@@ -725,19 +725,13 @@ def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
     assert "0 fail" in out
 
 
-def test_probe_script_maps_the_krepp_node_check_exit_codes():
-    """krepp_node_check's exit code is the krepp-index row's status: a bad copy on the
-    probe's one node, or a krepp version difference, warns; a missing PATH_NODE_LOCAL
-    or an unreachable control plane fails."""
-    from qiita_compute_orchestrator import krepp_node_check as kc
-
+def test_probe_script_maps_the_node_cache_probe_exit_codes():
+    """node_cache.probe's exit code is the node-cache row's status: unset skips, a
+    root that is not a writable directory on the probe's node warns, anything else
+    (the module failing) fails."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
-    assert "run_module_probe qiita_compute_orchestrator.krepp_node_check" in script
-    for code, value in (
-        (kc.EXIT_OK, "ok"),
-        (kc.EXIT_SKIP, "skip"),
-        (kc.EXIT_WARN, "warn"),
-    ):
-        assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} krepp-index={value}' in script
-    assert '*) echo "' + cr._PROBE_LINE_PREFIX + " krepp-index=fail" in script
-    assert cr._classify_probe_pair("krepp-index", "warn") == "warn"
+    assert "run_module_probe qiita_compute_orchestrator.node_cache" in script
+    for code, value in ((0, "ok"), (3, "skip"), (4, "warn")):
+        assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} node-cache={value}' in script
+    assert '*) echo "' + cr._PROBE_LINE_PREFIX + " node-cache=fail" in script
+    assert cr._classify_probe_pair("node-cache", "warn") == "warn"

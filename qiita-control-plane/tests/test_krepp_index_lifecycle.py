@@ -11,7 +11,6 @@ import pytest
 from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
 from qiita_common.models import (
     INDEX_TYPE_KREPP,
-    IndexPathRoot,
     ReferenceIndexState,
 )
 
@@ -73,7 +72,6 @@ async def _register(world, label: str, sums: str = "a" * 64) -> int:
         fs_path=f"references/{world['reference_idx']}/krepp/{label}",
         params=_params(sums),
         state=ReferenceIndexState.REGISTERED,
-        fs_path_root=IndexPathRoot.NODE_LOCAL,
     )
 
 
@@ -137,36 +135,28 @@ async def _ticket(world, reference_index_idx: int, state: str) -> int:
 # --- schema -----------------------------------------------------------------
 
 
-async def test_existing_index_types_default_to_active_absolute(world):
+async def test_existing_index_types_default_to_active(world):
     pool = world["pool"]
     idx = await pool.fetchval(
         "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
         " VALUES ($1, 'rype', '/srv/x.ryxdi', '{}'::jsonb) RETURNING reference_index_idx",
         world["reference_idx"],
     )
-    row = await pool.fetchrow(
-        "SELECT state, fs_path_root FROM qiita.reference_index WHERE reference_index_idx = $1",
-        idx,
+    state = await pool.fetchval(
+        "SELECT state FROM qiita.reference_index WHERE reference_index_idx = $1", idx
     )
-    assert (row["state"], row["fs_path_root"]) == (
-        ReferenceIndexState.ACTIVE,
-        IndexPathRoot.ABSOLUTE,
-    )
+    assert state == ReferenceIndexState.ACTIVE
 
 
-@pytest.mark.parametrize(
-    ("index_type", "root"),
-    [(INDEX_TYPE_KREPP, IndexPathRoot.ABSOLUTE), ("rype", IndexPathRoot.NODE_LOCAL)],
-)
-async def test_node_local_root_is_krepp_only(world, index_type, root):
+async def test_a_krepp_path_is_relative(world):
+    """A krepp row's fs_path is relative to PATH_DERIVED (NODE_CACHED_INDEX_TYPES)."""
     with pytest.raises(asyncpg.CheckViolationError):
         await world["pool"].execute(
             "INSERT INTO qiita.reference_index"
-            " (reference_idx, index_type, fs_path, params, fs_path_root)"
-            " VALUES ($1, $2, 'x', '{}'::jsonb, $3)",
+            " (reference_idx, index_type, fs_path, params, state)"
+            " VALUES ($1, $2, '/srv/krepp/a', '{}'::jsonb, 'registered')",
             world["reference_idx"],
-            index_type,
-            root,
+            INDEX_TYPE_KREPP,
         )
 
 
@@ -194,7 +184,6 @@ async def test_register_index_writes_krepp_registered_only(world, state):
             fs_path=f"references/{world['reference_idx']}/krepp/x",
             params=_params("c" * 64),
             state=state,
-            fs_path_root=IndexPathRoot.NODE_LOCAL,
         )
 
 
@@ -400,6 +389,8 @@ def _report(reference_index_idx: int, own: int, minimum: float = 0.9) -> str:
         own_edge_share=own / 100,
         min_own_edge_share=minimum,
         passed=own / 100 >= minimum,
+        build_krepp_version="v0.10.0",
+        linked_krepp_version="v0.12.3",
     ).model_dump_json()
 
 
@@ -413,6 +404,25 @@ async def test_export_writes_the_build_record(world, tmp_path):
     record = KreppBuildRecord.model_validate_json(path.read_text())
     assert record.fs_path == f"references/{world['reference_idx']}/krepp/a"
     assert record.sha256sums_sha256 == "d" * 64
+    assert record.node_cache_evict == []
+
+
+async def test_export_names_removed_builds_for_eviction(world, tmp_path):
+    from qiita_common.krepp import KreppBuildRecord
+
+    from qiita_control_plane.actions.library import export_krepp_build
+
+    a = await _register(world, "a", "d" * 64)
+    gone = await _register(world, "gone", "e" * 64)
+    await world["pool"].execute(
+        "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
+        gone,
+        ReferenceIndexState.REMOVED,
+    )
+    path = await export_krepp_build(world["pool"], world["reference_idx"], a, tmp_path)
+    record = KreppBuildRecord.model_validate_json(path.read_text())
+    assert f"references/{world['reference_idx']}/krepp/gone" in record.node_cache_evict
+    assert record.fs_path not in record.node_cache_evict
 
 
 async def test_export_refuses_another_reference_and_a_retired_build(world, tmp_path):
@@ -443,6 +453,10 @@ async def test_activate_from_a_passing_report_records_it(world, tmp_path):
     assert row["state"] == ReferenceIndexState.ACTIVE
     activation = json.loads(row["params"])["activation"]
     assert activation["own_edge_share"] == 0.97 and activation["node"] == "b-cn-01"
+    assert (activation["build_krepp_version"], activation["linked_krepp_version"]) == (
+        "v0.10.0",
+        "v0.12.3",
+    )
 
 
 async def test_activate_refuses_a_failing_or_foreign_report(world, tmp_path):

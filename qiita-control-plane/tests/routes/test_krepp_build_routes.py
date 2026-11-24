@@ -10,11 +10,9 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_REFERENCE_INDEX_REMOVE,
-    URL_REFERENCE_KREPP_BUILD_ACTIVE,
     URL_WORK_TICKET_RUN,
 )
-from qiita_common.krepp import SHA256SUMS_SHA256_PARAM
-from qiita_common.models import INDEX_TYPE_KREPP, IndexPathRoot, ReferenceIndexState
+from qiita_common.models import INDEX_TYPE_KREPP, ReferenceIndexState
 
 pytestmark = pytest.mark.db
 
@@ -73,13 +71,12 @@ async def failed_ticket_on_build(postgres_pool, human_admin_session, monkeypatch
     )
     build = await pool.fetchval(
         "INSERT INTO qiita.reference_index"
-        " (reference_idx, index_type, fs_path, params, state, fs_path_root)"
-        " VALUES ($1, $2, 'references/x/krepp/a', '{}'::jsonb, $3, $4)"
+        " (reference_idx, index_type, fs_path, params, state)"
+        " VALUES ($1, $2, 'references/x/krepp/a', '{}'::jsonb, $3)"
         " RETURNING reference_index_idx",
         reference_idx,
         INDEX_TYPE_KREPP,
         ReferenceIndexState.RETIRED,
-        IndexPathRoot.NODE_LOCAL,
     )
     ticket = await pool.fetchval(
         "INSERT INTO qiita.work_ticket (action_id, action_version, originator_principal_idx,"
@@ -172,27 +169,3 @@ async def test_remove_404s_a_build_of_another_reference(client, failed_ticket_on
     w = failed_ticket_on_build
     resp = await client.post(_remove_url(w, reference_idx=w["reference_idx"] + 100000))
     assert resp.status_code == 404
-
-
-async def test_active_builds_lists_only_active_krepp_builds(client, failed_ticket_on_build):
-    w = failed_ticket_on_build
-    listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
-    assert w["build"] not in [b["reference_index_idx"] for b in listed]
-    await w["pool"].execute(
-        "UPDATE qiita.reference_index SET state = $2,"
-        " params = jsonb_build_object($3::text, repeat('e', 64))"
-        " WHERE reference_index_idx = $1",
-        w["build"],
-        ReferenceIndexState.ACTIVE,
-        SHA256SUMS_SHA256_PARAM,
-    )
-    listed = (await client.get(URL_REFERENCE_KREPP_BUILD_ACTIVE)).json()
-    mine = [b for b in listed if b["reference_index_idx"] == w["build"]]
-    assert mine == [
-        {
-            "reference_index_idx": w["build"],
-            "reference_idx": w["reference_idx"],
-            "fs_path": "references/x/krepp/a",
-            "sha256sums_sha256": "e" * 64,
-        }
-    ]
