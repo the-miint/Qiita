@@ -11,7 +11,12 @@
   - an input cap that applies to only one form of a request;
   - an artifact check that goes further than its siblings' checks;
   - a constraint that rules out a state the data can be in;
-  - an artifact that an admin, rather than Qiita, places or removes.
+  - an artifact that an admin, rather than Qiita, places or removes;
+  - a docstring that explains one feature's code by an unrelated feature's, or carries its
+    callers' reasons;
+  - a claim that one kind is "the one" with some property;
+  - a count over lake data copied into a control-plane column;
+  - a query result fetched only to test whether it is empty.
 
   Sequence storage is now chunked only when a sequence can be longer than one chunk.
   Casts of a column already of that type, a producer `ORDER BY` with no named consumer, an
