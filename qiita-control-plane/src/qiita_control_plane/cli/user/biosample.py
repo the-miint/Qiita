@@ -24,8 +24,8 @@ from qiita_common.models import (
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
     BiosampleBulkLinkRequest,
+    BiosampleIdentifierKey,
     BiosampleImportRequest,
-    BiosampleLinkKey,
     BiosampleStudyLookupRequest,
 )
 
@@ -46,7 +46,7 @@ _BIOSAMPLE_IDX = "biosample_idx"
 # names a biosample whatever its study. The request's idx key is offered as
 # biosample_idx.
 _BIOSAMPLE_KEY_BY_CHOICE = {
-    (_BIOSAMPLE_IDX if key == IDX_KEY else key): key for key in get_args(BiosampleLinkKey)
+    (_BIOSAMPLE_IDX if key == IDX_KEY else key): key for key in get_args(BiosampleIdentifierKey)
 }
 # export_entity_id is listed first, as the default identifier kind.
 _BIOSAMPLE_KEY_CHOICES = (
@@ -398,7 +398,7 @@ def _handle_biosample_bulk_link(args: argparse.Namespace, parser: argparse.Argum
         bulk_link_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_LINK_BY_STUDY}".format(
             study_idx=args.study_idx
         )
-        # Each refused value is labelled as the file's column holds it.
+        # Each refused value is labeled as the file's column holds it.
         link_response = _common.call_all_or_nothing(
             "POST",
             args.base_url,

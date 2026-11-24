@@ -3503,10 +3503,8 @@ async def fetch_entity_to_study_links_by_entity_idxs(
 ) -> dict[int, asyncpg.Record]:
     """Return a dict of entity_idx -> link row for each of entity_idxs that has a
     spec.link_table row to study_idx, retired links included; each row carries
-    entity_idx, created_by_idx, created_at and retired.
-
-    Scoped to study_idx: an entity with no link row to it is absent from the
-    returned dict. The entity's own retirement is not consulted.
+    entity_idx, created_by_idx, created_at and retired. The entity's own
+    retirement is not consulted.
     """
     # f-string interpolation of identifiers is safe: spec fields are frozen
     # module-level constants, never reached by caller input.

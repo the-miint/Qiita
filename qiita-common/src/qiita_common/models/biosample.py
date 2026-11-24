@@ -727,9 +727,9 @@ class BiosampleStudyLookupRequest(BiosampleLookupRequest):
         return self
 
 
-# The kinds of identifier that a bulk biosample link accepts: the natural keys and
-# the biosample's idx, each naming a biosample whatever study it is in.
-BiosampleLinkKey = Literal[*get_args(BiosampleLookupKey), "idx"]
+# The kinds of identifier that name a biosample whatever study it is in: the natural
+# keys and the biosample's idx.
+BiosampleIdentifierKey = Literal[*get_args(BiosampleLookupKey), "idx"]
 
 BIOSAMPLE_BULK_LINK_MAX_VALUES = 2_000
 
@@ -743,7 +743,7 @@ class BiosampleBulkLinkRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    key: BiosampleLinkKey
+    key: BiosampleIdentifierKey
     values: list[NonBlankText] = Field(min_length=1, max_length=BIOSAMPLE_BULK_LINK_MAX_VALUES)
 
     @model_validator(mode="after")
@@ -934,7 +934,7 @@ class RosterResolveResponse(BaseModel):
     rows: list[RosterResolvedRow]
 
 
-# Roster-specific names for the shared all-or-nothing models, kept for outside importers.
+# Roster-specific names for the shared all-or-nothing models.
 RosterProblem = RequestItemProblem
 RosterResolveFailure = AllOrNothingFailure
 

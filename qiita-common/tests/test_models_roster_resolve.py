@@ -114,6 +114,6 @@ def test_failure_round_trips() -> None:
 
 
 def test_roster_failure_names_are_the_shared_models() -> None:
-    """Tests the case where outside code imports the roster-specific names: each is
-    the shared all-or-nothing model itself."""
+    """Tests the case where the roster-specific names are compared with the shared
+    all-or-nothing models: each is the shared model itself."""
     assert (RosterProblem, RosterResolveFailure) == (RequestItemProblem, AllOrNothingFailure)

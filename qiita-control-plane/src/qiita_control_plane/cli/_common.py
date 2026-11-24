@@ -752,12 +752,12 @@ def exit_with_all_or_nothing_failure(
     failure: AllOrNothingFailure, *, label_for: Callable[[str], str], advice: str
 ) -> NoReturn:
     """Print `failure`'s message, each problem against `label_for(item_id)`, and
-    `advice` to stderr, then raise SystemExit(1)."""
+    `advice` to stderr, then exit 1."""
     lines = [f"error: {failure.message}:"]
     lines += [f"  - {label_for(p.item_id)}: {p.message}" for p in failure.problems]
     lines.append(advice)
     print("\n".join(lines), file=sys.stderr)
-    raise SystemExit(1)
+    sys.exit(1)
 
 
 def call_all_or_nothing(

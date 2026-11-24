@@ -35,7 +35,7 @@ from qiita_common.models.biosample import (
     BIOSAMPLE_BULK_LINK_MAX_VALUES,
     LOOKUP_IDX_PATTERN,
     BiosampleBulkLinkRequest,
-    BiosampleLinkKey,
+    BiosampleIdentifierKey,
     BiosampleLookupKey,
     BiosampleStudyLookupKey,
     BiosampleStudyLookupRequest,
@@ -1908,8 +1908,8 @@ def test_lookup_literals_match_their_name_constants():
     constants for its values: the test fails when the two differ."""
     natural_key_count = len(get_args(BiosampleLookupKey))
     added_by_study_lookup = get_args(BiosampleStudyLookupKey)[natural_key_count:]
-    added_by_link = get_args(BiosampleLinkKey)[natural_key_count:]
-    actual = (get_args(LookupReturnKey), added_by_study_lookup, added_by_link)
+    added_by_identifier_key = get_args(BiosampleIdentifierKey)[natural_key_count:]
+    actual = (get_args(LookupReturnKey), added_by_study_lookup, added_by_identifier_key)
     assert actual == ((EXPORT_ENTITY_ID, IDX_KEY), (IDX_KEY, UNIQUE_FIELD_KEY), (IDX_KEY,))
 
 
