@@ -1,7 +1,7 @@
 ### Changed
 
 - **The `qiita-reviewer` agent checks for patterns that human review found and it did not
-  (#PR).** New rules cover:
+  (#940).** New rules cover:
   - a new index type, feature source, public identifier or route following the mechanisms
     of the existing ones;
   - a new gate table, identifier kind or lake table being added to every list that names
