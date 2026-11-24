@@ -131,6 +131,31 @@ async def test_schedule_dispatch_registers_and_removes_task(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_schedule_dispatch_detaches_from_a_surrounding_step_scope(monkeypatch):
+    """A ticket dispatched from inside a step's scope (plan-shards fans out children
+    through `dispatch_cb` → here) is its own unit of work: `_bounded_run` wraps the run
+    in `no_step_scope`, so the child's `summarize()` does not land on the dispatching
+    step. `create_task` copies the scope, so without the wrap it would."""
+    from qiita_common.step_log import step_scope, summarize
+
+    app = _fake_app()
+    done = asyncio.Event()
+
+    async def _fake_run(_app, ticket_idx, **_kwargs):
+        # Without the detach this lands on the parent scope copied into the task.
+        summarize(child_count=1)
+        done.set()
+
+    monkeypatch.setattr("qiita_control_plane.dispatch._run_and_log", _fake_run)
+
+    with step_scope("plan-shards") as parent:
+        task = schedule_dispatch(app, work_ticket_idx=11)
+        await asyncio.wait_for(done.wait(), timeout=5)
+    await task
+    assert parent.summary == {}
+
+
+@pytest.mark.asyncio
 async def test_a_dispatch_queued_behind_the_cap_logs_the_wait(monkeypatch, caplog):
     """A dispatch waiting for a slot must be visible in the log: no runner has
     started it yet, so it carries no `transient_reason` and no `dispatch_held`,

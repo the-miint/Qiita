@@ -68,6 +68,13 @@ STEP_MANIFEST_FILENAME = "manifest.json"
 STEP_OUTPUT_SUBDIR = "output"
 STEP_LOGS_SUBDIR = "logs"
 
+# The two files inside `STEP_LOGS_SUBDIR`: the step's narrative (stderr) and its
+# one-line JSON receipt (stdout). A native step's writer is the orchestrator's
+# launcher; an in-process `action:`'s is `qiita_common.step_log`. The control plane
+# reads both back from the same names (see `routes/work_ticket.py`).
+STEP_STDERR_FILENAME = "stderr"
+STEP_STDOUT_FILENAME = "stdout"
+
 # The file the `mint-features` action writes its feature map under, in its attempt's
 # directory. The control plane's primitive writes it, and its resume path rebuilds
 # the path without re-running the primitive; a job reading another ticket's map

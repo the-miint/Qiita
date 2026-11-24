@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+from qiita_common.step_log import no_step_scope
 
 from .fanout_dispatch import cohort_for_work_ticket, held_cohorts, top_up_dispatch
 from .follow_on import submit_follow_on
@@ -245,6 +246,14 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
     semaphore = dispatch_semaphore(app)
 
     async def _bounded_run() -> None:
+        # A dispatched ticket is its own unit of work even when a step scheduled it
+        # (plan-shards fans out children through `dispatch_cb` → here), so it runs
+        # outside the scheduling step's scope — see `no_step_scope` for why
+        # create_task would otherwise leak that scope into the child.
+        with no_step_scope():
+            await _bounded_run_inner()
+
+    async def _bounded_run_inner() -> None:
         # Observable queueing: without this a ticket waiting for a slot is
         # indistinguishable from one whose dispatch died (no runner has started
         # it, so no transient_reason, no dispatch_held), and the in-flight gate
