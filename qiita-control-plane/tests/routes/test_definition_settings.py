@@ -32,7 +32,11 @@ from qiita_common.models import (
 from qiita_control_plane.repositories.alignment_definition import mint_alignment_definition
 from qiita_control_plane.repositories.mask_definition import mint_mask_definition
 from qiita_control_plane.repositories.processing import mint_processing
-from qiita_control_plane.testing.db_teardown import delete_output_equivalences
+from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+from qiita_control_plane.testing.db_teardown import (
+    delete_output_equivalences,
+    teardown_entity_graph,
+)
 
 pytestmark = pytest.mark.db
 
@@ -814,6 +818,49 @@ async def test_an_edit_is_refused_while_a_public_handle_cites_the_definition(
         assert resp.status_code == 200, resp.text
     finally:
         await postgres_pool.execute("DELETE FROM qiita.exported_processing WHERE idx = $1", handle)
+
+
+async def test_a_processing_edit_is_refused_while_an_exported_identifier_cites_it(
+    postgres_pool, clients, defs
+):
+    """A processing is cited by `exported_identifier` (its amplicon QM handles), not
+    `exported_processing`. A live handle refuses the settings edit; retiring it lets
+    the edit through."""
+    idx = await defs["make"](DefinitionKind.PROCESSING, threshold=1)
+    biosample_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=defs["owner"]
+    )
+    handle = await postgres_pool.fetchval(
+        "INSERT INTO qiita.exported_identifier (processing_idx, prep_sample_idx, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        idx,
+        prep_sample_idx,
+        defs["owner"],
+    )
+    try:
+        current = await _params(postgres_pool, DefinitionKind.PROCESSING, idx)
+        body = {"params": {**current, "threshold": 2}, "reason": _REASON}
+        resp = await clients["admin"].patch(_url(DefinitionKind.PROCESSING, idx), json=body)
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == DefinitionSettingsRefusal.PUBLISHED
+        assert "exported_identifier" in detail["detail"]
+
+        await postgres_pool.execute(
+            "UPDATE qiita.exported_identifier SET retired = true, retired_at = now(),"
+            " retire_reason = 'withdrawn in a test' WHERE idx = $1",
+            handle,
+        )
+        resp = await clients["admin"].patch(_url(DefinitionKind.PROCESSING, idx), json=body)
+        assert resp.status_code == 200, resp.text
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.exported_identifier WHERE idx = $1", handle)
+        await teardown_entity_graph(
+            postgres_pool,
+            study_idxs=[],
+            biosample_idxs=[biosample_idx],
+            prep_sample_idxs=[prep_sample_idx],
+        )
 
 
 # ---------------------------------------------------------------------------
