@@ -373,6 +373,49 @@ async def test_remove_refuses_while_an_activation_of_the_build_runs(world):
         await _remove(pool, a)
 
 
+async def _name_in_context(pool, ticket: int, value) -> None:
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET action_context = jsonb_build_object($2::text, $3::numeric)"
+        " WHERE work_ticket_idx = $1",
+        ticket,
+        REFERENCE_INDEX_IDX_BINDING,
+        value,
+    )
+
+
+async def test_remove_counts_an_activation_whose_context_spells_the_idx_as_a_float(world):
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    ticket = await _ticket(world, None, "processing")
+    await _name_in_context(pool, ticket, f"{a}.0")
+    with pytest.raises(KreppBuildTransitionRefused, match=str(ticket)):
+        await _remove(pool, a)
+
+
+async def test_remove_ignores_tickets_that_cannot_read_the_build(world):
+    """The other side of the gate: an activation of another build, and a cancelled
+    ticket whose reap finished, do not hold the build."""
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    b = await _register(world, "b", "b" * 64)
+    other = await _ticket(world, None, "processing")
+    await _name_in_context(pool, other, b)
+    await _ticket(world, a, "cancelled")
+    assert (await _remove(pool, a)).state is ReferenceIndexState.REMOVED
+
+
+async def test_removed_build_of_ticket_sees_an_activation_ticket(world):
+    pool = world["pool"]
+    a = await _register(world, "a", "a" * 64)
+    ticket = await _ticket(world, None, "failed")
+    await _name_in_context(pool, ticket, a)
+    async with pool.acquire() as conn, conn.transaction():
+        assert await removed_build_of_ticket(conn, ticket) is None
+    await _remove(pool, a)
+    async with pool.acquire() as conn, conn.transaction():
+        assert await removed_build_of_ticket(conn, ticket) == a
+
+
 async def test_remove_a_registered_build_that_was_never_activated(world):
     a = await _register(world, "a")
     change = await _remove(world["pool"], a)

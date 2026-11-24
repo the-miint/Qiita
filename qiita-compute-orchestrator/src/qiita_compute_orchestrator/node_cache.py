@@ -13,18 +13,17 @@ reads a sealed folder from:
 - ``PATH_NODE_LOCAL`` unset: the master copy under ``PATH_DERIVED``, after
   ``verify_sealed``.
 - set: the node's copy at the same relative path, made on first use. Jobs on one node
-  take a per-folder ``flock`` in turn. The first checks the master's file list as
-  ``verify_sealed`` does, checks the free space against the manifest's sizes, copies
-  into a hidden ``.partial`` folder while hashing every file against ``SHA256SUMS``,
-  copies ``manifest.json`` last and renames the folder into place, so a folder at
+  take a per-folder ``flock`` in turn. The first runs ``verify_sealed`` on the
+  master, checks the free space against the manifest's sizes, copies into a hidden
+  ``.partial`` folder while hashing every file against ``SHA256SUMS``, copies
+  ``manifest.json`` last and renames the folder into place, so a folder at
   the target path was always written whole. A job that waited finds the copy and
-  runs ``verify_sealed`` on it. A disk that fills during the copy fails the job as a
-  lack of space before it does.
+  runs ``verify_sealed`` on it. A disk that fills during the copy fails the job
+  with the same ``space`` error as the check before the copy.
 
 ``evict`` deletes node copies the caller names (folders whose build was removed).
-The lock covers making a copy, not reading it: a copy is safe to delete only once no
-job can still read it, which the control plane holds for a removed build
-(``repositories.reference_index.tickets_running_on_build``). The cluster admins only
+The lock covers making a copy, not reading it; what makes eviction safe is at
+``repositories.reference_index.tickets_running_on_build``. The cluster admins only
 create ``PATH_NODE_LOCAL`` on each node, writable by the job user; nothing is copied
 by hand.
 """
@@ -253,9 +252,8 @@ def _copy_hashed(src: Path, dst: Path, want: str) -> None:
 
 
 def _copy(master: Path, target: Path, expected_sums_sha256: str, threads: int) -> None:
+    manifest = verify_sealed(master, expected_sums_sha256)
     listed = _read_sums(master, expected_sums_sha256)
-    _check_file_list(master, listed)
-    manifest = json.loads((master / MANIFEST).read_text())
     files = [rel for rel in listed if rel != MANIFEST]
     need = sum(manifest["files"].values()) + sum(
         (master / n).stat().st_size for n in (MANIFEST, SHA256SUMS)

@@ -248,6 +248,30 @@ def test_a_master_with_an_unlisted_file_is_refused_with_the_cache_too(world):
     assert exc.value.check == "files" and not world.copy.exists()
 
 
+def _wrong_manifest_size(world) -> str:
+    """Make the master's manifest give a.bin a wrong size, with every hash matching;
+    return the new SHA256SUMS hash."""
+    manifest_path = world.master / nc.MANIFEST
+    manifest_path.write_text(manifest_path.read_text().replace('"a.bin": 5000', '"a.bin": 4999'))
+    sums_path = world.master / nc.SHA256SUMS
+    lines = [
+        f"{nc.sha256_file(manifest_path)}  {nc.MANIFEST}" if ln.endswith(nc.MANIFEST) else ln
+        for ln in sums_path.read_text().splitlines()
+    ]
+    sums_path.write_text("\n".join(lines) + "\n")
+    return hashlib.sha256(sums_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_a_master_whose_manifest_sizes_are_wrong_is_refused_in_both_modes(world, cached):
+    sums = _wrong_manifest_size(world)
+    if not cached:
+        world.settings.path_node_local = None
+    with pytest.raises(nc.SealedFolderInvalid) as exc:
+        nc.materialize(REL, sums)
+    assert exc.value.check == "size" and not world.copy.exists()
+
+
 def test_an_unwritable_root_fails_by_name(world):
     world.node.chmod(0o555)
     try:

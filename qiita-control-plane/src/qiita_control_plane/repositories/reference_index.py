@@ -2,7 +2,7 @@
 
 A build is registered by `actions.library.register_index` (`registered`), activated
 once it has passed the activation checks (`activate_krepp_build`), and
-removed once no running ticket uses it (`remove_krepp_build`). Each change locks the
+removed once no ticket may still read it (`remove_krepp_build`). Each change locks the
 reference's krepp rows `FOR UPDATE` first, so two changes to one reference's builds
 serialize. `/run` refuses a ticket whose build is removed (`removed_build_of_ticket`).
 
@@ -10,7 +10,7 @@ serialize. `/run` refuses a ticket whose build is removed (`removed_build_of_tic
 yet. The code that will (the placement workflow's step that fixes a ticket to the
 reference's active build) has to hold the build row `FOR SHARE`, re-read under that
 lock that the build is `active`, and keep the lock until it commits the ticket's
-column: `remove_krepp_build` counts the running tickets on a build under `FOR UPDATE`
+column: `remove_krepp_build` counts the tickets that may read a build under `FOR UPDATE`
 of the same row, and a write made outside that lock could fix a ticket to a build
 being removed.
 """
@@ -126,12 +126,13 @@ async def activate_krepp_build(
 async def tickets_running_on_build(conn: asyncpg.Connection, reference_index_idx: int) -> list[int]:
     """The tickets that may still have a job reading the build, oldest first: fixed to
     it or naming it in their context (an activation ticket), and non-terminal or with
-    a cancel's reap of their SLURM jobs still pending. A node's copy of a removed build
-    is deleted by the next job that evicts on that node (node_cache.evict), so removal
-    waits for every such job."""
+    a cancel's reap of their SLURM jobs still pending. Removal waits for every such
+    ticket because a job on a node deletes that node's copy of a removed build
+    (`node_cache.evict`) whether or not another job there is still reading it. The
+    context value is compared as jsonb, so `42` and `42.0` name the same build."""
     rows = await conn.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
-        " WHERE (reference_index_idx = $1 OR action_context->>$3 = $1::text)"
+        " WHERE (reference_index_idx = $1 OR action_context->$3 = to_jsonb($1::bigint))"
         "   AND (state = ANY($2::qiita.work_ticket_state[]) OR reap_pending_since IS NOT NULL)"
         " ORDER BY work_ticket_idx",
         reference_index_idx,
@@ -164,7 +165,8 @@ async def remove_krepp_build(
     if running:
         raise KreppBuildTransitionRefused(
             reference_index_idx,
-            f"work tickets {running} are running on it; wait for them to finish",
+            f"work tickets {running} may still read it (running, or cancelled with their"
+            " SLURM jobs still being reaped); wait for them to finish",
         )
     await conn.execute(
         "UPDATE qiita.reference_index SET state = $2 WHERE reference_index_idx = $1",
@@ -175,17 +177,21 @@ async def remove_krepp_build(
 
 
 async def removed_build_of_ticket(conn: asyncpg.Connection, work_ticket_idx: int) -> int | None:
-    """For a redrive: the `reference_index_idx` the ticket is fixed to when that build
-    is removed, else None. The build row is held `FOR SHARE` whatever its state, so a
-    `remove_krepp_build` (which locks it `FOR UPDATE` and counts running tickets)
+    """For a redrive: the build the ticket is fixed to, or names in its context (an
+    activation ticket), when that build is removed, else None. The build row is held
+    `FOR SHARE` whatever its state, so a `remove_krepp_build` (which locks it
+    `FOR UPDATE` and counts the tickets that may read it, by the same two links)
     either commits first and is refused here, or waits for the redrive to commit and
-    then sees the revived ticket as running."""
+    then sees the revived ticket."""
     row = await conn.fetchrow(
         "SELECT ri.reference_index_idx, ri.state FROM qiita.work_ticket wt"
-        " JOIN qiita.reference_index ri USING (reference_index_idx)"
+        " JOIN qiita.reference_index ri ON ri.reference_index_idx = wt.reference_index_idx"
+        "   OR wt.action_context->$2 = to_jsonb(ri.reference_index_idx)"
         " WHERE wt.work_ticket_idx = $1"
+        " ORDER BY ri.reference_index_idx"
         " FOR SHARE OF ri",
         work_ticket_idx,
+        REFERENCE_INDEX_IDX_BINDING,
     )
     if row is None or row["state"] != ReferenceIndexState.REMOVED:
         return None

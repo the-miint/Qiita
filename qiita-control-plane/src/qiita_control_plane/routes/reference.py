@@ -218,8 +218,8 @@ async def remove_reference_krepp_build(
 ) -> ReferenceIndex:
     """Mark a registered or retired krepp build `removed` (`reference:delete`,
     system_admin). 404 when the row is not a krepp build of this reference; 409 when
-    it is the active build or a ticket fixed to it is still running
-    (`repositories.reference_index.remove_krepp_build`). The files are deleted by the
+    it is the active build or a ticket may still read it
+    (`repositories.reference_index.remove_krepp_build`). The master is deleted by the
     operator afterwards; tickets fixed to the build keep it, and `/run` refuses them."""
     try:
         async with pool.acquire() as conn, conn.transaction():
