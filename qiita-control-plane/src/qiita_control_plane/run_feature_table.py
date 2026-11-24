@@ -34,7 +34,6 @@ import duckdb
 import pyarrow as pa
 import pyarrow.flight as flight
 from qiita_common import analytic as ft
-from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
@@ -77,14 +76,16 @@ class Source:
 # two are expected to converge behind this request shape, a `Source` carrying how it
 # produces its COO (a lake selection or a compute job) and `value_kind` widening past
 # "count", once the compute path can answer under this route.
+# Keyed on the `processing.workflow` value `_source_of` reads off each run, so a key
+# is a workflow name.
 SOURCES: dict[str, Source] = {
     # The trim length is the ASV's length, and orientation decides which strand it
     # is read on: ASVs from runs differing in these are different features, so
     # merging them would yield disjoint blocks under one table's name. Other params
     # (the SortMeRNA reference, the workflow version) change which reads survive,
     # not what an ASV is.
-    AMPLICON_ACTION_ID: Source(
-        method=AMPLICON_ACTION_ID,
+    "amplicon": Source(
+        method="amplicon",
         value_kind="count",
         values_table=AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
         value_column="count",

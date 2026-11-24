@@ -5,7 +5,6 @@ import hashlib
 
 import pyarrow as pa
 import pytest
-from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.models.run_feature_table import FeatureTableSample
 
 from qiita_control_plane.run_feature_table import (
@@ -25,7 +24,7 @@ def build_coo(cohort, values, sequences, labels):
 def _cohort(*names):
     """Processed samples (run 7, prep_sample i) named `names` in order."""
     return Cohort(
-        source=SOURCES[AMPLICON_ACTION_ID],
+        source=SOURCES["amplicon"],
         runs=[7],
         samples=[
             ProcessedSample(

@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 
 from qiita_common import analytic as ft
-from qiita_common.actions import AMPLICON_ACTION_ID
 from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_FEATURE,
     PATH_FEATURE_TABLE_PREFIX,
@@ -48,9 +47,10 @@ MANIFEST_NOTE = (
     " part of the bundle."
 )
 
-# What each method's feature ids are, for the manifest.
+# What each method's feature ids are, for the manifest. Keyed by workflow name,
+# like `run_feature_table.SOURCES`.
 _FEATURE_ID = {
-    AMPLICON_ACTION_ID: "exported-feature handle (QF); the sequence companion maps it to md5",
+    "amplicon": "exported-feature handle (QF); the sequence companion maps it to md5",
 }
 
 
