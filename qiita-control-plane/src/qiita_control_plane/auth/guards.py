@@ -1,4 +1,5 @@
-"""FastAPI dependency factories that gate routes on Principal capability.
+"""FastAPI dependency factories that gate routes on Principal capability, and the
+access and ownership checks that routes apply to the resources they act on.
 
 Compose freely:
     @router.post(...)

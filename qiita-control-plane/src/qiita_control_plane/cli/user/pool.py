@@ -1,7 +1,4 @@
-"""qiita user CLI — bcl-convert and pool-masking operator gestures.
-
-Split out of the former single-file ``cli.user`` module; behavior unchanged.
-"""
+"""qiita user CLI — bcl-convert and pool-masking operator gestures."""
 
 import argparse
 import base64
