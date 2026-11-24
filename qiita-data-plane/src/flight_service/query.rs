@@ -89,14 +89,10 @@ pub(super) const ALLOWED_TABLES: &[&str] = &[
     // the MINTED namespace, which is the join into the shared feature space this
     // table cannot make.
     "bin_quality",
-    // The amplicon feature-table surfaces, scoped by a cohort of runs over
-    // prep_samples (processing_idx + prep_sample_idx lists). `amplicon_membership`
-    // is served ONLY as the exclusion-aware VIEW — like `alignment_visible`, the
-    // raw table is deliberately absent so a blocked ASV can't reach a feature
-    // table. The counts view carries both cohort columns, so the generic filter
-    // path scopes it. `amplicon_sequence` has neither column (a sequence is stored
-    // once, content-deduped by feature_idx), so `build_amplicon_sequence_query`
-    // resolves the cohort through the same view — which also applies the exclusion.
+    // The amplicon feature-table surfaces. `amplicon_membership` is served only as
+    // its exclusion-aware view, like `alignment_visible`, so a blocked ASV cannot
+    // reach a feature table; `amplicon_sequence` is scoped by
+    // `build_amplicon_sequence_query`.
     "amplicon_membership_visible",
     "amplicon_sequence",
 ];
@@ -464,12 +460,13 @@ fn is_alignment_doget_surface(table: &str) -> bool {
 ///
 /// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
 /// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
-/// per-table rather than global. What is listed is the one table an empty filter
-/// would turn into the whole alignment sink. The assembly surfaces are not
-/// listed and do not need to be: like `read_masked`, their scope IS their query
-/// shape (`build_assembly_run_query`), which has no empty form to refuse.
+/// per-table rather than global. What is listed are the views an empty filter
+/// would turn into a whole sink: the alignment and the amplicon counts. The
+/// assembly and amplicon-sequence surfaces are not listed and do not need to be:
+/// like `read_masked`, their scope IS their query shape, which has no empty form
+/// to refuse.
 fn requires_scoped_filter(table: &str) -> bool {
-    is_alignment_doget_surface(table)
+    is_alignment_doget_surface(table) || table == "amplicon_membership_visible"
 }
 
 /// The DoGet surfaces whose scope is one assembly RUN.
@@ -492,6 +489,11 @@ fn is_bin_quality_surface(table: &str) -> bool {
     table == "bin_quality"
 }
 
+/// The amplicon ASV-sequence surface, scoped by `build_amplicon_sequence_query`.
+fn is_amplicon_sequence_surface(table: &str) -> bool {
+    table == "amplicon_sequence"
+}
+
 /// The query a verified DoGet ticket selects: what `do_get` streams and what
 /// `count_doget` counts, from one path so the two cannot select different rows.
 /// Each caller verifies the ticket itself, mapping a failure to `unauthenticated`.
@@ -509,13 +511,6 @@ pub(super) fn ticket_query(payload: &auth::TicketPayload) -> Result<(String, Str
         &payload.members,
         &payload.columns,
     )
-}
-
-/// The amplicon ASV-sequence surface. Like `assembled_sequence` it carries no
-/// cohort column (one row per `feature_idx`), so its cohort scope is read off
-/// `amplicon_membership_visible` by `build_amplicon_sequence_query`.
-fn is_amplicon_sequence_surface(table: &str) -> bool {
-    table == "amplicon_sequence"
 }
 
 /// Build a SQL query for the given table and filter.
@@ -573,9 +568,6 @@ pub(super) fn build_query(
         return build_bin_quality_query(filter);
     }
 
-    // The ASV sequences carry no cohort column, so the cohort (its runs over its
-    // prep_samples) is resolved through `amplicon_membership_visible` — also not a
-    // generic WHERE clause, and the view is what applies the exclusion anti-join.
     if is_amplicon_sequence_surface(table) {
         return build_amplicon_sequence_query(filter);
     }

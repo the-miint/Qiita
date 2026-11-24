@@ -1154,6 +1154,16 @@ fn build_query_amplicon_membership_visible_uses_the_generic_cohort_filter() {
     assert_eq!(full, "qiita_lake.amplicon_membership_visible");
     assert!(sql.contains("processing_idx IN (7,8)"), "got: {sql}");
     assert!(sql.contains("prep_sample_idx IN (42,43)"), "got: {sql}");
+    assert!(
+        build_query(
+            "amplicon_membership_visible",
+            &auth::TicketFilter::new(),
+            &[],
+            &[]
+        )
+        .is_err(),
+        "empty filter on amplicon_membership_visible must be rejected"
+    );
 }
 
 #[test]
