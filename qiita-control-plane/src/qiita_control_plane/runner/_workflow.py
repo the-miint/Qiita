@@ -698,6 +698,13 @@ async def run_workflow(
         # Amplicon completion gate: a workflow declaring the terminal
         # `finalize-amplicon-sample` action gets the pool's qiita.amplicon_sample
         # rows materialized 'pending' here (see `_create_amplicon_gate_pending`).
+        #
+        # Known gap, shared with the assembly gate above: this runs on every
+        # dispatch, so redriving a ticket that already completed finalize reopens
+        # its 'no_data' rows to 'pending' (the reopen asymmetry in
+        # `create_amplicon_samples_pending`) while the completed finalize step is
+        # fast-forwarded rather than re-run, stranding them at 'pending'. The fix
+        # belongs across both gates, not here.
         if _workflow_writes_amplicon_gate(action.steps):
             if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
                 raise _submission_bad_input(

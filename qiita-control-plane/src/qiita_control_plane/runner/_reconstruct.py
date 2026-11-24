@@ -651,10 +651,11 @@ async def _run_action_primitive(
         return {}
 
     if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
-        # After register-files, so an identifier never names data that did not
-        # land. processing_idx from `bound`, the run identity the runner minted
-        # before the loop; created_by is the ticket's originator, the person the
-        # identifiers are minted for.
+        # After register-files (so an identifier never names data that did not
+        # land) and after finalize-amplicon-sample (so the mint refuses any sample
+        # the gate still holds 'pending'). processing_idx from `bound`, the run
+        # identity the runner minted before the loop; created_by is the ticket's
+        # originator, the person the identifiers are minted for.
         if set(entry.inputs) != {"asv_counts"}:
             raise RuntimeError(
                 f"mint-amplicon-identifiers expects inputs [asv_counts]; got {entry.inputs!r}"

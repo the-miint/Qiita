@@ -91,19 +91,22 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
-  # mint the public QM identifier of every processed sample denoise counted, so
-  # a feature table built from this run can label its samples without exposing
-  # prep_sample_idx. after register-files: an identifier never names data that
-  # did not land.
-  - action: mint-amplicon-identifiers
-    inputs: [asv_counts]
-    outputs: []
-
   # close the run's per-sample gate (qiita.amplicon_sample): 'completed' for each
   # sample denoise produced ASVs for, 'no_data' for the rest of the pool (the gate
   # records state only; the count is read from amplicon_membership in the lake).
   # the runner materialized the pool's 'pending' rows when it minted the run.
+  # before the mint: it refuses to mint a sample whose gate is not yet 'completed',
+  # so a handle is never minted before the run closes the sample it names.
   - action: finalize-amplicon-sample
+    inputs: [asv_counts]
+    outputs: []
+
+  # mint the public QM identifier of every processed sample denoise counted, so
+  # a feature table built from this run can label its samples without exposing
+  # prep_sample_idx. after register-files: an identifier never names data that
+  # did not land; after finalize: it never names a sample the gate still holds
+  # 'pending'.
+  - action: mint-amplicon-identifiers
     inputs: [asv_counts]
     outputs: []
 

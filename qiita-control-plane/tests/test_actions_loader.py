@@ -1700,10 +1700,12 @@ def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
 
 
 def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_and_gate_tail():
-    """amplicon 1.1.0 ends with `mint-amplicon-identifiers` and
-    `finalize-amplicon-sample` after register-files, both reading denoise's
+    """amplicon 1.1.0 ends with `finalize-amplicon-sample` then
+    `mint-amplicon-identifiers` after register-files, both reading denoise's
     asv_counts (register-files has moved the staged membership into the lake by
-    then). Its context is pinned by test_amplicon_1_1_0_drops_the_primer_knobs."""
+    then). Finalize precedes the mint so a handle is never minted for a sample the
+    gate still holds 'pending'. Its context is pinned by
+    test_amplicon_1_1_0_drops_the_primer_knobs."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1713,7 +1715,7 @@ def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_and_gate_tail():
     old, new = by_key[("amplicon", "1.0.0")], by_key[("amplicon", "1.1.0")]
     assert [s.name for s in new.steps] == [
         *(s.name for s in old.steps),
-        "mint-amplicon-identifiers",
         "finalize-amplicon-sample",
+        "mint-amplicon-identifiers",
     ]
     assert new.steps[-2].inputs == new.steps[-1].inputs == ["asv_counts"]

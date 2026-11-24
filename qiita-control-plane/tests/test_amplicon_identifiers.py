@@ -14,6 +14,7 @@ from qiita_common.actions import PROCESSING_IDX_BINDING, WorkflowAction
 
 from qiita_control_plane.actions.library import mint_amplicon_identifiers
 from qiita_control_plane.repositories.exported_identifier import (
+    ProcessingSampleNotCompleteError,
     mint_processing_exported_identifiers,
 )
 from qiita_control_plane.repositories.processing import mint_processing
@@ -28,9 +29,21 @@ from qiita_control_plane.testing.db_teardown import delete_principal, teardown_e
 pytestmark = pytest.mark.db
 
 
+async def _close_gate_completed(pool, processing_idx: int, prep_sample_idxs: list[int]) -> None:
+    """Close the amplicon gate 'completed' for the cohort — the state the mint
+    requires (finalize-amplicon-sample runs before the mint in the workflow)."""
+    await pool.executemany(
+        "INSERT INTO qiita.amplicon_sample (processing_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')"
+        " ON CONFLICT (processing_idx, prep_sample_idx) DO UPDATE SET state = 'completed'",
+        [(processing_idx, ps) for ps in prep_sample_idxs],
+    )
+
+
 @pytest.fixture
 async def run(postgres_pool):
-    """A user, two sequenced prep_samples, and an amplicon processing run."""
+    """A user, two sequenced prep_samples, and an amplicon processing run whose
+    completion gate is closed 'completed' for both samples."""
     principal_idx = await seed_user_principal(
         postgres_pool, prefix="amp-qm", suffix=str(uuid.uuid4())[:8]
     )
@@ -45,13 +58,19 @@ async def run(postgres_pool):
             version="1.1.0",
             params={"workflow": "amplicon", "version": "1.1.0", "probe": str(uuid.uuid4())},
         )
+    prep_sample_idxs = sorted(ps for _, ps in samples)
+    await _close_gate_completed(postgres_pool, processing["processing_idx"], prep_sample_idxs)
     yield {
         "principal_idx": principal_idx,
-        "prep_sample_idxs": sorted(ps for _, ps in samples),
+        "prep_sample_idxs": prep_sample_idxs,
         "processing_idx": processing["processing_idx"],
     }
     await postgres_pool.execute(
         "DELETE FROM qiita.exported_identifier WHERE processing_idx = $1",
+        processing["processing_idx"],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.amplicon_sample WHERE processing_idx = $1",
         processing["processing_idx"],
     )
     await postgres_pool.execute(
@@ -97,6 +116,32 @@ async def test_repository_mint_is_idempotent(postgres_pool, run):
     assert [r["prep_sample_idx"] for r in first] == run["prep_sample_idxs"]
     assert [r["export_id"] for r in first] == [r["export_id"] for r in second]
     assert all(r["export_id"].startswith("QM") for r in first)
+
+
+async def test_repository_mint_refuses_a_sample_whose_gate_is_pending(postgres_pool, run):
+    # Reopen one sample's gate; the mint refuses the whole cohort and mints nothing,
+    # so a handle never names a sample the run has not closed.
+    pending = run["prep_sample_idxs"][0]
+    await postgres_pool.execute(
+        "UPDATE qiita.amplicon_sample SET state = 'pending'"
+        " WHERE processing_idx = $1 AND prep_sample_idx = $2",
+        run["processing_idx"],
+        pending,
+    )
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        with pytest.raises(ProcessingSampleNotCompleteError) as exc:
+            await mint_processing_exported_identifiers(
+                conn,
+                processing_idx=run["processing_idx"],
+                prep_sample_idxs=run["prep_sample_idxs"],
+                created_by_idx=run["principal_idx"],
+            )
+    assert exc.value.not_complete == [pending]
+    minted = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.exported_identifier WHERE processing_idx = $1",
+        run["processing_idx"],
+    )
+    assert minted == 0
 
 
 async def test_repository_mint_reissues_a_retired_tuple(postgres_pool, run):

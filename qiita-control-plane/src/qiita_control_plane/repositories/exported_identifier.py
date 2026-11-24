@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 import asyncpg
 
+from .amplicon import AMPLICON_SAMPLE_COMPLETED
 from .block import MASK_SAMPLE_COMPLETED
 from .mask_definition import lock_active_mask, lock_mask
 
@@ -196,6 +197,22 @@ async def mint_exported_mask_identifiers(
         )
 
 
+class ProcessingSampleNotCompleteError(RuntimeError):
+    """Cohort members whose `amplicon_sample` gate is not 'completed', ascending.
+
+    An identifier names a processed sample; a prep_sample the run has not closed as
+    'completed' has no landed data to name yet.
+    """
+
+    def __init__(self, processing_idx: int, not_complete: list[int]) -> None:
+        self.processing_idx = processing_idx
+        self.not_complete = not_complete
+        super().__init__(
+            f"{len(not_complete)} prep_sample(s) are not completed under processing"
+            f" {processing_idx}: {not_complete}"
+        )
+
+
 async def mint_processing_exported_identifiers(
     conn: asyncpg.Connection,
     *,
@@ -207,12 +224,34 @@ async def mint_processing_exported_identifiers(
     live `export_id` for every `(processing_idx, prep_sample)` pair and return them
     all ascending. Idempotent and all-or-nothing for the reasons given there.
 
+    Mirrors the mask kind's gate discipline: holds the processing row `FOR SHARE`
+    and refuses unless every cohort member's `amplicon_sample` gate is 'completed'
+    (`ProcessingSampleNotCompleteError`), so a handle is never minted before the
+    run's `finalize-amplicon-sample` has closed the sample — the amplicon workflow
+    orders finalize before this mint. `amplicon_sample` is the processing kind's
+    completion gate, the twin of `mask_sample` for the mask kind.
+
     Takes a connection rather than a pool so a caller can mint inside its own
     transaction."""
+    cohort = sorted(set(prep_sample_idxs))
+    await conn.execute(
+        "SELECT 1 FROM qiita.processing WHERE processing_idx = $1 FOR SHARE",
+        processing_idx,
+    )
+    completed = await conn.fetch(
+        "SELECT prep_sample_idx FROM qiita.amplicon_sample"
+        " WHERE processing_idx = $1 AND prep_sample_idx = ANY($2::bigint[]) AND state = $3",
+        processing_idx,
+        cohort,
+        AMPLICON_SAMPLE_COMPLETED,
+    )
+    not_complete = _missing_from(completed, cohort)
+    if not_complete:
+        raise ProcessingSampleNotCompleteError(processing_idx, not_complete)
     return await _mint_live(
         conn,
         column="processing_idx",
         idx=processing_idx,
-        prep_sample_idxs=prep_sample_idxs,
+        prep_sample_idxs=cohort,
         created_by_idx=created_by_idx,
     )
