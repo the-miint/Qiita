@@ -14,9 +14,11 @@
 - **`qiita biosample bulk-link` links into a study every biosample that a TSV file's
   column names (#939).** `--key` names the identifier kind (`export_entity_id` by default),
   and the file's column with that exact header holds the values; other columns are
-  ignored. A blank cell, a repeated value, or more than 2,000 values is refused before
-  anything is sent. The command prints which values were linked and which were already
-  linked; if any value cannot be linked, it lists every such value and links none.
+  ignored. A blank cell, a repeated value, more than 2,000 values, or a file whose data
+  lines are not one row each (an empty line between rows, or a line break inside a cell)
+  is refused before anything is sent. The command prints which values were linked and
+  which were already linked; if any value cannot be linked, it lists every such value and
+  links none.
 
 ### Changed
 

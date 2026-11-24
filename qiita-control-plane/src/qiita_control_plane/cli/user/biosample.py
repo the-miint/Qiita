@@ -134,9 +134,8 @@ def _read_tsv_with_column(
 def _refuse_rows_off_their_lines(
     tsv_rows: list[dict[str, str]], tsv_file: Path, parser: argparse.ArgumentParser
 ) -> None:
-    """Exit through `parser.error` unless each data line of `tsv_file` is one of
-    `tsv_rows`, so that a row can be named by its line and an output row pasted
-    beside its line."""
+    """Exit through `parser.error` unless `tsv_file` has as many data lines as
+    `tsv_rows` holds rows, so that a row can be named by its line."""
     # The reader skips an empty line in a file of several columns and joins a quoted
     # cell that spans lines.
     data_line_count = count_data_lines(tsv_file)
@@ -152,7 +151,9 @@ def _refuse_blank_cells(
     tsv_rows: list[dict[str, str]], column: str, tsv_file: Path, parser: argparse.ArgumentParser
 ) -> None:
     """Exit through `parser.error` if any row's `column` cell is blank, naming
-    each such row by its line as DuckDB's read errors do, the header being line 1."""
+    each such row by its line as DuckDB's read errors do, the header being line 1.
+    A file whose rows cannot be matched to its lines is refused first."""
+    _refuse_rows_off_their_lines(tsv_rows, tsv_file, parser)
     blank_lines = [
         str(line) for line, tsv_row in enumerate(tsv_rows, start=2) if not tsv_row[column].strip()
     ]
@@ -318,7 +319,6 @@ def _lookup_column_to_tsv(
     # Check the output, read the file, and build the request before any request is sent.
     _require_new_output(args.output, parser)
     tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=column_flag)
-    _refuse_rows_off_their_lines(tsv_rows, args.tsv_file, parser)
     _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
     lookup_request = _build_values_request(build_request, tsv_rows, column, args.tsv_file, parser)
 
@@ -392,7 +392,6 @@ def _handle_biosample_bulk_link(args: argparse.Namespace, parser: argparse.Argum
     # Read the file and build the request before any request is sent.
     column = args.key
     tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=_KEY_FLAG)
-    _refuse_rows_off_their_lines(tsv_rows, args.tsv_file, parser)
     _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
 
     def _build_request(values: list[str]) -> BiosampleBulkLinkRequest:
