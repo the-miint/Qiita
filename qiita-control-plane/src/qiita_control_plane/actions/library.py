@@ -73,7 +73,7 @@ from ..repositories.alignment_definition import (
     ALIGNMENT_SAMPLE_COMPLETED,
     ALIGNMENT_SAMPLE_INVALIDATED,
 )
-from ..repositories.amplicon import close_amplicon_samples
+from ..repositories.amplicon import assert_pool_samples_completed, close_amplicon_samples
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
@@ -3572,7 +3572,12 @@ async def mint_amplicon_identifiers(
     sample set amplicon_load wrote to `amplicon_membership`: membership is that
     file joined to the feature map, and the join drops no row. Read from the
     denoise output rather than the staged membership because register-files moves
-    staged files into the lake, so after it runs there is no staged copy left."""
+    staged files into the lake, so after it runs there is no staged copy left.
+
+    Refuses unless every sample's `amplicon_sample` gate is 'completed'
+    (`assert_pool_samples_completed`), so a handle is never minted before
+    `finalize-amplicon-sample` has closed the sample — the workflow orders finalize
+    before this mint."""
     with duckdb_connect() as duck:
         prep_sample_idxs = [
             row[0]
@@ -3584,6 +3589,9 @@ async def mint_amplicon_identifiers(
     if not prep_sample_idxs:
         return 0
     async with pool.acquire() as conn, conn.transaction():
+        await assert_pool_samples_completed(
+            conn, processing_idx=processing_idx, prep_sample_idxs=prep_sample_idxs
+        )
         await mint_processing_exported_identifiers(
             conn,
             processing_idx=processing_idx,

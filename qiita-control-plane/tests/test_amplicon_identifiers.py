@@ -13,8 +13,8 @@ import pytest
 from qiita_common.actions import PROCESSING_IDX_BINDING, WorkflowAction
 
 from qiita_control_plane.actions.library import mint_amplicon_identifiers
+from qiita_control_plane.repositories.amplicon import AmpliconSampleNotCompleteError
 from qiita_control_plane.repositories.exported_identifier import (
-    ProcessingSampleNotCompleteError,
     mint_processing_exported_identifiers,
 )
 from qiita_control_plane.repositories.processing import mint_processing
@@ -118,9 +118,11 @@ async def test_repository_mint_is_idempotent(postgres_pool, run):
     assert all(r["export_id"].startswith("QM") for r in first)
 
 
-async def test_repository_mint_refuses_a_sample_whose_gate_is_pending(postgres_pool, run):
-    # Reopen one sample's gate; the mint refuses the whole cohort and mints nothing,
-    # so a handle never names a sample the run has not closed.
+async def test_mint_amplicon_identifiers_refuses_a_sample_whose_gate_is_pending(
+    postgres_pool, run, tmp_path
+):
+    # Reopen one sample's gate; the amplicon mint refuses the whole cohort and writes
+    # nothing, so a handle never names a sample the run has not closed.
     pending = run["prep_sample_idxs"][0]
     await postgres_pool.execute(
         "UPDATE qiita.amplicon_sample SET state = 'pending'"
@@ -128,14 +130,14 @@ async def test_repository_mint_refuses_a_sample_whose_gate_is_pending(postgres_p
         run["processing_idx"],
         pending,
     )
-    async with postgres_pool.acquire() as conn, conn.transaction():
-        with pytest.raises(ProcessingSampleNotCompleteError) as exc:
-            await mint_processing_exported_identifiers(
-                conn,
-                processing_idx=run["processing_idx"],
-                prep_sample_idxs=run["prep_sample_idxs"],
-                created_by_idx=run["principal_idx"],
-            )
+    counts = _write_asv_counts(tmp_path / "denoise", run["prep_sample_idxs"])
+    with pytest.raises(AmpliconSampleNotCompleteError) as exc:
+        await mint_amplicon_identifiers(
+            postgres_pool,
+            processing_idx=run["processing_idx"],
+            asv_counts_path=counts,
+            created_by_idx=run["principal_idx"],
+        )
     assert exc.value.not_complete == [pending]
     minted = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.exported_identifier WHERE processing_idx = $1",
