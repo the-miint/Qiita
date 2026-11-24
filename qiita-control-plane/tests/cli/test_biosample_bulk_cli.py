@@ -1,6 +1,6 @@
-"""`qiita biosample bulk-create` and `qiita biosample lookup`: the TSV file each reads,
-the request it sends, how it names the study, and the TSV file it writes. Also the
-reading of a refusal that lists every problem with a request."""
+"""`qiita biosample bulk-create`, `qiita biosample lookup` and `qiita biosample
+bulk-link`: the TSV file each reads, the request it sends, how it names the study, and
+what it writes. Also the reading of a refusal that lists every problem with a request."""
 
 import json
 import os
@@ -11,11 +11,16 @@ import pytest
 from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BULK_BY_STUDY,
+    URL_BIOSAMPLE_BULK_LINK_BY_STUDY,
     URL_BIOSAMPLE_LOOKUP_BY_STUDY,
     URL_STUDY_LOOKUP,
 )
+from qiita_common.auth_constants import API_PREFIX
 from qiita_common.models import EXPORT_ENTITY_ID, IDX_KEY, UNIQUE_FIELD_KEY, AllOrNothingFailure
-from qiita_common.models.biosample import BIOSAMPLE_BULK_IMPORT_MAX_ROWS
+from qiita_common.models.biosample import (
+    BIOSAMPLE_BULK_IMPORT_MAX_ROWS,
+    BIOSAMPLE_BULK_LINK_MAX_VALUES,
+)
 
 from qiita_control_plane.cli import _common as cli_common
 from qiita_control_plane.cli.user import main
@@ -28,6 +33,7 @@ _OWNER_BIOSAMPLE_ID_COLUMN = "sample_name"
 _STUDY_IDX = 7
 _BULK_URL = URL_BIOSAMPLE_BULK_BY_STUDY.format(study_idx=_STUDY_IDX)
 _LOOKUP_URL = URL_BIOSAMPLE_LOOKUP_BY_STUDY.format(study_idx=_STUDY_IDX)
+_BULK_LINK_URL = URL_BIOSAMPLE_BULK_LINK_BY_STUDY.format(study_idx=_STUDY_IDX)
 # lookup case -> (identifier flags, column header, request key, two values)
 _LOOKUP_CASES: dict[str, tuple[tuple[str, ...], str, str, tuple[str, str]]] = {
     EXPORT_ENTITY_ID: (
@@ -65,6 +71,11 @@ _LOOKUP_CASES: dict[str, tuple[tuple[str, ...], str, str, tuple[str, str]]] = {
 # (case, return key) pairs that look a kind up for itself, which would head both
 # output columns alike and so are refused rather than resolved.
 _LOOKUP_SELF_PAIRS = {(EXPORT_ENTITY_ID, EXPORT_ENTITY_ID), ("biosample_idx", "biosample_idx")}
+# bulk-link case -> the lookup case's shape: every --key choice, and the default key
+_BULK_LINK_CASES = {
+    **{case: shape for case, shape in _LOOKUP_CASES.items() if case != UNIQUE_FIELD_KEY},
+    "default": ((), EXPORT_ENTITY_ID, EXPORT_ENTITY_ID, ("QB1", "QB2")),
+}
 # return key -> the two identifiers that the stubbed route returns for a case's two values
 _LOOKUP_IDENTIFIERS: dict[str, tuple[str | int, str | int]] = {
     EXPORT_ENTITY_ID: ("QB517", "QB518"),
@@ -876,3 +887,192 @@ def test_exit_with_all_or_nothing_failure(capsys):
         "fix them and re-run.\n"
     )
     assert (exc_info.value.code, capsys.readouterr().err) == (1, expected_stderr)
+
+
+def test_call_all_or_nothing(monkeypatch):
+    """Tests the case where the route accepts the request: its decoded body is
+    returned."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"linked": ["a"]}, status=200)
+
+    body = cli_common.call_all_or_nothing(
+        "POST", _BASE, "qk_test", "/any", json={"x": 1}, label_for=str, advice="re-run."
+    )
+
+    sent = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    assert (body, sent) == ({"linked": ["a"]}, [("POST", f"{_BASE}{API_PREFIX}/any", {"x": 1})])
+
+
+def test_call_all_or_nothing_refused(monkeypatch, capsys):
+    """Tests the case where the route refuses the request listing its problems:
+    each problem prints against its item's label, then the advice, and the call
+    exits 1."""
+    _stub_post(monkeypatch, {}, response_json={"detail": _ALL_OR_NOTHING_DETAIL}, status=422)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_common.call_all_or_nothing(
+            "POST",
+            _BASE,
+            "qk_test",
+            "/any",
+            json={},
+            label_for=lambda item_id: f"row {item_id}",
+            advice="fix them and re-run.",
+        )
+
+    expected_stderr = (
+        "error: 2 of 3 things went wrong:\n"
+        "  - row a: first problem with a\n"
+        "  - row a: second problem with a\n"
+        "  - row c: the problem with c\n"
+        "fix them and re-run.\n"
+    )
+    assert (exc_info.value.code, capsys.readouterr().err) == (1, expected_stderr)
+
+
+@pytest.mark.parametrize(
+    ("status", "response_json"),
+    [
+        pytest.param(422, {"detail": [{"loc": ["body"], "msg": "bad", "type": "x"}]}, id="shape"),
+        pytest.param(409, {"detail": _ALL_OR_NOTHING_DETAIL}, id="not_a_422"),
+    ],
+)
+def test_call_all_or_nothing_other_error(monkeypatch, status, response_json):
+    """Tests the case where the route answers an error that lists no problems:
+    the error is raised as `call` raises it."""
+    _stub_post(monkeypatch, {}, response_json=response_json, status=status)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        cli_common.call_all_or_nothing(
+            "POST", _BASE, "qk_test", "/any", json={}, label_for=str, advice="re-run."
+        )
+
+    assert exc_info.value.response.status_code == status
+
+
+def _bulk_link_argv(tsv_file: Path, *extra: str, study_args: tuple[str, ...] = ()) -> list[str]:
+    """The bulk-link argv, naming the study by its idx unless `study_args` is given."""
+    study = study_args or ("--study-idx", str(_STUDY_IDX))
+    return [
+        "--base-url",
+        _BASE,
+        "biosample",
+        "bulk-link",
+        *study,
+        "--tsv-file",
+        str(tsv_file),
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize("case", list(_BULK_LINK_CASES))
+def test__handle_biosample_bulk_link(monkeypatch, tmp_path, capsys, case):
+    """Tests the case where each identifier kind, and the default kind, names the
+    biosamples in a file whose first value is padded: one request carries every
+    row's value under the kind's request key, and the route's answer is printed as
+    JSON."""
+    flags, column, request_key, (first, second) = _BULK_LINK_CASES[case]
+    link_response = {"linked": [first], "already_linked": [second]}
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=link_response)
+    tsv_text = f"{column}\tnote\n {first} \tone\n{second}\t\n"
+
+    rc = main(_bulk_link_argv(_write_tsv_file(tmp_path, tsv_text), *flags))
+
+    calls = [(r["method"], r["url"], r["json"]) for r in captured["requests"]]
+    expected_body = {"key": request_key, "values": [first, second]}
+    expected_calls = [("POST", _BASE + _BULK_LINK_URL, expected_body)]
+    outcome = (rc, calls, json.loads(capsys.readouterr().out))
+    assert outcome == (0, expected_calls, link_response)
+
+
+def test__handle_biosample_bulk_link_by_study_export_id(monkeypatch, tmp_path, capsys):
+    """Tests the case where the study is named by --study-export-id, and every link
+    already existed: the id is resolved through the study lookup, the values are
+    linked into that study, and the 200 answer is printed as JSON."""
+    link_response = {"linked": [], "already_linked": ["QB1"]}
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json=link_response,
+        status=200,
+        responses_by_url={URL_STUDY_LOOKUP: {"resolved": {"QS7": _STUDY_IDX}, "missing": []}},
+    )
+    tsv_file = _write_tsv_file(tmp_path, "export_entity_id\nQB1\n")
+
+    rc = main(_bulk_link_argv(tsv_file, study_args=("--study-export-id", "QS7")))
+
+    urls = [r["url"] for r in captured["requests"]]
+    outcome = (rc, urls, json.loads(capsys.readouterr().out))
+    assert outcome == (0, [_BASE + URL_STUDY_LOOKUP, _BASE + _BULK_LINK_URL], link_response)
+
+
+def test__handle_biosample_bulk_link_refused(monkeypatch, tmp_path, capsys):
+    """Tests the case where the route refuses the request: every problem prints
+    against its value under the file's column header, with the route's message
+    as written, and the command exits 1."""
+    refusal = {
+        "message": "2 of 3 values could not be linked",
+        "problems": [
+            {"item_id": "41", "message": "there is no biosample with idx '41'"},
+            {"item_id": "43", "message": "the biosample with idx '43' is retired"},
+        ],
+    }
+    _stub_post(monkeypatch, {}, response_json={"detail": refusal}, status=422)
+    tsv_file = _write_tsv_file(tmp_path, "biosample_idx\n41\n42\n43\n")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_bulk_link_argv(tsv_file, "--key", "biosample_idx"))
+
+    expected_stderr = (
+        "error: 2 of 3 values could not be linked:\n"
+        "  - biosample_idx=41: there is no biosample with idx '41'\n"
+        "  - biosample_idx=43: the biosample with idx '43' is retired\n"
+        "nothing was linked; fix these values and re-run.\n"
+    )
+    assert (exc_info.value.code, capsys.readouterr().err) == (1, expected_stderr)
+
+
+def test__handle_biosample_bulk_link_unavailable(monkeypatch, tmp_path, capsys):
+    """Tests the case where the route answers 503: the answer is printed and the
+    command exits 1."""
+    unavailable = {"detail": "resubmit the identical request"}
+    _stub_post(monkeypatch, {}, response_json=unavailable, status=503)
+    tsv_file = _write_tsv_file(tmp_path, "export_entity_id\nQB1\n")
+
+    rc = main(_bulk_link_argv(tsv_file))
+
+    stderr = capsys.readouterr().err
+    assert (rc, "http error 503" in stderr and "resubmit" in stderr) == (1, True), stderr
+
+
+@pytest.mark.parametrize(
+    ("tsv_text", "flags", "message"),
+    [
+        ("export_entity_id\nQB1\n  \nQB2\n", (), "line(s) 3, counting"),
+        ("export_entity_id\nQB1\nQB2\nQB1\n", (), "values must not repeat: ['QB1']"),
+        (
+            "export_entity_id\n"
+            + "".join(f"QB{i}\n" for i in range(BIOSAMPLE_BULK_LINK_MAX_VALUES + 1)),
+            (),
+            f"at most {BIOSAMPLE_BULK_LINK_MAX_VALUES} items",
+        ),
+        ("sample_id\nS-1\n", (), "no 'export_entity_id' column"),
+        ("matrix_tube_id\nX\n", ("--key", "matrix_tube_id"), "must match ^[0-9]{10}$: ['X']"),
+    ],
+    ids=["blank-cell", "repeat", "over-cap", "missing-column", "invalid-value"],
+)
+def test__handle_biosample_bulk_link_refuses_before_request(
+    monkeypatch, tmp_path, capsys, tsv_text, flags, message
+):
+    """Tests the case where the file cannot make a valid bulk link: the command
+    exits 2 naming the problem, before any request."""
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"linked": [], "already_linked": []})
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(_bulk_link_argv(_write_tsv_file(tmp_path, tsv_text), *flags))
+
+    stderr = capsys.readouterr().err
+    assert (exc_info.value.code, captured["requests"], message in stderr) == (2, [], True), stderr

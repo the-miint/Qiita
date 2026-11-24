@@ -158,24 +158,16 @@ def _resolve_roster(
             for row in preflight_rows
         ]
     ).model_dump(mode="json", exclude_none=True)
-    try:
-        resp = _common.call(
-            "POST",
-            base_url,
-            token,
-            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
-            json=body,
-        )
-    except httpx.HTTPStatusError as exc:
-        failure = _common.all_or_nothing_failure_from(exc)
-        if failure is None:
-            raise  # not a roster verdict (e.g. a request-shape 422)
-        label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
-        _common.exit_with_all_or_nothing_failure(
-            failure,
-            label_for=label_by_item.__getitem__,
-            advice="fix the registry or the preflight and re-run.",
-        )
+    label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
+    resp = _common.call_all_or_nothing(
+        "POST",
+        base_url,
+        token,
+        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
+        json=body,
+        label_for=label_by_item.__getitem__,
+        advice="fix the registry or the preflight and re-run.",
+    )
     return {r.item_id: r for r in RosterResolveResponse.model_validate(resp).rows}
 
 

@@ -88,9 +88,9 @@ from .amplicon import _handle_submit_golay_demux
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import (
+    _BIOSAMPLE_KEY_CHOICES,
     _BULK_CREATE_OUTPUT_FIELDS,
     _KEY_FLAG,
-    _LOOKUP_KEY_CHOICES,
     _LOOKUP_RETURN_KEY_BY_CHOICE,
     _OUTPUT_FLAG,
     _OWNER_BIOSAMPLE_ID_FIELD_NAME_FLAG,
@@ -98,6 +98,7 @@ from .biosample import (
     _TSV_FILE_FLAG,
     _UNIQUE_FIELD_NAME_FLAG,
     _handle_biosample_bulk_create,
+    _handle_biosample_bulk_link,
     _handle_biosample_create,
     _handle_biosample_lookup,
 )
@@ -744,7 +745,7 @@ def _build_parser() -> argparse.ArgumentParser:
     lookup_key_group = p_biosample_lookup.add_mutually_exclusive_group(required=True)
     lookup_key_group.add_argument(
         _KEY_FLAG,
-        choices=_LOOKUP_KEY_CHOICES,
+        choices=_BIOSAMPLE_KEY_CHOICES,
         help="the identifier kind, which also heads its column",
     )
     lookup_key_group.add_argument(
@@ -808,7 +809,35 @@ def _build_parser() -> argparse.ArgumentParser:
         study_call_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_STUDY_LINK}",
         study_call_model=None,
         study_call_kv_flags=(),
+        study_call_reuse_note="biosample {biosample_idx} was already linked to the study",
     )
+
+    p_biosample_bulk_link = p_biosample_sub.add_parser(
+        "bulk-link",
+        help=(
+            "Link into a study every existing biosample that a TSV file's column of"
+            " identifiers names, in one all-or-nothing request"
+            " (POST /study/{S}/biosample/bulk-link)"
+        ),
+    )
+    _add_study_arg(p_biosample_bulk_link)
+    p_biosample_bulk_link.add_argument(
+        _TSV_FILE_FLAG,
+        type=Path,
+        required=True,
+        help=(
+            f"tab-separated file with a header row; the column headed by the {_KEY_FLAG}"
+            " value holds one identifier per row, none repeated, and every other column is"
+            " ignored"
+        ),
+    )
+    p_biosample_bulk_link.add_argument(
+        _KEY_FLAG,
+        choices=_BIOSAMPLE_KEY_CHOICES,
+        default=EXPORT_ENTITY_ID,
+        help="the identifier kind, which also heads its column (default: %(default)s)",
+    )
+    p_biosample_bulk_link.set_defaults(handler=_handle_biosample_bulk_link)
 
     biosample_unique_field_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY_UNIQUE_FIELD}"
     biosample_unique_field_metadata_path = (

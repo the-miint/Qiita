@@ -760,6 +760,31 @@ def exit_with_all_or_nothing_failure(
     raise SystemExit(1)
 
 
+def call_all_or_nothing(
+    method: str,
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    json: dict,
+    label_for: Callable[[str], str],
+    advice: str,
+) -> dict | list:
+    """Call a route that refuses a request whole, returning the decoded body.
+    A refusal that lists its problems exits as `exit_with_all_or_nothing_failure`
+    does, with `label_for` and `advice`; any other non-2xx status raises
+    httpx.HTTPStatusError, as `call` does."""
+    try:
+        body = call(method, base_url, token, path, json=json)
+    except httpx.HTTPStatusError as exc:
+        failure = all_or_nothing_failure_from(exc)
+        # An error that lists no problems (e.g. a request-shape 422) is not a refusal
+        if failure is None:
+            raise
+        exit_with_all_or_nothing_failure(failure, label_for=label_for, advice=advice)
+    return body
+
+
 def validation_messages(exc: ValidationError) -> str:
     """A ValidationError's errors flattened to one stderr line."""
     return "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())

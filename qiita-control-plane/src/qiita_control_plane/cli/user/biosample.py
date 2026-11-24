@@ -11,6 +11,7 @@ import duckdb
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BULK_BY_STUDY,
+    PATH_BIOSAMPLE_BULK_LINK_BY_STUDY,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_STUDY,
     PATH_STUDY_PREFIX,
@@ -22,8 +23,9 @@ from qiita_common.models import (
     UNIQUE_FIELD_KEY,
     BiosampleBulkImportRequest,
     BiosampleBulkImportResponse,
+    BiosampleBulkLinkRequest,
     BiosampleImportRequest,
-    BiosampleStudyLookupKey,
+    BiosampleLinkKey,
     BiosampleStudyLookupRequest,
 )
 
@@ -40,18 +42,16 @@ _UNIQUE_FIELD_NAME_FLAG = "--unique-field-name"
 _RETURN_KEY_FLAG = "--return-key"
 # The CLI's spelling of a biosample's idx.
 _BIOSAMPLE_IDX = "biosample_idx"
-# Each `lookup --key` choice to the request key that it sends: every study-scoped key
-# but unique_field, which --unique-field-name selects. The request's idx key is
-# offered as biosample_idx.
-_LOOKUP_KEY_BY_CHOICE = {
-    (_BIOSAMPLE_IDX if key == IDX_KEY else key): key
-    for key in get_args(BiosampleStudyLookupKey)
-    if key != UNIQUE_FIELD_KEY
+# Each `--key` choice to the request key that it sends: every identifier kind that
+# names a biosample whatever its study. The request's idx key is offered as
+# biosample_idx.
+_BIOSAMPLE_KEY_BY_CHOICE = {
+    (_BIOSAMPLE_IDX if key == IDX_KEY else key): key for key in get_args(BiosampleLinkKey)
 }
 # export_entity_id is listed first, as the default identifier kind.
-_LOOKUP_KEY_CHOICES = (
+_BIOSAMPLE_KEY_CHOICES = (
     EXPORT_ENTITY_ID,
-    *(choice for choice in _LOOKUP_KEY_BY_CHOICE if choice != EXPORT_ENTITY_ID),
+    *(choice for choice in _BIOSAMPLE_KEY_BY_CHOICE if choice != EXPORT_ENTITY_ID),
 )
 # Each `lookup --return-key` choice, which also heads the output's second column,
 # to the request's return_key.
@@ -129,6 +129,39 @@ def _read_tsv_with_column(
             f" {column_flag} names"
         )
     return tsv_rows
+
+
+def _refuse_blank_cells(
+    tsv_rows: list[dict[str, str]], column: str, tsv_file: Path, parser: argparse.ArgumentParser
+) -> None:
+    """Exit through `parser.error` if any row's `column` cell is blank, naming
+    each such row by its line as DuckDB's read errors do, the header being line 1."""
+    blank_lines = [
+        str(line) for line, tsv_row in enumerate(tsv_rows, start=2) if not tsv_row[column].strip()
+    ]
+    if blank_lines:
+        parser.error(
+            f"{_TSV_FILE_FLAG} {tsv_file} has a blank {column!r} cell on line(s)"
+            f" {', '.join(blank_lines)}, counting the header as line 1"
+        )
+
+
+def _build_values_request[RequestT: BaseModel](
+    build_request: Callable[[list[str]], RequestT],
+    tsv_rows: list[dict[str, str]],
+    column: str,
+    tsv_file: Path,
+    parser: argparse.ArgumentParser,
+) -> RequestT:
+    """The request that `build_request` makes from every row's `column` value. A
+    request that the model refuses exits through `parser.error`, naming the file,
+    the column and each refusal."""
+    try:
+        values_request = build_request([tsv_row[column] for tsv_row in tsv_rows])
+    except ValidationError as exc:
+        messages = "; ".join(error["msg"] for error in exc.errors())
+        parser.error(f"{_TSV_FILE_FLAG} {tsv_file} column {column!r}: {messages}")
+    return values_request
 
 
 def _require_new_output(output: Path, parser: argparse.ArgumentParser) -> None:
@@ -279,20 +312,8 @@ def _lookup_column_to_tsv(
             f" {len(tsv_rows)} row(s), so the output would not line up with the file:"
             " remove any empty line between rows and any line break inside a cell"
         )
-    # Name each blank cell by its line as DuckDB's read errors do, the header being line 1.
-    blank_lines = [
-        str(line) for line, tsv_row in enumerate(tsv_rows, start=2) if not tsv_row[column].strip()
-    ]
-    if blank_lines:
-        parser.error(
-            f"{_TSV_FILE_FLAG} {args.tsv_file} has a blank {column!r} cell on line(s)"
-            f" {', '.join(blank_lines)}, counting the header as line 1"
-        )
-    try:
-        lookup_request = build_request([tsv_row[column] for tsv_row in tsv_rows])
-    except ValidationError as exc:
-        messages = "; ".join(error["msg"] for error in exc.errors())
-        parser.error(f"{_TSV_FILE_FLAG} {args.tsv_file} column {column!r}: {messages}")
+    _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
+    lookup_request = _build_values_request(build_request, tsv_rows, column, args.tsv_file, parser)
 
     def _run(token: str) -> list[tuple[str, str]]:
         _common.resolve_study_idx(args, parser, args.base_url, token)
@@ -330,7 +351,7 @@ def _handle_biosample_lookup(args: argparse.Namespace, parser: argparse.Argument
         key, column_flag, field_name = UNIQUE_FIELD_KEY, _UNIQUE_FIELD_NAME_FLAG, column
     else:
         column = args.key
-        key, column_flag, field_name = _LOOKUP_KEY_BY_CHOICE[args.key], _KEY_FLAG, None
+        key, column_flag, field_name = _BIOSAMPLE_KEY_BY_CHOICE[args.key], _KEY_FLAG, None
 
     # The request model and the route, chosen together for a study-scoped lookup.
     def _build_request(values: list[str]) -> BiosampleStudyLookupRequest:
@@ -356,3 +377,37 @@ def _handle_biosample_lookup(args: argparse.Namespace, parser: argparse.Argument
         build_request=_build_request,
         lookup_path=_lookup_path,
     )
+
+
+def _handle_biosample_bulk_link(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Link into a study every biosample that a TSV file's column of identifiers
+    names, in one all-or-nothing request, and print the route's answer."""
+    # Read the file and build the request before any request is sent.
+    column = args.key
+    tsv_rows = _read_tsv_with_column(args.tsv_file, column, parser, column_flag=_KEY_FLAG)
+    _refuse_blank_cells(tsv_rows, column, args.tsv_file, parser)
+
+    def _build_request(values: list[str]) -> BiosampleBulkLinkRequest:
+        link_request = BiosampleBulkLinkRequest(key=_BIOSAMPLE_KEY_BY_CHOICE[column], values=values)
+        return link_request
+
+    link_request = _build_values_request(_build_request, tsv_rows, column, args.tsv_file, parser)
+
+    def _run(token: str) -> dict | list:
+        _common.resolve_study_idx(args, parser, args.base_url, token)
+        bulk_link_path = f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_BULK_LINK_BY_STUDY}".format(
+            study_idx=args.study_idx
+        )
+        # Each refused value is labelled as the file's column holds it.
+        link_response = _common.call_all_or_nothing(
+            "POST",
+            args.base_url,
+            token,
+            bulk_link_path,
+            json=link_request.model_dump(mode="json"),
+            label_for=lambda value: f"{column}={value}",
+            advice="nothing was linked; fix these values and re-run.",
+        )
+        return link_response
+
+    return _common.run_http_subcommand(_run)
