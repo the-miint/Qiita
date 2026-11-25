@@ -1125,3 +1125,20 @@ async def test_mint_features_appends_each_batch_off_the_event_loop(monkeypatch, 
             f"SELECT sequence_hash, feature_idx FROM read_parquet('{path}')"
         ).fetchall()
     assert sorted(rows) == sorted(feature_idx.items())
+
+
+def test_append_arrow_matches_columns_by_name_and_refuses_an_unknown_one():
+    """A batch whose columns are in another order than the table's lands in the
+    columns of the same names; a column the table lacks raises."""
+    import duckdb
+    import pyarrow as pa
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    with duckdb.connect(":memory:") as con:
+        con.execute("CREATE TABLE t (a BIGINT, b BIGINT)")
+        lib._append_arrow(con, "t", pa.table({"b": [1], "a": [2]}))
+        assert con.sql("SELECT a, b FROM t").fetchall() == [(2, 1)]
+        with pytest.raises(duckdb.BinderException):
+            lib._append_arrow(con, "t", pa.table({"a": [3], "c": [4]}))

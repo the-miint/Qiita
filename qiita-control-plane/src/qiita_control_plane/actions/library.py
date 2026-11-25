@@ -147,7 +147,7 @@ _CHUNK_SIZE = 10_000
 _MINT_CHUNK_SIZE = 2_000
 _MINT_STATEMENT_TIMEOUT_SECONDS = 60.0
 
-# The annotation_map columns `mint_annotation_features` copies from each batch's
+# The annotation_map columns that `mint_annotation_features` copies from each batch's
 # RETURNING rows.
 _ANNOTATION_MAP_COLUMNS = (
     "annotation_idx",
@@ -254,7 +254,7 @@ async def _mint_chunk(
 
 def _append_arrow(con: duckdb.DuckDBPyConnection, table: str, batch: pa.Table) -> None:
     """Append `batch` to `con`'s `table` in one Arrow insert, matching columns by name; a
-    column `table` lacks raises. Measured on DuckDB 2.0.0 (macOS), 2,000 rows into a
+    column that `table` lacks raises. Measured on DuckDB 2.0.0 (macOS), 2,000 rows into a
     two-column table: a per-row `executemany` took 350 ms, this append 1.1 ms (median
     of 5)."""
     con.register("_append_batch", batch)
