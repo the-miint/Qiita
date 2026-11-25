@@ -9,7 +9,7 @@
   the same way a genome is — a de-novo ASV, which names nothing outside its load, gets a
   minted `QF` — so the amplicon and metagenomic tables share one identifier mechanism, not
   two. Values and features are Arrow IPC streams; access is all-or-nothing over the
-  cohort, checked before the data plane is read. `qiita feature-table runs` writes the
+  cohort, checked before the data plane is read. `qiita feature-table select` writes the
   three as a bundle with the map needed to read it.
 - **Exclusion-aware amplicon read surfaces on the data plane.** The counts are served
   through a new `amplicon_membership_visible` view (`amplicon_membership` anti-joined

@@ -140,7 +140,6 @@ from .reference import (
     _handle_reference_list,
     _handle_reference_load,
 )
-from .run_feature_table import _handle_run_feature_table
 from .sequencing import (
     _handle_prep_protocol_list,
     _handle_prep_sample_retire,
@@ -151,6 +150,7 @@ from .sequencing import (
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
 )
+from .stored_feature_table import _handle_feature_table_select
 from .study import (
     _handle_study_access_grant,
     _handle_study_access_list,
@@ -1763,16 +1763,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
-    # `feature-table runs` — a table over a cohort from amplicon runs, read from
+    # `feature-table select` — a table over a cohort from amplicon runs, read from
     # the `/feature-table` routes and written straight from its sparse rows.
-    p_ft_runs = p_feature_table_sub.add_parser(
-        "runs",
+    p_ft_select = p_feature_table_sub.add_parser(
+        "select",
         help=(
             "Build a feature table from one or more amplicon runs over a study's prep_samples"
             " or a named list, and write it with the map needed to read it"
         ),
     )
-    p_ft_runs.add_argument(
+    p_ft_select.add_argument(
         "--processing-idx",
         type=int,
         nargs="+",
@@ -1782,23 +1782,23 @@ def _build_parser() -> argparse.ArgumentParser:
             " compare (same trim length and orientation); otherwise refused."
         ),
     )
-    runs_cohort = p_ft_runs.add_mutually_exclusive_group(required=True)
-    runs_cohort.add_argument(
+    select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
+    select_cohort.add_argument(
         "--study-idx", type=int, help="Every prep_sample of this study the runs processed."
     )
-    runs_cohort.add_argument(
+    select_cohort.add_argument(
         "--prep-sample-idx",
         type=int,
         nargs="+",
         help="Exactly these prep_samples; one the runs did not process is refused.",
     )
-    p_ft_runs.add_argument(
+    p_ft_select.add_argument(
         "--format",
         choices=TABLE_FORMATS,
         default=DEFAULT_TABLE_FORMAT,
         help=f"Table format (default {DEFAULT_TABLE_FORMAT}).",
     )
-    p_ft_runs.add_argument(
+    p_ft_select.add_argument(
         "--output",
         type=Path,
         required=True,
@@ -1807,7 +1807,7 @@ def _build_parser() -> argparse.ArgumentParser:
             " <stem>.exported-identifier.json, <stem>.manifest.json and the ASV sequences."
         ),
     )
-    p_ft_runs.set_defaults(handler=_handle_run_feature_table)
+    p_ft_select.set_defaults(handler=_handle_feature_table_select)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)

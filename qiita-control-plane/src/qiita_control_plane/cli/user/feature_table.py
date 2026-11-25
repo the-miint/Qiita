@@ -79,7 +79,7 @@ from ...feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
 )
-from ...run_feature_table import FEATURE_RELATION
+from ...stored_feature_table import FEATURE_RELATION
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -997,7 +997,7 @@ def _amplicon_sequences_copy_sql(path: Path, *, clearance: object = None) -> str
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
-    # The amplicon table's (`qiita feature-table runs`), not flag-gated.
+    # The amplicon table's (`qiita feature-table select`), not flag-gated.
     _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql, flag_gated=False),
 )
 

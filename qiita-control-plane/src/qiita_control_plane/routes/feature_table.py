@@ -11,7 +11,7 @@
     its handle, its sequence and length, and the sequence's md5, as an Arrow IPC stream.
 
 What a feature table is, which runs it can merge, and why COO, is in
-`run_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
+`stored_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
 for the web UI and the CLI alike.
 
 Access is all-or-nothing over the cohort, at the tier the other cohort reads use,
@@ -35,7 +35,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.flight_stream import StreamRowCountMismatch
-from qiita_common.models.run_feature_table import FeatureTableRequest, FeatureTableSamples
+from qiita_common.models.feature_table import FeatureTableRequest, FeatureTableSamples
 
 from ..auth.guards import (
     COHORT_MIN_TIER,
@@ -45,7 +45,7 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
-from ..run_feature_table import (
+from ..stored_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
     Cohort,
     CohortError,

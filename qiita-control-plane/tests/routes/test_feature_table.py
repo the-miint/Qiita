@@ -26,7 +26,7 @@ from qiita_common.api_paths import (
     URL_FEATURE_TABLE_VALUE,
 )
 from qiita_common.flight_stream import StreamRowCountMismatch
-from qiita_common.models.run_feature_table import MAX_FEATURE_TABLE_RUNS
+from qiita_common.models.feature_table import MAX_FEATURE_TABLE_RUNS
 
 from qiita_control_plane.repositories.processing import mint_processing
 
@@ -90,8 +90,8 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
             }
         )
 
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_table", _fetch)
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.mint_feature_labels", _labels)
+    monkeypatch.setattr("qiita_control_plane.routes.feature_table.fetch_table", _fetch)
+    monkeypatch.setattr("qiita_control_plane.routes.feature_table.mint_feature_labels", _labels)
     yield {"processing_idx": processing_idx, "runs": runs, "fetched": fetched, **seed}
     await db.execute(
         "DELETE FROM qiita.exported_identifier WHERE processing_idx = ANY($1::bigint[])", runs
@@ -343,7 +343,7 @@ async def test_an_unreadable_named_sample_403s_before_the_uncounted_404(
 async def test_a_study_cohort_over_the_cap_413s(role_keyed_clients, amplicon_run, monkeypatch):
     """A study cohort has no request-model bound, so it is capped at resolve: wider than
     MAX_COHORT_PREP_SAMPLE_IDX is refused (413) rather than buffered into one response."""
-    monkeypatch.setattr("qiita_control_plane.run_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
+    monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
     run = amplicon_run
     resp = await role_keyed_clients["user"].post(
         URL_FEATURE_TABLE_VALUE,
@@ -359,7 +359,7 @@ async def test_an_unreadable_study_403s_before_it_is_resolved(
     """A study cohort is authorized before it is resolved, so a caller who may not
     read the study learns nothing of its cohort — not its size (the 413) and not
     whether the runs processed any of it (the 404)."""
-    monkeypatch.setattr("qiita_control_plane.run_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 0)
+    monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 0)
     run = amplicon_run
     resp = await role_keyed_clients["user"].post(
         URL_FEATURE_TABLE_VALUE,
@@ -413,7 +413,7 @@ async def test_a_data_plane_failure_is_a_502(
     def _fail(**_):
         raise failure
 
-    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_table", _fail)
+    monkeypatch.setattr("qiita_control_plane.routes.feature_table.fetch_table", _fail)
     resp = await role_keyed_clients["wet"].post(
         URL_FEATURE_TABLE_VALUE,
         json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),

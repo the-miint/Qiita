@@ -1,4 +1,4 @@
-"""`qiita feature-table runs`: the bundle written from the `/feature-table` routes'
+"""`qiita feature-table select`: the bundle written from the `/feature-table` routes'
 answers — an amplicon table's values, columns, and each feature's sequence and md5."""
 
 import hashlib
@@ -14,8 +14,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
 
-from qiita_control_plane.cli.user.run_feature_table import MAP_NOTE
-from qiita_control_plane.run_feature_table import (
+from qiita_control_plane.cli.user.stored_feature_table import MAP_NOTE
+from qiita_control_plane.stored_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
     FEATURES_SCHEMA,
     VALUES_SCHEMA,
@@ -59,7 +59,7 @@ def _run(monkeypatch, tmp_path, method, values, features, extra=(), *, call=None
             "--base-url",
             "http://cp",
             "feature-table",
-            "runs",
+            "select",
             "--processing-idx",
             "7",
             "--study-idx",

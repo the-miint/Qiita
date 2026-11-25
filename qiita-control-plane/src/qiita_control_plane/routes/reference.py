@@ -919,7 +919,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # Per-subject assembly quality, signed by the human assembly run mint
         # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
-        # The amplicon feature-table surfaces, served by routes/run_feature_table.py
+        # The amplicon feature-table surfaces, served by routes/feature_table.py
         # and scoped to a cohort of (processing_idx, prep_sample_idx). The counts
         # go through the exclusion-aware VIEW (raw `amplicon_membership` is not
         # Flight-readable); the sequences resolve the cohort through that view. Both

@@ -41,7 +41,7 @@ from qiita_common.amplicon_constants import (
 )
 from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import MAX_COHORT_PREP_SAMPLE_IDX
-from qiita_common.models.run_feature_table import (
+from qiita_common.models.feature_table import (
     FeatureTableRequest,
     FeatureTableSample,
     FeatureTableValueKind,
@@ -162,7 +162,7 @@ def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
             parts.append(f"no run at {missing}")
         raise CohortError(
             404,
-            f"feature-table runs serves {', '.join(sorted(SOURCES))} runs only: "
+            f"feature-table select serves {', '.join(sorted(SOURCES))} runs only: "
             + "; ".join(parts),
         )
     methods = {p: found[p]["workflow"] for p in runs}

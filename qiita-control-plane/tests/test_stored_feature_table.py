@@ -5,9 +5,9 @@ import hashlib
 
 import pyarrow as pa
 import pytest
-from qiita_common.models.run_feature_table import FeatureTableSample
+from qiita_common.models.feature_table import FeatureTableSample
 
-from qiita_control_plane.run_feature_table import (
+from qiita_control_plane.stored_feature_table import (
     SOURCES,
     Cohort,
     ProcessedSample,

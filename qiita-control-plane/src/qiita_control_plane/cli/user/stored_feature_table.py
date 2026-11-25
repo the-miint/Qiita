@@ -1,6 +1,6 @@
 """qiita user CLI — the run feature table.
 
-`qiita feature-table runs` writes a feature table of amplicon runs: the control
+`qiita feature-table select` writes a feature table of amplicon runs: the control
 plane's `/feature-table` routes answer the cohort's columns, its values as sparse
 COO `(sample, feature, value)`, and its features, and this writes them as a bundle.
 The routes are the one implementation of a run table, which the web UI reads too,
@@ -28,9 +28,9 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_VALUE,
 )
 from qiita_common.duckdb_relation import registered
-from qiita_common.models.run_feature_table import FeatureTableRequest
+from qiita_common.models.feature_table import FeatureTableRequest
 
-from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
+from ...stored_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
 from .. import _common
 from .feature_table import (
     _bundle_targets,
@@ -146,8 +146,8 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     return written, sizes
 
 
-def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Entry point for `qiita feature-table runs`. Fails loudly (exit 1) on the
+def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Entry point for `qiita feature-table select`. Fails loudly (exit 1) on the
     first refusal; a failure part-way leaves no bundle file behind."""
     import duckdb  # noqa: PLC0415
     from pydantic import ValidationError  # noqa: PLC0415
