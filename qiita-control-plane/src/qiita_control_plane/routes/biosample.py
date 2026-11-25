@@ -119,6 +119,7 @@ from ..repositories._sample_helpers import (
 )
 from ..repositories.biosample import (
     fetch_biosample,
+    fetch_biosample_idxs_by_identifier,
     fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_biosamples_by_idxs,
@@ -925,10 +926,8 @@ async def resolve_biosample_idxs_by_kind(
             noun=BIOSAMPLE_METADATA_SPEC.entity_kind,
             tiers=tiers,
         )
-    elif key == IDX_KEY:
-        resolved = {value: int(value) for value in values}
     else:
-        resolved = await fetch_biosample_idxs_by_natural_key(
+        resolved = await fetch_biosample_idxs_by_identifier(
             conn, key=key, values=values, include_retired=True
         )
     return resolved

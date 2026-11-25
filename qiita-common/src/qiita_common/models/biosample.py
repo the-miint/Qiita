@@ -676,7 +676,7 @@ BiosampleLookupKey = Literal[
 ]
 
 
-def _check_lookup_value_pattern(key: str, values: list[str]) -> None:
+def check_lookup_value_pattern(key: str, values: list[str]) -> None:
     """Raise ValueError naming every one of `values` that does not match the
     pattern that `key`'s values must match; a key with no pattern accepts any."""
     pattern = _LOOKUP_VALUE_PATTERNS.get(key)
@@ -697,7 +697,7 @@ class BiosampleLookupRequest(NaturalKeyLookupRequest):
 
     @model_validator(mode="after")
     def _check_value_pattern(self) -> BiosampleLookupRequest:
-        _check_lookup_value_pattern(self.key, self.values)
+        check_lookup_value_pattern(self.key, self.values)
         return self
 
 
@@ -748,7 +748,7 @@ class BiosampleBulkLinkRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_values(self) -> BiosampleBulkLinkRequest:
-        _check_lookup_value_pattern(self.key, self.values)
+        check_lookup_value_pattern(self.key, self.values)
         check_no_repeats(self.values, field="values")
         return self
 
