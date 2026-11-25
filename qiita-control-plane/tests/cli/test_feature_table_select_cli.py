@@ -42,7 +42,9 @@ def _body(values, features):
     return pack_feature_table(cohort, values, features)
 
 
-def _run(monkeypatch, tmp_path, values, features, extra=(), *, fetch_binary=None, rc=0):
+def _run(
+    monkeypatch, tmp_path, values, features, extra=(), *, cohort=None, fetch_binary=None, rc=0
+):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user._parser import _build_parser
 
@@ -66,8 +68,7 @@ def _run(monkeypatch, tmp_path, values, features, extra=(), *, fetch_binary=None
             "select",
             "--method",
             "amplicon",
-            "--study-idx",
-            "3",
+            *(cohort or ["--study", "QS3"]),
             "--format",
             "parquet",
             "--output",
@@ -131,11 +132,33 @@ def test_parameters_are_sent_typed_and_recorded(monkeypatch, tmp_path):
         extra=["--parameter", "trim=150", "--parameter", "orient_primer=false"],
     )
     assert sent == [
-        {"method": "amplicon", "parameters": {"trim": 150, "orient_primer": False}, "study_idx": 3}
+        {
+            "method": "amplicon",
+            "parameters": {"trim": 150, "orient_primer": False},
+            "study": {"value": "QS3"},
+        }
     ]
     manifest = json.loads(out.with_name("table.manifest.json").read_text())
     assert manifest["kind"] == "amplicon"
     assert manifest["parameters"] == _PARAMETERS
+
+
+def test_biosamples_are_named_by_the_key_her_lookups_take(monkeypatch, tmp_path):
+    """`--key` names the identifier kind, as `qiita biosample bulk-link` does, with a
+    biosample's idx spelled biosample_idx."""
+    sent = []
+    for key, sent_key in (("biosample_accession", "biosample_accession"), ("biosample_idx", "idx")):
+        (tmp_path / key).mkdir()
+        _, request = _run(
+            monkeypatch,
+            tmp_path / key,
+            _values([("QM1", "QF1", 5.0)]),
+            _features([("QF1", "ACGT")]),
+            cohort=["--biosample", "1", "2", "--key", key],
+        )
+        sent += request
+        assert request[0]["biosample"] == {"key": sent_key, "values": ["1", "2"]}
+    assert len(sent) == 2
 
 
 def test_a_parameter_without_a_value_is_refused_before_anything_is_read(

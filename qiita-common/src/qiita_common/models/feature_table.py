@@ -14,9 +14,17 @@ from pydantic import (
     model_validator,
 )
 
-from qiita_common.models._base import PrepSampleCohort
-
-PositiveIdx = Annotated[int, Field(gt=0)]
+from qiita_common.models._base import (
+    EXPORT_ENTITY_ID,
+    MAX_COHORT_PREP_SAMPLE_IDX,
+    NonBlankText,
+    check_no_repeats,
+)
+from qiita_common.models.biosample import (
+    BiosampleIdentifierKey,
+    StudyLookupKey,
+    check_lookup_value_pattern,
+)
 
 # What a table's values are.
 FeatureTableValueKind = Literal["count"]
@@ -26,8 +34,35 @@ FeatureTableValueKind = Literal["count"]
 FeatureTableParameter = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
+class FeatureTableStudy(BaseModel):
+    """A study, named by one value of the identifier kind `key` names, as a study
+    lookup takes it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: StudyLookupKey = EXPORT_ENTITY_ID
+    value: NonBlankText
+
+
+class FeatureTableBiosamples(BaseModel):
+    """Biosamples, named by values of the identifier kind `key` names, as a biosample
+    lookup takes them. No value may repeat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: BiosampleIdentifierKey = EXPORT_ENTITY_ID
+    values: list[NonBlankText] = Field(min_length=1, max_length=MAX_COHORT_PREP_SAMPLE_IDX)
+
+    @model_validator(mode="after")
+    def _check_values(self) -> Self:
+        check_lookup_value_pattern(self.key, self.values)
+        check_no_repeats(self.values, field="values")
+        return self
+
+
 class FeatureTableRequest(BaseModel):
-    """A method's stored values over a cohort: a study's prep_samples, or a named list.
+    """A method's stored values over a cohort: a study's prep_samples, or the
+    prep_samples of named biosamples.
 
     The server draws on the method's active runs that processed the cohort, narrowed to
     those whose settings match `parameters`, and refuses runs that would not compare.
@@ -37,13 +72,13 @@ class FeatureTableRequest(BaseModel):
 
     method: Annotated[str, Field(min_length=1)]
     parameters: dict[str, FeatureTableParameter] = Field(default_factory=dict)
-    study_idx: PositiveIdx | None = None
-    prep_sample_idx: PrepSampleCohort | None = None
+    study: FeatureTableStudy | None = None
+    biosample: FeatureTableBiosamples | None = None
 
     @model_validator(mode="after")
     def _one_cohort(self) -> Self:
-        if (self.study_idx is None) == (self.prep_sample_idx is None):
-            raise ValueError("name the samples by exactly one of study_idx or prep_sample_idx")
+        if (self.study is None) == (self.biosample is None):
+            raise ValueError("name the samples by exactly one of study or biosample")
         return self
 
 

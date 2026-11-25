@@ -150,7 +150,7 @@ from .sequencing import (
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
 )
-from .stored_feature_table import _handle_feature_table_select
+from .stored_feature_table import SELECT_KEY_CHOICES, _handle_feature_table_select
 from .study import (
     _handle_study_access_grant,
     _handle_study_access_list,
@@ -1789,13 +1789,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
     select_cohort.add_argument(
-        "--study-idx", type=int, help="Every prep_sample of this study a matching run processed."
+        "--study",
+        metavar="VALUE",
+        help="Every prep_sample of this study a matching run processed, the study named by --key.",
     )
     select_cohort.add_argument(
-        "--prep-sample-idx",
-        type=int,
+        "--biosample",
+        metavar="VALUE",
         nargs="+",
-        help="Exactly these prep_samples; one no matching run processed is refused.",
+        help=(
+            "Every prep_sample of these biosamples a matching run processed, each named by"
+            " --key; a biosample none of whose prep_samples one processed is refused."
+        ),
+    )
+    p_ft_select.add_argument(
+        _KEY_FLAG,
+        choices=SELECT_KEY_CHOICES,
+        help=f"The kind of identifier --study or --biosample names (default {EXPORT_ENTITY_ID}).",
     )
     p_ft_select.add_argument(
         "--format",

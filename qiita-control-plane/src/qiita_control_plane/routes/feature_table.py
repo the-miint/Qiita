@@ -1,7 +1,7 @@
 """A feature table of stored values over REST: `POST /feature-table`.
 
-The body (`FeatureTableRequest`) names a method, its parameters, and a study or a
-prep_sample list; the answer is one zip (`pack_feature_table`) of:
+The body (`FeatureTableRequest`) names a method, its parameters, and a study or a list
+of biosamples, each by any of its identifiers; the answer is one zip (`pack_feature_table`) of:
 
   * the table's columns as JSON: each processed sample's QM (its column name) and its
     biosample's public name (to join to metadata); with the method, what its values
@@ -49,6 +49,7 @@ from ..stored_feature_table import (
     mint_feature_labels,
     pack_feature_table,
     resolve_cohort,
+    resolve_scope,
 )
 from ._helpers import authorize_prep_sample_cohort
 
@@ -59,23 +60,28 @@ async def _authorized_cohort(
     pool: asyncpg.Pool, caller: HumanUser, request: FeatureTableRequest
 ) -> Cohort:
     # Authorize what the request names before resolving it: resolve_cohort's
-    # refusals describe the cohort (which named prep_samples no matching run
-    # processed, how many prep_samples a study holds), so a caller who may not read it
-    # is refused first. A study cohort's prep_samples are authorized again once
-    # resolved, because one may also be linked to a study the caller cannot read.
-    if request.study_idx is not None:
-        await require_caller_has_tier_on_all_studies(
-            pool, caller=caller, study_idxs=[request.study_idx], min_tier=COHORT_MIN_TIER
-        )
-    else:
-        await authorize_prep_sample_cohort(
-            pool, caller=caller, prep_sample_idx=request.prep_sample_idx, min_tier=COHORT_MIN_TIER
-        )
+    # refusals describe the cohort (which named biosamples no matching run processed,
+    # how many prep_samples a study holds), so a caller who may not read it is refused
+    # first. A study cohort's prep_samples are authorized again once resolved, because
+    # one may also be linked to a study the caller cannot read. Which study or
+    # biosamples a value names is answered before that, as the lookups answer it.
     try:
-        cohort = await resolve_cohort(pool, request)
+        scope = await resolve_scope(pool, request)
+        if scope.study_idx is not None:
+            await require_caller_has_tier_on_all_studies(
+                pool, caller=caller, study_idxs=[scope.study_idx], min_tier=COHORT_MIN_TIER
+            )
+        else:
+            await authorize_prep_sample_cohort(
+                pool,
+                caller=caller,
+                prep_sample_idx=scope.prep_sample_idxs,
+                min_tier=COHORT_MIN_TIER,
+            )
+        cohort = await resolve_cohort(pool, request, scope)
     except CohortError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
-    if request.study_idx is not None:
+    if scope.study_idx is not None:
         await authorize_prep_sample_cohort(
             pool, caller=caller, prep_sample_idx=cohort.prep_sample_idxs, min_tier=COHORT_MIN_TIER
         )

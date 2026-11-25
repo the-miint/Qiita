@@ -16,15 +16,18 @@ import contextlib
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 from qiita_common import analytic as ft
 from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_ROOT
 from qiita_common.duckdb_relation import registered
+from qiita_common.models import EXPORT_ENTITY_ID
+from qiita_common.models.biosample import StudyLookupKey
 from qiita_common.models.feature_table import FeatureTableRequest
 
 from ...stored_feature_table import FEATURE_TABLE_MEDIA_TYPE, SOURCES, unpack_feature_table
 from .. import _common
+from .biosample import _BIOSAMPLE_KEY_BY_CHOICE, _BIOSAMPLE_KEY_CHOICES
 from .feature_table import (
     _bundle_targets,
     _companions,
@@ -38,6 +41,12 @@ MANIFEST_NOTE = (
     " over the lake, so the same method over a different cohort yields a different"
     " table — which is why this record is part of the bundle."
 )
+# Each `--key` choice: a study's identifier kinds and a biosample's, spelled as the
+# biosample commands spell them, with export_entity_id (the default) first.
+SELECT_KEY_CHOICES = tuple(
+    dict.fromkeys((EXPORT_ENTITY_ID, *get_args(StudyLookupKey), *_BIOSAMPLE_KEY_CHOICES))
+)
+
 MAP_NOTE = (
     "This file maps each column of the table beside it, named by its QM (export_id), to"
     " its biosample's public name (biosample), the key to join your sample metadata."
@@ -57,11 +66,14 @@ def _parameter(text: str) -> tuple[str, Any]:
 
 
 def _request(args: argparse.Namespace) -> FeatureTableRequest:
+    named = {} if args.key is None else {"key": _BIOSAMPLE_KEY_BY_CHOICE.get(args.key, args.key)}
+    cohort = (
+        {"study": {**named, "value": args.study}}
+        if args.study is not None
+        else {"biosample": {**named, "values": args.biosample}}
+    )
     return FeatureTableRequest(
-        method=args.method,
-        parameters=dict(_parameter(p) for p in args.parameter or ()),
-        study_idx=args.study_idx,
-        prep_sample_idx=args.prep_sample_idx,
+        method=args.method, parameters=dict(_parameter(p) for p in args.parameter or ()), **cohort
     )
 
 
