@@ -1888,7 +1888,9 @@ async def write_assembly_membership(
     total_written = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
-            register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
+            await run_on_connection(
+                duck, register_contig_attribute_table, duck, genomes_dir / CONTIG_ATTRIBUTES_FILE
+            )
 
             def _with_source_ids(batch: pa.RecordBatch) -> dict[str, list[Any]]:
                 cols = batch.to_pydict()

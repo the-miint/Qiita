@@ -170,9 +170,12 @@ async def test_write_assembly_membership_reports_a_contig_collapse(postgres_pool
         )
 
 
-async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, tmp_path):
+async def test_membership_stores_the_assembler_contig_attributes(
+    postgres_pool, tmp_path, monkeypatch
+):
     """The sidecar's values reach qiita.assembly_membership, and a contig it does
-    not mention still gets its row.
+    not mention still gets its row. The sidecar loads on a thread other than the
+    event loop's.
 
     The Postgres and DuckLake copies of this table are written by different
     components — this primitive and `assembly_load` — so both carry the columns or
@@ -236,6 +239,18 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
 
     bare = tmp_path / "bare"
     bare.mkdir()
+
+    import threading
+
+    loop_thread = threading.get_ident()
+    sidecar_threads: list[int] = []
+    real_register = lib.register_contig_attribute_table
+
+    def _recording_register(conn, path):
+        sidecar_threads.append(threading.get_ident())
+        real_register(conn, path)
+
+    monkeypatch.setattr(lib, "register_contig_attribute_table", _recording_register)
 
     try:
         # FIRST write the run with no sidecar at all, so its rows exist with NULL
@@ -315,6 +330,7 @@ async def test_membership_stores_the_assembler_contig_attributes(postgres_pool, 
         assert [tuple(r) for r in again] == [tuple(r) for r in rows], (
             "a replay with no sidecar must not erase attributes an earlier pass stored"
         )
+        assert sidecar_threads and loop_thread not in sidecar_threads
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.assembly_membership WHERE prep_sample_idx = $1", prep_sample_idx

@@ -8,7 +8,8 @@
   running, `/health` and `qiita ticket list` timed out. Each batch is now one Arrow insert
   in a worker thread. The batch reads of those actions, of the genome associations, the
   annotation terms, `write_membership` and `write_assembly_membership` (reading each batch
-  from DuckDB and turning it into Python lists) also run in a worker thread now.
+  from DuckDB and turning it into Python lists) also run in a worker thread now, as does
+  `write_assembly_membership`'s load of the contig-attribute sidecar.
 
 ### Changed
 
