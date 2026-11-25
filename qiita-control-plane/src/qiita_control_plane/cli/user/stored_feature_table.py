@@ -2,8 +2,8 @@
 
 The control plane's `/feature-table` routes answer the cohort's columns, its values as
 sparse COO `(sample, feature, value)` and its features' sequences, and this writes them
-as a bundle with `feature-table build`'s writer. The routes are the one implementation,
-which the web UI reads too, so the two cannot disagree about a table.
+as a bundle with `feature-table build`'s writer. The routes are the one implementation;
+this writes what they answer.
 
 The table is written straight from its COO rows — BIOM and Parquet both take
 `(feature_id, sample_id, value)` — so it is never made dense on the way to disk.
@@ -31,6 +31,7 @@ from ...stored_feature_table import ARROW_STREAM_MEDIA_TYPE, SOURCES
 from .. import _common
 from .feature_table import (
     _bundle_targets,
+    _companions,
     _tool_versions,
     _write_bundle,
 )
@@ -156,11 +157,10 @@ def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.Argu
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        # The refusals that need only the flags, before a connection or a read.
-        # The method is known only from the answer; the write checks the whole
-        # bundle again.
+        # The refusals that need only the flags, before a connection or a read; the
+        # write checks the whole bundle again.
         _request(args)
-        _bundle_targets(args.output, args.format)
+        _bundle_targets(args.output, args.format, companions=_companions("sequences"))
         with contextlib.closing(connect_with_miint()) as con:
             written, sizes = _build(args, token, con)
     except ValidationError as exc:

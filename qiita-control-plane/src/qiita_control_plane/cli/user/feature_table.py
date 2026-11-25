@@ -966,16 +966,11 @@ class _Companion(NamedTuple):
     alone, since it runs before anything has been computed, and `_write_bundle` needs the
     writers — so a member cannot be reserved a path and then not written, and adding one
     is a line here rather than a third positional index at each site.
-
-    `flag_gated` is the default: a member a `--flag` asks for. `sequences` is not: it is
-    written whenever the caller passes its clearance, so it is excluded from the flag
-    lookup (`_requested_companions`) rather than masked out of it.
     """
 
     name: str
     suffix: str
     copy_sql: Callable[..., str]
-    flag_gated: bool = True
 
 
 # In write order. Each suffix is derived from the caller's name for the reason the
@@ -984,7 +979,7 @@ class _Companion(NamedTuple):
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
-    _Companion("sequences", ".sequences.parquet", ft.sequences_copy_sql, flag_gated=False),
+    _Companion("sequences", ".sequences.parquet", ft.sequences_copy_sql),
 )
 
 
@@ -1207,12 +1202,22 @@ def _manifest_payload(
     }
 
 
+def _companions(*names: str) -> tuple[_Companion, ...]:
+    """The companions named, in write order. An unknown name is refused: silently writing
+    nothing is the one outcome a bundle must not have, since the member would be absent
+    from a bundle whose whole promise is all-of-its-files."""
+    unknown = set(names) - {c.name for c in _COMPANIONS}
+    if unknown:
+        raise ValueError(f"no bundle companion is named {sorted(unknown)}")
+    return tuple(c for c in _COMPANIONS if c.name in names)
+
+
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
-    """The flag-gated companions these flags ask for, in write order. Spelled out per
-    member rather than read off the namespace, so a renamed flag is a signature change
-    here instead of a silently absent file."""
+    """The companions these flags ask for. Spelled out per member rather than read off
+    the namespace, so a renamed flag is a signature change here instead of a silently
+    absent file."""
     asked = {"taxonomy": taxonomy, "tree": tree}
-    return tuple(c for c in _COMPANIONS if c.flag_gated and asked[c.name])
+    return _companions(*(name for name, on in asked.items() if on))
 
 
 # Written INTO the map as well as printed, because a warning that lives only in a
@@ -1316,12 +1321,7 @@ def _write_bundle(
     reproduced; the rest because an artifact naming rows the table does not contain is
     worse than no artifact. Half a bundle is not a partial result but a useless one.
     """
-    unknown = set(clearances) - {c.name for c in _COMPANIONS}
-    if unknown:
-        # Silently writing nothing is the one outcome a bundle must not have: the member
-        # would be absent from a bundle whose whole promise is all-of-its-files.
-        raise ValueError(f"no bundle companion is named {sorted(unknown)}")
-    companions = tuple(c for c in _COMPANIONS if c.name in clearances)
+    companions = _companions(*clearances)
     targets = _bundle_targets(table_path, fmt, companions=companions)
     pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]
     for partial, _ in pairs:

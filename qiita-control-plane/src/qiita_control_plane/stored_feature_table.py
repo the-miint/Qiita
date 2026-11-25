@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import asyncpg
@@ -67,6 +68,9 @@ class Source:
     noun: str
     # What a feature id is, for the bundle manifest.
     feature_id_note: str
+    # The exported-feature mint that names this method's features
+    # (`repositories.exported_feature`), returning `feature_idx -> handle`.
+    mint: Callable[..., Awaitable[dict[int, str]]]
 
 
 # The registry of methods this endpoint can answer. A method belongs here when its
@@ -89,6 +93,7 @@ SOURCES: dict[str, Source] = {
         merge_keys=(TRIM_BINDING, ORIENT_PRIMER_BINDING),
         noun="ASVs",
         feature_id_note="exported-feature handle (QF); the sequence companion maps it to md5",
+        mint=mint_observed_features,
     ),
 }
 
@@ -269,19 +274,18 @@ VALUE_RELATION = "stored_value"
 
 
 async def mint_feature_labels(
-    pool: asyncpg.Pool, *, created_by_idx: int, features: pa.Table
+    pool: asyncpg.Pool, *, source: Source, created_by_idx: int, features: pa.Table
 ) -> pa.Table:
-    """The exported-feature mint response as Arrow `(feature_idx, export_feature_id)` — a
-    `QF` per de-novo feature, minted if absent. `features` is any cohort relation carrying
-    a `feature_idx` column; the relabel reads the result as `feature_label`."""
+    """`source`'s mint response as Arrow `(feature_idx, export_feature_id)`, minting any
+    handle that is absent. `features` is any cohort relation carrying a `feature_idx`
+    column; the relabel reads the result as the feature label."""
     feature_idx = sorted({int(f) for f in features.column("feature_idx").to_pylist()})
-    handles = await mint_observed_features(
-        pool, feature_idx=feature_idx, created_by_idx=created_by_idx
-    )
+    handles = await source.mint(pool, feature_idx=feature_idx, created_by_idx=created_by_idx)
+    ordered = sorted(handles)
     return pa.table(
         {
-            "feature_idx": pa.array(list(handles), pa.int64()),
-            "export_feature_id": pa.array([handles[f] for f in handles], pa.string()),
+            "feature_idx": pa.array(ordered, pa.int64()),
+            "export_feature_id": pa.array([handles[f] for f in ordered], pa.string()),
         }
     )
 

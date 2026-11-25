@@ -3,16 +3,15 @@
 `POST /feature-table/{sample,value,feature}` all take the same body
 (`FeatureTableRequest`: runs, and a study or a prep_sample list) and answer:
 
-  * samples — the table's columns as JSON: each processed sample's column name,
-    its QM, and its biosample's public name (to join to metadata); with the runs'
-    method and what their values are (`count`);
+  * samples — the table's columns as JSON: each processed sample's QM (its column
+    name) and its biosample's public name (to join to metadata); with the runs' method
+    and what their values are;
   * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
   * features — `(feature, sequence, length, md5)` for every feature the values name:
     its handle, its sequence and length, and the sequence's md5, as an Arrow IPC stream.
 
 What a feature table is, which runs it can merge, and why COO, is in
-`stored_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
-for the web UI and the CLI alike.
+`stored_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets.
 
 Access is all-or-nothing over the cohort, at the tier the other cohort reads use,
 checked before anything is read from the data plane (`_authorized_cohort`). The
@@ -133,7 +132,9 @@ async def feature_table_values(
     """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
     cohort = await _authorized_cohort(pool, caller, request)
     values = await _read(cohort, cohort.source.values_table, data_plane_url, signing_key)
-    labels = await mint_feature_labels(pool, created_by_idx=caller.principal_idx, features=values)
+    labels = await mint_feature_labels(
+        pool, source=cohort.source, created_by_idx=caller.principal_idx, features=values
+    )
     table = build_values(cohort, values, labels)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
@@ -152,7 +153,7 @@ async def feature_table_features(
     cohort = await _authorized_cohort(pool, caller, request)
     sequences = await _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key)
     labels = await mint_feature_labels(
-        pool, created_by_idx=caller.principal_idx, features=sequences
+        pool, source=cohort.source, created_by_idx=caller.principal_idx, features=sequences
     )
     table = build_features(cohort, sequences, labels)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)

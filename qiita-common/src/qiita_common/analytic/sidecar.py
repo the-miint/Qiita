@@ -439,8 +439,9 @@ def sequences_diagnostics_sql() -> str:
         f"(SELECT count(DISTINCT feature_id) FROM {LABELLED_RELATION} l "
         f"  ANTI JOIN {FEATURE_SEQUENCE_TABLE} s ON s.feature = l.feature_id) "
         f"  AS unsequenced_features, "
-        f"(SELECT count(*) - count(DISTINCT feature) FROM {FEATURE_SEQUENCE_TABLE}) "
-        f"  AS repeated_features"
+        f"(SELECT count(*) FROM (SELECT s.feature FROM {FEATURE_SEQUENCE_TABLE} s "
+        f"  SEMI JOIN {LABELLED_RELATION} l ON l.feature_id = s.feature "
+        f"  GROUP BY s.feature HAVING count(*) > 1)) AS repeated_features"
     )
 
 

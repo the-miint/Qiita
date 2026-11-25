@@ -315,10 +315,21 @@ def test_check_refuses_a_published_feature_with_no_sequence():
             _sequences_check(con)
 
 
-def test_check_refuses_a_feature_with_two_sequences():
+def test_check_counts_the_features_with_repeated_sequences_not_the_extra_rows():
     import duckdb
 
     with duckdb.connect() as con:
-        _sequences_setup(con, published=["QF1"], sequenced=[("QF1", "ACGT"), ("QF1", "ACGA")])
-        with pytest.raises(ValueError, match="more than one sequence"):
+        sequenced = [("QF1", "ACGT"), ("QF1", "ACGA"), ("QF1", "ACGC"), ("QF2", "TT")]
+        _sequences_setup(con, published=["QF1", "QF2"], sequenced=sequenced)
+        with pytest.raises(ValueError, match="1 feature\\(s\\) carry more than one sequence"):
             _sequences_check(con)
+
+
+def test_a_repeated_sequence_of_an_unpublished_feature_is_not_the_tables_concern():
+    """The copy writes only published features, so a repeat outside them is not one."""
+    import duckdb
+
+    with duckdb.connect() as con:
+        sequenced = [("QF1", "ACGT"), ("QF9", "GG"), ("QF9", "CC")]
+        _sequences_setup(con, published=["QF1"], sequenced=sequenced)
+        assert _sequences_check(con).rows == 1

@@ -1,5 +1,5 @@
-"""The run feature table's COO: public names only, nothing densified, for an
-amplicon run's ASV counts."""
+"""The stored-value feature table's COO: public names only, nothing densified. The
+fixture runs are amplicon."""
 
 import hashlib
 
@@ -138,3 +138,27 @@ def test_the_values_round_trip_through_an_arrow_stream():
         _labels([(10, "QF10")]),
     )
     assert pa.ipc.open_stream(arrow_stream_bytes(values)).read_all().equals(values)
+
+
+async def test_features_are_named_by_the_methods_own_mint():
+    """Which kind of handle names a method's features is the method's: the relabel mints
+    through `Source.mint`, not a mint of its own choosing."""
+    import dataclasses
+
+    from qiita_control_plane.stored_feature_table import mint_feature_labels
+
+    asked = []
+
+    async def mint(pool, *, feature_idx, created_by_idx):
+        asked.append((feature_idx, created_by_idx))
+        return {f: f"QF{f}" for f in feature_idx}
+
+    source = dataclasses.replace(SOURCES["amplicon"], mint=mint)
+    labels = await mint_feature_labels(
+        None, source=source, created_by_idx=5, features=pa.table({"feature_idx": [9, 3, 9]})
+    )
+    assert asked == [([3, 9], 5)]
+    assert labels.to_pylist() == [
+        {"feature_idx": 3, "export_feature_id": "QF3"},
+        {"feature_idx": 9, "export_feature_id": "QF9"},
+    ]

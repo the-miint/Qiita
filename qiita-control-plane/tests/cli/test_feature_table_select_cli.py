@@ -140,3 +140,17 @@ def test_a_stale_scope_403_asks_for_a_fresh_login(monkeypatch, tmp_path, capsys)
 
     _run(monkeypatch, tmp_path, "amplicon", None, None, call=call, rc=1)
     assert "qiita login" in capsys.readouterr().err
+
+
+def test_an_occupied_sequences_file_is_refused_before_anything_is_read(
+    monkeypatch, tmp_path, capsys
+):
+    """The sequences file is part of every bundle, so its name is checked with the rest
+    before the routes are asked for anything (and before the mint names a feature)."""
+    (tmp_path / "table.sequences.parquet").write_bytes(b"theirs")
+
+    def call(*_, **__):
+        raise AssertionError("nothing should be read for a bundle that cannot be written")
+
+    _run(monkeypatch, tmp_path, "amplicon", None, None, call=call, rc=1)
+    assert "table.sequences.parquet" in capsys.readouterr().err

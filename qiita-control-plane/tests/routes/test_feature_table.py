@@ -1,11 +1,9 @@
 """Route tests for POST /feature-table/{sample,value,feature}.
 
-One cohort request — amplicon runs, and a study or a named
-prep_sample list — answered as the table's columns (JSON) and its values and
-features (Arrow IPC).
-A column is a processed sample (a live QM of one of the runs); it is named by
-its biosample's deposited accession when no other column shares it, else by its
-QM. Access is all-or-nothing over the cohort, checked before the data plane is
+One cohort request — runs of one method, and a study or a named prep_sample list —
+answered as the table's columns (JSON) and its values and features (Arrow IPC). The
+fixture runs are amplicon. A column is a processed sample (a live QM of one of the
+runs), named by its QM. Access is all-or-nothing over the cohort, checked before the data plane is
 read. The data-plane read is stubbed; its scope is pinned by the data plane's
 own tests.
 """
@@ -80,7 +78,7 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
             }
         )
 
-    async def _labels(pool, *, created_by_idx, features):
+    async def _labels(pool, *, source, created_by_idx, features):
         # Stand in for the exported-feature mint (tested separately): a deterministic
         # QF per feature_idx, so the route tests assert handles, not minted idxs.
         fids = sorted({int(f) for f in features.column("feature_idx").to_pylist()})
