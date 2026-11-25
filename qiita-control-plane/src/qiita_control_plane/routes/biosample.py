@@ -911,8 +911,8 @@ async def resolve_biosample_idxs_by_kind(
 
     Neither retirement nor a link to study_idx is checked; the caller decides
     which matches count. Under `unique_field`, the values are those of the
-    study's field named by unique_field_display_name. Under `idx`, each value
-    maps to itself as a number, whether or not a biosample has it.
+    study's field named by unique_field_display_name; every other kind resolves
+    as `fetch_biosample_idxs_by_identifier` resolves it.
     """
     if key == UNIQUE_FIELD_KEY:
         if unique_field_display_name is None:

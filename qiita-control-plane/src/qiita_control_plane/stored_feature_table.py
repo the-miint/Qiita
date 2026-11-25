@@ -9,9 +9,10 @@ sidecar maps that handle to its sequence and md5.
 The caller names a method, its parameters and a cohort, never a run: which runs answer
 is the server's to choose, and they merge only when their features compare
 (`Source.merge_keys`). Three steps, each testable alone:
-  * `resolve_scope` turns the study or biosamples the request names, by any of their
-    identifiers, into the prep_samples to authorize, and `resolve_cohort` picks the
-    processed samples of the matching runs among them, each a column under its QM;
+  * `source_of` checks the method and its parameters, `resolve_scope` looks up the study
+    or biosamples the request names by any of their identifiers, and `resolve_cohort`
+    picks the processed samples of the matching runs among them, each a column under
+    its QM;
   * `fetch_table` reads their values, or their features' sequences, under one signed
     scope;
   * `mint_feature_labels` names each feature, and `stage_values` / `stage_features`
@@ -48,10 +49,12 @@ from qiita_common.models.feature_table import (
     FeatureTableSamples,
     FeatureTableValueKind,
 )
+from qiita_common.models.processing import ProcessingStatus
 
 from .auth.tickets import sign_ticket
 from .repositories.biosample import fetch_biosample_idxs_by_identifier
 from .repositories.exported_feature import mint_observed_features
+from .repositories.prep_sample import fetch_live_prep_sample_idxs_by_biosample
 from .repositories.study import fetch_study_idxs_by_natural_key
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
 
@@ -172,9 +175,8 @@ class CohortScope:
 async def resolve_scope(pool: asyncpg.Pool, request: FeatureTableRequest) -> CohortScope:
     """The study, or the biosamples and their live prep_samples, that `request` names.
 
-    A study that no value names is a 404. A biosample value that names no live
-    biosample refuses the request with a 422 listing every such value, as a bulk
-    biosample link does.
+    A value that names no study is a 404. Values that name no live biosample refuse the
+    request together, with a 422 listing each, as a bulk biosample link does.
     """
     if request.study is not None:
         key, value = request.study.key, request.study.value
@@ -187,19 +189,13 @@ async def resolve_scope(pool: asyncpg.Pool, request: FeatureTableRequest) -> Coh
     biosample_idx = await fetch_biosample_idxs_by_identifier(
         pool, key=named.key, values=named.values
     )
-    rows = await pool.fetch(
-        "SELECT b.idx AS biosample_idx, ps.idx AS prep_sample_idx FROM qiita.biosample b"
-        "  LEFT JOIN qiita.prep_sample ps ON ps.biosample_idx = b.idx AND NOT ps.retired"
-        " WHERE b.idx = ANY($1::bigint[]) AND NOT b.retired",
-        sorted(set(biosample_idx.values())),
-    )
-    live = {r["biosample_idx"] for r in rows}
+    live = await fetch_live_prep_sample_idxs_by_biosample(pool, biosample_idx.values())
     unnamed = [v for v in named.values if biosample_idx.get(v) not in live]
     if unnamed:
         raise CohortError(422, f"these {named.key} values name no biosample: {unnamed}")
     return CohortScope(
         biosample_idx=biosample_idx,
-        prep_sample_idxs=sorted({r["prep_sample_idx"] for r in rows if r["prep_sample_idx"]}),
+        prep_sample_idxs=[ps for prep_samples in live.values() for ps in prep_samples],
     )
 
 
@@ -227,21 +223,9 @@ def _shared_settings(
     return dict(zip(source.merge_keys, found.pop(), strict=True))
 
 
-async def resolve_cohort(
-    pool: asyncpg.Pool, request: FeatureTableRequest, scope: CohortScope
-) -> Cohort:
-    """The processed samples of `request.method` over `scope`, each with its column
-    name.
-
-    A processed sample is a live QM (`exported_identifier`) of an active run of the
-    method whose params contain `request.parameters` (by value and type), and whose
-    prep_sample is in the study (live link) or among the named biosamples' prep_samples,
-    and not ENA-flagged. Each workflow mints one per sample it reported on, so a
-    prep_sample two matching runs processed, or a biosample with two processed
-    prep_samples, is two columns. The runs must agree on the method's merge keys
-    (`_shared_settings`). A named biosample no matching run processed is refused rather
-    than trimmed.
-    """
+def source_of(request: FeatureTableRequest) -> Source:
+    """The method `request` names, refusing (422) one not in `SOURCES` or a parameter the
+    method does not take. Reads only the request, so it runs before any lookup."""
     source = SOURCES.get(request.method)
     if source is None:
         raise CohortError(
@@ -256,7 +240,25 @@ async def resolve_cohort(
             f"{source.method} takes the parameters {', '.join(source.merge_keys)};"
             f" not {', '.join(unknown)}",
         )
+    return source
 
+
+async def resolve_cohort(
+    pool: asyncpg.Pool, source: Source, request: FeatureTableRequest, scope: CohortScope
+) -> Cohort:
+    """The processed samples of `source`'s method over `scope`, each with its column
+    name.
+
+    A processed sample is a live QM (`exported_identifier`) of an active run of the
+    method whose params contain `request.parameters` (as JSON compares them), and whose
+    prep_sample is in the study (live link) or among the named biosamples' prep_samples,
+    and not ENA-flagged. Each workflow mints one per prep_sample it reported on, so a
+    prep_sample two matching runs processed, or a biosample with two processed
+    prep_samples, is two columns. The runs must agree on the method's merge keys
+    (`_shared_settings`). A named biosample no matching run processed is refused rather
+    than trimmed.
+    """
+    # Ordered so the answer, and the columns' order in it, is the same on every request.
     processed = await pool.fetch(
         "SELECT ei.processing_idx, ei.prep_sample_idx, ps.biosample_idx, ei.export_id, p.params,"
         f"      {BIOSAMPLE_NAME_SQL} AS biosample"
@@ -266,7 +268,7 @@ async def resolve_cohort(
         "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
         f" {BIOSAMPLE_NAME_JOIN}"
         "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
-        " WHERE p.workflow = $1 AND p.status = 'active' AND p.params @> $2::jsonb"
+        " WHERE p.workflow = $1 AND p.status = $5 AND p.params @> $2::jsonb"
         "   AND NOT ei.retired AND ss.ena_status IS NULL"
         "   AND ($3::bigint IS NULL OR EXISTS ("
         "     SELECT 1 FROM qiita.prep_sample_to_study pst"
@@ -277,6 +279,7 @@ async def resolve_cohort(
         json.dumps(request.parameters),
         scope.study_idx,
         None if scope.biosample_idx is None else scope.prep_sample_idxs,
+        ProcessingStatus.ACTIVE,
     )
     if scope.biosample_idx is not None:
         processed_biosamples = {r["biosample_idx"] for r in processed}
@@ -298,8 +301,8 @@ async def resolve_cohort(
     if len(runs) > MAX_FEATURE_TABLE_RUNS:
         raise CohortError(
             413,
-            f"{len(runs)} {source.method} runs processed this cohort, over the"
-            f" {MAX_FEATURE_TABLE_RUNS} one table merges; narrow it by parameters or cohort.",
+            f"{len(runs)} {source.method} runs processed this cohort, and one table merges"
+            f" at most {MAX_FEATURE_TABLE_RUNS}; narrow it by parameters or cohort.",
         )
 
     samples = [
@@ -314,14 +317,13 @@ async def resolve_cohort(
     # A study cohort has no bound, and a biosample may have several prep_samples, while
     # the route reads the whole Flight stream into one response, so refuse a cohort too
     # large to sign as a single ticket rather than buffer an unbounded table. Narrowing
-    # is the caller's to do (by biosample or a smaller study), since the table's meaning
-    # is the whole cohort.
+    # is the caller's to do, since the table's meaning is the whole cohort.
     if len(cohort.prep_sample_idxs) > MAX_COHORT_PREP_SAMPLE_IDX:
         raise CohortError(
             413,
             f"this cohort spans {len(cohort.prep_sample_idxs)} prep_samples, over the"
-            f" {MAX_COHORT_PREP_SAMPLE_IDX} a single request serves; narrow it by"
-            " biosample or a smaller study.",
+            f" {MAX_COHORT_PREP_SAMPLE_IDX} a single request serves; name fewer"
+            " biosamples, or a smaller study.",
         )
     return cohort
 

@@ -50,6 +50,7 @@ from ..stored_feature_table import (
     pack_feature_table,
     resolve_cohort,
     resolve_scope,
+    source_of,
 )
 from ._helpers import authorize_prep_sample_cohort
 
@@ -59,13 +60,14 @@ router = APIRouter(prefix=PATH_FEATURE_TABLE_PREFIX, tags=["feature-table"])
 async def _authorized_cohort(
     pool: asyncpg.Pool, caller: HumanUser, request: FeatureTableRequest
 ) -> Cohort:
-    # Authorize what the request names before resolving it: resolve_cohort's
-    # refusals describe the cohort (which named biosamples no matching run processed,
-    # how many prep_samples a study holds), so a caller who may not read it is refused
-    # first. A study cohort's prep_samples are authorized again once resolved, because
-    # one may also be linked to a study the caller cannot read. Which study or
-    # biosamples a value names is answered before that, as the lookups answer it.
+    # Authorize the cohort before resolving its processed samples: resolve_cohort's
+    # refusals describe it (which named biosamples no matching run processed, how many
+    # prep_samples it spans), so a caller who may not read it is refused first. A study
+    # is authorized by its tier, then its resolved prep_samples, because one may also be
+    # linked to a study the caller cannot read. Which study or biosamples a value names
+    # is answered before any of that, as the study and biosample lookups answer it.
     try:
+        source = source_of(request)
         scope = await resolve_scope(pool, request)
         if scope.study_idx is not None:
             await require_caller_has_tier_on_all_studies(
@@ -78,7 +80,7 @@ async def _authorized_cohort(
                 prep_sample_idx=scope.prep_sample_idxs,
                 min_tier=COHORT_MIN_TIER,
             )
-        cohort = await resolve_cohort(pool, request, scope)
+        cohort = await resolve_cohort(pool, source, request, scope)
     except CohortError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     if scope.study_idx is not None:
@@ -123,7 +125,9 @@ async def feature_table(
     labels = await mint_feature_labels(
         pool, source=cohort.source, created_by_idx=caller.principal_idx, features=values
     )
-    body = pack_feature_table(
-        cohort, build_values(cohort, values, labels), build_features(cohort, sequences, labels)
+    body = await asyncio.to_thread(
+        lambda: pack_feature_table(
+            cohort, build_values(cohort, values, labels), build_features(cohort, sequences, labels)
+        )
     )
     return Response(body, media_type=FEATURE_TABLE_MEDIA_TYPE)

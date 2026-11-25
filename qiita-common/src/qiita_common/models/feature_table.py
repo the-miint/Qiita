@@ -1,7 +1,7 @@
 """A feature table request: a method's stored values over a cohort, and the processed
 samples that become its columns."""
 
-from typing import Annotated, Literal, Self
+from typing import Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -30,7 +30,7 @@ from qiita_common.models.biosample import (
 FeatureTableValueKind = Literal["count"]
 
 # A method parameter's value. Strict, because a parameter matches a run's stored setting
-# by type as well as value: "150" is not 150.
+# as JSON compares them: "150" is not 150, and true is not 1.
 FeatureTableParameter = StrictBool | StrictInt | StrictFloat | StrictStr
 
 
@@ -70,7 +70,7 @@ class FeatureTableRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    method: Annotated[str, Field(min_length=1)]
+    method: NonBlankText
     parameters: dict[str, FeatureTableParameter] = Field(default_factory=dict)
     study: FeatureTableStudy | None = None
     biosample: FeatureTableBiosamples | None = None
@@ -78,7 +78,7 @@ class FeatureTableRequest(BaseModel):
     @model_validator(mode="after")
     def _one_cohort(self) -> Self:
         if (self.study is None) == (self.biosample is None):
-            raise ValueError("name the samples by exactly one of study or biosample")
+            raise ValueError("name the cohort by exactly one of study or biosample")
         return self
 
 

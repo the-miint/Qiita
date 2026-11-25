@@ -150,7 +150,11 @@ from .sequencing import (
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
 )
-from .stored_feature_table import SELECT_KEY_CHOICES, _handle_feature_table_select
+from .stored_feature_table import (
+    SELECT_KEY_CHOICES,
+    SELECT_METHOD_CHOICES,
+    _handle_feature_table_select,
+)
 from .study import (
     _handle_study_access_grant,
     _handle_study_access_list,
@@ -1769,13 +1773,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "select",
         help=(
             "Write a feature table of the values a method's runs stored, over a study's"
-            " prep_samples or a named list, with the map needed to read it"
+            " prep_samples or the prep_samples of named biosamples, with the map needed to"
+            " read it"
         ),
     )
     p_ft_select.add_argument(
         "--method",
         required=True,
-        help="The method whose stored values make the table (a workflow, e.g. amplicon).",
+        choices=SELECT_METHOD_CHOICES,
+        help="The method whose stored values make the table.",
     )
     p_ft_select.add_argument(
         "--parameter",
@@ -1799,7 +1805,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help=(
             "Every prep_sample of these biosamples a matching run processed, each named by"
-            " --key; a biosample none of whose prep_samples one processed is refused."
+            " --key; a biosample with no prep_sample a matching run processed is refused."
         ),
     )
     p_ft_select.add_argument(

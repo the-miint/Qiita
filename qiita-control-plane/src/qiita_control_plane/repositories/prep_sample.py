@@ -15,7 +15,7 @@ top-level transaction; the caller controls transaction scope so multiple
 calls compose atomically on one connection.
 """
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import asyncpg
 
@@ -87,6 +87,27 @@ async def fetch_biosample_idx_for_prep_sample(
         "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
         prep_sample_idx,
     )
+
+
+async def fetch_live_prep_sample_idxs_by_biosample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idxs: Iterable[int],
+) -> dict[int, list[int]]:
+    """Return `{biosample_idx: [prep_sample_idx, ...]}` for every live biosample among
+    `biosample_idxs`, each with its live prep_samples (possibly none). A retired or
+    absent biosample is omitted."""
+    rows = await pool_or_conn.fetch(
+        "SELECT b.idx AS biosample_idx, ps.idx AS prep_sample_idx FROM qiita.biosample b"
+        "  LEFT JOIN qiita.prep_sample ps ON ps.biosample_idx = b.idx AND NOT ps.retired"
+        " WHERE b.idx = ANY($1::bigint[]) AND NOT b.retired",
+        list(biosample_idxs),
+    )
+    live: dict[int, list[int]] = {}
+    for r in rows:
+        prep_samples = live.setdefault(r["biosample_idx"], [])
+        if r["prep_sample_idx"] is not None:
+            prep_samples.append(r["prep_sample_idx"])
+    return live
 
 
 async def set_prep_sample_retired(

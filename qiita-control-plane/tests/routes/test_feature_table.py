@@ -283,9 +283,12 @@ async def test_runs_that_disagree_are_refused_naming_what_to_choose(
     assert set(values.column("sample").to_pylist()) == {await _qm(db, other, run["ps_a"])}
 
 
-async def test_a_parameter_matches_its_stored_type(role_keyed_clients, amplicon_run):
-    """A parameter matches a run's stored setting by value and type: "150" is not 150."""
+async def test_a_parameter_matches_as_json_compares_it(role_keyed_clients, amplicon_run):
+    """A parameter matches a run's stored setting as JSON compares them: 150 matches the
+    stored 150, and "150" does not."""
     run = amplicon_run
+    body = _body(biosamples=_qbs(run, "ps_a"), trim=150)
+    assert (await _post(role_keyed_clients["wet"], body)).status_code == 200
     resp = await _post(role_keyed_clients["wet"], _body(biosamples=_qbs(run, "ps_a"), trim="150"))
     assert resp.status_code == 404, resp.text
 
@@ -330,8 +333,10 @@ async def test_more_matching_runs_than_one_table_merges_413s(
 async def test_refuses_what_the_method_does_not_take(
     role_keyed_clients, amplicon_run, body, fragment
 ):
+    """Refused before any lookup: the study is one no value names, which would be a 404
+    if it were looked up first."""
     run = amplicon_run
-    request = _body(biosamples=_qbs(run, "ps_a"))
+    request = _body(study="QS999999999999")
     if "method" in body:
         request["method"] = body["method"]
     else:
@@ -342,7 +347,7 @@ async def test_refuses_what_the_method_does_not_take(
     assert run["fetched"] == []
 
 
-async def test_a_named_sample_no_matching_run_processed_404s(role_keyed_clients, amplicon_run):
+async def test_a_named_biosample_no_matching_run_processed_404s(role_keyed_clients, amplicon_run):
     run = amplicon_run
     resp = await _post(role_keyed_clients["wet"], _body(biosamples=_qbs(run, "ps_a", "ps_e")))
     assert resp.status_code == 404, resp.text
@@ -357,7 +362,7 @@ async def test_refuses_a_partially_readable_cohort_whole(role_keyed_clients, amp
     assert run["fetched"] == []
 
 
-async def test_study_idx_names_that_studys_samples(role_keyed_clients, amplicon_run):
+async def test_a_study_names_its_processed_samples(role_keyed_clients, amplicon_run):
     run, db = amplicon_run, role_keyed_clients["pool"]
     resp = await _post(role_keyed_clients["user"], _body(study=run["qs"][run["study_1"]]))
     assert resp.status_code == 200, resp.text
@@ -366,18 +371,18 @@ async def test_study_idx_names_that_studys_samples(role_keyed_clients, amplicon_
     ]
 
 
-async def test_study_idx_with_no_matching_run_404s(role_keyed_clients, amplicon_run):
+async def test_a_value_that_names_no_study_404s(role_keyed_clients, amplicon_run):
     resp = await _post(role_keyed_clients["wet"], _body(study="QS999999999999"))
     assert resp.status_code == 404, resp.text
 
 
-async def test_an_unreadable_named_sample_403s_before_the_unprocessed_404(
+async def test_an_unreadable_named_biosample_403s_before_the_unprocessed_404(
     role_keyed_clients, amplicon_run
 ):
-    """The named cohort is authorized before it is resolved, so a caller who may not
-    read a named prep_sample is refused 403 — never handed the 404 that enumerates
-    which named prep_samples no run processed. ps_b is study_2 (unreadable to user);
-    ps_e is unprocessed."""
+    """The named biosamples' prep_samples are authorized before the cohort is resolved,
+    so a caller who may not read one is refused 403, never handed the 404 that lists
+    which named biosamples no run processed. ps_b is study_2's (unreadable to user);
+    ps_e's biosample is unprocessed."""
     run = amplicon_run
     resp = await _post(role_keyed_clients["user"], _body(biosamples=_qbs(run, "ps_b", "ps_e")))
     assert resp.status_code == 403, resp.text
@@ -390,6 +395,18 @@ async def test_a_study_cohort_over_the_cap_413s(role_keyed_clients, amplicon_run
     monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
     run = amplicon_run
     resp = await _post(role_keyed_clients["user"], _body(study=run["qs"][run["study_1"]]))
+    assert resp.status_code == 413, resp.text
+    assert run["fetched"] == []
+
+
+async def test_biosamples_spanning_more_prep_samples_than_the_cap_413(
+    role_keyed_clients, amplicon_run, monkeypatch
+):
+    """A biosample cohort is bounded by its values, not its prep_samples, so it is capped
+    at resolve too."""
+    monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
+    run = amplicon_run
+    resp = await _post(role_keyed_clients["wet"], _body(biosamples=_qbs(run, "ps_a", "ps_c")))
     assert resp.status_code == 413, resp.text
     assert run["fetched"] == []
 
@@ -422,8 +439,8 @@ async def test_a_readable_study_with_a_prep_sample_linked_elsewhere_403s(
 async def test_biosamples_name_their_processed_samples_by_any_identifier(
     role_keyed_clients, amplicon_run
 ):
-    """A biosample is named by any of its identifiers, as amandabirmingham's lookups
-    take them: here by its idx rather than its QB. The columns are the same."""
+    """A biosample is named by any identifier kind the biosample lookup takes: here by
+    its idx rather than its QB. The columns are the same."""
     run, db = amplicon_run, role_keyed_clients["pool"]
     biosample_idx = await db.fetchval(
         "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1", run["ps_a"]
@@ -467,8 +484,8 @@ async def test_each_processed_prep_sample_of_a_biosample_is_a_column(
 async def test_a_value_that_names_no_biosample_is_refused_with_every_such_value(
     role_keyed_clients, amplicon_run
 ):
-    """As amandabirmingham's bulk link refuses: a 422 naming every value that resolves
-    to no live biosample, before anything is read."""
+    """As the bulk biosample link refuses: a 422 naming every value that resolves to no
+    live biosample, before anything is read."""
     run = amplicon_run
     resp = await _post(
         role_keyed_clients["wet"],

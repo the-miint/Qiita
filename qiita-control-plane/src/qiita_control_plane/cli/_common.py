@@ -426,7 +426,7 @@ def fetch_binary(
     json: dict | None = None,
 ) -> tuple[bytes, str]:
     """GET a bulk binary body, refusing to wait on a link that will not finish; with
-    `json`, POST it as the request body instead.
+    `json`, POST `json` as the request instead of a GET.
 
     Returns `(body, content_type)`. The type is handed back rather than checked
     here because only the caller knows what it asked for; `PARQUET_MEDIA_TYPE`'s

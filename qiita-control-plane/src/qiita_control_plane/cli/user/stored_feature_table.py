@@ -41,8 +41,10 @@ MANIFEST_NOTE = (
     " over the lake, so the same method over a different cohort yields a different"
     " table — which is why this record is part of the bundle."
 )
-# Each `--key` choice: a study's identifier kinds and a biosample's, spelled as the
-# biosample commands spell them, with export_entity_id (the default) first.
+# Each `--method` choice: the methods whose stored values make a table.
+SELECT_METHOD_CHOICES = tuple(sorted(SOURCES))
+# Each `--key` choice: a study's identifier kinds, and a biosample's as the biosample
+# commands spell them, with export_entity_id (the default) first.
 SELECT_KEY_CHOICES = tuple(
     dict.fromkeys((EXPORT_ENTITY_ID, *get_args(StudyLookupKey), *_BIOSAMPLE_KEY_CHOICES))
 )

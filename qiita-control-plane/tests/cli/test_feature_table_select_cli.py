@@ -143,7 +143,25 @@ def test_parameters_are_sent_typed_and_recorded(monkeypatch, tmp_path):
     assert manifest["parameters"] == _PARAMETERS
 
 
-def test_biosamples_are_named_by_the_key_her_lookups_take(monkeypatch, tmp_path):
+def test_a_key_of_the_other_cohort_form_is_refused_before_anything_is_read(
+    monkeypatch, tmp_path, capsys
+):
+    def fetch_binary(*_, **__):
+        raise AssertionError("nothing should be read for a key the study cannot take")
+
+    _run(
+        monkeypatch,
+        tmp_path,
+        None,
+        None,
+        cohort=["--study", "QS3", "--key", "matrix_tube_id"],
+        fetch_binary=fetch_binary,
+        rc=1,
+    )
+    assert "study.key" in capsys.readouterr().err
+
+
+def test_biosamples_are_named_by_the_key_the_lookups_take(monkeypatch, tmp_path):
     """`--key` names the identifier kind, as `qiita biosample bulk-link` does, with a
     biosample's idx spelled biosample_idx."""
     sent = []
