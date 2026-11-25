@@ -1,4 +1,4 @@
-"""The run feature table over REST: one cohort request, three answers.
+"""A feature table of stored values over REST: one cohort request, three answers.
 
 `POST /feature-table/{sample,value,feature}` all take the same body
 (`FeatureTableRequest`: runs, and a study or a prep_sample list) and answer:

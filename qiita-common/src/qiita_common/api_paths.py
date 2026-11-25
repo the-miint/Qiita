@@ -1225,7 +1225,7 @@ URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
 )
 
 # =============================================================================
-# /feature-table/* — a run feature table, as a query over a cohort
+# /feature-table/* — a feature table of stored values, as a query over a cohort
 # =============================================================================
 PATH_FEATURE_TABLE_PREFIX = "/feature-table"
 PATH_FEATURE_TABLE_SAMPLE = "/sample"

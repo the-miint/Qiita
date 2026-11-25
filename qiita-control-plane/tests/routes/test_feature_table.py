@@ -29,6 +29,7 @@ from qiita_common.flight_stream import StreamRowCountMismatch
 from qiita_common.models.feature_table import MAX_FEATURE_TABLE_RUNS
 
 from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.stored_feature_table import ARROW_STREAM_MEDIA_TYPE
 
 pytestmark = pytest.mark.db
 
@@ -138,7 +139,7 @@ def _sequences() -> pa.Table:
 
 
 def _arrow(resp) -> pa.Table:
-    assert resp.headers["content-type"] == "application/vnd.apache.arrow.stream"
+    assert resp.headers["content-type"] == ARROW_STREAM_MEDIA_TYPE
     return pa.ipc.open_stream(resp.content).read_all()
 
 
@@ -319,7 +320,7 @@ async def test_an_unreadable_named_sample_403s_before_the_uncounted_404(
     """The named cohort is authorized before it is resolved, so a caller who may not
     read a named prep_sample is refused 403 — never handed the 404 that enumerates
     which named prep_samples a run did not count. ps_b is study_2 (unreadable to
-    user); ps_e is uncounted, which the old resolve-first ordering 404'd on."""
+    user); ps_e is uncounted."""
     run = amplicon_run
     resp = await role_keyed_clients["user"].post(
         URL_FEATURE_TABLE_VALUE,

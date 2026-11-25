@@ -18,8 +18,7 @@ AMPLICON_MEMBERSHIP_VISIBLE_TABLE = "amplicon_membership_visible"
 # rather than in a separate chunk table — unlike a reference genome, which is chunked.
 AMPLICON_SEQUENCE_TABLE = "amplicon_sequence"
 
-# action_context keys of two amplicon knobs: the processing params hash them, and
-# a run feature table merges runs only where they agree.
+# action_context keys of two amplicon knobs, which the processing params hash.
 TRIM_BINDING = "trim"
 ORIENT_PRIMER_BINDING = "orient_primer"
 

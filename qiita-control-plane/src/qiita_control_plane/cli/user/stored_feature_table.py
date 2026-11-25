@@ -1,15 +1,12 @@
-"""qiita user CLI — the run feature table.
+"""qiita user CLI — `qiita feature-table select`, a feature table of stored values.
 
-`qiita feature-table select` writes a feature table of amplicon runs: the control
-plane's `/feature-table` routes answer the cohort's columns, its values as sparse
-COO `(sample, feature, value)`, and its features, and this writes them as a bundle.
-The routes are the one implementation of a run table, which the web UI reads too,
-so the two cannot disagree about one.
+The control plane's `/feature-table` routes answer the cohort's columns, its values as
+sparse COO `(sample, feature, value)` and its features' sequences, and this writes them
+as a bundle with `feature-table build`'s writer. The routes are the one implementation,
+which the web UI reads too, so the two cannot disagree about a table.
 
-A run's features are ASVs (counts, named by their exported-feature handle, a `QF`).
 The table is written straight from its COO rows — BIOM and Parquet both take
 `(feature_id, sample_id, value)` — so it is never made dense on the way to disk.
-The bundle also carries each feature's sequence and md5, mapped from the handle.
 """
 
 from __future__ import annotations
@@ -45,7 +42,7 @@ MANIFEST_NOTE = (
     " part of the bundle."
 )
 MAP_NOTE = (
-    "This file maps each column of the table beside it (sample) to its QM (export_id) and"
+    "This file maps each column of the table beside it, named by its QM (export_id), to"
     " its biosample's public name (biosample), the key to join your sample metadata."
 )
 

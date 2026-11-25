@@ -1763,13 +1763,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
-    # `feature-table select` — a table over a cohort from amplicon runs, read from
+    # `feature-table select` — a table of stored values over a cohort, read from
     # the `/feature-table` routes and written straight from its sparse rows.
     p_ft_select = p_feature_table_sub.add_parser(
         "select",
         help=(
-            "Build a feature table from one or more amplicon runs over a study's prep_samples"
-            " or a named list, and write it with the map needed to read it"
+            "Write a feature table of the values one or more runs of one method stored, over"
+            " a study's prep_samples or a named list, with the map needed to read it"
         ),
     )
     p_ft_select.add_argument(
@@ -1779,7 +1779,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "The runs to draw from. Several merge into one table only when their features"
-            " compare (same trim length and orientation); otherwise refused."
+            " compare (for amplicon, the same trim length and orientation); otherwise refused."
         ),
     )
     select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
@@ -1804,7 +1804,8 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Where to write the table. The rest of the bundle is named after it:"
-            " <stem>.exported-identifier.json, <stem>.manifest.json and the ASV sequences."
+            " <stem>.exported-identifier.json, <stem>.manifest.json and"
+            " <stem>.sequences.parquet."
         ),
     )
     p_ft_select.set_defaults(handler=_handle_feature_table_select)

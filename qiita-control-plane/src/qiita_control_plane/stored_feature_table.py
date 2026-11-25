@@ -1,25 +1,21 @@
-"""A run feature table: a query over a cohort, answered as sparse COO.
+"""A feature table of stored values: a selection over a cohort, answered as sparse COO.
 
-A feature table is not a run's artifact. It is a selection — one or more amplicon
-runs, over a study's prep_samples or a named list — of the ASV counts the lake already
-holds as COO rows, one per processed sample and feature. ASVs are content-deduped
-into one feature space, so the same sequence found by two runs is one feature,
-named by its exported-feature handle (a `QF<n>`, minted like a genome's), with the
-feature companion mapping that handle back to the sequence and its md5.
+Unlike `feature-table build`, which computes its table from the whole cohort, this one
+selects values the lake already stores, one per (processed sample, feature), for one
+or more runs of a method in `SOURCES`. Features share one `feature_idx` space, so a
+feature two runs found is one row, named by its exported-feature handle; the
+sequences sidecar maps that handle to its sequence and md5.
 
-Merging runs is that selection, nothing more, provided they are runs whose
-features compare (`Source.merge_keys` — one trim length and orientation). Three
-steps, each testable alone:
-  * `resolve_cohort` picks the processed samples (one run's view of one
-    prep_sample) the request names and gives each a public column name;
-  * `fetch_table` reads their values, or the ASV sequences, under one signed scope;
-  * `mint_feature_labels` names each feature with its exported-feature handle, and
-    `stage_values` / `stage_features` turn the reads into the values
-    `(sample, feature, value)` and the feature mapping `(feature, sequence, length, md5)`,
-    public handles only.
+Merging runs is that selection, provided they are runs whose features compare
+(`Source.merge_keys`). Three steps, each testable alone:
+  * `resolve_cohort` picks the processed samples the request names, each a column
+    under its QM;
+  * `fetch_table` reads their values, or their features' sequences, under one signed
+    scope;
+  * `mint_feature_labels` names each feature, and `stage_values` / `stage_features`
+    relabel the reads on `ft.FEATURE_AXIS` into public handles only.
 
-Nothing is made dense: a rapid-16S pool is ~8% dense, and density falls as runs
-and samples are added. Internal idxs are join keys and never reach the output.
+Nothing is made dense. Internal idxs are join keys and never reach the output.
 """
 
 from __future__ import annotations
@@ -63,11 +59,11 @@ class Source:
     values_table: str
     # The values table's column holding a cell's value.
     value_column: str
-    # The sequence table, keyed by feature_idx, carrying each feature's bytes inline.
+    # The table holding each feature's sequence, keyed by feature_idx.
     sequences_table: str
     # The run params whose difference makes two runs' features incomparable.
     merge_keys: tuple[str, ...]
-    # What a run counts, for refusals ("these runs' ASVs ...").
+    # What a feature is, for refusals ("these runs' ASVs ...").
     noun: str
     # What a feature id is, for the bundle manifest.
     feature_id_note: str
@@ -101,8 +97,7 @@ SOURCES: dict[str, Source] = {
 # handle per observation, making the stream larger than a dense TSV.
 _NAME = pa.dictionary(pa.int32(), pa.string())
 VALUES_SCHEMA = pa.schema([("sample", _NAME), ("feature", _NAME), ("value", pa.float64())])
-# The feature companion is the handle -> (sequence, md5) mapping: the QF names the
-# column, and md5 is the reproducible-from-sequence id QIIME2/GG2 tools expect.
+# Each feature's handle, sequence, length and md5 (`ft.FEATURE_SEQUENCE_TABLE`).
 FEATURES_SCHEMA = pa.schema(
     [
         ("feature", pa.string()),
@@ -162,7 +157,7 @@ def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
             parts.append(f"no run at {missing}")
         raise CohortError(
             404,
-            f"feature-table select serves {', '.join(sorted(SOURCES))} runs only: "
+            f"a feature table of stored values serves {', '.join(sorted(SOURCES))} runs only: "
             + "; ".join(parts),
         )
     methods = {p: found[p]["workflow"] for p in runs}
@@ -367,9 +362,9 @@ def build_values(cohort: Cohort, values: pa.Table, labels: pa.Table) -> pa.Table
 
 
 def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.Table:
-    """The features `(feature, sequence, length, md5)` as Arrow, for the REST answer: the
-    handle-to-sequence mapping. The ticket scopes the sequences to the cohort's ASVs, and
-    `labels` is the mint response that names them."""
+    """The features `(feature, sequence, length, md5)` as Arrow, for the REST answer. The
+    ticket scopes the sequences to the cohort's features, and `labels` is the mint
+    response that names them."""
     with duckdb.connect() as duck:
         duck.register("sequences", sequences)
         duck.register("labels", labels)

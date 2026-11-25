@@ -1199,10 +1199,9 @@ fn doget_feature_idxs(conn: &Connection, table: &str, filter: &auth::TicketFilte
         .collect()
 }
 
-/// The amplicon surfaces are actually served — the gap the 502 exposed. A cohort's
-/// counts stream from `amplicon_membership_visible`, its sequences resolve through
-/// that same view, and a blocklisted ASV is absent from BOTH even though its base
-/// rows remain: the exclusion the raw tables could not enforce. Unique ids so the
+/// The amplicon surfaces are served end to end: a cohort's counts stream from
+/// `amplicon_membership_visible`, its sequences resolve through that same view, and a
+/// blocklisted ASV is absent from BOTH even though its base rows remain. Unique ids so the
 /// shared serial catalog never collides.
 #[test]
 #[serial_test::serial]
