@@ -66,7 +66,8 @@ context_schema:
       minimum: 0
 
 steps:
-  # Resources are long-read-assembly 1.0.2's gene_call step's.
+  # Resources are long-read-assembly 1.0.2's gene_call step's, where its walltime's
+  # measurement is.
   - step: gene_call
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.gene_call_recover
@@ -78,7 +79,7 @@ steps:
     baseline_resources:
       cpu: 4
       mem_gb: 16
-      walltime: PT2H
+      walltime: PT4H
 
   - action: mint-gene-features
     inputs: [gene_manifest]

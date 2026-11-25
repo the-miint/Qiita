@@ -136,6 +136,16 @@ _log = logging.getLogger(__name__)
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
 
+# `mint_features` reads its manifest, and `_mint_chunk` looks up and inserts
+# qiita.feature, in batches of this many hashes, with this per-statement timeout in
+# place of the pool's 10 s `command_timeout`. The lookup probes the
+# `sequence_hash` unique index once per hash, at random positions. Measured on the
+# live DB on 2026-11-25 (qiita.feature 48.7 M rows, its index 1980 MB,
+# shared_buffers 128 MB): 10,000 random hashes took 10,871 ms, 10,746 of the
+# buffers read from disk, so a 10,000-hash batch reached the pool timeout.
+_MINT_CHUNK_SIZE = 2_000
+_MINT_STATEMENT_TIMEOUT_SECONDS = 60.0
+
 # How many collapsed record groups the membership warning names before it says it
 # cut the list. Same name and value as runner/_reference.py and
 # runner/_feature_table.py, which cap their own reports.
@@ -188,6 +198,7 @@ async def _mint_chunk(
         "SELECT feature_idx, sequence_hash FROM qiita.feature"
         " WHERE sequence_hash = ANY($1::uuid[])",
         hashes,
+        timeout=_MINT_STATEMENT_TIMEOUT_SECONDS,
     )
     existing_map = {row["sequence_hash"]: row["feature_idx"] for row in existing}
 
@@ -201,6 +212,7 @@ async def _mint_chunk(
             " ON CONFLICT (sequence_hash) DO NOTHING"
             " RETURNING feature_idx, sequence_hash",
             novel,
+            timeout=_MINT_STATEMENT_TIMEOUT_SECONDS,
         )
         new_map = {row["sequence_hash"]: row["feature_idx"] for row in new_rows}
 
@@ -212,6 +224,7 @@ async def _mint_chunk(
                 "SELECT feature_idx, sequence_hash FROM qiita.feature"
                 " WHERE sequence_hash = ANY($1::uuid[])",
                 still_missing,
+                timeout=_MINT_STATEMENT_TIMEOUT_SECONDS,
             )
             for row in extra:
                 existing_map[row["sequence_hash"]] = row["feature_idx"]
@@ -538,7 +551,7 @@ async def mint_features(
     """Mint feature_idx values for sequence hashes in a manifest Parquet file.
 
     `manifest_path` points to a Parquet file with a `sequence_hash` column
-    (UUIDs). The function streams it via DuckDB in `_CHUNK_SIZE` batches,
+    (UUIDs). The function streams it via DuckDB in `_MINT_CHUNK_SIZE` batches,
     upserts qiita.feature per batch, and writes a `feature_map.parquet` into
     `output_dir` with columns (sequence_hash UUID, feature_idx BIGINT).
 
@@ -603,7 +616,7 @@ async def mint_features(
             read_conn,
             "SELECT sequence_hash FROM read_parquet(?)",
             [str(manifest_path)],
-            _CHUNK_SIZE,
+            _MINT_CHUNK_SIZE,
         )
         for batch in reader:
             raw_hashes = batch.column("sequence_hash").to_pylist()
