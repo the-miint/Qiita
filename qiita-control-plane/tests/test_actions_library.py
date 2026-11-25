@@ -1078,3 +1078,50 @@ async def test_mint_phylogeny_edge_id_data_raises_when_the_data_plane_returns_no
             signing_key=b"\x00" * 32,
             data_plane_url="grpc://dp:50051",
         )
+
+
+async def test_mint_features_appends_each_batch_off_the_event_loop(monkeypatch, tmp_path):
+    """Every batch's feature_map insert runs in a worker thread, not on the loop the
+    API is served from, and the map still holds one row per distinct hash across
+    batches."""
+    import threading
+    import uuid
+
+    import duckdb
+
+    from qiita_control_plane.actions import library as lib
+
+    hashes = [uuid.uuid4() for _ in range(5)]
+    manifest = tmp_path / "manifest.parquet"
+    with duckdb.connect(":memory:") as c:
+        values = ", ".join(f"('{h}'::UUID)" for h in [*hashes, hashes[0], hashes[3]])
+        c.execute(
+            f"COPY (SELECT * FROM (VALUES {values}) t(sequence_hash)) TO '{manifest}'"
+            " (FORMAT PARQUET)"
+        )
+    feature_idx = {h: 100 + i for i, h in enumerate(hashes)}
+
+    async def _fake_mint_chunk(conn, entries):
+        return {e.sequence_hash: feature_idx[e.sequence_hash] for e in entries}, 0, len(entries)
+
+    loop_thread = threading.get_ident()
+    append_threads: list[int] = []
+    real_append = lib._append_feature_map
+
+    def _recording_append(con, mapping):
+        append_threads.append(threading.get_ident())
+        real_append(con, mapping)
+
+    monkeypatch.setattr(lib, "_mint_chunk", _fake_mint_chunk)
+    monkeypatch.setattr(lib, "_append_feature_map", _recording_append)
+    monkeypatch.setattr(lib, "_MINT_CHUNK_SIZE", 2)
+
+    path, _, _ = await lib.mint_features(_FakeExclusionPool(), manifest, tmp_path / "out")
+
+    assert len(append_threads) == 4, "7 manifest rows in batches of 2"
+    assert loop_thread not in append_threads
+    with duckdb.connect(":memory:") as c:
+        rows = c.execute(
+            f"SELECT sequence_hash, feature_idx FROM read_parquet('{path}')"
+        ).fetchall()
+    assert sorted(rows) == sorted(feature_idx.items())

@@ -240,6 +240,25 @@ async def _mint_chunk(
     return mapping, len(new_map), len(existing_map) + concurrent_reused
 
 
+def _append_feature_map(con: duckdb.DuckDBPyConnection, mapping: dict[UUID, int]) -> None:
+    """Append one batch's `sequence_hash -> feature_idx` pairs to `con`'s `feature_map`
+    temp table in one Arrow insert.
+
+    `mint_features` calls it through `run_on_connection`, so the insert runs in a
+    worker thread. On 2026-11-25, with five gene-call mints running at once, the
+    control plane's `/health` timed out; five `py-spy dump`s of its main thread, two
+    seconds apart, were all in a per-row `executemany` of this insert on the event
+    loop. Measured on DuckDB 2.0.0 (macOS), 2,000 rows: `executemany` 350 ms, this
+    insert 2.3 ms."""
+    batch = pa.table(
+        {
+            "sequence_hash": pa.array([str(h) for h in mapping], pa.string()),
+            "feature_idx": pa.array(list(mapping.values()), pa.int64()),
+        }
+    )
+    con.from_arrow(batch).insert_into("feature_map")
+
+
 async def upsert_genomes(
     conn: asyncpg.Connection,
     sources: list[str],
@@ -559,8 +578,9 @@ async def mint_features(
     Streaming is deliberate: this primitive runs in-process on the control
     plane's single event loop, so it must never materialise the whole hash
     set (a genome-scale reference is tens of millions of rows). Each batch is
-    bounded, the per-batch upsert `await`s (yielding the loop), and the one
-    large blocking step — the final Parquet write — is offloaded to a thread.
+    bounded, the per-batch upsert `await`s (yielding the loop), and the per-batch
+    feature_map insert and the final Parquet write run in a worker thread
+    (`run_on_connection`).
     Mirrors the streaming contract `write_membership` already follows.
 
     Returns (feature_map_path, minted, reused). `minted` counts novel
@@ -632,15 +652,11 @@ async def mint_features(
             # duplicates collapse here; cross-batch duplicates are collapsed by
             # SELECT DISTINCT at COPY time below.
             if chunk_mapping:
-                write_conn.executemany(
-                    "INSERT INTO feature_map VALUES (?, ?)",
-                    [(str(h), idx) for h, idx in chunk_mapping.items()],
-                )
+                await run_on_connection(write_conn, _append_feature_map, write_conn, chunk_mapping)
 
         out = validate_parquet_path(feature_map_path)
-        # The one large blocking step — DISTINCT + sort + Parquet encode — runs
-        # off the event loop so it never starves the API the CP also serves. An
-        # empty manifest yields zero rows and a valid empty Parquet here.
+        # DISTINCT + sort + Parquet encode, off the event loop like the per-batch
+        # insert. An empty manifest yields zero rows and a valid empty Parquet here.
         await run_on_connection(
             write_conn,
             write_conn.execute,

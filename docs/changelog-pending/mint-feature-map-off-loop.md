@@ -1,0 +1,14 @@
+### Fixed
+
+- **Feature minting no longer stalls the control plane's API (#TBD).** `mint_features`
+  (behind `mint-features`, `mint-gene-features` and `mint-annotation-features`) wrote each
+  batch's `sequence_hash -> feature_idx` pairs into its working table with a per-row
+  insert on the control plane's event loop; with several mints running, `/health` and
+  `qiita ticket list` timed out. Each batch is now one Arrow insert in a worker thread.
+
+### Changed
+
+- **The reviewer agent flags blocking work on the control plane's event loop (#TBD).** A
+  rule under R9 and a trigger-map row: a synchronous DuckDB call, file I/O or row loop
+  inside an `async def` in `qiita-control-plane/src/` that runs per batch or grows with
+  the input.
