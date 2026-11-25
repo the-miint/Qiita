@@ -99,6 +99,9 @@ SAMPLE_LABEL_TABLE = "sample_label"
 
 # `feature_idx -> feature_id`, the feature-keyed counterpart of `GENOME_LABEL_TABLE`.
 FEATURE_LABEL_TABLE = "feature_label"
+# Each published feature's sequence: `(feature, sequence, length, md5)`, keyed by the
+# published handle. The md5 is what sequence-keyed tools (QIIME 2) match on.
+FEATURE_SEQUENCE_TABLE = "feature_sequence"
 
 # The published shape — a VIEW, not a table, and the second exception to the
 # non-temp-TABLE rule above (`COVERAGE_ALIGNMENTS_VIEW` is the first, for the same

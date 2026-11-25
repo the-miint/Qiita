@@ -69,7 +69,7 @@ from qiita_common.models import (
     deprecated_read_refusal,
 )
 from qiita_common.models._base import MAX_COHORT_PREP_SAMPLE_IDX
-from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_OPTS_TRANSFER, validate_parquet_path
+from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
 if TYPE_CHECKING:
@@ -79,7 +79,6 @@ from ...feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
 )
-from ...stored_feature_table import FEATURE_RELATION
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -968,9 +967,9 @@ class _Companion(NamedTuple):
     writers — so a member cannot be reserved a path and then not written, and adding one
     is a line here rather than a third positional index at each site.
 
-    `flag_gated` is the default: a member a `--flag` asks for. The amplicon `sequences`
-    member is not — it is always written by its own path — so it is excluded from the
-    flag lookup (`_requested_companions`) rather than masked out of it.
+    `flag_gated` is the default: a member a `--flag` asks for. `sequences` is not: it is
+    written whenever the caller passes its clearance, so it is excluded from the flag
+    lookup (`_requested_companions`) rather than masked out of it.
     """
 
     name: str
@@ -979,26 +978,13 @@ class _Companion(NamedTuple):
     flag_gated: bool = True
 
 
-def _amplicon_sequences_copy_sql(path: Path, *, clearance: object = None) -> str:
-    """COPY the handle -> (sequence, md5) mapping to Parquet: each published feature's
-    `QF`, its ASV sequence, and the reproducible-from-sequence md5. SEMI JOIN to the
-    published set (not `IN`) and unordered, like `write.taxonomy_copy_sql`: the reader
-    joins on the id. `clearance` is accepted for the uniform companion dispatch; this
-    companion has no relabel gate to clear."""
-    del clearance
-    return (
-        f"COPY (SELECT f.feature AS feature_id, f.sequence, f.length, f.md5"
-        f" FROM {FEATURE_RELATION} f"
-        f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = f.feature)"
-        f" TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
-    )
-
-
+# In write order. Each suffix is derived from the caller's name for the reason the
+# identifier map's is, and named for what it holds rather than for the reference it came
+# from: a reference name is not ours to compose into a filename either.
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
-    # The amplicon table's (`qiita feature-table select`), not flag-gated.
-    _Companion("sequences", ".sequences.parquet", _amplicon_sequences_copy_sql, flag_gated=False),
+    _Companion("sequences", ".sequences.parquet", ft.sequences_copy_sql, flag_gated=False),
 )
 
 

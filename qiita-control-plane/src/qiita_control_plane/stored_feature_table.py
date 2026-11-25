@@ -268,8 +268,8 @@ def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, tabl
         return read_all_counted(client, ticket, name=table)
 
 
-# The relations `stage_features` and `stage_values` create on the caller's connection.
-FEATURE_RELATION = "stored_feature"
+# The relation `stage_values` creates on the caller's connection (`stage_features`
+# creates `ft.FEATURE_SEQUENCE_TABLE`).
 VALUE_RELATION = "stored_value"
 
 
@@ -292,12 +292,12 @@ async def mint_feature_labels(
 
 
 def stage_features(con, *, labels: str, sequences: str) -> None:
-    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length, md5): each
+    """Create `ft.FEATURE_SEQUENCE_TABLE` (feature_idx, feature, sequence, length, md5): each
     feature under its minted handle (`labels`), with the sequence and its md5 — the
     companion that maps the published handle back to a reproducible, sequence-derived id."""
     con.execute(ft.feature_label_table_sql(labels, ft.FEATURE_AXIS))
     con.execute(
-        f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
+        f"CREATE TEMP TABLE {ft.FEATURE_SEQUENCE_TABLE} AS"
         " SELECT s.feature_idx, l.feature_id AS feature, s.sequence,"
         "        length(s.sequence)::INTEGER AS length, md5(s.sequence) AS md5"
         f" FROM {sequences} s JOIN {ft.FEATURE_LABEL_TABLE} l USING (feature_idx)"
@@ -352,11 +352,11 @@ def build_values(cohort: Cohort, values: pa.Table, labels: pa.Table) -> pa.Table
     """The values `(sample, feature, value)` as Arrow, for the REST answer. `labels` is
     the exported-feature mint response that names each feature."""
     with duckdb.connect() as duck:
-        duck.register("run_values", values)
+        duck.register("stored_values", values)
         duck.register("names", names_table(cohort))
         duck.register("labels", labels)
         stage_values(
-            duck, source=cohort.source, names="names", values="run_values", labels="labels"
+            duck, source=cohort.source, names="names", values="stored_values", labels="labels"
         )
         # Ordered so the dictionary-encoded `sample`/`feature` codes are assigned in a
         # stable order, making the stream reproducible.
@@ -375,7 +375,7 @@ def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.
         duck.register("labels", labels)
         stage_features(duck, labels="labels", sequences="sequences")
         table = duck.sql(
-            f"SELECT f.feature, f.sequence, f.length, f.md5 FROM {FEATURE_RELATION} f"
+            f"SELECT f.feature, f.sequence, f.length, f.md5 FROM {ft.FEATURE_SEQUENCE_TABLE} f"
         ).to_arrow_table()
     return table.cast(FEATURES_SCHEMA)
 

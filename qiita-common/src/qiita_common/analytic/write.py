@@ -13,8 +13,13 @@ from pathlib import Path
 # is what every writer below uses, BIOM included.
 from ..parquet import PARQUET_OPTS_TRANSFER, validate_parquet_path
 from ..taxonomy import QUOTED_RANK_COLUMNS
-from .relations import LABELLED_RELATION, TAXONOMY_SIDECAR_RELATION, TREE_TABLE
-from .sidecar import TaxonomyClearance, TreeClearance
+from .relations import (
+    FEATURE_SEQUENCE_TABLE,
+    LABELLED_RELATION,
+    TAXONOMY_SIDECAR_RELATION,
+    TREE_TABLE,
+)
+from .sidecar import SequencesClearance, TaxonomyClearance, TreeClearance
 
 # BIOM's `generated-by` attribute. The writer's own default is `miint`, which names
 # the library rather than the system that produced the file. The system and no
@@ -101,3 +106,16 @@ def tree_copy_sql(path: Path, *, clearance: TreeClearance) -> str:
     """
     _ = clearance
     return f"COPY {TREE_TABLE} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+
+
+def sequences_copy_sql(path: Path, *, clearance: SequencesClearance) -> str:
+    """COPY each published feature's sequence to Parquet: `(feature_id, sequence, length,
+    md5)`, restricted to the features the table names. **Takes a `SequencesClearance`**;
+    see that dataclass."""
+    _ = clearance
+    return (
+        f"COPY (SELECT s.feature AS feature_id, s.sequence, s.length, s.md5 "
+        f"FROM {FEATURE_SEQUENCE_TABLE} s "
+        f"SEMI JOIN {LABELLED_RELATION} l ON l.feature_id = s.feature) "
+        f"TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+    )

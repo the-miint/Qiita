@@ -30,7 +30,7 @@ from qiita_common.api_paths import (
 from qiita_common.duckdb_relation import registered
 from qiita_common.models.feature_table import FeatureTableRequest
 
-from ...stored_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
+from ...stored_feature_table import ARROW_STREAM_MEDIA_TYPE, SOURCES
 from .. import _common
 from .feature_table import (
     _bundle_targets,
@@ -93,20 +93,20 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     method = columns["method"]
     values = _arrow(args, token, PATH_FEATURE_TABLE_VALUE, request)
     features = _arrow(args, token, PATH_FEATURE_TABLE_FEATURE, request)
-    with registered(con, "run_values", values):
+    with registered(con, "stored_values", values):
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
             " SELECT feature AS feature_id, sample AS sample_id, value"
-            " FROM run_values ORDER BY sample_id, feature_id"
+            " FROM stored_values ORDER BY sample_id, feature_id"
         )
-    with registered(con, "run_features", features):
-        con.execute(f"CREATE TEMP TABLE {FEATURE_RELATION} AS SELECT * FROM run_features")
-    unnamed = con.execute(
-        f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION} l"
-        f" ANTI JOIN {FEATURE_RELATION} f ON f.feature = l.feature_id"
-    ).fetchone()[0]
-    if unnamed:
-        raise RuntimeError(f"{unnamed} feature(s) of the table are missing from its features")
+    with registered(con, "stored_features", features):
+        con.execute(
+            f"CREATE TEMP TABLE {ft.FEATURE_SEQUENCE_TABLE} AS SELECT * FROM stored_features"
+        )
+    cur = con.execute(ft.sequences_diagnostics_sql())
+    sequences = ft.check_sequences_diagnostics(
+        **dict(zip((c[0] for c in cur.description), cur.fetchone(), strict=True))
+    )
     sizes = dict(
         zip(
             ("observations", "samples", "features"),
@@ -117,7 +117,6 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             strict=True,
         )
     )
-    clearances: dict[str, Any] = {"sequences": None}
 
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
@@ -140,7 +139,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         fmt=args.format,
         identifiers=columns["samples"],
         manifest=manifest,
-        clearances=clearances,
+        clearances={"sequences": sequences},
         map_note=MAP_NOTE,
     )
     return written, sizes
