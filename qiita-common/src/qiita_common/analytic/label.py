@@ -256,8 +256,8 @@ def check_relabel_diagnostics(
         raise ValueError(
             f"{samples} samples in this table share only {sample_ids} distinct "
             f"export_ids, so relabelling merges samples. An export_id is minted per "
-            f"processed sample and cannot repeat, so the exported-identifier map this "
-            f"was staged from did not come from the mint route."
+            f"processed sample and cannot repeat, so the sample labels were staged from "
+            f"something other than the exported-identifier mint."
         )
 
     return LabelClearance(rows=labelled_rows)

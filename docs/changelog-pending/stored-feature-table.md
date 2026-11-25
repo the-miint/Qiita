@@ -2,7 +2,7 @@
 
 - **A feature table of stored values over REST.** `POST /feature-table/{sample,value,feature}`
   answers one cohort request — one or more runs of one method whose values the lake
-  stores per (processed sample, feature), today amplicon, over a study's prep_samples or a
+  stores per (processed sample, feature) (the methods in `SOURCES`), over a study's prep_samples or a
   named prep_sample list — with the table's columns (each processed sample under its QM),
   its values as sparse COO `(sample, feature, value)`, and its features
   `(feature, sequence, length, md5)`. Features are named through `exported_feature` the

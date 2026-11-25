@@ -84,23 +84,17 @@ OGU_OUTPUT_TABLE = "ogu_output"
 # by the control plane from the data plane's read.
 FEATURE_OUTPUT_TABLE = "feature_output"
 
-# The two label relations, each `internal key -> public handle`.
-#
-# **The row axis is a genome only because this table is the OGU table.** A feature is not
-# always a genome — an amplicon sequence variant, a full-length 16S observed in a sample,
-# an assembled contig are all features with no genome to roll up to — so a row-keyed
-# kind of table is a genuine second shape, not a variant spelling of this one. The identifier
-# layer is already ready for it: the mint behind `export_feature_id` publishes a genome
-# OR a `(reference, feature)` pair. What is genome-only is the roll-up, which counts what
-# `woltka_ogu` counts. This name says `genome` to be honest about that, rather than
-# implying generality the computation does not have.
+# The label relations, each `internal key -> public handle`; which ones a relabel reads is
+# its `RelabelAxis`. The genome-keyed one is named `genome` because only the OGU roll-up
+# produces genome rows; a feature-keyed table labels its rows through `FEATURE_LABEL_TABLE`.
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
 
 # `feature_idx -> feature_id`, the feature-keyed counterpart of `GENOME_LABEL_TABLE`.
 FEATURE_LABEL_TABLE = "feature_label"
-# Each published feature's sequence: `(feature, sequence, length, md5)`, keyed by the
-# published handle. The md5 is what sequence-keyed tools (QIIME 2) match on.
+# Each feature's sequence, keyed by its published handle: at least `(feature, sequence,
+# length, md5)`, the columns the sequences sidecar writes. The md5 is what
+# sequence-keyed tools (QIIME 2) match on.
 FEATURE_SEQUENCE_TABLE = "feature_sequence"
 
 # The published shape — a VIEW, not a table, and the second exception to the

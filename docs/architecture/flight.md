@@ -419,3 +419,16 @@ genome map for a different reference than the alignment used — and those `para
 verified against the digest the server reported for them (`_alignment_summary`) before
 anything is read off them, because the manifest cites that digest as the processing's
 reproducibility key.
+
+### The stored-value feature table
+
+`POST /feature-table/{sample,value,feature}` (and `qiita feature-table select`, which
+writes what they answer) serve the other kind of feature table: one whose values a run
+already stored, one per (processed sample, feature), so the table is a selection rather
+than a computation. The methods that store values this way are `SOURCES` in
+`stored_feature_table.py`; amplicon is one. Because nothing has to be computed over the
+cohort, the control plane reads the values over Flight, relabels them in its own DuckDB
+through the same `qiita_common.analytic` relabel the client-side table uses
+(`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers Arrow IPC. Authorization,
+the identifier mints and the ticket scope are the ones described above; the CLI writes
+the bundle with `feature-table build`'s writer.

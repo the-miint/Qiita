@@ -1779,7 +1779,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "The runs to draw from. Several merge into one table only when their features"
-            " compare (for amplicon, the same trim length and orientation); otherwise refused."
+            " compare (the method's merge keys agree); otherwise refused."
         ),
     )
     select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
