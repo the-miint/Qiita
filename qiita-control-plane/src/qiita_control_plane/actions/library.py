@@ -132,17 +132,18 @@ _log = logging.getLogger(__name__)
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
-# transaction duration. 10K is a pragmatic default for the expected
-# feature batch sizes.
+# transaction duration. 10K is a pragmatic default; feature minting uses
+# `_MINT_CHUNK_SIZE` below.
 _CHUNK_SIZE = 10_000
 
 # `mint_features` reads its manifest, and `_mint_chunk` looks up and inserts
-# qiita.feature, in batches of this many hashes, with this per-statement timeout in
-# place of the pool's 10 s `command_timeout`. The lookup probes the
-# `sequence_hash` unique index once per hash, at random positions. Measured on the
-# live DB on 2026-11-25 (qiita.feature 48.7 M rows, its index 1980 MB,
+# qiita.feature, in batches of this many hashes, each statement with this timeout in
+# place of the pool's default `command_timeout` (`db.get_pool`). The lookup probes
+# the `sequence_hash` unique index once per hash, at random positions. Measured on
+# the live DB on 2026-11-25 (qiita.feature 48.7 M rows, its index 1980 MB,
 # shared_buffers 128 MB): 10,000 random hashes took 10,871 ms, 10,746 of the
-# buffers read from disk, so a 10,000-hash batch reached the pool timeout.
+# buffers read from disk, which reached the pool default. 2,000 is a fifth of that
+# batch; neither 2,000 nor 60 s has been measured itself.
 _MINT_CHUNK_SIZE = 2_000
 _MINT_STATEMENT_TIMEOUT_SECONDS = 60.0
 

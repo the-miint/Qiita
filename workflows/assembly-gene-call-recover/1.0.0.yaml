@@ -66,8 +66,8 @@ context_schema:
       minimum: 0
 
 steps:
-  # Resources are long-read-assembly 1.0.2's gene_call step's, where its walltime's
-  # measurement is.
+  # Resources are long-read-assembly 1.0.2's gene_call step's; the comment there
+  # gives the walltime's measurement.
   - step: gene_call
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.gene_call_recover

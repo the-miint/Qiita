@@ -208,8 +208,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   from the lines the `--limit 5` run printed. Expect no NULL `genome_idx` and a non-zero
   gene count:
   `SELECT (SELECT count(*) FROM qiita_lake.gene_call WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.assembly_membership WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.bin_quality WHERE prep_sample_idx = PS AND processing_idx = RUN);`
-  Measure each step's peak memory and elapsed time against its unmeasured baseline
-  (gene_call 16 GB / 2 h; assembly_load 32 GB / 2 h), for every attempt:
+  Measure each step's peak memory and elapsed time against its baseline
+  (gene_call 16 GB / 4 h; assembly_load 32 GB / 2 h), for every attempt:
   `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
   `SELECT step_name, attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY step_index, attempt`.
   Then submit the rest, paced:
