@@ -25,6 +25,7 @@ from qiita_common.models.biosample import (
     StudyLookupKey,
     check_lookup_value_pattern,
 )
+from qiita_common.models.reference import ReferenceHandle
 
 # What a table's values are.
 FeatureTableValueKind = Literal["count"]
@@ -74,6 +75,9 @@ class FeatureTableRequest(BaseModel):
     parameters: dict[str, FeatureTableParameter] = Field(default_factory=dict)
     study: FeatureTableStudy | None = None
     biosample: FeatureTableBiosamples | None = None
+    # The reference to classify the table's features against, when the caller wants
+    # each feature's taxonomic lineage with the table.
+    taxonomy: ReferenceHandle | None = None
 
     @model_validator(mode="after")
     def _one_cohort(self) -> Self:
@@ -104,4 +108,6 @@ class FeatureTableSamples(BaseModel):
     # The settings the runs share, one per parameter the method takes, whether or not
     # the request named it; None where the runs store none.
     parameters: dict[str, FeatureTableParameter | None]
+    # The reference that classified the features, when the request named one.
+    taxonomy: ReferenceHandle | None = None
     samples: list[FeatureTableSample]

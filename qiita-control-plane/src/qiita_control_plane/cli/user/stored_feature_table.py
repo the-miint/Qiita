@@ -74,8 +74,12 @@ def _request(args: argparse.Namespace) -> FeatureTableRequest:
         if args.study is not None
         else {"biosample": {**named, "values": args.biosample}}
     )
+    taxonomy = None if args.taxonomy is None else dict(zip(("name", "version"), args.taxonomy))
     return FeatureTableRequest(
-        method=args.method, parameters=dict(_parameter(p) for p in args.parameter or ()), **cohort
+        method=args.method,
+        parameters=dict(_parameter(p) for p in args.parameter or ()),
+        taxonomy=taxonomy,
+        **cohort,
     )
 
 
@@ -102,8 +106,8 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     )
     if not content_type.startswith(FEATURE_TABLE_MEDIA_TYPE):
         raise RuntimeError(f"/feature-table answered {content_type!r}, not a feature table")
-    columns, values, features = unpack_feature_table(body)
-    values, features = _decoded(values), _decoded(features)
+    answer = unpack_feature_table(body)
+    columns, values, features = answer.samples, _decoded(answer.values), _decoded(answer.features)
     with registered(con, "stored_values", values):
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
@@ -114,8 +118,20 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         con.execute(
             f"CREATE TEMP TABLE {ft.FEATURE_SEQUENCE_TABLE} AS SELECT * FROM stored_features"
         )
+    clearances: dict[str, Any] = {}
+    if answer.taxonomy is not None:
+        with registered(con, "stored_taxonomy", answer.taxonomy):
+            # Scoped to the published features, so the sidecar is as wide as the table
+            # by construction, which is the clearance it carries.
+            con.execute(
+                f"CREATE TEMP TABLE {ft.TAXONOMY_SIDECAR_RELATION} AS"
+                " SELECT t.feature AS feature_id, t.* EXCLUDE (feature) FROM stored_taxonomy t"
+                f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = t.feature"
+            )
+        (rows,) = con.execute(f"SELECT count(*) FROM {ft.TAXONOMY_SIDECAR_RELATION}").fetchone()
+        clearances["taxonomy"] = ft.TaxonomyClearance(rows=rows)
     cur = con.execute(ft.sequences_diagnostics_sql())
-    sequences = ft.check_sequences_diagnostics(
+    clearances["sequences"] = ft.check_sequences_diagnostics(
         **dict(zip((c[0] for c in cur.description), cur.fetchone(), strict=True))
     )
     sizes = dict(
@@ -137,6 +153,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             "kind": columns.method,
             "value_kind": columns.value_kind,
             "parameters": columns.parameters,
+            # The reference that classified the lineage beside the table, when one did:
+            # the features are the same whichever reference names them, so this is what
+            # makes the lineage reproducible.
+            "taxonomy": None if columns.taxonomy is None else columns.taxonomy.model_dump(),
             "feature_id": SOURCES[columns.method].feature_id_note,
             # Each column's QM, not the request's idxs: a published manifest carries
             # only handles a reader can resolve. Sorted so the record does not depend
@@ -153,7 +173,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         fmt=args.format,
         identifiers=identifiers,
         manifest=manifest,
-        clearances={"sequences": sequences},
+        clearances=clearances,
         map_note=MAP_NOTE,
     )
     return written, sizes
@@ -176,7 +196,8 @@ def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.Argu
         # The refusals that need only the flags, before a connection or a read; the
         # write checks the whole bundle again.
         _request(args)
-        _bundle_targets(args.output, args.format, companions=_companions("sequences"))
+        companions = ("sequences", "taxonomy") if args.taxonomy else ("sequences",)
+        _bundle_targets(args.output, args.format, companions=_companions(*companions))
         with contextlib.closing(connect_with_miint()) as con:
             written, sizes = _build(args, token, con)
     except ValidationError as exc:
@@ -203,5 +224,6 @@ def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.Argu
     print(f"and the map needed to read it: {map_path}")
     print(f"and the record of what produced it: {manifest_path}")
     for path in companions:
-        print(f"and each feature's sequence: {path}")
+        what = "taxonomic lineage" if path.name.endswith(".taxonomy.parquet") else "sequence"
+        print(f"and each feature's {what}: {path}")
     return 0

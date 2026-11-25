@@ -50,6 +50,8 @@ from qiita_common.models.feature_table import (
     FeatureTableValueKind,
 )
 from qiita_common.models.processing import ProcessingStatus
+from qiita_common.models.reference import SERVABLE_REFERENCE_STATUSES, ReferenceHandle
+from qiita_common.taxonomy import RANK_COLUMNS, TAXONOMY_SOURCE_TABLE, rank_columns_sql
 
 from .auth.tickets import sign_ticket
 from .repositories.biosample import fetch_biosample_idxs_by_identifier
@@ -110,11 +112,13 @@ SOURCES: dict[str, Source] = {
 }
 
 # One `/feature-table` answer: a zip of the columns as JSON (`FeatureTableSamples`), and
-# the values and features as Arrow IPC streams.
+# the values and features as Arrow IPC streams; with the taxonomy as a third stream when
+# the request named a reference.
 FEATURE_TABLE_MEDIA_TYPE = "application/zip"
 SAMPLES_MEMBER = "samples.json"
 VALUES_MEMBER = "values.arrows"
 FEATURES_MEMBER = "features.arrows"
+TAXONOMY_MEMBER = "taxonomy.arrows"
 
 # Dictionary-encoded names: each sample and feature id is sent once, and each row
 # carries two small integer codes and its value. Plain strings would repeat the
@@ -129,6 +133,15 @@ FEATURES_SCHEMA = pa.schema(
         ("length", pa.int32()),
         ("md5", pa.string()),
     ]
+)
+
+
+# A feature's handle and its ranks (`RANK_COLUMNS`), coarsest first, with their source
+# `d__/p__/…` prefixes restored. A rank the reference does not resolve for a feature is
+# NULL, and a feature the reference does not place is a row of NULL ranks: the taxonomy is
+# a lookup, not a filter.
+TAXONOMY_SCHEMA = pa.schema(
+    [("feature", pa.string()), *((rank, pa.string()) for rank in RANK_COLUMNS)]
 )
 
 
@@ -328,6 +341,26 @@ async def resolve_cohort(
     return cohort
 
 
+async def resolve_reference(pool: asyncpg.Pool, handle: ReferenceHandle) -> int:
+    """The `reference_idx` of the reference `handle` names, refusing one that does not
+    exist (404) or whose data is not servable (409). The idx stays server-side: it is
+    signed into the taxonomy ticket and never returned."""
+    row = await pool.fetchrow(
+        "SELECT reference_idx, status FROM qiita.reference WHERE name = $1 AND version = $2",
+        handle.name,
+        handle.version,
+    )
+    if row is None:
+        raise CohortError(404, f"no reference named ({handle.name!r}, {handle.version!r})")
+    if row["status"] not in SERVABLE_REFERENCE_STATUSES:
+        raise CohortError(
+            409,
+            f"reference ({handle.name!r}, {handle.version!r}) is {row['status']!r}; it must"
+            f" be one of {[s.value for s in SERVABLE_REFERENCE_STATUSES]}",
+        )
+    return row["reference_idx"]
+
+
 def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, table: str) -> pa.Table:
     """Read `table` over the cohort's runs and prep_samples, the two keys the data
     plane scopes these tables by. Blocking (Flight is synchronous); callers run it
@@ -336,6 +369,44 @@ def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, tabl
     ticket = sign_ticket(table=table, filter=scope, secret=signing_key)
     with flight.FlightClient(data_plane_url) as client:
         return read_all_counted(client, ticket, name=table)
+
+
+def _reference_has_taxonomy(client: flight.FlightClient, ticket: bytes) -> bool:
+    """Whether the reference has any taxonomy at all, read only until the first non-empty
+    batch: the readiness probe that tells a reference whose taxonomy is not loaded (no
+    rows) from one that is loaded and places none of these features."""
+    for chunk in client.do_get(flight.Ticket(ticket)):
+        if chunk.data.num_rows:
+            return True
+    return False
+
+
+def fetch_taxonomy(
+    *, data_plane_url: str, signing_key: bytes, reference_idx: int, feature_idxs: list[int]
+) -> pa.Table | None:
+    """The reference's taxonomy rows for `feature_idxs`, or None when the reference has no
+    taxonomy loaded. Blocking (Flight is synchronous); callers run it off the event loop.
+
+    Two tickets, both scoped, since an unscoped one would authorize a whole-table dump: the
+    first to the table's features, and the second, only when the first matched nothing, to
+    the whole reference, to tell "not loaded" from "places none of these"."""
+    roster = sign_ticket(
+        table=TAXONOMY_SOURCE_TABLE,
+        filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
+        secret=signing_key,
+    )
+    with flight.FlightClient(data_plane_url) as client:
+        taxonomy = client.do_get(flight.Ticket(roster)).read_all()
+        if taxonomy.num_rows:
+            return taxonomy
+        whole_reference = sign_ticket(
+            table=TAXONOMY_SOURCE_TABLE,
+            filter={"reference_idx": [reference_idx]},
+            secret=signing_key,
+        )
+        if not _reference_has_taxonomy(client, whole_reference):
+            return None
+    return taxonomy
 
 
 # The relation `stage_values` creates on the caller's connection (`stage_features`
@@ -445,6 +516,30 @@ def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.
     return table.cast(FEATURES_SCHEMA)
 
 
+def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
+    """The taxonomy `(feature, <ranks>)` as Arrow: each feature `labels` names (the mint
+    response) under its handle, with the reference's ranks for it. `taxonomy` is the
+    reference's rows for those features. The join is the shared feature-axis sidecar, so
+    serving and a client-written sidecar are one definition."""
+    with duckdb.connect() as duck:
+        duck.register("labels", labels)
+        duck.register("reference_taxonomy", taxonomy)
+        duck.execute(ft.feature_label_table_sql("labels", ft.FEATURE_AXIS))
+        duck.execute(ft.taxonomy_table_sql("reference_taxonomy"))
+        # No representative reduction on this axis, so a duplicate row would fan a
+        # feature into two answer rows.
+        (repeated,) = duck.execute(
+            f"SELECT count(*) - count(DISTINCT feature_idx) FROM {ft.TAXONOMY_TABLE}"
+        ).fetchone()
+        ft.refuse_repeated_features(repeated)
+        duck.execute(ft.feature_taxonomy_sidecar_sql())
+        table = duck.sql(
+            f"SELECT feature_id AS feature, {rank_columns_sql()}"
+            f" FROM {ft.TAXONOMY_SIDECAR_RELATION} ORDER BY feature"
+        ).to_arrow_table()
+    return table.cast(TAXONOMY_SCHEMA)
+
+
 def _arrow_stream(table: pa.Table) -> bytes:
     sink = io.BytesIO()
     with pa.ipc.new_stream(sink, table.schema) as writer:
@@ -452,13 +547,32 @@ def _arrow_stream(table: pa.Table) -> bytes:
     return sink.getvalue()
 
 
-def pack_feature_table(cohort: Cohort, values: pa.Table, features: pa.Table) -> bytes:
-    """One `/feature-table` answer: the cohort's columns, `values` (`build_values`) and
-    `features` (`build_features`)."""
+@dataclass(frozen=True)
+class FeatureTableAnswer:
+    """A `/feature-table` answer, unpacked."""
+
+    samples: FeatureTableSamples
+    values: pa.Table
+    features: pa.Table
+    # Present exactly when the request named a reference (`samples.taxonomy`).
+    taxonomy: pa.Table | None = None
+
+
+def pack_feature_table(
+    cohort: Cohort,
+    values: pa.Table,
+    features: pa.Table,
+    *,
+    taxonomy: tuple[ReferenceHandle, pa.Table] | None = None,
+) -> bytes:
+    """One `/feature-table` answer: the cohort's columns, `values` (`build_values`),
+    `features` (`build_features`) and, when the request named a reference, that reference
+    and `build_taxonomy`'s answer."""
     samples = FeatureTableSamples(
         method=cohort.source.method,
         value_kind=cohort.source.value_kind,
         parameters=cohort.parameters,
+        taxonomy=None if taxonomy is None else taxonomy[0],
         samples=[s.column for s in cohort.samples],
     )
     sink = io.BytesIO()
@@ -466,19 +580,34 @@ def pack_feature_table(cohort: Cohort, values: pa.Table, features: pa.Table) -> 
         zf.writestr(SAMPLES_MEMBER, samples.model_dump_json())
         zf.writestr(VALUES_MEMBER, _arrow_stream(values))
         zf.writestr(FEATURES_MEMBER, _arrow_stream(features))
+        if taxonomy is not None:
+            zf.writestr(TAXONOMY_MEMBER, _arrow_stream(taxonomy[1]))
     return sink.getvalue()
 
 
-def unpack_feature_table(body: bytes) -> tuple[FeatureTableSamples, pa.Table, pa.Table]:
-    """`pack_feature_table`'s inverse: the columns, values and features."""
+def unpack_feature_table(body: bytes) -> FeatureTableAnswer:
+    """`pack_feature_table`'s inverse."""
     with zipfile.ZipFile(io.BytesIO(body)) as zf:
         members = set(zf.namelist())
         expected = {SAMPLES_MEMBER, VALUES_MEMBER, FEATURES_MEMBER}
-        if members != expected:
+        if members - {TAXONOMY_MEMBER} != expected:
             raise ValueError(
-                f"a feature table answer holds {sorted(expected)}, not {sorted(members)}"
+                f"a feature table answer holds {sorted(expected)}, and {TAXONOMY_MEMBER}"
+                f" when a reference classified it; not {sorted(members)}"
             )
         samples = FeatureTableSamples.model_validate_json(zf.read(SAMPLES_MEMBER))
-        values = pa.ipc.open_stream(zf.read(VALUES_MEMBER)).read_all()
-        features = pa.ipc.open_stream(zf.read(FEATURES_MEMBER)).read_all()
-    return samples, values, features
+        if (TAXONOMY_MEMBER in members) != (samples.taxonomy is not None):
+            raise ValueError(
+                f"{TAXONOMY_MEMBER} and the classifying reference in {SAMPLES_MEMBER}"
+                " must come together"
+            )
+
+        def stream(member: str) -> pa.Table:
+            return pa.ipc.open_stream(zf.read(member)).read_all()
+
+        return FeatureTableAnswer(
+            samples=samples,
+            values=stream(VALUES_MEMBER),
+            features=stream(FEATURES_MEMBER),
+            taxonomy=stream(TAXONOMY_MEMBER) if TAXONOMY_MEMBER in members else None,
+        )

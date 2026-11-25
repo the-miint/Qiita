@@ -162,8 +162,8 @@ def _sequences() -> pa.Table:
 def _answer(resp):
     """The body's columns (as JSON), values and features."""
     assert resp.headers["content-type"] == FEATURE_TABLE_MEDIA_TYPE
-    samples, values, features = unpack_feature_table(resp.content)
-    return samples.model_dump(), values, features
+    answer = unpack_feature_table(resp.content)
+    return answer.samples.model_dump(), answer.values, answer.features
 
 
 def _body(*, study=None, biosamples=None, key=None, method="amplicon", **parameters):
@@ -576,3 +576,181 @@ async def test_requires_auth(role_keyed_clients, amplicon_run):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await _post(anon, _body(study="QS1"))
     assert resp.status_code == 401, resp.text
+
+
+# --- taxonomy -------------------------------------------------------------------------
+
+_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
+
+
+@pytest.fixture
+async def taxonomy_reference(role_keyed_clients, pool_alignment_seed):
+    """A reference the request names by its public (name, version) handle; the route
+    resolves it to the internal reference_idx, which stays server-side."""
+    db, seed = role_keyed_clients["pool"], pool_alignment_seed
+    name, version = f"greengenes2-{uuid.uuid4().hex[:8]}", "2024.09"
+    reference_idx = await db.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, $2, 'taxonomy_authority', 'active', $3) RETURNING reference_idx",
+        name,
+        version,
+        seed["owner_idx"],
+    )
+    yield {"name": name, "version": version, "reference_idx": reference_idx}
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+
+def _taxonomy_table(rows):
+    """A reference_taxonomy_visible answer: (feature_idx, <unprefixed ranks>)."""
+    cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
+    for i, rank in enumerate(_RANKS, start=1):
+        cols[rank] = pa.array([r[i] for r in rows], pa.string())
+    return pa.table(cols)
+
+
+def _classified(run, name, version):
+    body = _body(biosamples=_qbs(run, "ps_a"))
+    body["taxonomy"] = {"name": name, "version": version}
+    return body
+
+
+def _stub_taxonomy(monkeypatch, answer):
+    seen = []
+
+    def _fetch_taxonomy(*, data_plane_url, signing_key, reference_idx, feature_idxs):
+        seen.append((reference_idx, list(feature_idxs)))
+        return answer
+
+    monkeypatch.setattr("qiita_control_plane.routes.feature_table.fetch_taxonomy", _fetch_taxonomy)
+    return seen
+
+
+async def test_the_table_carries_no_taxonomy_unless_asked(
+    role_keyed_clients, amplicon_run, monkeypatch
+):
+    seen = _stub_taxonomy(monkeypatch, None)
+    resp = await _post(role_keyed_clients["wet"], _body(biosamples=_qbs(amplicon_run, "ps_a")))
+    assert resp.status_code == 200, resp.text
+    answer = unpack_feature_table(resp.content)
+    assert answer.taxonomy is None and answer.samples.taxonomy is None
+    assert seen == []
+
+
+async def test_a_named_reference_classifies_each_feature(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    ref = taxonomy_reference
+    seen = _stub_taxonomy(
+        monkeypatch,
+        _taxonomy_table([(77, "Bacteria", "Bacillota", None, None, None, None, None, None)]),
+    )
+    resp = await _post(
+        role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
+    )
+    assert resp.status_code == 200, resp.text
+    # The public (name, version) resolved to the internal idx, which scopes the ticket
+    # alongside the table's own features.
+    assert seen == [(ref["reference_idx"], [77])]
+    answer = unpack_feature_table(resp.content)
+    assert answer.samples.taxonomy.model_dump() == {
+        "name": ref["name"],
+        "version": ref["version"],
+    }
+    table = answer.taxonomy.to_pydict()
+    assert table["feature"] == ["QF77"]
+    # Ranks come back with their source prefixes restored; an unresolved rank is NULL.
+    assert table["domain"] == ["d__Bacteria"]
+    assert table["phylum"] == ["p__Bacillota"]
+    assert table["class"] == [None]
+
+
+async def test_a_feature_the_reference_does_not_place_keeps_null_ranks(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    ref = taxonomy_reference
+    _stub_taxonomy(monkeypatch, _taxonomy_table([]))
+    resp = await _post(
+        role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
+    )
+    assert resp.status_code == 200, resp.text
+    table = unpack_feature_table(resp.content).taxonomy.to_pydict()
+    assert table["feature"] == ["QF77"]
+    assert table["domain"] == [None]
+
+
+@pytest.mark.parametrize(
+    ("version", "status"),
+    [("9999.9", None), (None, "loading")],
+    ids=["unknown version", "not servable"],
+)
+async def test_a_reference_that_cannot_classify_is_refused_before_any_read(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch, version, status
+):
+    """A (name, version) no reference carries is a 404, matched on both halves; a
+    reference that exists but is not active or indexing is a 409. Either is refused
+    before the data plane is read."""
+    ref, db = taxonomy_reference, role_keyed_clients["pool"]
+    seen = _stub_taxonomy(monkeypatch, None)
+    if status is not None:
+        await db.execute(
+            "UPDATE qiita.reference SET status = $1 WHERE reference_idx = $2",
+            status,
+            ref["reference_idx"],
+        )
+    resp = await _post(
+        role_keyed_clients["wet"],
+        _classified(amplicon_run, ref["name"], version or ref["version"]),
+    )
+    assert resp.status_code == (404 if status is None else 409), resp.text
+    assert amplicon_run["fetched"] == [] and seen == []
+
+
+async def test_a_reference_with_no_taxonomy_loaded_409s(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    ref = taxonomy_reference
+    _stub_taxonomy(monkeypatch, None)
+    resp = await _post(
+        role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
+    )
+    assert resp.status_code == 409, resp.text
+    assert "carries no taxonomy" in resp.json()["detail"]
+
+
+async def test_a_table_with_no_features_has_an_empty_taxonomy(
+    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
+):
+    """The data plane refuses a ticket with an empty feature list, so an empty table's
+    taxonomy is answered empty without a read."""
+    ref = taxonomy_reference
+    seen = _stub_taxonomy(monkeypatch, None)
+    empty = pa.table(
+        {
+            "prep_sample_idx": pa.array([], pa.int64()),
+            "processing_idx": pa.array([], pa.int64()),
+            "feature_idx": pa.array([], pa.int64()),
+            "count": pa.array([], pa.int64()),
+            "sequence": pa.array([], pa.string()),
+        }
+    )
+    monkeypatch.setattr("qiita_control_plane.routes.feature_table.fetch_table", lambda **_: empty)
+    resp = await _post(
+        role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
+    )
+    assert resp.status_code == 200, resp.text
+    taxonomy = unpack_feature_table(resp.content).taxonomy
+    assert taxonomy.num_rows == 0
+    assert taxonomy.column_names == ["feature", *_RANKS]
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    "taxonomy",
+    [{"name": "greengenes2"}, {"name": "", "version": "2024.09"}, {"reference_idx": 1}],
+    ids=["no version", "blank name", "internal idx"],
+)
+async def test_a_malformed_reference_is_422(role_keyed_clients, amplicon_run, taxonomy):
+    body = _body(biosamples=_qbs(amplicon_run, "ps_a"))
+    body["taxonomy"] = taxonomy
+    resp = await _post(role_keyed_clients["wet"], body)
+    assert resp.status_code == 422, resp.text

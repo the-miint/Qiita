@@ -8,7 +8,9 @@ of biosamples, each by any of its identifiers; the answer is one zip (`pack_feat
     are, and the settings its runs share;
   * the values, sparse COO `(sample, feature, value)`, as an Arrow IPC stream;
   * the features, `(feature, sequence, length, md5)` for every feature the values
-    name, as an Arrow IPC stream.
+    name, as an Arrow IPC stream;
+  * when the request names a reference (`taxonomy`), each of those features' lineage
+    under it, `(feature, <ranks>)`, as an Arrow IPC stream.
 
 What a feature table is, which runs answer it, and why COO, is in
 `stored_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets.
@@ -41,14 +43,18 @@ from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..stored_feature_table import (
     FEATURE_TABLE_MEDIA_TYPE,
+    TAXONOMY_SCHEMA,
     Cohort,
     CohortError,
     build_features,
+    build_taxonomy,
     build_values,
     fetch_table,
+    fetch_taxonomy,
     mint_feature_labels,
     pack_feature_table,
     resolve_cohort,
+    resolve_reference,
     resolve_scope,
     source_of,
 )
@@ -116,8 +122,16 @@ async def feature_table(
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
-    """The cohort's feature table: its columns, values and features, in one answer."""
+    """The cohort's feature table: its columns, values and features, and each feature's
+    lineage when the request names a reference, in one answer."""
     cohort = await _authorized_cohort(pool, caller, request)
+    reference_idx = None
+    if request.taxonomy is not None:
+        # Before any read: a reference that cannot classify refuses the whole request.
+        try:
+            reference_idx = await resolve_reference(pool, request.taxonomy)
+        except CohortError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     values, sequences = await asyncio.gather(
         _read(cohort, cohort.source.values_table, data_plane_url, signing_key),
         _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key),
@@ -125,9 +139,53 @@ async def feature_table(
     labels = await mint_feature_labels(
         pool, source=cohort.source, created_by_idx=caller.principal_idx, features=values
     )
-    body = await asyncio.to_thread(
-        lambda: pack_feature_table(
-            cohort, build_values(cohort, values, labels), build_features(cohort, sequences, labels)
+    reference_taxonomy = None
+    # A table with no features has an empty taxonomy, unread: the data plane refuses a
+    # ticket with an empty feature list.
+    if request.taxonomy is not None and labels.num_rows:
+        reference_taxonomy = await _read_taxonomy(
+            labels, reference_idx, data_plane_url, signing_key
         )
-    )
+
+    def build() -> bytes:
+        taxonomy = None
+        if request.taxonomy is not None:
+            lineage = (
+                TAXONOMY_SCHEMA.empty_table()
+                if reference_taxonomy is None
+                else build_taxonomy(labels, reference_taxonomy)
+            )
+            taxonomy = (request.taxonomy, lineage)
+        return pack_feature_table(
+            cohort,
+            build_values(cohort, values, labels),
+            build_features(cohort, sequences, labels),
+            taxonomy=taxonomy,
+        )
+
+    body = await asyncio.to_thread(build)
     return Response(body, media_type=FEATURE_TABLE_MEDIA_TYPE)
+
+
+async def _read_taxonomy(
+    labels: pa.Table, reference_idx: int, data_plane_url: str, signing_key: bytes
+) -> pa.Table:
+    """The reference's taxonomy rows for each labelled feature (`fetch_taxonomy`),
+    refusing a reference that carries none."""
+    feature_idxs = labels.column("feature_idx").to_pylist()
+    try:
+        taxonomy = await asyncio.to_thread(
+            lambda: fetch_taxonomy(
+                data_plane_url=data_plane_url,
+                signing_key=signing_key,
+                reference_idx=reference_idx,
+                feature_idxs=feature_idxs,
+            )
+        )
+    except (flight.FlightError, StreamRowCountMismatch) as exc:
+        raise HTTPException(
+            status_code=502, detail=f"data plane read of the reference taxonomy failed: {exc}"
+        ) from exc
+    if taxonomy is None:
+        raise HTTPException(status_code=409, detail="that reference carries no taxonomy")
+    return taxonomy

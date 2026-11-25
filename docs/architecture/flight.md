@@ -431,6 +431,7 @@ control plane chooses the method's matching runs. Because nothing has to be comp
 over the cohort, it reads the values over Flight, relabels them in its own DuckDB
 through the same `qiita_common.analytic` relabel the client-side table uses
 (`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers one zip of the columns
-(JSON) and the values and features (Arrow IPC). Authorization, the identifier mints and
+(JSON) and the values and features (Arrow IPC), with each feature's lineage when the
+request names a reference. Authorization, the identifier mints and
 the ticket scope are the ones described above; the CLI writes the bundle with
 `feature-table build`'s writer.

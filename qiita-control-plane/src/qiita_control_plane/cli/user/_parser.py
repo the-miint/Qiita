@@ -1809,6 +1809,16 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_select.add_argument(
+        "--taxonomy",
+        nargs=2,
+        metavar=("NAME", "VERSION"),
+        help=(
+            "Also write <stem>.taxonomy.parquet: each feature's lineage under the reference"
+            " with this name and version (`qiita reference list`). A feature the reference"
+            " does not place has NULL ranks rather than being left out."
+        ),
+    )
+    p_ft_select.add_argument(
         _KEY_FLAG,
         choices=SELECT_KEY_CHOICES,
         help=f"The kind of identifier --study or --biosample names (default {EXPORT_ENTITY_ID}).",
@@ -1825,8 +1835,8 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Where to write the table. The rest of the bundle is named after it:"
-            " <stem>.exported-identifier.json, <stem>.manifest.json and"
-            " <stem>.sequences.parquet."
+            " <stem>.exported-identifier.json, <stem>.manifest.json,"
+            " <stem>.sequences.parquet and, with --taxonomy, <stem>.taxonomy.parquet."
         ),
     )
     p_ft_select.set_defaults(handler=_handle_feature_table_select)

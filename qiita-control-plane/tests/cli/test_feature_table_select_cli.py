@@ -10,12 +10,14 @@ import pyarrow as pa
 from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_ROOT
 from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
 from qiita_common.models.feature_table import FeatureTableSample
+from qiita_common.models.reference import ReferenceHandle
 
 from qiita_control_plane.cli.user.stored_feature_table import MAP_NOTE
 from qiita_control_plane.stored_feature_table import (
     FEATURE_TABLE_MEDIA_TYPE,
     FEATURES_SCHEMA,
     SOURCES,
+    TAXONOMY_SCHEMA,
     VALUES_SCHEMA,
     Cohort,
     ProcessedSample,
@@ -29,7 +31,7 @@ _SAMPLES = [
 _PARAMETERS = {"trim": 150, "orient_primer": False}
 
 
-def _body(values, features):
+def _body(values, features, taxonomy=None):
     cohort = Cohort(
         source=SOURCES["amplicon"],
         runs=[7],
@@ -39,11 +41,20 @@ def _body(values, features):
             for i, s in enumerate(_SAMPLES, start=1)
         ],
     )
-    return pack_feature_table(cohort, values, features)
+    return pack_feature_table(cohort, values, features, taxonomy=taxonomy)
 
 
 def _run(
-    monkeypatch, tmp_path, values, features, extra=(), *, cohort=None, fetch_binary=None, rc=0
+    monkeypatch,
+    tmp_path,
+    values,
+    features,
+    extra=(),
+    *,
+    cohort=None,
+    taxonomy=None,
+    fetch_binary=None,
+    rc=0,
 ):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user._parser import _build_parser
@@ -54,7 +65,7 @@ def _run(
         assert path == f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_ROOT}"
         assert accept == FEATURE_TABLE_MEDIA_TYPE
         sent.append(json)
-        return _body(values, features), FEATURE_TABLE_MEDIA_TYPE
+        return _body(values, features, taxonomy), FEATURE_TABLE_MEDIA_TYPE
 
     monkeypatch.setattr(_common, "read_token", lambda *a, **k: "qk_tok")
     monkeypatch.setattr(_common, "fetch_binary", fetch_binary or answer)
@@ -227,3 +238,52 @@ def test_an_occupied_sequences_file_is_refused_before_anything_is_read(
 
     _run(monkeypatch, tmp_path, None, None, fetch_binary=fetch_binary, rc=1)
     assert "table.sequences.parquet" in capsys.readouterr().err
+
+
+def test_a_named_reference_writes_each_features_lineage_beside_the_table(monkeypatch, tmp_path):
+    """`--taxonomy NAME VERSION` asks the one request to classify the features, writes
+    the lineage as `<stem>.taxonomy.parquet`, and records the reference in the manifest."""
+    reference = ReferenceHandle(name="greengenes2", version="2024.09")
+    lineage = pa.table(
+        {
+            "feature": ["QF1"],
+            **{r: pa.array([None], pa.string()) for r in TAXONOMY_SCHEMA.names[1:]},
+        }
+    ).cast(TAXONOMY_SCHEMA)
+    out, sent = _run(
+        monkeypatch,
+        tmp_path,
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT")]),
+        ["--taxonomy", "greengenes2", "2024.09"],
+        taxonomy=(reference, lineage),
+    )
+    assert sent[0]["taxonomy"] == {"name": "greengenes2", "version": "2024.09"}
+    with duckdb.connect() as con:
+        rows = con.execute(
+            "SELECT feature_id, domain FROM read_parquet(?)",
+            [str(out.with_name("table.taxonomy.parquet"))],
+        ).fetchall()
+    assert rows == [("QF1", None)]
+    manifest = json.loads(out.with_name("table.manifest.json").read_text())
+    assert manifest["taxonomy"] == {"name": "greengenes2", "version": "2024.09"}
+
+
+def test_an_occupied_taxonomy_file_is_refused_before_anything_is_read(
+    monkeypatch, tmp_path, capsys
+):
+    (tmp_path / "table.taxonomy.parquet").write_bytes(b"theirs")
+
+    def fetch_binary(*_, **__):
+        raise AssertionError("nothing should be read for a bundle that cannot be written")
+
+    _run(
+        monkeypatch,
+        tmp_path,
+        None,
+        None,
+        ["--taxonomy", "greengenes2", "2024.09"],
+        fetch_binary=fetch_binary,
+        rc=1,
+    )
+    assert "table.taxonomy.parquet" in capsys.readouterr().err

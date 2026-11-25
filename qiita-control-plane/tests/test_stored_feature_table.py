@@ -3,21 +3,27 @@ fixture runs are amplicon."""
 
 import hashlib
 import io
+import types
 import zipfile
 
 import pyarrow as pa
 import pytest
 from qiita_common.models.feature_table import FeatureTableSample
+from qiita_common.models.reference import ReferenceHandle
 
 from qiita_control_plane.stored_feature_table import (
     SOURCES,
     Cohort,
     ProcessedSample,
     build_features,
+    build_taxonomy,
     build_values,
+    fetch_taxonomy,
     pack_feature_table,
     unpack_feature_table,
 )
+
+_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
 
 
 def build_coo(cohort, values, sequences, labels):
@@ -142,14 +148,35 @@ def test_the_table_round_trips_through_one_body():
         _sequences([(10, "ACGT")]),
         _labels([(10, "QF10")]),
     )
-    samples, values_back, features_back = unpack_feature_table(
-        pack_feature_table(cohort, values, features)
+    answer = unpack_feature_table(pack_feature_table(cohort, values, features))
+    assert answer.samples.method == "amplicon"
+    assert answer.samples.parameters == {"trim": 150, "orient_primer": False}
+    assert [s.export_id for s in answer.samples.samples] == ["QM1"]
+    assert answer.values.equals(values)
+    assert answer.features.equals(features)
+    # No taxonomy was asked for, so the answer carries none and names no reference.
+    assert answer.taxonomy is None
+    assert answer.samples.taxonomy is None
+
+
+def test_a_taxonomy_travels_with_the_reference_that_classified_it():
+    cohort = _cohort("QM1")
+    values, features = build_coo(
+        cohort,
+        _membership([(1, 10, 5)]),
+        _sequences([(10, "ACGT")]),
+        _labels([(10, "QF10")]),
     )
-    assert samples.method == "amplicon"
-    assert samples.parameters == {"trim": 150, "orient_primer": False}
-    assert [s.export_id for s in samples.samples] == ["QM1"]
-    assert values_back.equals(values)
-    assert features_back.equals(features)
+    taxonomy = build_taxonomy(
+        _labels([(10, "QF10")]),
+        _taxonomy([(10, "Bacteria", None, None, None, None, None, None, None)]),
+    )
+    reference = ReferenceHandle(name="greengenes2", version="2024.09")
+    answer = unpack_feature_table(
+        pack_feature_table(cohort, values, features, taxonomy=(reference, taxonomy))
+    )
+    assert answer.samples.taxonomy == reference
+    assert answer.taxonomy.equals(taxonomy)
 
 
 def test_a_body_without_every_part_is_refused():
@@ -158,6 +185,127 @@ def test_a_body_without_every_part_is_refused():
         zf.writestr("samples.json", "{}")
     with pytest.raises(ValueError, match="values.arrows"):
         unpack_feature_table(sink.getvalue())
+
+
+def _taxonomy(rows):
+    """A reference_taxonomy answer: (feature_idx, <unprefixed ranks>)."""
+    cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
+    for i, rank in enumerate(_RANKS, start=1):
+        cols[rank] = pa.array([r[i] for r in rows], pa.string())
+    return pa.table(cols)
+
+
+def test_taxonomy_keys_each_feature_by_handle_and_restores_rank_prefixes():
+    table = build_taxonomy(
+        _labels([(10, "QF10")]),
+        _taxonomy([(10, "Bacteria", "Bacillota", None, None, None, None, None, None)]),
+    )
+    assert table.column_names == ["feature", *_RANKS]
+    row = table.to_pylist()[0]
+    assert row["feature"] == "QF10"
+    # Prefixes restored; an unresolved rank stays NULL, not a bare "c__".
+    assert row["domain"] == "d__Bacteria"
+    assert row["phylum"] == "p__Bacillota"
+    assert row["class"] is None
+
+
+def test_taxonomy_keeps_a_feature_the_reference_does_not_place():
+    # A feature (20) with no taxonomy row survives with all-NULL ranks: the query is a
+    # lookup, not a filter.
+    table = build_taxonomy(
+        _labels([(10, "QF10"), (20, "QF20")]),
+        _taxonomy([(10, "Bacteria", None, None, None, None, None, None, None)]),
+    )
+    rows = {r["feature"]: r for r in table.to_pylist()}
+    assert rows["QF20"]["domain"] is None
+    assert rows["QF10"]["domain"] == "d__Bacteria"
+
+
+def test_a_reference_with_two_rows_for_one_feature_is_refused():
+    # With no representative reduction on this axis, a duplicate row would fan the
+    # feature into two answer rows with disagreeing lineages, so it fails loud as the
+    # genome axis does.
+    with pytest.raises(ValueError, match="more than one row"):
+        build_taxonomy(
+            _labels([(10, "QF10")]),
+            _taxonomy(
+                [
+                    (10, "Bacteria", None, None, None, None, None, None, None),
+                    (10, "Archaea", None, None, None, None, None, None, None),
+                ]
+            ),
+        )
+
+
+# --- fetch_taxonomy: the two-ticket readiness logic, over a fake Flight stream ---
+
+
+class _FakeStream:
+    """A FlightStreamReader stand-in: `read_all()` for the roster read, and iteration
+    (chunks with `.data.num_rows`) for the whole-reference readiness probe."""
+
+    def __init__(self, table):
+        self._table = table
+
+    def read_all(self):
+        return self._table
+
+    def __iter__(self):
+        for batch in self._table.to_batches():
+            yield types.SimpleNamespace(data=batch)
+
+
+class _FakeFlightClient:
+    """Answers `do_get` from a queue of tables, in call order (roster, then, only if the
+    roster was empty, the whole-reference probe)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def do_get(self, _ticket):
+        return _FakeStream(self._responses.pop(0))
+
+
+def _tax(n):
+    """A reference_taxonomy answer with `n` rows (0 = empty)."""
+    return pa.table(
+        {
+            "feature_idx": pa.array(list(range(n)), pa.int64()),
+            "domain": pa.array(["d__X"] * n, pa.string()),
+        }
+    )
+
+
+def _fetch(monkeypatch, responses):
+    monkeypatch.setattr(
+        "qiita_control_plane.stored_feature_table.flight.FlightClient",
+        lambda _url: _FakeFlightClient(responses),
+    )
+    return fetch_taxonomy(
+        data_plane_url="grpc://x", signing_key=b"x" * 32, reference_idx=1, feature_idxs=[10]
+    )
+
+
+def test_fetch_taxonomy_returns_the_roster_rows_when_they_match(monkeypatch):
+    out = _fetch(monkeypatch, [_tax(2)])
+    assert out is not None and out.num_rows == 2
+
+
+def test_fetch_taxonomy_returns_empty_when_loaded_but_nothing_placed(monkeypatch):
+    # Roster empty, but the reference carries taxonomy: a real (empty) answer, not None.
+    out = _fetch(monkeypatch, [_tax(0), _tax(3)])
+    assert out is not None and out.num_rows == 0
+
+
+def test_fetch_taxonomy_returns_none_when_no_taxonomy_is_loaded(monkeypatch):
+    # Roster empty and the reference has no taxonomy at all: not loaded yet, so None.
+    assert _fetch(monkeypatch, [_tax(0), _tax(0)]) is None
 
 
 async def test_features_are_named_by_the_methods_own_mint():
