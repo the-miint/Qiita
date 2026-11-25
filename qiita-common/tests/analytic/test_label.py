@@ -19,7 +19,7 @@ def _relabel_check(
     feature_ids=10,
     samples=5,
     sample_ids=5,
-    axis=ft.OGU_AXIS,
+    axis=ft.GENOME_AXIS,
 ) -> ft.LabelClearance:
     """`check_relabel_diagnostics` over a clean row, with one field overridable per
     test — the defaults describe 100 rows of 10 features across 5 samples, all
@@ -77,16 +77,24 @@ def test_the_genome_label_table_renames_the_minted_handle():
     No DISTINCT, unlike the map-fed version this replaced — the mint answers once per
     genome, so a duplicate is a fault to refuse rather than a fan-out to collapse.
     """
-    sql = ft.genome_label_table_sql("mint_src")
+    sql = ft.feature_label_table_sql("mint_src")
     assert "DISTINCT" not in sql
+    assert f"CREATE TABLE {ft.GENOME_LABEL_TABLE} AS SELECT genome_idx," in sql
     assert "export_feature_id AS feature_id" in sql
     assert "FROM mint_src" in sql
 
 
 def test_the_sample_label_table_renames_the_minted_handle():
     sql = ft.sample_label_table_sql("mint_src")
-    assert "export_id AS sample_id" in sql
+    assert "SELECT prep_sample_idx, export_id AS sample_id" in sql
     assert "FROM mint_src" in sql
+
+
+def test_the_feature_axis_sample_label_carries_the_processed_sample_key():
+    """A column of a feature-axis table is a processed sample, so its label row carries
+    both key columns; the handle is the same QM."""
+    sql = ft.sample_label_table_sql("mint_src", ft.FEATURE_AXIS)
+    assert "SELECT processing_idx, prep_sample_idx, export_id AS sample_id" in sql
 
 
 def test_the_diagnostics_and_the_relabel_read_THE_SAME_join():
@@ -208,33 +216,16 @@ def test_the_relabel_sql_is_unreachable_without_a_clearance():
 
 
 # --- The feature axis ------------------------------------------------------------------
-# The feature-keyed flavour over one `RelabelAxis`; the genome tests above are the
-# regression guard that the default axis stays byte-identical.
-
-AMPLICON_COUNT = "amplicon_count"
+# Feature-keyed rows over processed-sample columns, through the same relabel; the genome
+# tests above are the regression guard that the default axis stays byte-identical.
 
 
-def _feature_axis() -> ft.RelabelAxis:
-    """The amplicon axis: feature-keyed rows, and the composite `(processing_idx,
-    prep_sample_idx)` sample key — both generalizations exercised at once."""
-    return ft.RelabelAxis(
-        output=AMPLICON_COUNT,
-        feature_key="feature_idx",
-        feature_label=ft.FEATURE_LABEL_TABLE,
-        sample_key=("processing_idx", "prep_sample_idx"),
-        sample_label=ft.SAMPLE_LABEL_TABLE,
-        feature_noun="feature",
-        handle_noun="sequence hash",
-        unlabelled_feature_hint="stage the sequence relation for every observed feature",
-    )
-
-
-def test_the_default_axis_reproduces_the_ogu_spine_exactly():
+def test_the_default_axis_is_the_genome_axis():
     """The generalization is only safe if the metagenomic path is byte-identical. A
     no-arg call and the explicit OGU axis must produce the same join, and it must still
     be the genome-keyed one over `ogu_output`.
     """
-    assert label._labelled_select_sql() == label._labelled_select_sql(ft.OGU_AXIS)
+    assert label._labelled_select_sql() == label._labelled_select_sql(ft.GENOME_AXIS)
     joined = label._labelled_select_sql()
     assert "o.genome_idx" in joined
     assert f"FROM {ft.OGU_OUTPUT_TABLE} o" in joined
@@ -242,32 +233,30 @@ def test_the_default_axis_reproduces_the_ogu_spine_exactly():
 
 
 def test_the_feature_label_table_reads_the_minted_handle():
-    """The feature-axis twin of `genome_label_table_sql`: the handle is the minted
-    `export_feature_id` read from the mint response, not a computed md5 — no DISTINCT
-    (one row per feature already)."""
-    sql = ft.feature_label_table_sql("mint_src")
+    """The same helper on the feature axis: the minted `export_feature_id`, keyed on
+    `feature_idx`."""
+    sql = ft.feature_label_table_sql("mint_src", ft.FEATURE_AXIS)
     assert "DISTINCT" not in sql
+    assert f"CREATE TABLE {ft.FEATURE_LABEL_TABLE} AS SELECT feature_idx," in sql
     assert "export_feature_id AS feature_id" in sql
-    assert "SELECT feature_idx," in sql
     assert "FROM mint_src" in sql
-    assert ft.FEATURE_LABEL_TABLE in sql
 
 
 def test_the_feature_axis_join_keys_on_feature_idx():
     """Same LEFT-JOIN spine, keyed on the feature axis: the counts relation and the
     feature label both carry `feature_idx`."""
-    joined = label._labelled_select_sql(_feature_axis())
-    assert f"FROM {AMPLICON_COUNT} o" in joined
+    joined = label._labelled_select_sql(ft.FEATURE_AXIS)
+    assert f"FROM {ft.FEATURE_OUTPUT_TABLE} o" in joined
     assert f"LEFT JOIN {ft.FEATURE_LABEL_TABLE} g ON o.feature_idx = g.feature_idx" in joined
     assert joined.count("LEFT JOIN") == 2
     assert "genome_idx" not in joined
 
 
 def test_the_composite_sample_key_joins_on_every_column():
-    """A pooled amplicon sample is `(processing_idx, prep_sample_idx)`, so both columns
-    are carried and the sample join is ANDed over both — the same prep_sample in two runs
+    """A processed sample is `(processing_idx, prep_sample_idx)`, so both columns are
+    carried and the sample join is ANDed over both — the same prep_sample in two runs
     stays two samples instead of collapsing."""
-    joined = label._labelled_select_sql(_feature_axis())
+    joined = label._labelled_select_sql(ft.FEATURE_AXIS)
     assert "o.processing_idx, o.prep_sample_idx" in joined
     assert (
         f"LEFT JOIN {ft.SAMPLE_LABEL_TABLE} s "
@@ -276,39 +265,38 @@ def test_the_composite_sample_key_joins_on_every_column():
     # The distinct-sample count is over the pair, not one column.
     assert (
         "count(DISTINCT (processing_idx, prep_sample_idx)) AS samples"
-        in ft.relabel_diagnostics_sql(_feature_axis())
+        in ft.relabel_diagnostics_sql(ft.FEATURE_AXIS)
     )
 
 
 def test_the_feature_axis_still_drops_the_internal_key_from_the_published_columns():
     """The projection enforcement holds on either axis: `feature_idx` is joined ON and
     then dropped, so it cannot reach a published file."""
-    sql = ft.labelled_relation_sql(clearance=_relabel_check(), axis=_feature_axis())
+    sql = ft.labelled_relation_sql(clearance=_relabel_check(), axis=ft.FEATURE_AXIS)
     projection = sql.split(" FROM ", 1)[0]
     assert projection.endswith(", ".join(ft.LABELLED_COLUMNS))
     assert "feature_idx" not in projection
 
 
 def test_the_feature_axis_diagnostics_measure_the_feature_key_and_its_counts():
-    sql = ft.relabel_diagnostics_sql(_feature_axis())
+    sql = ft.relabel_diagnostics_sql(ft.FEATURE_AXIS)
     assert "count(DISTINCT feature_idx) AS features" in sql
-    assert f"(SELECT count(*) FROM {AMPLICON_COUNT})" in sql
+    assert f"(SELECT count(*) FROM {ft.FEATURE_OUTPUT_TABLE})" in sql
 
 
 def test_the_feature_axis_diagnostics_and_relabel_read_the_same_join():
     """The same one-join invariant the genome axis has, per axis: what is measured is
     what is written."""
-    axis = _feature_axis()
+    axis = ft.FEATURE_AXIS
     joined = label._labelled_select_sql(axis)
     assert joined in ft.relabel_diagnostics_sql(axis)
     assert joined in ft.labelled_relation_sql(clearance=_relabel_check(), axis=axis)
 
 
 def test_the_feature_axis_refusals_name_a_feature_not_a_genome():
-    """A wrong amplicon table must not be refused in genome vocabulary. The unlabelled
-    message names a feature, and the collision message names the sequence hash."""
-    axis = _feature_axis()
+    """A wrong feature-axis table is refused in its own vocabulary."""
+    axis = ft.FEATURE_AXIS
     with pytest.raises(ValueError, match="rows name a feature with no public handle"):
         _relabel_check(unlabelled_feature_rows=3, axis=axis)
-    with pytest.raises(ValueError, match="sequence hash"):
+    with pytest.raises(ValueError, match="10 features in this table share only 9"):
         _relabel_check(features=10, feature_ids=9, axis=axis)

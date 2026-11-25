@@ -30,7 +30,7 @@ def _cohort(*names):
             ProcessedSample(
                 processing_idx=7,
                 prep_sample_idx=i,
-                column=FeatureTableSample(sample=n, export_id=n, biosample=f"QB{i}"),
+                column=FeatureTableSample(export_id=n, biosample=f"QB{i}"),
             )
             for i, n in enumerate(names, start=1)
         ],

@@ -22,7 +22,10 @@ _CREATE_BUILDERS = {
     "survivor_table_sql(per-sample)": lambda: ft.survivor_table_sql(ft.CoverageScope.PER_SAMPLE),
     "ogu_input_table_sql": lambda: ft.ogu_input_table_sql(survivor_scope=ft.CoverageScope.POOLED),
     "ogu_output_table_sql": lambda: ft.ogu_output_table_sql(populated=True),
-    "genome_label_table_sql": lambda: ft.genome_label_table_sql("mint_src"),
+    "feature_label_table_sql": lambda: ft.feature_label_table_sql("mint_src"),
+    "feature_label_table_sql(feature)": lambda: ft.feature_label_table_sql(
+        "mint_src", ft.FEATURE_AXIS
+    ),
     "sample_label_table_sql": lambda: ft.sample_label_table_sql("mint_src"),
     "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
     "taxonomy_table_sql": lambda: ft.taxonomy_table_sql("taxonomy_stream"),

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from .relations import (
     FEATURE_LABEL_TABLE,
+    FEATURE_OUTPUT_TABLE,
     GENOME_LABEL_TABLE,
     LABELLED_RELATION,
     MAP_TABLE,
@@ -38,17 +39,13 @@ LABELLED_COLUMNS = tuple(LABELLED_SCHEMA)
 
 @dataclass(frozen=True)
 class RelabelAxis:
-    """Which relations a relabel runs over, and the vocabulary its refusals speak.
+    """What a table's rows and columns are keyed by, for the one relabel both kinds of
+    table go through: `_labelled_select_sql`, its diagnostics and `labelled_relation_sql`.
 
-    The default is the OGU (genome-keyed) flavour. The feature-keyed flavour — rows that
-    ARE features, named by content — carries its differences here rather than forking the
-    SQL, so one `_labelled_select_sql`, one set of diagnostics and one `labelled_relation_sql`
-    check both.
-
-    `sample_key` is the column(s) that name a sample: one `prep_sample_idx` for a single
-    `woltka_ogu` run, `(processing_idx, prep_sample_idx)` for an amplicon pool, where the
-    same prep_sample in two runs is two processed samples. The nouns and
-    `unlabelled_feature_hint` let a refusal name the right thing on either flavour.
+    `feature_key` is a row's internal key, and `sample_key` the column(s) naming a
+    column: one `prep_sample_idx`, or `(processing_idx, prep_sample_idx)` where a table
+    merges runs and the same prep_sample in two runs is two processed samples.
+    `feature_noun` and `unlabelled_feature_hint` are what a refusal says about a row.
     """
 
     output: str = OGU_OUTPUT_TABLE
@@ -57,7 +54,6 @@ class RelabelAxis:
     sample_key: tuple[str, ...] = ("prep_sample_idx",)
     sample_label: str = SAMPLE_LABEL_TABLE
     feature_noun: str = "genome"
-    handle_noun: str = "export_feature_id"
     unlabelled_feature_hint: str = (
         "The exported-feature mint has to cover every genome the counts mention — mint it "
         "for the genomes the roll-up actually emitted, not for a set resolved before the "
@@ -65,44 +61,38 @@ class RelabelAxis:
     )
 
 
-OGU_AXIS = RelabelAxis()
+# Rows are genomes, columns prep_samples: the OGU table.
+GENOME_AXIS = RelabelAxis()
+
+# Rows are features, columns processed samples: a table of the values one or more runs
+# stored per (prep_sample, feature).
+FEATURE_AXIS = RelabelAxis(
+    output=FEATURE_OUTPUT_TABLE,
+    feature_key="feature_idx",
+    feature_label=FEATURE_LABEL_TABLE,
+    sample_key=("processing_idx", "prep_sample_idx"),
+    feature_noun="feature",
+    unlabelled_feature_hint="The exported-feature mint has to cover every feature the values name",
+)
 
 
-def genome_label_table_sql(source: str) -> str:
-    """`genome_idx -> feature_id` from `source`, the exported-feature mint's response
-    as the route returns it (`(genome_idx, export_feature_id, …)`).
+def feature_label_table_sql(source: str, axis: RelabelAxis = GENOME_AXIS) -> str:
+    """`<feature key> -> feature_id` from `source`, the exported-feature mint's response
+    as the route returns it (`(<feature key>, export_feature_id, …)`).
 
-    One row per genome already, so no DISTINCT: a duplicate here would be a mint that
-    answered twice for one genome, which `check_relabel_diagnostics` refuses rather
-    than silently collapsing — the two rows might carry different handles. Same shape
-    and same reasoning as `sample_label_table_sql`.
+    The mint returns one row per entity, so no DISTINCT: a repeated key in `source` is a
+    fault upstream, and collapsing it could hide two different handles.
+    `check_relabel_diagnostics` refuses it instead, as the table-size change it causes.
 
-    **The handle is not always the genome's accession**, which is why this reads a
-    minted column and not `genome.source_id`: the mint publishes the accession
-    wherever one exists and is unique across the published namespace, and a `QF<n>`
-    handle where it is not. The uniqueness that makes a published label name one thing
-    is a database constraint on that mint, not something a client can assert about a
-    map it was handed.
+    **The handle is not always an accession**, which is why this reads the minted column
+    and not, say, `genome.source_id`: the mint publishes an accession wherever one exists
+    and is unique across the published namespace, and a `QF<n>` handle where it is not.
+    That uniqueness is a database constraint on the mint, not something a client can
+    assert about a map it was handed.
     """
     return (
-        f"CREATE TABLE {GENOME_LABEL_TABLE} AS "
-        f"SELECT genome_idx, export_feature_id AS feature_id FROM {source}"
-    )
-
-
-def feature_label_table_sql(source: str) -> str:
-    """`feature_idx -> feature_id` from `source`, the exported-feature mint's response
-    (`(feature_idx, export_feature_id, …)`).
-
-    The feature-axis twin of `genome_label_table_sql`: identical shape and reasoning. A
-    de-novo feature (an ASV) has no accession, so the mint hands it a `QF<n>`; one that
-    is also a reference sequence may carry an accession. The handle is the mint's to
-    decide, not a client's. No DISTINCT — a duplicate is a mint that answered twice,
-    which `check_relabel_diagnostics` refuses.
-    """
-    return (
-        f"CREATE TABLE {FEATURE_LABEL_TABLE} AS "
-        f"SELECT feature_idx, export_feature_id AS feature_id FROM {source}"
+        f"CREATE TABLE {axis.feature_label} AS "
+        f"SELECT {axis.feature_key}, export_feature_id AS feature_id FROM {source}"
     )
 
 
@@ -130,21 +120,17 @@ def published_membership_sql() -> str:
     )
 
 
-def sample_label_table_sql(source: str) -> str:
-    """`prep_sample_idx -> sample_id` from `source`, the exported-identifier map as
-    the mint route returns it (`(prep_sample_idx, export_id, …)`).
-
-    One row per sample already, so no DISTINCT: a duplicate here would be a mint
-    that answered twice for one sample, which `check_relabel_diagnostics` refuses
-    rather than silently collapsing — the two rows might carry different handles.
-    """
+def sample_label_table_sql(source: str, axis: RelabelAxis = GENOME_AXIS) -> str:
+    """`<sample key> -> sample_id` from `source`, the exported-identifier map as the
+    mint route returns it (`(<sample key>, export_id, …)`). No DISTINCT, for the reason
+    `feature_label_table_sql` gives."""
     return (
-        f"CREATE TABLE {SAMPLE_LABEL_TABLE} AS "
-        f"SELECT prep_sample_idx, export_id AS sample_id FROM {source}"
+        f"CREATE TABLE {axis.sample_label} AS "
+        f"SELECT {', '.join(axis.sample_key)}, export_id AS sample_id FROM {source}"
     )
 
 
-def _labelled_select_sql(axis: RelabelAxis = OGU_AXIS) -> str:
+def _labelled_select_sql(axis: RelabelAxis = GENOME_AXIS) -> str:
     """The counts with both labels attached — the one join definition the
     diagnostics measure and the relabel writes, so what was checked is what lands.
 
@@ -152,10 +138,6 @@ def _labelled_select_sql(axis: RelabelAxis = OGU_AXIS) -> str:
     join as a NULL id for the diagnostics to see and refuse it. An INNER join would
     drop it instead, shortening the published table by exactly the rows a caller had
     no way to notice were missing.
-
-    One definition over both flavours: `axis` names the counts relation, the feature
-    key, the sample key, and the two label relations, so the genome path and the feature
-    path differ in their inputs and not in this join.
     """
     sample_cols = ", ".join(f"o.{key}" for key in axis.sample_key)
     sample_on = " AND ".join(f"o.{key} = s.{key}" for key in axis.sample_key)
@@ -181,7 +163,7 @@ class LabelClearance:
     rows: int
 
 
-def relabel_diagnostics_sql(axis: RelabelAxis = OGU_AXIS) -> str:
+def relabel_diagnostics_sql(axis: RelabelAxis = GENOME_AXIS) -> str:
     """One row for `check_relabel_diagnostics`, over the labelled join.
 
     The unjoined count comes from a scalar subquery because it is the one number the
@@ -190,8 +172,7 @@ def relabel_diagnostics_sql(axis: RelabelAxis = OGU_AXIS) -> str:
 
     `features`/`feature_ids` mirror `samples`/`sample_ids`: the distinct count of the
     internal key against the distinct count of the public handle, which is how a collision
-    that merges two features under one handle shows up. `axis` supplies both internal keys,
-    so the same measurement serves the genome and the feature flavour.
+    that merges two features under one handle shows up.
     """
     sample_key = (
         axis.sample_key[0] if len(axis.sample_key) == 1 else f"({', '.join(axis.sample_key)})"
@@ -219,12 +200,11 @@ def check_relabel_diagnostics(
     feature_ids: int,
     samples: int,
     sample_ids: int,
-    axis: RelabelAxis = OGU_AXIS,
+    axis: RelabelAxis = GENOME_AXIS,
 ) -> LabelClearance:
     """Refuse every way the relabel can produce a WRONG published table instead of
     an error, and return the `LabelClearance` `labelled_relation_sql` requires. Takes
-    `relabel_diagnostics_sql()`'s row, and `axis` so the refusals name the right thing on
-    either flavour.
+    `relabel_diagnostics_sql()`'s row, and the `axis` it was measured on.
 
     All three faults are silent in the output: an inflated count, a row named by a
     NULL id, or two features merged under one handle. None of them raises anywhere
@@ -264,7 +244,7 @@ def check_relabel_diagnostics(
     if feature_ids < features:
         raise ValueError(
             f"{features} {axis.feature_noun}s in this table share only {feature_ids} "
-            f"distinct {axis.handle_noun} values, so relabelling merges "
+            f"distinct export_feature_id values, so relabelling merges "
             f"{axis.feature_noun}s that are not the same thing. The published namespace "
             f"is UNIQUE across live rows, so this cannot happen server-side — but the "
             f"check costs one comparison and the failure it guards is invisible: "
@@ -283,14 +263,14 @@ def check_relabel_diagnostics(
     return LabelClearance(rows=labelled_rows)
 
 
-def labelled_relation_sql(*, clearance: LabelClearance, axis: RelabelAxis = OGU_AXIS) -> str:
+def labelled_relation_sql(*, clearance: LabelClearance, axis: RelabelAxis = GENOME_AXIS) -> str:
     """Relabel the counts into `LABELLED_RELATION`: `LABELLED_COLUMNS` and nothing else.
 
     The projection is the enforcement. Both `*_idx` columns are joined ON and then
     dropped, so no writer downstream can read one out of this relation even by
     accident — which is the property that keeps our internal identifiers out of a
-    file somebody publishes. One `LABELLED_RELATION` for both flavours, so every writer
-    after it is axis-blind.
+    file somebody publishes. Every axis writes the same `LABELLED_RELATION`, so no
+    writer after it depends on the axis.
 
     **Takes a `LabelClearance`**, so it cannot be reached by accident without having
     run `check_relabel_diagnostics`; see `LabelClearance`.

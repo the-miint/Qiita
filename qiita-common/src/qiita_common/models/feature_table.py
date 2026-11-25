@@ -1,6 +1,5 @@
-"""A run feature table: one cohort request over amplicon runs, and the samples it
-names. One table holds runs whose features compare — amplicon runs of one trim
-length and orientation — so their ASV counts line up into one matrix."""
+"""A feature table request: one or more runs of one method over a cohort, and the
+processed samples that become its columns."""
 
 from typing import Annotated, Literal, Self
 
@@ -13,16 +12,15 @@ PositiveIdx = Annotated[int, Field(gt=0)]
 # The most runs one feature-table request may merge.
 MAX_FEATURE_TABLE_RUNS = 32
 
-# What a table's values are: reads counted per feature (amplicon ASVs).
+# What a table's values are.
 FeatureTableValueKind = Literal["count"]
 
 
 class FeatureTableRequest(BaseModel):
-    """Which runs, over which samples: a study's, or a named list.
+    """Which runs, over which prep_samples: a study's, or a named list.
 
-    The runs merge into one table only when they are runs of one method whose
-    features compare: amplicon runs of one trim length and orientation. The route
-    refuses the rest.
+    The runs merge into one table only when they are runs of one method whose features
+    compare (that method's merge keys); the route refuses the rest.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -42,15 +40,11 @@ class FeatureTableRequest(BaseModel):
 
 class FeatureTableSample(BaseModel):
     """One column of the table: a processed sample (one run's view of one
-    prep_sample), under its public name."""
+    prep_sample)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    # The column name the values use: the biosample's deposited accession
-    # (BioSample, else ENA) when no other column of the table shares it, else the
-    # processed sample's QM.
-    sample: str
-    # The processed sample's QM, always: the stable handle, whatever `sample` is.
+    # The processed sample's QM: the column's name in the values.
     export_id: str
     # The biosample's public name as the study's sample listing shows it
     # (accession, else QB): the key for joining the column to its metadata.

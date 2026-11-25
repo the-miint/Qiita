@@ -203,7 +203,6 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
 
     processed = await pool.fetch(
         "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id,"
-        "       COALESCE(b.biosample_accession, b.ena_sample_accession) AS accession,"
         f"      {BIOSAMPLE_NAME_SQL} AS biosample"
         "  FROM qiita.exported_identifier ei"
         "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
@@ -234,26 +233,11 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
     if any(r["biosample"] is None for r in processed):
         raise RuntimeError("a processed sample's biosample has no accession and no QB")
 
-    # A deposited accession names one column only when no other column of this
-    # table shares it (one biosample, one processed sample); otherwise each of
-    # those columns falls back to its own QM, so the two stay distinguishable.
-    per_accession: dict[str, int] = {}
-    for r in processed:
-        if r["accession"]:
-            per_accession[r["accession"]] = per_accession.get(r["accession"], 0) + 1
     samples = [
         ProcessedSample(
             processing_idx=r["processing_idx"],
             prep_sample_idx=r["prep_sample_idx"],
-            column=FeatureTableSample(
-                sample=(
-                    r["accession"]
-                    if r["accession"] and per_accession[r["accession"]] == 1
-                    else r["export_id"]
-                ),
-                export_id=r["export_id"],
-                biosample=r["biosample"],
-            ),
+            column=FeatureTableSample(export_id=r["export_id"], biosample=r["biosample"]),
         )
         for r in processed
     ]
@@ -284,23 +268,9 @@ def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, tabl
         return read_all_counted(client, ticket, name=table)
 
 
-# The relations `stage_values` creates on the caller's connection.
-FEATURE_RELATION = "run_feature"
-VALUE_RELATION = "run_value"
-COUNT_RELATION = "run_count"
-
-# The amplicon flavour of the shared relabel: the feature axis is `feature_idx` labelled
-# by its minted `export_feature_id` (the OGU default handle), and the sample axis is the
-# pooled (processing_idx, prep_sample_idx). Only those differ from the OGU default.
-AMPLICON_AXIS = ft.RelabelAxis(
-    output=COUNT_RELATION,
-    feature_key="feature_idx",
-    feature_label=ft.FEATURE_LABEL_TABLE,
-    sample_key=("processing_idx", "prep_sample_idx"),
-    sample_label=ft.SAMPLE_LABEL_TABLE,
-    feature_noun="feature",
-    unlabelled_feature_hint="the exported-feature mint has to cover every feature the counts name",
-)
+# The relations `stage_features` and `stage_values` create on the caller's connection.
+FEATURE_RELATION = "stored_feature"
+VALUE_RELATION = "stored_value"
 
 
 async def mint_feature_labels(
@@ -325,7 +295,7 @@ def stage_features(con, *, labels: str, sequences: str) -> None:
     """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length, md5): each
     feature under its minted handle (`labels`), with the sequence and its md5 — the
     companion that maps the published handle back to a reproducible, sequence-derived id."""
-    con.execute(ft.feature_label_table_sql(labels))
+    con.execute(ft.feature_label_table_sql(labels, ft.FEATURE_AXIS))
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
         " SELECT s.feature_idx, l.feature_id AS feature, s.sequence,"
@@ -337,30 +307,28 @@ def stage_features(con, *, labels: str, sequences: str) -> None:
 def _clear_relabel(con) -> ft.LabelClearance:
     """The shared relabel diagnostics, returning the clearance `labelled_relation_sql`
     requires — the check that refuses a value whose sample has no QM or feature no handle."""
-    cur = con.execute(ft.relabel_diagnostics_sql(AMPLICON_AXIS))
+    cur = con.execute(ft.relabel_diagnostics_sql(ft.FEATURE_AXIS))
     row = dict(zip((column[0] for column in cur.description), cur.fetchone(), strict=True))
-    return ft.check_relabel_diagnostics(**row, axis=AMPLICON_AXIS)
+    return ft.check_relabel_diagnostics(**row, axis=ft.FEATURE_AXIS)
 
 
 def stage_values(con, *, source: Source, names: str, values: str, labels: str) -> None:
     """Relabel `values` to public names into `VALUE_RELATION` (sample, feature, value)
     through the shared `analytic/label.py` relabel.
 
-    The three label inputs — feature label (`labels`, the mint response), sample label
-    (`names`), and counts — feed `labelled_relation_sql`, held to the same
-    `check_relabel_diagnostics` invariants as the OGU table. The trailing COO sum is a wire
-    concern (a sparse cell is one `(sample, feature)` pair), not part of the relabel."""
-    con.execute(ft.feature_label_table_sql(labels))
+    The feature labels (`labels`, the mint response), the sample labels (`names`, each
+    processed sample's QM) and the values feed `labelled_relation_sql` on
+    `ft.FEATURE_AXIS`, held to the same `check_relabel_diagnostics` invariants as the OGU
+    table. The trailing sum is a wire concern (a sparse cell is one `(sample, feature)`
+    pair), not part of the relabel."""
+    con.execute(ft.feature_label_table_sql(labels, ft.FEATURE_AXIS))
+    con.execute(ft.sample_label_table_sql(names, ft.FEATURE_AXIS))
     con.execute(
-        f"CREATE TABLE {ft.SAMPLE_LABEL_TABLE} AS "
-        f"SELECT processing_idx, prep_sample_idx, sample AS sample_id FROM {names}"
-    )
-    con.execute(
-        f"CREATE TABLE {COUNT_RELATION} AS "
+        f"CREATE TABLE {ft.FEATURE_OUTPUT_TABLE} AS "
         f"SELECT processing_idx, prep_sample_idx, feature_idx, {source.value_column} AS value "
         f"FROM {values}"
     )
-    con.execute(ft.labelled_relation_sql(clearance=_clear_relabel(con), axis=AMPLICON_AXIS))
+    con.execute(ft.labelled_relation_sql(clearance=_clear_relabel(con), axis=ft.FEATURE_AXIS))
     con.execute(
         f"CREATE TEMP TABLE {VALUE_RELATION} AS"
         " SELECT sample_id AS sample, feature_id AS feature, sum(value)::DOUBLE AS value"
@@ -369,12 +337,13 @@ def stage_values(con, *, source: Source, names: str, values: str, labels: str) -
 
 
 def names_table(cohort: Cohort) -> pa.Table:
-    """(processing_idx, prep_sample_idx, sample): each processed sample's column name."""
+    """(processing_idx, prep_sample_idx, export_id): each processed sample's QM, in the
+    shape of the exported-identifier mint's response."""
     return pa.table(
         {
             "processing_idx": pa.array([s.processing_idx for s in cohort.samples], pa.int64()),
             "prep_sample_idx": pa.array([s.prep_sample_idx for s in cohort.samples], pa.int64()),
-            "sample": pa.array([s.column.sample for s in cohort.samples], pa.string()),
+            "export_id": pa.array([s.column.export_id for s in cohort.samples], pa.string()),
         }
     )
 

@@ -952,7 +952,7 @@ def _stage_labels(conn, *, feature_handles, handles) -> None:
         + _values(handles, "prep_sample_idx, export_id", "?::BIGINT, ?::VARCHAR"),
         [x for r in handles for x in r],
     )
-    conn.execute(ft.genome_label_table_sql("_exported_feature_src"))
+    conn.execute(ft.feature_label_table_sql("_exported_feature_src"))
     conn.execute(ft.sample_label_table_sql("_mint_src"))
 
 

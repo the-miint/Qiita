@@ -80,13 +80,16 @@ OGU_INPUT_TABLE = "ogu_input"
 # server-side job COPYs `woltka_ogu_select_sql()` straight out to Parquet and
 # relabels nothing, because its output stays inside the system.
 OGU_OUTPUT_TABLE = "ogu_output"
+# The feature-axis counterpart: one stored value per (processed sample, feature), staged
+# by the control plane from the data plane's read.
+FEATURE_OUTPUT_TABLE = "feature_output"
 
 # The two label relations, each `internal key -> public handle`.
 #
-# **The row axis is a genome only because this table flavour is OGU.** A feature is not
+# **The row axis is a genome only because this table is the OGU table.** A feature is not
 # always a genome — an amplicon sequence variant, a full-length 16S observed in a sample,
 # an assembled contig are all features with no genome to roll up to — so a row-keyed
-# flavour is a genuine second shape, not a variant spelling of this one. The identifier
+# kind of table is a genuine second shape, not a variant spelling of this one. The identifier
 # layer is already ready for it: the mint behind `export_feature_id` publishes a genome
 # OR a `(reference, feature)` pair. What is genome-only is the roll-up, which counts what
 # `woltka_ogu` counts. This name says `genome` to be honest about that, rather than
@@ -94,11 +97,7 @@ OGU_OUTPUT_TABLE = "ogu_output"
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
 
-# The feature-axis label source — `feature_idx -> feature_id`, the row-keyed flavour the
-# note above anticipates. Same minted handle as `GENOME_LABEL_TABLE`: `export_feature_id`.
-# The feature axis names features Qiita observed itself (an ASV), which carry no accession,
-# so the handle is a minted `QF<n>`. Only the key column differs, so both feed one
-# `labelled_relation_sql`.
+# `feature_idx -> feature_id`, the feature-keyed counterpart of `GENOME_LABEL_TABLE`.
 FEATURE_LABEL_TABLE = "feature_label"
 
 # The published shape — a VIEW, not a table, and the second exception to the

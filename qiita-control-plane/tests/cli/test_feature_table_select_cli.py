@@ -23,8 +23,8 @@ from qiita_control_plane.stored_feature_table import (
 )
 
 _SAMPLES = [
-    {"sample": "QM1", "export_id": "QM1", "biosample": "QB1"},
-    {"sample": "QM2", "export_id": "QM2", "biosample": "QB2"},
+    {"export_id": "QM1", "biosample": "QB1"},
+    {"export_id": "QM2", "biosample": "QB2"},
 ]
 
 

@@ -644,7 +644,7 @@ def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
         entries,
         relation=_EXPORTED_FEATURE_SOURCE,
         columns=[("genome_idx", pa.int64()), ("export_feature_id", pa.string())],
-        table_sql=ft.genome_label_table_sql,
+        table_sql=ft.feature_label_table_sql,
     )
 
 

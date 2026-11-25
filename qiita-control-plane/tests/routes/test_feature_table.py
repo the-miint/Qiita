@@ -193,59 +193,48 @@ async def test_samples_join_each_column_to_its_biosample(role_keyed_clients, amp
     )
     assert resp.status_code == 200, resp.text
     qm = await _qm(db, run["processing_idx"], run["ps_a"])
-    assert resp.json()["samples"] == [
-        {
-            "sample": qm,
-            "export_id": qm,
-            "biosample": await _qb(db, run["ps_a"]),
-        }
-    ]
+    assert resp.json()["samples"] == [{"export_id": qm, "biosample": await _qb(db, run["ps_a"])}]
 
 
-async def test_a_deposited_accession_names_its_column(role_keyed_clients, amplicon_run):
+async def test_a_column_is_its_qm_and_the_accession_names_its_biosample(
+    role_keyed_clients, amplicon_run
+):
+    """Every column is named by its QM, as `feature-table build` names them; a deposited
+    accession is the biosample's public name, the key for joining metadata."""
     run, db = amplicon_run, role_keyed_clients["pool"]
     accession = f"SAMEA{uuid.uuid4().int % 10**9}"
     await _set_accession(db, run["ps_a"], accession)
     try:
-        resp = await role_keyed_clients["wet"].post(
-            URL_FEATURE_TABLE_SAMPLE,
-            json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]]),
-        )
-        assert resp.status_code == 200, resp.text
-        (column,) = resp.json()["samples"]
-        assert column["sample"] == accession
-        assert column["biosample"] == accession
-        assert column["export_id"].startswith("QM")
+        body = _body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]])
+        columns = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_SAMPLE, json=body)
+        values = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_VALUE, json=body)
+        assert columns.status_code == 200, columns.text
+        assert values.status_code == 200, values.text
+        qm = await _qm(db, run["processing_idx"], run["ps_a"])
+        assert columns.json()["samples"] == [{"export_id": qm, "biosample": accession}]
+        assert set(_arrow(values).column("sample").to_pylist()) == {qm}
     finally:
         await _set_accession(db, run["ps_a"], None)
 
 
-async def test_one_biosample_in_two_runs_is_two_columns_by_qm(role_keyed_clients, amplicon_run):
-    """Merging two comparable runs that both counted ps_a: its accession would
-    name two columns, so each falls back to its own QM."""
+async def test_one_prep_sample_in_two_runs_is_two_columns(role_keyed_clients, amplicon_run):
+    """Merging two comparable runs that both processed ps_a: two processed samples, so
+    two columns, each under its own QM."""
     run, db = amplicon_run, role_keyed_clients["pool"]
     second = await _mint_run(db, run["owner_idx"], [run["ps_a"]])
     run["runs"].append(second)
-    await _set_accession(db, run["ps_a"], f"SAMEA{uuid.uuid4().int % 10**9}")
-    try:
-        resp = await role_keyed_clients["wet"].post(
-            URL_FEATURE_TABLE_VALUE,
-            json=_body([run["processing_idx"], second], prep_sample_idx=[run["ps_a"]]),
-        )
-        assert resp.status_code == 200, resp.text
-        assert set(_arrow(resp).column("sample").to_pylist()) == {
-            await _qm(db, run["processing_idx"], run["ps_a"]),
-            await _qm(db, second, run["ps_a"]),
-        }
-        assert run["fetched"] == [
-            (
-                AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
-                sorted([run["processing_idx"], second]),
-                [run["ps_a"]],
-            )
-        ]
-    finally:
-        await _set_accession(db, run["ps_a"], None)
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_VALUE,
+        json=_body([run["processing_idx"], second], prep_sample_idx=[run["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert set(_arrow(resp).column("sample").to_pylist()) == {
+        await _qm(db, run["processing_idx"], run["ps_a"]),
+        await _qm(db, second, run["ps_a"]),
+    }
+    assert run["fetched"] == [
+        (AMPLICON_MEMBERSHIP_VISIBLE_TABLE, sorted([run["processing_idx"], second]), [run["ps_a"]])
+    ]
 
 
 async def test_refuses_runs_whose_asvs_are_not_comparable(role_keyed_clients, amplicon_run):
