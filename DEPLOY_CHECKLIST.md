@@ -208,8 +208,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   from the lines the `--limit 5` run printed. Expect no NULL `genome_idx` and a non-zero
   gene count:
   `SELECT (SELECT count(*) FROM qiita_lake.gene_call WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.assembly_membership WHERE prep_sample_idx = PS AND processing_idx = RUN), (SELECT count(*) FILTER (WHERE genome_idx IS NULL) FROM qiita_lake.bin_quality WHERE prep_sample_idx = PS AND processing_idx = RUN);`
-  Measure each step's peak memory and elapsed time against its unmeasured baseline
-  (gene_call 16 GB / 2 h; assembly_load 32 GB / 2 h), for every attempt:
+  Measure each step's peak memory and elapsed time against its baseline
+  (gene_call 16 GB unmeasured / 4 h; assembly_load 32 GB / 2 h, both unmeasured), for every attempt:
   `sacct -j <job> -o MaxRSS,Elapsed`, with each `<job>` from
   `SELECT step_name, attempt, state, slurm_job_id FROM qiita.work_ticket_step WHERE work_ticket_idx = <T> AND slurm_job_id IS NOT NULL ORDER BY step_index, attempt`.
   Then submit the rest, paced:
@@ -347,6 +347,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
 - New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
 - The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)
+- long-read-assembly 1.0.2's and assembly-gene-call-recover 1.0.0's `gene_call` walltime goes from 2 h to 4 h, edited in place; it arrives through the deploy's usual `qiita-admin actions sync`. (#950)
 - `DELETE /reference/{reference_idx}` now answers 409, with or without `force`, for a reference that asserts a genome derivation (`qiita.genome_derivation`); after the bucket-6 WoL repair, reference 18 does. (#926)
 - The checkm step reads the gene_call step's genes, from a new image, `long-read-assembly-checkm-1.0.2.sif`, which the deploy builds. **Keep `long-read-assembly-checkm-1.0.1.sif`**: 1.0.1 still names it and no spec builds it any more (`sif-build.d/checkm.env`). (#898)
 - `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise, for a ticket in a redrivable state, the refusal a submit of that work would get (403/422). The ticket is checked against its action's current definition, so a ticket stored under a version since edited in place (a tighter `context_schema`, a lower `mem_ceiling_gb`) is refused with 422 and the work must be submitted again. Scripts that re-run other users' tickets need an admin token. (#902)
