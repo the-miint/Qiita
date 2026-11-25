@@ -30,15 +30,16 @@ via `qiita_common.duckdb_miint` (single source for the `MIINT_EXTENSION_REPO` /
 
 Beside them sit `duckdb_connect`, for service code that needs no miint, and two
 helpers for any DuckDB connection the control plane uses, miint loaded or not:
-`arrow_batches` streams a result as Arrow, and `run_on_connection` runs a statement in
-a worker thread so that a cancelled caller interrupts it.
+`arrow_batches` streams a result as Arrow, `run_on_connection` runs a statement in
+a worker thread so that a cancelled caller interrupts it, and `converted_batches` is
+`arrow_batches` for async code, read through `run_on_connection`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -140,6 +141,32 @@ async def run_on_connection[T](
             except asyncio.CancelledError:
                 pass  # The cancellation being handled is re-raised below.
         raise
+
+
+async def converted_batches[T](
+    con: duckdb.DuckDBPyConnection,
+    sql: str,
+    params: Sequence[object],
+    rows_per_batch: int,
+    convert: Callable[[pa.RecordBatch], T],
+) -> AsyncIterator[T]:
+    """Yield `convert(batch)` for each non-empty batch of `arrow_batches(con, sql, ...)`.
+
+    Opening the reader, reading each batch and `convert` all run in a worker thread
+    through `run_on_connection`, so neither DuckDB nor the conversion to Python
+    objects holds the event loop the control plane serves its API from. Put the
+    per-row work of a batch (`to_pylist`, building models) in `convert`."""
+    reader = await run_on_connection(con, arrow_batches, con, sql, params, rows_per_batch)
+    done = object()
+
+    def next_converted() -> T | object:
+        for batch in reader:
+            if batch.num_rows:
+                return convert(batch)
+        return done
+
+    while (item := await run_on_connection(con, next_converted)) is not done:
+        yield item
 
 
 def _connect() -> duckdb.DuckDBPyConnection:

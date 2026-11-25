@@ -67,7 +67,7 @@ from qiita_common.qc_reasons import load_qc_reasons
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_sql
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
-from ..miint import arrow_batches, duckdb_connect, run_on_connection
+from ..miint import converted_batches, duckdb_connect, run_on_connection
 from ..problem_list import capped
 from ..repositories import require_transaction
 from ..repositories.alignment_definition import (
@@ -477,7 +477,7 @@ async def _associate_genomes(
     """
     with duckdb_connect() as duck:
         prep_select = "g.prep_sample_idx" if has_prep else "CAST(NULL AS BIGINT) AS prep_sample_idx"
-        reader = arrow_batches(
+        batches = converted_batches(
             duck,
             f"SELECT fm.feature_idx, g.genome_source, g.genome_source_id, {prep_select}"
             " FROM read_parquet(?) AS m"
@@ -485,17 +485,16 @@ async def _associate_genomes(
             " JOIN read_parquet(?) AS fm USING (sequence_hash)",
             [str(manifest_path), str(genome_map_path), str(feature_map_path)],
             _CHUNK_SIZE,
+            pa.RecordBatch.to_pydict,
         )
-        for batch in reader:
-            feat_idxs = batch.column("feature_idx").to_pylist()
-            if not feat_idxs:
-                continue
-            sources = batch.column("genome_source").to_pylist()
-            source_ids = batch.column("genome_source_id").to_pylist()
-            prep_sample_idxs = batch.column("prep_sample_idx").to_pylist()
+        async for cols in batches:
             async with pool.acquire() as conn, conn.transaction():
                 await _write_genome_associations(
-                    conn, feat_idxs, sources, source_ids, prep_sample_idxs
+                    conn,
+                    cols["feature_idx"],
+                    cols["genome_source"],
+                    cols["genome_source_id"],
+                    cols["prep_sample_idx"],
                 )
 
 
@@ -592,8 +591,9 @@ async def mint_features(
     Streaming is deliberate: this primitive runs in-process on the control
     plane's single event loop, so it must never materialise the whole hash
     set (a genome-scale reference is tens of millions of rows). Each batch is
-    bounded, the per-batch upsert `await`s, and the per-batch feature_map insert
-    and the final Parquet write run in a worker thread (`run_on_connection`).
+    bounded, the per-batch upsert `await`s, and the manifest read
+    (`converted_batches`), the per-batch feature_map insert and the final Parquet
+    write run in a worker thread (`run_on_connection`).
     Mirrors the streaming contract `write_membership` already follows.
 
     Returns (feature_map_path, minted, reused). `minted` counts novel
@@ -646,17 +646,16 @@ async def mint_features(
         # upsert), and an ORDER BY would force a full blocking sort before the
         # first batch, defeating the streaming. The output is separately
         # ordered by feature_idx at COPY time.
-        reader = arrow_batches(
+        batches = converted_batches(
             read_conn,
             "SELECT sequence_hash FROM read_parquet(?)",
             [str(manifest_path)],
             _MINT_CHUNK_SIZE,
+            lambda batch: [
+                FeatureHashEntry(sequence_hash=h) for h in batch.column("sequence_hash").to_pylist()
+            ],
         )
-        for batch in reader:
-            raw_hashes = batch.column("sequence_hash").to_pylist()
-            if not raw_hashes:
-                continue
-            entries = [FeatureHashEntry(sequence_hash=h) for h in raw_hashes]
+        async for entries in batches:
             async with pool.acquire() as conn, conn.transaction():
                 chunk_mapping, minted, reused = await _mint_chunk(conn, entries)
             total_minted += minted
@@ -828,7 +827,7 @@ async def _write_annotation_claims(
             return out_path
 
         read_conn.execute("SET preserve_insertion_order=false")
-        reader = arrow_batches(
+        batches = converted_batches(
             read_conn,
             "SELECT afm.feature_idx, "
             "       fm.feature_idx AS parent_feature_idx, "
@@ -843,14 +842,12 @@ async def _write_annotation_claims(
                 str(feature_map_path),
             ],
             _CHUNK_SIZE,
+            pa.RecordBatch.to_pydict,
         )
 
         resolved = 0
-        for batch in reader:
-            if not batch.num_rows:
-                continue
-            resolved += batch.num_rows
-            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
+        async for cols in batches:
+            resolved += len(cols["feature_idx"])
             async with pool.acquire() as conn, conn.transaction():
                 rows = await conn.fetch(
                     "INSERT INTO qiita.reference_annotation"
@@ -1038,11 +1035,10 @@ async def _write_annotation_terms(
         params = [str(annotation_manifest_path), str(feature_map_path)]
 
         # PASS 1 — the terms themselves.
-        terms = arrow_batches(read_conn, _term_grain_sql(), params, _CHUNK_SIZE)
-        for batch in terms:
-            if not batch.num_rows:
-                continue
-            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
+        terms = converted_batches(
+            read_conn, _term_grain_sql(), params, _CHUNK_SIZE, pa.RecordBatch.to_pydict
+        )
+        async for cols in terms:
             async with pool.acquire() as conn, conn.transaction():
                 await conn.execute(
                     "INSERT INTO qiita.annotation_term (system, system_id, definition)"
@@ -1058,12 +1054,11 @@ async def _write_annotation_terms(
                 )
 
         # PASS 2 — the links, now that every term they name is resolvable.
-        links = arrow_batches(read_conn, _link_grain_sql(), params, _CHUNK_SIZE)
+        links = converted_batches(
+            read_conn, _link_grain_sql(), params, _CHUNK_SIZE, pa.RecordBatch.to_pydict
+        )
         linked = 0
-        for batch in links:
-            if not batch.num_rows:
-                continue
-            cols = {n: batch.column(n).to_pylist() for n in batch.schema.names}
+        async for cols in links:
             async with pool.acquire() as conn, conn.transaction():
                 # Resolve BOTH sides by their natural keys in one statement: the
                 # occurrence by (reference, parent, window, type, strand) and the term by
@@ -1108,9 +1103,10 @@ async def _write_annotation_terms(
                 # FIRST-run shortfall is detectable here — but a natural-key spelling that
                 # drifts from the UPSERT's would silently resolve NOTHING on a first run,
                 # leaving a reference whose annotations cite no terms at all. Catch that.
-                if written == 0 and batch.num_rows and not await _links_exist(conn, reference_idx):
+                proposed = len(cols["system"])
+                if written == 0 and not await _links_exist(conn, reference_idx):
                     raise ValueError(
-                        f"reference {reference_idx}: {batch.num_rows} annotation-term link(s) "
+                        f"reference {reference_idx}: {proposed} annotation-term link(s) "
                         "resolved to nothing — the natural key used to look up an annotation "
                         "no longer matches the one it was minted against"
                     )
@@ -1257,23 +1253,20 @@ async def write_membership(
     total_seen = 0
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
-            reader = arrow_batches(
+            batches = converted_batches(
                 duck,
                 MEMBERSHIP_ACCESSION_JOIN_SQL,
                 [str(feature_map_path), str(manifest_path)],
                 _CHUNK_SIZE,
+                pa.RecordBatch.to_pydict,
             )
-            for batch in reader:
-                feature_idxs = batch.column("feature_idx").to_pylist()
-                if not feature_idxs:
-                    continue
-                accessions = batch.column("accession").to_pylist()
+            async for cols in batches:
                 async with conn.transaction():
                     chunk_linked = await _write_membership_rows(
-                        conn, reference_idx, feature_idxs, accessions
+                        conn, reference_idx, cols["feature_idx"], cols["accession"]
                     )
                 total_linked += chunk_linked
-                total_seen += len(feature_idxs)
+                total_seen += len(cols["feature_idx"])
     # Outside the pool and the reader: a report-only aggregate has no claim on a
     # pooled connection, and `mint_features` sets the precedent for keeping a
     # blocking DuckDB step off the loop the CP also serves its API from.
@@ -1896,27 +1889,29 @@ async def write_assembly_membership(
     async with pool.acquire() as conn:
         with duckdb_connect() as duck:
             register_contig_attribute_table(duck, genomes_dir / CONTIG_ATTRIBUTES_FILE)
-            reader = arrow_batches(
-                duck,
-                ASSEMBLY_MEMBERSHIP_JOIN_SQL,
-                [str(bin_map_path), str(manifest_path), str(feature_map_path)],
-                _CHUNK_SIZE,
-            )
-            for batch in reader:
-                kinds = batch.column("kind").to_pylist()
-                if not kinds:
-                    continue
-                bin_ids = batch.column("bin_id").to_pylist()
-                feature_idxs = batch.column("feature_idx").to_pylist()
-                source_ids = [
+
+            def _with_source_ids(batch: pa.RecordBatch) -> dict[str, list[Any]]:
+                cols = batch.to_pydict()
+                cols["source_id"] = [
                     assembly_genome_source_id(
                         prep_sample_idx=prep_sample_idx,
                         processing_idx=processing_idx,
                         kind=kind,
                         bin_id=bin_id,
                     )
-                    for kind, bin_id in zip(kinds, bin_ids, strict=True)
+                    for kind, bin_id in zip(cols["kind"], cols["bin_id"], strict=True)
                 ]
+                return cols
+
+            batches = converted_batches(
+                duck,
+                ASSEMBLY_MEMBERSHIP_JOIN_SQL,
+                [str(bin_map_path), str(manifest_path), str(feature_map_path)],
+                _CHUNK_SIZE,
+                _with_source_ids,
+            )
+            async for cols in batches:
+                source_ids = cols["source_id"]
                 # One transaction over both writes: a genome with no row pointing at
                 # it is unreachable (nothing else records which run minted it), and a
                 # row whose genome vanished is the NULL the column comment warns about.
@@ -1931,14 +1926,14 @@ async def write_assembly_membership(
                         conn,
                         prep_sample_idx=prep_sample_idx,
                         processing_idx=processing_idx,
-                        kinds=kinds,
-                        bin_ids=bin_ids,
-                        feature_idxs=feature_idxs,
+                        kinds=cols["kind"],
+                        bin_ids=cols["bin_id"],
+                        feature_idxs=cols["feature_idx"],
                         genome_idxs=genome_idxs,
-                        raw_names=batch.column("raw_name").to_pylist(),
-                        circularities=batch.column("circularity").to_pylist(),
-                        depths=batch.column("depth").to_pylist(),
-                        mults=batch.column("mult").to_pylist(),
+                        raw_names=cols["raw_name"],
+                        circularities=cols["circularity"],
+                        depths=cols["depth"],
+                        mults=cols["mult"],
                     )
                 total_written += written
     await asyncio.to_thread(

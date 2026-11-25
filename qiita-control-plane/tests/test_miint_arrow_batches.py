@@ -13,7 +13,7 @@ import pytest
 
 from qiita_control_plane.actions.library import _CHUNK_SIZE
 from qiita_control_plane.cli.reference_load import _CHUNK_ROWS_PER_BATCH
-from qiita_control_plane.miint import arrow_batches
+from qiita_control_plane.miint import arrow_batches, converted_batches
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -77,3 +77,38 @@ def test_each_project_errors_on_arrow_from_execute(project):
         and re.match(message, emitted, re.IGNORECASE)
         for action, message, category in (entry.split(":") for entry in entries)
     ), f"{project}: no filterwarnings entry errors on {emitted!r}"
+
+
+async def test_converted_batches_convert_each_non_empty_batch_off_the_event_loop():
+    """`convert` sees every row once, never an empty batch, and runs on a thread other
+    than the event loop's; so does the read, which runs beside it."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    convert_threads: list[int] = []
+
+    def convert(batch):
+        assert batch.num_rows
+        convert_threads.append(threading.get_ident())
+        return batch.column("x").to_pylist()
+
+    con = duckdb.connect()
+    got = [
+        chunk
+        async for chunk in converted_batches(
+            con, "SELECT range AS x FROM range(?) WHERE range % 2 = 0", [10], 2, convert
+        )
+    ]
+    assert [x for chunk in got for x in chunk] == [0, 2, 4, 6, 8]
+    assert convert_threads and loop_thread not in convert_threads
+
+
+async def test_converted_batches_of_an_empty_result_yield_nothing():
+    con = duckdb.connect()
+    got = [
+        chunk
+        async for chunk in converted_batches(
+            con, "SELECT range AS x FROM range(0)", [], 2, lambda b: b.num_rows
+        )
+    ]
+    assert got == []
