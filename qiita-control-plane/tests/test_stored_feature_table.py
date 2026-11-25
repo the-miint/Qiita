@@ -113,7 +113,7 @@ def test_no_internal_identifier_reaches_the_output():
 def test_a_value_of_an_unnamed_sample_is_refused():
     # The shared relabel refuses it: the value's sample has no label, so it would carry a
     # NULL sample_id — the same check the OGU table runs, not a second one.
-    with pytest.raises(ValueError, match="NULL sample_id"):
+    with pytest.raises(ValueError, match="processed sample with no public handle"):
         build_coo(
             _cohort("QM1"),
             _membership([(2, 10, 5)]),

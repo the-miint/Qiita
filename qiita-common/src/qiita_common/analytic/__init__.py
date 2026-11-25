@@ -1,11 +1,9 @@
 """The analytic export surface, as SQL text.
 
-Two consumers run this same analytic and must not disagree about it: the
-compute-orchestrator native job `estimate_feature_table` (server-side, reached
-through a work ticket) and the client-side feature-table recipe (a user's machine,
-composing the analytic-export routes). They differ in everything *around* the
-analytic — where the inputs come from, how the result is written — so the SQL lives
-here and the streaming and I/O stay with each caller.
+Every caller that builds or publishes a feature table runs this one analytic, so they
+cannot disagree about it. Callers differ in everything *around* the analytic, such as
+where the inputs come from and how the result is written, so the SQL lives here and
+the streaming and I/O stay with each caller.
 
 They disagree about the analytic in exactly one place: `denovo_map_statements` gates
 the de novo arm on CheckM scores, and a client-built combined table calls
@@ -36,9 +34,9 @@ The modules, in the order a recipe reaches them:
 | `reconcile` | the de novo arm's own relations, and precedence between the two arms |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
 | `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
-| `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
+| `ogu` | `woltka_ogu`'s input and output, for the table computed from alignments |
 | `label` | the relabel to public handles |
-| `sidecar` | the taxonomy sidecar and the sheared tree |
+| `sidecar` | the companions: the taxonomy sidecar, the sheared tree, the sequences |
 | `write` | the Parquet / BIOM / tree writers |
 """
 

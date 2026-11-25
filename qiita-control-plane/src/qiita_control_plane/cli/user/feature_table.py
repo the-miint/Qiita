@@ -959,12 +959,12 @@ MANIFEST_NOTE = (
 
 
 class _Companion(NamedTuple):
-    """An optional bundle member: the flag that asks for one, the suffix it lands at, and
-    the COPY that writes it.
+    """A bundle member beside the table: its name, the suffix it lands at, and the COPY
+    that writes it.
 
-    One record read by both halves — `_bundle_targets` needs the suffixes from the flags
-    alone, since it runs before anything has been computed, and `_write_bundle` needs the
-    writers — so a member cannot be reserved a path and then not written, and adding one
+    One record read by both halves — `_bundle_targets` needs the suffixes of the members
+    asked for, since it runs before anything has been computed, and `_write_bundle` needs
+    the writers — so a member cannot be reserved a path and then not written, and adding one
     is a line here rather than a third positional index at each site.
     """
 

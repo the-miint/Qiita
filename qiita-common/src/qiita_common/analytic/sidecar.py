@@ -1,7 +1,7 @@
-"""The two optional companions to a published table: the taxonomy sidecar and the
-sheared tree.
+"""The companions to a published table: the taxonomy sidecar, the sheared tree, and each
+feature's sequence.
 
-Both are named from the same `exported_feature` mint the table's rows are, so
+Each is named from the same `exported_feature` mint the table's rows are, so
 `feature_id` is the join key across the bundle — which is what makes them joinable to
 the table rather than merely shipped beside it.
 """

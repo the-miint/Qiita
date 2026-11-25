@@ -3,8 +3,7 @@
 **A caller that PUBLISHES the table stages two more relations** — the label
 relations — and relabels the counts through them, ending at `LABELLED_RELATION`
 (`LABELLED_SCHEMA`): our `*_idx` keys are gone, and the public handles are VARCHAR,
-which is what makes the result writable as BIOM at all. `LABELLED_RELATION` is the
-only relation in this package the writers will copy.
+which is what makes the result writable as BIOM at all.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ class RelabelAxis:
     `feature_key` is a row's internal key, and `sample_key` the column(s) naming a
     column: one `prep_sample_idx`, or `(processing_idx, prep_sample_idx)` where a table
     merges runs and the same prep_sample in two runs is two processed samples.
-    `feature_noun` and `unlabelled_feature_hint` are what a refusal says about a row.
+    The nouns and hints are what a refusal says about a row or a column.
     """
 
     output: str = OGU_OUTPUT_TABLE
@@ -58,6 +57,11 @@ class RelabelAxis:
         "The exported-feature mint has to cover every genome the counts mention — mint it "
         "for the genomes the roll-up actually emitted, not for a set resolved before the "
         "coverage filter ran"
+    )
+    sample_noun: str = "prep_sample"
+    unlabelled_sample_hint: str = (
+        "The exported-identifier map has to cover the whole cohort the counts were "
+        "streamed for — mint it for the same prep_sample list"
     )
 
 
@@ -73,6 +77,8 @@ FEATURE_AXIS = RelabelAxis(
     sample_key=("processing_idx", "prep_sample_idx"),
     feature_noun="feature",
     unlabelled_feature_hint="The exported-feature mint has to cover every feature the values name",
+    sample_noun="processed sample",
+    unlabelled_sample_hint="Every processed sample the values name needs its QM",
 )
 
 
@@ -235,10 +241,9 @@ def check_relabel_diagnostics(
         )
     if unlabelled_sample_rows:
         raise ValueError(
-            f"{unlabelled_sample_rows} of {output_rows} rows name a sample with no "
-            f"public handle, so the published table would carry a NULL sample_id. The "
-            f"exported-identifier map has to cover the whole cohort the counts were "
-            f"streamed for — mint it for the same prep_sample list."
+            f"{unlabelled_sample_rows} of {output_rows} rows name a {axis.sample_noun} "
+            f"with no public handle, so the published table would carry a NULL "
+            f"sample_id. {axis.unlabelled_sample_hint}."
         )
 
     if feature_ids < features:
@@ -254,10 +259,10 @@ def check_relabel_diagnostics(
         )
     if sample_ids < samples:
         raise ValueError(
-            f"{samples} samples in this table share only {sample_ids} distinct "
-            f"export_ids, so relabelling merges samples. An export_id is minted per "
-            f"processed sample and cannot repeat, so the sample labels were staged from "
-            f"something other than the exported-identifier mint."
+            f"{samples} {axis.sample_noun}s in this table share only {sample_ids} distinct "
+            f"export_ids, so relabelling merges {axis.sample_noun}s. An export_id is "
+            f"minted once and cannot repeat, so the labels were staged from something "
+            f"other than the exported-identifier mint."
         )
 
     return LabelClearance(rows=labelled_rows)

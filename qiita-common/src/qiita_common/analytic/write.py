@@ -1,4 +1,4 @@
-"""Writing the published artifacts out: the table, and the two sidecars.
+"""Writing the published artifacts out: the table and its companions.
 
 Every COPY target is a SQL string literal, which cannot be bound, so each writer
 validates the path it interpolates (`validate_parquet_path`).
