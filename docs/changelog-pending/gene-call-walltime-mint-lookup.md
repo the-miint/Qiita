@@ -1,7 +1,7 @@
 ### Fixed
 
 - **`gene_call` gets a 4 h walltime, and feature minting looks up `qiita.feature` in
-  smaller batches with a longer timeout (#N).** long-read-assembly 1.0.2's and
+  smaller batches with a longer timeout (#950).** long-read-assembly 1.0.2's and
   assembly-gene-call-recover 1.0.0's `gene_call` step goes from `PT2H` to `PT4H` (both
   edited in place). Every action that mints through `mint_features` (`mint-features`,
   `mint-gene-features`, `mint-annotation-features`) now looks up and inserts
