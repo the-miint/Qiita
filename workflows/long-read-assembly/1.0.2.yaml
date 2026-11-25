@@ -353,9 +353,9 @@ steps:
   # genes.faa / genes.gff that the checkm step hands CheckM; `gene_manifest` is the gene rows,
   # for mint-gene-features. Here, after bin_refine, because it reads only what
   # assembly_hash reads. cpu and mem_gb are assembly_hash's, not measured for this
-  # step. walltime PT4H: of five assembly-gene-call-recover runs of this job on
-  # 4 CPUs (SLURM Elapsed), four finished at 2 h 09 min, 2 h 09 min, 2 h 24 min and
-  # 2 h 41 min; the fifth was still running at 2 h 46 min.
+  # step. walltime PT4H is 1.44x the longest of five assembly-gene-call-recover runs
+  # of this job on 4 CPUs (SLURM Elapsed: 2 h 09 min, 2 h 09 min, 2 h 24 min,
+  # 2 h 41 min, 2 h 47 min).
   - step: gene_call
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.gene_call
