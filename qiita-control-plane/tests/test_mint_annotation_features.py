@@ -100,12 +100,26 @@ async def test_no_gff_still_writes_a_typed_empty_annotation_map(postgres_pool, t
     )
 
 
-async def test_mints_annotation_idx_terms_and_links(postgres_pool, tmp_path):
+async def test_mints_annotation_idx_terms_and_links(postgres_pool, tmp_path, monkeypatch):
     """The populated path. One interval carrying THREE cross-references in one Dbxref —
     the shape NCBI actually emits (4816 features of E. coli RefSeq carry three, 4161
-    carry five) — must produce three terms and three links, not one.
+    carry five) — must produce three terms and three links, not one. The feature_map and
+    annotation_map appends run on a thread other than the event loop's.
     """
+    import threading
+
+    from qiita_control_plane.actions import library as lib
     from qiita_control_plane.actions.library import mint_annotation_features
+
+    loop_thread = threading.get_ident()
+    appends: list[tuple[str, int]] = []
+    real_append = lib._append_arrow
+
+    def _recording_append(con, table, batch):
+        appends.append((table, threading.get_ident()))
+        real_append(con, table, batch)
+
+    monkeypatch.setattr(lib, "_append_arrow", _recording_append)
 
     reference_idx = await _reference(postgres_pool)
     parent_hash, interval_hash = uuid.uuid4(), uuid.uuid4()
@@ -146,6 +160,8 @@ async def test_mints_annotation_idx_terms_and_links(postgres_pool, tmp_path):
     )
 
     assert minted == 1  # the interval's own feature_idx
+    assert {table for table, _ in appends} == {"feature_map", "annotation_map"}
+    assert loop_thread not in {thread for _, thread in appends}
     (mapped,) = _rows(annotation_map)
     assert mapped["parent_feature_idx"] == parent_feature_idx
     assert (mapped["position"], mapped["stop_position"]) == (2001, 3001)

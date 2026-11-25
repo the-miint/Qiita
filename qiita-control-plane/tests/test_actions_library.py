@@ -1106,14 +1106,14 @@ async def test_mint_features_appends_each_batch_off_the_event_loop(monkeypatch, 
 
     loop_thread = threading.get_ident()
     append_threads: list[int] = []
-    real_append = lib._append_feature_map
+    real_append = lib._append_arrow
 
-    def _recording_append(con, mapping):
+    def _recording_append(con, table, batch):
         append_threads.append(threading.get_ident())
-        real_append(con, mapping)
+        real_append(con, table, batch)
 
     monkeypatch.setattr(lib, "_mint_chunk", _fake_mint_chunk)
-    monkeypatch.setattr(lib, "_append_feature_map", _recording_append)
+    monkeypatch.setattr(lib, "_append_arrow", _recording_append)
     monkeypatch.setattr(lib, "_MINT_CHUNK_SIZE", 2)
 
     path, _, _ = await lib.mint_features(_FakeExclusionPool(), manifest, tmp_path / "out")

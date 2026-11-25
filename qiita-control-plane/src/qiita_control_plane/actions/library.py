@@ -147,6 +147,18 @@ _CHUNK_SIZE = 10_000
 _MINT_CHUNK_SIZE = 2_000
 _MINT_STATEMENT_TIMEOUT_SECONDS = 60.0
 
+# `mint_annotation_features`' annotation_map columns, in table order: the order its
+# per-batch Arrow append is built in.
+_ANNOTATION_MAP_COLUMNS = (
+    "annotation_idx",
+    "feature_idx",
+    "parent_feature_idx",
+    "position",
+    "stop_position",
+    "annotation_type",
+    "strand",
+)
+
 # How many collapsed record groups the membership warning names before it says it
 # cut the list. Same name and value as runner/_reference.py and
 # runner/_feature_table.py, which cap their own reports.
@@ -240,23 +252,20 @@ async def _mint_chunk(
     return mapping, len(new_map), len(existing_map) + concurrent_reused
 
 
-def _append_feature_map(con: duckdb.DuckDBPyConnection, mapping: dict[UUID, int]) -> None:
-    """Append one batch's `sequence_hash -> feature_idx` pairs to `con`'s `feature_map`
-    temp table in one Arrow insert.
+def _append_arrow(con: duckdb.DuckDBPyConnection, table: str, batch: pa.Table) -> None:
+    """Append `batch`, its columns in `table`'s order, to `con`'s `table` in one Arrow
+    insert. Measured on DuckDB 2.0.0 (macOS), 2,000 rows into a two-column table: a
+    per-row `executemany` took 350 ms, this insert 2.3 ms."""
+    con.from_arrow(batch).insert_into(table)
 
-    `mint_features` calls it through `run_on_connection`, so the insert runs in a
-    worker thread. On 2026-11-25, with five gene-call mints running at once, the
-    control plane's `/health` timed out; five `py-spy dump`s of its main thread, two
-    seconds apart, were all in a per-row `executemany` of this insert on the event
-    loop. Measured on DuckDB 2.0.0 (macOS), 2,000 rows: `executemany` 350 ms, this
-    insert 2.3 ms."""
-    batch = pa.table(
+
+def _feature_map_batch(mapping: dict[UUID, int]) -> pa.Table:
+    return pa.table(
         {
-            "sequence_hash": pa.array([str(h) for h in mapping], pa.string()),
+            "sequence_hash": pa.array([h.bytes for h in mapping], pa.uuid()),
             "feature_idx": pa.array(list(mapping.values()), pa.int64()),
         }
     )
-    con.from_arrow(batch).insert_into("feature_map")
 
 
 async def upsert_genomes(
@@ -578,9 +587,8 @@ async def mint_features(
     Streaming is deliberate: this primitive runs in-process on the control
     plane's single event loop, so it must never materialise the whole hash
     set (a genome-scale reference is tens of millions of rows). Each batch is
-    bounded, the per-batch upsert `await`s (yielding the loop), and the per-batch
-    feature_map insert and the final Parquet write run in a worker thread
-    (`run_on_connection`).
+    bounded, the per-batch upsert `await`s, and the per-batch feature_map insert
+    and the final Parquet write run in a worker thread (`run_on_connection`).
     Mirrors the streaming contract `write_membership` already follows.
 
     Returns (feature_map_path, minted, reused). `minted` counts novel
@@ -652,11 +660,18 @@ async def mint_features(
             # duplicates collapse here; cross-batch duplicates are collapsed by
             # SELECT DISTINCT at COPY time below.
             if chunk_mapping:
-                await run_on_connection(write_conn, _append_feature_map, write_conn, chunk_mapping)
+                # Off the event loop, which also serves the API: with five mints running
+                # on the loop, the control plane stopped answering `/health`.
+                await run_on_connection(
+                    write_conn,
+                    lambda: _append_arrow(
+                        write_conn, "feature_map", _feature_map_batch(chunk_mapping)
+                    ),
+                )
 
         out = validate_parquet_path(feature_map_path)
-        # DISTINCT + sort + Parquet encode, off the event loop like the per-batch
-        # insert. An empty manifest yields zero rows and a valid empty Parquet here.
+        # DISTINCT + sort + Parquet encode. An empty manifest yields zero rows and a
+        # valid empty Parquet here.
         await run_on_connection(
             write_conn,
             write_conn.execute,
@@ -859,20 +874,13 @@ async def _write_annotation_claims(
                     cols["score"],
                     cols["phase"],
                 )
-            write_conn.executemany(
-                "INSERT INTO annotation_map VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        r["annotation_idx"],
-                        r["feature_idx"],
-                        r["parent_feature_idx"],
-                        r["position"],
-                        r["stop_position"],
-                        r["annotation_type"],
-                        r["strand"],
-                    )
-                    for r in rows
-                ],
+            await run_on_connection(
+                write_conn,
+                lambda: _append_arrow(
+                    write_conn,
+                    "annotation_map",
+                    pa.table({c: [r[c] for r in rows] for c in _ANNOTATION_MAP_COLUMNS}),
+                ),
             )
 
         # An unresolvable interval (or parent) means the manifests disagree — the join
