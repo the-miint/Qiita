@@ -1,33 +1,42 @@
-"""A feature table request: one or more runs of one method over a cohort, and the
-processed samples that become its columns."""
+"""A feature table request: a method's stored values over a cohort, and the processed
+samples that become its columns."""
 
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    model_validator,
+)
 
 from qiita_common.models._base import PrepSampleCohort
 
 PositiveIdx = Annotated[int, Field(gt=0)]
 
-# The most runs one feature-table request may merge.
-MAX_FEATURE_TABLE_RUNS = 32
-
 # What a table's values are.
 FeatureTableValueKind = Literal["count"]
 
+# A method parameter's value. Strict, because a parameter matches a run's stored setting
+# by type as well as value: "150" is not 150.
+FeatureTableParameter = StrictBool | StrictInt | StrictFloat | StrictStr
+
 
 class FeatureTableRequest(BaseModel):
-    """Which runs, over which prep_samples: a study's, or a named list.
+    """A method's stored values over a cohort: a study's prep_samples, or a named list.
 
-    The runs merge into one table only when they are runs of one method whose features
-    compare (that method's merge keys); the route refuses the rest.
+    The server draws on the method's active runs that processed the cohort, narrowed to
+    those whose settings match `parameters`, and refuses runs that would not compare.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    processing_idx: Annotated[
-        list[PositiveIdx], Field(min_length=1, max_length=MAX_FEATURE_TABLE_RUNS)
-    ]
+    method: Annotated[str, Field(min_length=1)]
+    parameters: dict[str, FeatureTableParameter] = Field(default_factory=dict)
     study_idx: PositiveIdx | None = None
     prep_sample_idx: PrepSampleCohort | None = None
 
@@ -57,4 +66,7 @@ class FeatureTableSamples(BaseModel):
     # The runs' method (`qiita.processing.workflow`) and what its values are.
     method: str
     value_kind: FeatureTableValueKind
+    # The settings the runs share, one per parameter the method takes, whether or not
+    # the request named it; None where the runs store none.
+    parameters: dict[str, FeatureTableParameter | None]
     samples: list[FeatureTableSample]

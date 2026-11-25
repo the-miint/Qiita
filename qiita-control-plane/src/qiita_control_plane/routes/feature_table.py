@@ -1,16 +1,16 @@
-"""A feature table of stored values over REST: one cohort request, three answers.
+"""A feature table of stored values over REST: `POST /feature-table`.
 
-`POST /feature-table/{sample,value,feature}` all take the same body
-(`FeatureTableRequest`: runs, and a study or a prep_sample list) and answer:
+The body (`FeatureTableRequest`) names a method, its parameters, and a study or a
+prep_sample list; the answer is one zip (`pack_feature_table`) of:
 
-  * samples — the table's columns as JSON: each processed sample's QM (its column
-    name) and its biosample's public name (to join to metadata); with the runs' method
-    and what their values are;
-  * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
-  * features — `(feature, sequence, length, md5)` for every feature the values name:
-    its handle, its sequence and length, and the sequence's md5, as an Arrow IPC stream.
+  * the table's columns as JSON: each processed sample's QM (its column name) and its
+    biosample's public name (to join to metadata); with the method, what its values
+    are, and the settings its runs share;
+  * the values, sparse COO `(sample, feature, value)`, as an Arrow IPC stream;
+  * the features, `(feature, sequence, length, md5)` for every feature the values
+    name, as an Arrow IPC stream.
 
-What a feature table is, which runs it can merge, and why COO, is in
+What a feature table is, which runs answer it, and why COO, is in
 `stored_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets.
 
 Access is all-or-nothing over the cohort, at the tier the other cohort reads use,
@@ -26,15 +26,10 @@ import pyarrow as pa
 import pyarrow.flight as flight
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
-from qiita_common.api_paths import (
-    PATH_FEATURE_TABLE_FEATURE,
-    PATH_FEATURE_TABLE_PREFIX,
-    PATH_FEATURE_TABLE_SAMPLE,
-    PATH_FEATURE_TABLE_VALUE,
-)
+from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_ROOT
 from qiita_common.auth_constants import Scope
 from qiita_common.flight_stream import StreamRowCountMismatch
-from qiita_common.models.feature_table import FeatureTableRequest, FeatureTableSamples
+from qiita_common.models.feature_table import FeatureTableRequest
 
 from ..auth.guards import (
     COHORT_MIN_TIER,
@@ -45,14 +40,14 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
 from ..stored_feature_table import (
-    ARROW_STREAM_MEDIA_TYPE,
+    FEATURE_TABLE_MEDIA_TYPE,
     Cohort,
     CohortError,
-    arrow_stream_bytes,
     build_features,
     build_values,
     fetch_table,
     mint_feature_labels,
+    pack_feature_table,
     resolve_cohort,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -64,8 +59,8 @@ async def _authorized_cohort(
     pool: asyncpg.Pool, caller: HumanUser, request: FeatureTableRequest
 ) -> Cohort:
     # Authorize what the request names before resolving it: resolve_cohort's
-    # refusals describe the cohort (which named prep_samples the runs did not
-    # process, how many prep_samples a study holds), so a caller who may not read it
+    # refusals describe the cohort (which named prep_samples no matching run
+    # processed, how many prep_samples a study holds), so a caller who may not read it
     # is refused first. A study cohort's prep_samples are authorized again once
     # resolved, because one may also be linked to a study the caller cannot read.
     if request.study_idx is not None:
@@ -104,24 +99,8 @@ async def _read(cohort: Cohort, table: str, data_plane_url: str, signing_key: by
         ) from exc
 
 
-@router.post(PATH_FEATURE_TABLE_SAMPLE)
-async def feature_table_samples(
-    request: FeatureTableRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    caller: HumanUser = Depends(require_complete_profile),
-    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-) -> FeatureTableSamples:
-    """The table's columns: one per processed sample the request names."""
-    cohort = await _authorized_cohort(pool, caller, request)
-    return FeatureTableSamples(
-        method=cohort.source.method,
-        value_kind=cohort.source.value_kind,
-        samples=[s.column for s in cohort.samples],
-    )
-
-
-@router.post(PATH_FEATURE_TABLE_VALUE, response_class=Response)
-async def feature_table_values(
+@router.post(PATH_FEATURE_TABLE_ROOT, response_class=Response)
+async def feature_table(
     request: FeatureTableRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     signing_key: bytes = Depends(get_flight_signing_key),
@@ -129,31 +108,16 @@ async def feature_table_values(
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
-    """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
+    """The cohort's feature table: its columns, values and features, in one answer."""
     cohort = await _authorized_cohort(pool, caller, request)
-    values = await _read(cohort, cohort.source.values_table, data_plane_url, signing_key)
+    values, sequences = await asyncio.gather(
+        _read(cohort, cohort.source.values_table, data_plane_url, signing_key),
+        _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key),
+    )
     labels = await mint_feature_labels(
         pool, source=cohort.source, created_by_idx=caller.principal_idx, features=values
     )
-    table = build_values(cohort, values, labels)
-    return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
-
-
-@router.post(PATH_FEATURE_TABLE_FEATURE, response_class=Response)
-async def feature_table_features(
-    request: FeatureTableRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    signing_key: bytes = Depends(get_flight_signing_key),
-    data_plane_url: str = Depends(get_data_plane_url),
-    caller: HumanUser = Depends(require_complete_profile),
-    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-) -> Response:
-    """Every feature the values name, `(feature, sequence, length, md5)`, an Arrow IPC
-    stream — the published handle mapped to its sequence and md5."""
-    cohort = await _authorized_cohort(pool, caller, request)
-    sequences = await _read(cohort, cohort.source.sequences_table, data_plane_url, signing_key)
-    labels = await mint_feature_labels(
-        pool, source=cohort.source, created_by_idx=caller.principal_idx, features=sequences
+    body = pack_feature_table(
+        cohort, build_values(cohort, values, labels), build_features(cohort, sequences, labels)
     )
-    table = build_features(cohort, sequences, labels)
-    return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
+    return Response(body, media_type=FEATURE_TABLE_MEDIA_TYPE)

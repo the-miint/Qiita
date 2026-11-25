@@ -1,11 +1,11 @@
-"""Route tests for POST /feature-table/{sample,value,feature}.
+"""Route tests for POST /feature-table.
 
-One cohort request — runs of one method, and a study or a named prep_sample list —
-answered as the table's columns (JSON) and its values and features (Arrow IPC). The
-fixture runs are amplicon. A column is a processed sample (a live QM of one of the
-runs), named by its QM. Access is all-or-nothing over the cohort, checked before the data plane is
-read. The data-plane read is stubbed; its scope is pinned by the data plane's
-own tests.
+One request — a method, its parameters, and a study or a named prep_sample list —
+answered as one body carrying the table's columns, values and features. The fixture
+runs are amplicon. A column is a processed sample (a live QM of a matching run), named
+by its QM. Access is all-or-nothing over the cohort, checked before the data plane is
+read. The data-plane read is stubbed; its scope is pinned by the data plane's own
+tests.
 """
 
 import hashlib
@@ -18,16 +18,14 @@ from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_VISIBLE_TABLE,
     AMPLICON_SEQUENCE_TABLE,
 )
-from qiita_common.api_paths import (
-    URL_FEATURE_TABLE_FEATURE,
-    URL_FEATURE_TABLE_SAMPLE,
-    URL_FEATURE_TABLE_VALUE,
-)
+from qiita_common.api_paths import URL_FEATURE_TABLE
 from qiita_common.flight_stream import StreamRowCountMismatch
-from qiita_common.models.feature_table import MAX_FEATURE_TABLE_RUNS
 
 from qiita_control_plane.repositories.processing import mint_processing
-from qiita_control_plane.stored_feature_table import ARROW_STREAM_MEDIA_TYPE
+from qiita_control_plane.stored_feature_table import (
+    FEATURE_TABLE_MEDIA_TYPE,
+    unpack_feature_table,
+)
 
 pytestmark = pytest.mark.db
 
@@ -136,13 +134,17 @@ def _sequences() -> pa.Table:
     )
 
 
-def _arrow(resp) -> pa.Table:
-    assert resp.headers["content-type"] == ARROW_STREAM_MEDIA_TYPE
-    return pa.ipc.open_stream(resp.content).read_all()
+def _answer(resp):
+    """The body's columns (as JSON), values and features."""
+    assert resp.headers["content-type"] == FEATURE_TABLE_MEDIA_TYPE
+    samples, values, features = unpack_feature_table(resp.content)
+    return samples.model_dump(), values, features
 
 
-def _body(runs, *, study_idx=None, prep_sample_idx=None):
-    body = {"processing_idx": runs}
+def _body(*, study_idx=None, prep_sample_idx=None, method="amplicon", **parameters):
+    body = {"method": method}
+    if parameters:
+        body["parameters"] = parameters
     if study_idx is not None:
         body["study_idx"] = study_idx
     if prep_sample_idx is not None:
@@ -150,31 +152,30 @@ def _body(runs, *, study_idx=None, prep_sample_idx=None):
     return body
 
 
-async def test_counts_are_coo_named_by_qm_and_handle(role_keyed_clients, amplicon_run):
+async def _post(client, body):
+    return await client.post(URL_FEATURE_TABLE, json=body)
+
+
+async def test_one_answer_carries_the_columns_values_and_features(role_keyed_clients, amplicon_run):
     run, db = amplicon_run, role_keyed_clients["pool"]
     cohort = sorted([run["ps_a"], run["ps_b"], run["ps_c"]])
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], prep_sample_idx=cohort),
-    )
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=cohort))
     assert resp.status_code == 200, resp.text
-    table = _arrow(resp)
-    assert table.column_names == ["sample", "feature", "value"]
+    samples, values, features = _answer(resp)
     qms = [await _qm(db, run["processing_idx"], p) for p in cohort]
-    assert sorted(zip(*table.to_pydict().values(), strict=True)) == sorted(
+
+    assert samples["method"] == "amplicon"
+    assert samples["value_kind"] == "count"
+    # The settings the table's runs share, whether or not the request named them.
+    assert samples["parameters"] == {"trim": 150, "orient_primer": False}
+    assert samples["samples"] == [
+        {"export_id": qm, "biosample": await _qb(db, p)} for qm, p in zip(qms, cohort, strict=True)
+    ]
+    assert values.column_names == ["sample", "feature", "value"]
+    assert sorted(zip(*values.to_pydict().values(), strict=True)) == sorted(
         (qm, "QF77", float(i + 1)) for i, qm in enumerate(qms)
     )
-    assert run["fetched"] == [(AMPLICON_MEMBERSHIP_VISIBLE_TABLE, [run["processing_idx"]], cohort)]
-
-
-async def test_features_map_each_handle_to_sequence_and_md5(role_keyed_clients, amplicon_run):
-    run = amplicon_run
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_FEATURE,
-        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]]),
-    )
-    assert resp.status_code == 200, resp.text
-    assert _arrow(resp).to_pylist() == [
+    assert features.to_pylist() == [
         {
             "feature": "QF77",
             "sequence": ASV,
@@ -182,17 +183,11 @@ async def test_features_map_each_handle_to_sequence_and_md5(role_keyed_clients, 
             "md5": hashlib.md5(ASV.encode()).hexdigest(),
         }
     ]
-
-
-async def test_samples_join_each_column_to_its_biosample(role_keyed_clients, amplicon_run):
-    run, db = amplicon_run, role_keyed_clients["pool"]
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_SAMPLE,
-        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]]),
+    # Each table read once, under the one scope.
+    assert sorted(run["fetched"]) == sorted(
+        (t, [run["processing_idx"]], cohort)
+        for t in (AMPLICON_MEMBERSHIP_VISIBLE_TABLE, AMPLICON_SEQUENCE_TABLE)
     )
-    assert resp.status_code == 200, resp.text
-    qm = await _qm(db, run["processing_idx"], run["ps_a"])
-    assert resp.json()["samples"] == [{"export_id": qm, "biosample": await _qb(db, run["ps_a"])}]
 
 
 async def test_a_column_is_its_qm_and_the_accession_names_its_biosample(
@@ -204,79 +199,120 @@ async def test_a_column_is_its_qm_and_the_accession_names_its_biosample(
     accession = f"SAMEA{uuid.uuid4().int % 10**9}"
     await _set_accession(db, run["ps_a"], accession)
     try:
-        body = _body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]])
-        columns = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_SAMPLE, json=body)
-        values = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_VALUE, json=body)
-        assert columns.status_code == 200, columns.text
-        assert values.status_code == 200, values.text
+        resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]]))
+        assert resp.status_code == 200, resp.text
+        samples, values, _ = _answer(resp)
         qm = await _qm(db, run["processing_idx"], run["ps_a"])
-        assert columns.json()["samples"] == [{"export_id": qm, "biosample": accession}]
-        assert set(_arrow(values).column("sample").to_pylist()) == {qm}
+        assert samples["samples"] == [{"export_id": qm, "biosample": accession}]
+        assert set(values.column("sample").to_pylist()) == {qm}
     finally:
         await _set_accession(db, run["ps_a"], None)
 
 
-async def test_one_prep_sample_in_two_runs_is_two_columns(role_keyed_clients, amplicon_run):
-    """Merging two comparable runs that both processed ps_a: two processed samples, so
-    two columns, each under its own QM."""
+async def test_one_prep_sample_in_two_matching_runs_is_two_columns(
+    role_keyed_clients, amplicon_run
+):
+    """Two comparable runs that both processed ps_a: two processed samples, so two
+    columns, each under its own QM."""
     run, db = amplicon_run, role_keyed_clients["pool"]
     second = await _mint_run(db, run["owner_idx"], [run["ps_a"]])
     run["runs"].append(second)
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"], second], prep_sample_idx=[run["ps_a"]]),
-    )
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]]))
     assert resp.status_code == 200, resp.text
-    assert set(_arrow(resp).column("sample").to_pylist()) == {
+    assert set(_answer(resp)[1].column("sample").to_pylist()) == {
         await _qm(db, run["processing_idx"], run["ps_a"]),
         await _qm(db, second, run["ps_a"]),
     }
-    assert run["fetched"] == [
-        (AMPLICON_MEMBERSHIP_VISIBLE_TABLE, sorted([run["processing_idx"], second]), [run["ps_a"]])
-    ]
+    assert {(t, tuple(r)) for t, r, _ in run["fetched"]} == {
+        (t, tuple(sorted([run["processing_idx"], second])))
+        for t in (AMPLICON_MEMBERSHIP_VISIBLE_TABLE, AMPLICON_SEQUENCE_TABLE)
+    }
 
 
-async def test_refuses_runs_whose_asvs_are_not_comparable(role_keyed_clients, amplicon_run):
+async def test_runs_that_disagree_are_refused_naming_what_to_choose(
+    role_keyed_clients, amplicon_run
+):
+    """The cohort's runs differ in trim, so their features do not compare: the refusal
+    lists each setting found, and naming one in `parameters` selects its runs."""
     run, db = amplicon_run, role_keyed_clients["pool"]
     other = await _mint_run(db, run["owner_idx"], [run["ps_a"]], trim=100)
     run["runs"].append(other)
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"], other], prep_sample_idx=[run["ps_a"]]),
-    )
+
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]]))
     assert resp.status_code == 409, resp.text
-    assert "trim" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "trim=100" in detail and "trim=150" in detail, detail
+    assert run["fetched"] == []
+
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]], trim=100))
+    assert resp.status_code == 200, resp.text
+    samples, values, _ = _answer(resp)
+    assert samples["parameters"]["trim"] == 100
+    assert set(values.column("sample").to_pylist()) == {await _qm(db, other, run["ps_a"])}
+
+
+async def test_a_parameter_matches_its_stored_type(role_keyed_clients, amplicon_run):
+    """A parameter matches a run's stored setting by value and type: "150" is not 150."""
+    run = amplicon_run
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]], trim="150"))
+    assert resp.status_code == 404, resp.text
+
+
+async def test_a_deprecated_run_is_not_selected(role_keyed_clients, amplicon_run):
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    other = await _mint_run(db, run["owner_idx"], [run["ps_a"]], trim=100)
+    run["runs"].append(other)
+    await db.execute(
+        "UPDATE qiita.processing SET status = 'deprecated', deprecated_at = now(),"
+        " deprecated_by_idx = $2, deprecation_reason = 'test'"
+        " WHERE processing_idx = $1",
+        other,
+        run["owner_idx"],
+    )
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]]))
+    assert resp.status_code == 200, resp.text
+    assert set(_answer(resp)[1].column("sample").to_pylist()) == {
+        await _qm(db, run["processing_idx"], run["ps_a"])
+    }
+
+
+async def test_more_matching_runs_than_one_table_merges_413s(
+    role_keyed_clients, amplicon_run, monkeypatch
+):
+    monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_FEATURE_TABLE_RUNS", 1)
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    run["runs"].append(await _mint_run(db, run["owner_idx"], [run["ps_a"]]))
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"]]))
+    assert resp.status_code == 413, resp.text
     assert run["fetched"] == []
 
 
-async def test_404s_a_run_that_is_not_a_feature_table_run(role_keyed_clients, amplicon_run):
-    run, db = amplicon_run, role_keyed_clients["pool"]
-    async with db.acquire() as conn:
-        other = await mint_processing(
-            conn,
-            workflow="long-read-assembly",
-            version="1.0.0",
-            params={"workflow": "long-read-assembly", "probe": str(uuid.uuid4())},
-        )
-    run["runs"].append(other["processing_idx"])
-    # A run of another method names the method it is; a missing idx says so instead.
-    for runs, fragment in (
-        ([other["processing_idx"]], "is long-read-assembly"),
-        ([2**62], "no run at"),
-    ):
-        resp = await role_keyed_clients["wet"].post(
-            URL_FEATURE_TABLE_SAMPLE, json=_body(runs, prep_sample_idx=[run["ps_a"]])
-        )
-        assert resp.status_code == 404, resp.text
-        assert fragment in resp.json()["detail"], resp.text
-
-
-async def test_a_named_sample_the_runs_did_not_count_404s(role_keyed_clients, amplicon_run):
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        ({"method": "long-read-assembly"}, "serves amplicon"),
+        ({"reference": "gg2"}, "takes the parameters"),
+    ],
+    ids=["unserved method", "unknown parameter"],
+)
+async def test_refuses_what_the_method_does_not_take(
+    role_keyed_clients, amplicon_run, body, fragment
+):
     run = amplicon_run
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"], run["ps_e"]]),
-    )
+    request = _body(prep_sample_idx=[run["ps_a"]])
+    if "method" in body:
+        request["method"] = body["method"]
+    else:
+        request["parameters"] = body
+    resp = await _post(role_keyed_clients["wet"], request)
+    assert resp.status_code == 422, resp.text
+    assert fragment in resp.json()["detail"], resp.text
+    assert run["fetched"] == []
+
+
+async def test_a_named_sample_no_matching_run_processed_404s(role_keyed_clients, amplicon_run):
+    run = amplicon_run
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[run["ps_a"], run["ps_e"]]))
     assert resp.status_code == 404, resp.text
     assert run["fetched"] == []
 
@@ -284,9 +320,8 @@ async def test_a_named_sample_the_runs_did_not_count_404s(role_keyed_clients, am
 async def test_refuses_a_partially_readable_cohort_whole(role_keyed_clients, amplicon_run):
     """The reader sees study_1 only; ps_b is study_2's. Nothing is fetched."""
     run = amplicon_run
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"], run["ps_b"]]),
+    resp = await _post(
+        role_keyed_clients["user"], _body(prep_sample_idx=[run["ps_a"], run["ps_b"]])
     )
     assert resp.status_code == 403, resp.text
     assert run["fetched"] == []
@@ -294,35 +329,28 @@ async def test_refuses_a_partially_readable_cohort_whole(role_keyed_clients, amp
 
 async def test_study_idx_names_that_studys_samples(role_keyed_clients, amplicon_run):
     run, db = amplicon_run, role_keyed_clients["pool"]
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_SAMPLE,
-        json=_body([run["processing_idx"]], study_idx=run["study_1"]),
-    )
+    resp = await _post(role_keyed_clients["user"], _body(study_idx=run["study_1"]))
     assert resp.status_code == 200, resp.text
-    assert [c["export_id"] for c in resp.json()["samples"]] == [
+    assert [c["export_id"] for c in _answer(resp)[0]["samples"]] == [
         await _qm(db, run["processing_idx"], p) for p in sorted([run["ps_a"], run["ps_c"]])
     ]
 
 
-async def test_study_idx_with_none_of_the_runs_404s(role_keyed_clients, amplicon_run):
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_SAMPLE,
-        json=_body([amplicon_run["processing_idx"]], study_idx=2**62),
-    )
+async def test_study_idx_with_no_matching_run_404s(role_keyed_clients, amplicon_run):
+    resp = await _post(role_keyed_clients["wet"], _body(study_idx=2**62))
     assert resp.status_code == 404, resp.text
 
 
-async def test_an_unreadable_named_sample_403s_before_the_uncounted_404(
+async def test_an_unreadable_named_sample_403s_before_the_unprocessed_404(
     role_keyed_clients, amplicon_run
 ):
     """The named cohort is authorized before it is resolved, so a caller who may not
     read a named prep_sample is refused 403 — never handed the 404 that enumerates
-    which named prep_samples a run did not count. ps_b is study_2 (unreadable to
-    user); ps_e is uncounted."""
+    which named prep_samples no run processed. ps_b is study_2 (unreadable to user);
+    ps_e is unprocessed."""
     run = amplicon_run
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_b"], run["ps_e"]]),
+    resp = await _post(
+        role_keyed_clients["user"], _body(prep_sample_idx=[run["ps_b"], run["ps_e"]])
     )
     assert resp.status_code == 403, resp.text
     assert run["fetched"] == []
@@ -333,10 +361,7 @@ async def test_a_study_cohort_over_the_cap_413s(role_keyed_clients, amplicon_run
     MAX_COHORT_PREP_SAMPLE_IDX is refused (413) rather than buffered into one response."""
     monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 1)
     run = amplicon_run
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], study_idx=run["study_1"]),
-    )
+    resp = await _post(role_keyed_clients["user"], _body(study_idx=run["study_1"]))
     assert resp.status_code == 413, resp.text
     assert run["fetched"] == []
 
@@ -346,13 +371,10 @@ async def test_an_unreadable_study_403s_before_it_is_resolved(
 ):
     """A study cohort is authorized before it is resolved, so a caller who may not
     read the study learns nothing of its cohort — not its size (the 413) and not
-    whether the runs processed any of it (the 404)."""
+    whether any run processed it (the 404)."""
     monkeypatch.setattr("qiita_control_plane.stored_feature_table.MAX_COHORT_PREP_SAMPLE_IDX", 0)
     run = amplicon_run
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([run["processing_idx"]], study_idx=run["study_2"]),
-    )
+    resp = await _post(role_keyed_clients["user"], _body(study_idx=run["study_2"]))
     assert resp.status_code == 403, resp.text
     assert run["fetched"] == []
 
@@ -363,11 +385,8 @@ async def test_a_readable_study_with_a_prep_sample_linked_elsewhere_403s(
     """Passing the study's own gate is not enough: ps_e is linked to study_1 (readable)
     and study_2 (not), so the resolved cohort is refused whole, before any read."""
     run, db = amplicon_run, role_keyed_clients["pool"]
-    shared = await _mint_run(db, run["owner_idx"], [run["ps_a"], run["ps_e"]])
-    run["runs"].append(shared)
-    resp = await role_keyed_clients["user"].post(
-        URL_FEATURE_TABLE_VALUE, json=_body([shared], study_idx=run["study_1"])
-    )
+    run["runs"].append(await _mint_run(db, run["owner_idx"], [run["ps_e"]]))
+    resp = await _post(role_keyed_clients["user"], _body(study_idx=run["study_1"]))
     assert resp.status_code == 403, resp.text
     assert run["fetched"] == []
 
@@ -375,15 +394,16 @@ async def test_a_readable_study_with_a_prep_sample_linked_elsewhere_403s(
 @pytest.mark.parametrize(
     "body",
     [
-        {"processing_idx": [1]},
-        {"processing_idx": [1], "study_idx": 1, "prep_sample_idx": [1]},
-        {"processing_idx": [], "study_idx": 1},
-        {"processing_idx": list(range(1, MAX_FEATURE_TABLE_RUNS + 2)), "study_idx": 1},
+        {"method": "amplicon"},
+        {"method": "amplicon", "study_idx": 1, "prep_sample_idx": [1]},
+        {"study_idx": 1},
+        {"method": "amplicon", "study_idx": 1, "parameters": {"trim": [150]}},
+        {"method": "amplicon", "study_idx": 1, "processing_idx": [1]},
     ],
-    ids=["no samples", "both cohorts", "no runs", "too many runs"],
+    ids=["no samples", "both cohorts", "no method", "non-scalar parameter", "runs named"],
 )
 async def test_rejects_a_malformed_request(role_keyed_clients, amplicon_run, body):
-    resp = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_SAMPLE, json=body)
+    resp = await _post(role_keyed_clients["wet"], body)
     assert resp.status_code == 422, resp.text
 
 
@@ -402,10 +422,7 @@ async def test_a_data_plane_failure_is_a_502(
         raise failure
 
     monkeypatch.setattr("qiita_control_plane.routes.feature_table.fetch_table", _fail)
-    resp = await role_keyed_clients["wet"].post(
-        URL_FEATURE_TABLE_VALUE,
-        json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),
-    )
+    resp = await _post(role_keyed_clients["wet"], _body(prep_sample_idx=[amplicon_run["ps_a"]]))
     assert resp.status_code == 502, resp.text
 
 
@@ -415,25 +432,5 @@ async def test_requires_auth(role_keyed_clients, amplicon_run):
     from qiita_control_plane.main import app
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.post(
-            URL_FEATURE_TABLE_VALUE,
-            json=_body([amplicon_run["processing_idx"]], study_idx=1),
-        )
+        resp = await _post(anon, _body(study_idx=1))
     assert resp.status_code == 401, resp.text
-
-
-@pytest.mark.parametrize(
-    ("url", "table"),
-    [
-        (URL_FEATURE_TABLE_VALUE, AMPLICON_MEMBERSHIP_VISIBLE_TABLE),
-        (URL_FEATURE_TABLE_FEATURE, AMPLICON_SEQUENCE_TABLE),
-    ],
-    ids=["values", "features"],
-)
-async def test_each_route_reads_only_its_own_table(role_keyed_clients, amplicon_run, url, table):
-    run = amplicon_run
-    resp = await role_keyed_clients["wet"].post(
-        url, json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]])
-    )
-    assert resp.status_code == 200, resp.text
-    assert [t for t, _, _ in run["fetched"]] == [table]

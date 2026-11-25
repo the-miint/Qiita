@@ -1,9 +1,9 @@
 """qiita user CLI — `qiita feature-table select`, a feature table of stored values.
 
-The control plane's `/feature-table` routes answer the cohort's columns, its values as
+The control plane's `/feature-table` route answers the cohort's columns, its values as
 sparse COO `(sample, feature, value)` and its features' sequences, and this writes them
-as a bundle with `feature-table build`'s writer. The routes are the one implementation;
-this writes what they answer.
+as a bundle with `feature-table build`'s writer. The route is the one implementation;
+this writes what it answers.
 
 The table is written straight from its COO rows — BIOM and Parquet both take
 `(feature_id, sample_id, value)` — so it is never made dense on the way to disk.
@@ -13,21 +13,17 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from qiita_common import analytic as ft
-from qiita_common.api_paths import (
-    PATH_FEATURE_TABLE_FEATURE,
-    PATH_FEATURE_TABLE_PREFIX,
-    PATH_FEATURE_TABLE_SAMPLE,
-    PATH_FEATURE_TABLE_VALUE,
-)
+from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_ROOT
 from qiita_common.duckdb_relation import registered
 from qiita_common.models.feature_table import FeatureTableRequest
 
-from ...stored_feature_table import ARROW_STREAM_MEDIA_TYPE, SOURCES
+from ...stored_feature_table import FEATURE_TABLE_MEDIA_TYPE, SOURCES, unpack_feature_table
 from .. import _common
 from .feature_table import (
     _bundle_targets,
@@ -37,10 +33,10 @@ from .feature_table import (
 )
 
 MANIFEST_NOTE = (
-    "This file records what produced the table beside it: the runs and the samples it"
-    " was built over. A feature table is a selection over the lake, so the same runs"
-    " over a different cohort yield a different table — which is why this record is"
-    " part of the bundle."
+    "This file records what produced the table beside it: the method, the settings its"
+    " runs share, and the samples it was built over. A feature table is a selection"
+    " over the lake, so the same method over a different cohort yields a different"
+    " table — which is why this record is part of the bundle."
 )
 MAP_NOTE = (
     "This file maps each column of the table beside it, named by its QM (export_id), to"
@@ -48,28 +44,31 @@ MAP_NOTE = (
 )
 
 
+def _parameter(text: str) -> tuple[str, Any]:
+    """`KEY=VALUE`, with VALUE read as JSON where it parses (150, false) and as a string
+    otherwise, since a parameter matches a run's setting by type."""
+    key, sep, value = text.partition("=")
+    if not sep or not key:
+        raise ValueError(f"--parameter takes KEY=VALUE, not {text!r}")
+    try:
+        return key, json.loads(value)
+    except json.JSONDecodeError:
+        return key, value
+
+
 def _request(args: argparse.Namespace) -> FeatureTableRequest:
     return FeatureTableRequest(
-        processing_idx=args.processing_idx,
+        method=args.method,
+        parameters=dict(_parameter(p) for p in args.parameter or ()),
         study_idx=args.study_idx,
         prep_sample_idx=args.prep_sample_idx,
     )
 
 
-def _arrow(args: argparse.Namespace, token: str, path: str, request: dict[str, Any]):
-    """One of the cohort's Arrow IPC answers, with dictionary columns decoded."""
+def _decoded(table):
+    """`table` with its dictionary columns decoded to their values."""
     import pyarrow as pa  # noqa: PLC0415
 
-    body, content_type = _common.fetch_binary(
-        args.base_url,
-        token,
-        f"{PATH_FEATURE_TABLE_PREFIX}{path}",
-        accept=ARROW_STREAM_MEDIA_TYPE,
-        json=request,
-    )
-    if not content_type.startswith(ARROW_STREAM_MEDIA_TYPE):
-        raise RuntimeError(f"{path} answered {content_type!r}, not an Arrow stream")
-    table = pa.ipc.open_stream(body).read_all()
     return pa.table(
         {
             name: (col.cast(col.type.value_type) if pa.types.is_dictionary(col.type) else col)
@@ -79,18 +78,18 @@ def _arrow(args: argparse.Namespace, token: str, path: str, request: dict[str, A
 
 
 def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[str, int]]:
-    """Fetch the cohort's columns, values and features, and write the bundle."""
-    request = _request(args).model_dump(exclude_none=True)
-    columns = _common.call(
-        "POST",
+    """Fetch the cohort's table and write the bundle."""
+    body, content_type = _common.fetch_binary(
         args.base_url,
         token,
-        f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_SAMPLE}",
-        json=request,
+        f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_ROOT}",
+        accept=FEATURE_TABLE_MEDIA_TYPE,
+        json=_request(args).model_dump(exclude_none=True, exclude_defaults=True),
     )
-    method = columns["method"]
-    values = _arrow(args, token, PATH_FEATURE_TABLE_VALUE, request)
-    features = _arrow(args, token, PATH_FEATURE_TABLE_FEATURE, request)
+    if not content_type.startswith(FEATURE_TABLE_MEDIA_TYPE):
+        raise RuntimeError(f"/feature-table answered {content_type!r}, not a feature table")
+    columns, values, features = unpack_feature_table(body)
+    values, features = _decoded(values), _decoded(features)
     with registered(con, "stored_values", values):
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
@@ -116,16 +115,19 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         )
     )
 
+    identifiers = [s.model_dump() for s in columns.samples]
+
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
             "note": MANIFEST_NOTE,
-            "kind": method,
-            "value_kind": columns["value_kind"],
-            "feature_id": SOURCES[method].feature_id_note,
+            "kind": columns.method,
+            "value_kind": columns.value_kind,
+            "parameters": columns.parameters,
+            "feature_id": SOURCES[columns.method].feature_id_note,
             # Each column's QM, not the request's idxs: a published manifest carries
             # only handles a reader can resolve. Sorted so the record does not depend
             # on the order the samples came back in.
-            "cohort": sorted(s["export_id"] for s in columns["samples"]),
+            "cohort": sorted(s["export_id"] for s in identifiers),
             **sizes,
             "files": [p.name for p in targets],
             "versions": _tool_versions(con),
@@ -135,7 +137,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         con,
         table_path=args.output,
         fmt=args.format,
-        identifiers=columns["samples"],
+        identifiers=identifiers,
         manifest=manifest,
         clearances={"sequences": sequences},
         map_note=MAP_NOTE,

@@ -2,6 +2,8 @@
 fixture runs are amplicon."""
 
 import hashlib
+import io
+import zipfile
 
 import pyarrow as pa
 import pytest
@@ -11,9 +13,10 @@ from qiita_control_plane.stored_feature_table import (
     SOURCES,
     Cohort,
     ProcessedSample,
-    arrow_stream_bytes,
     build_features,
     build_values,
+    pack_feature_table,
+    unpack_feature_table,
 )
 
 
@@ -26,6 +29,7 @@ def _cohort(*names):
     return Cohort(
         source=SOURCES["amplicon"],
         runs=[7],
+        parameters={"trim": 150, "orient_primer": False},
         samples=[
             ProcessedSample(
                 processing_idx=7,
@@ -130,14 +134,30 @@ def test_a_feature_without_a_handle_is_refused():
         )
 
 
-def test_the_values_round_trip_through_an_arrow_stream():
-    values, _ = build_coo(
-        _cohort("QM1"),
+def test_the_table_round_trips_through_one_body():
+    cohort = _cohort("QM1")
+    values, features = build_coo(
+        cohort,
         _membership([(1, 10, 5)]),
         _sequences([(10, "ACGT")]),
         _labels([(10, "QF10")]),
     )
-    assert pa.ipc.open_stream(arrow_stream_bytes(values)).read_all().equals(values)
+    samples, values_back, features_back = unpack_feature_table(
+        pack_feature_table(cohort, values, features)
+    )
+    assert samples.method == "amplicon"
+    assert samples.parameters == {"trim": 150, "orient_primer": False}
+    assert [s.export_id for s in samples.samples] == ["QM1"]
+    assert values_back.equals(values)
+    assert features_back.equals(features)
+
+
+def test_a_body_without_every_part_is_refused():
+    sink = io.BytesIO()
+    with zipfile.ZipFile(sink, "w") as zf:
+        zf.writestr("samples.json", "{}")
+    with pytest.raises(ValueError, match="values.arrows"):
+        unpack_feature_table(sink.getvalue())
 
 
 async def test_features_are_named_by_the_methods_own_mint():

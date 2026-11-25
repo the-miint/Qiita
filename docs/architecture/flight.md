@@ -422,13 +422,15 @@ reproducibility key.
 
 ### The stored-value feature table
 
-`POST /feature-table/{sample,value,feature}` (and `qiita feature-table select`, which
-writes what they answer) serve the other kind of feature table: one whose values a run
-already stored, one per (processed sample, feature), so the table is a selection rather
-than a computation. The methods that store values this way are `SOURCES` in
-`stored_feature_table.py`; amplicon is one. Because nothing has to be computed over the
-cohort, the control plane reads the values over Flight, relabels them in its own DuckDB
+`POST /feature-table` (and `qiita feature-table select`, which writes what it answers)
+serves the other kind of feature table: one whose values a run already stored, one per
+(processed sample, feature), so the table is a selection rather than a computation. The
+methods that store values this way are `SOURCES` in `stored_feature_table.py`; amplicon
+is one. The request names a method, its parameters and a cohort, never a run; the
+control plane chooses the method's matching runs. Because nothing has to be computed
+over the cohort, it reads the values over Flight, relabels them in its own DuckDB
 through the same `qiita_common.analytic` relabel the client-side table uses
-(`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers Arrow IPC. Authorization,
-the identifier mints and the ticket scope are the ones described above; the CLI writes
-the bundle with `feature-table build`'s writer.
+(`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers one zip of the columns
+(JSON) and the values and features (Arrow IPC). Authorization, the identifier mints and
+the ticket scope are the ones described above; the CLI writes the bundle with
+`feature-table build`'s writer.

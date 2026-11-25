@@ -1764,33 +1764,38 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
     # `feature-table select` — a table of stored values over a cohort, read from
-    # the `/feature-table` routes and written straight from its sparse rows.
+    # `/feature-table` and written straight from its sparse rows.
     p_ft_select = p_feature_table_sub.add_parser(
         "select",
         help=(
-            "Write a feature table of the values one or more runs of one method stored, over"
-            " a study's prep_samples or a named list, with the map needed to read it"
+            "Write a feature table of the values a method's runs stored, over a study's"
+            " prep_samples or a named list, with the map needed to read it"
         ),
     )
     p_ft_select.add_argument(
-        "--processing-idx",
-        type=int,
-        nargs="+",
+        "--method",
         required=True,
+        help="The method whose stored values make the table (a workflow, e.g. amplicon).",
+    )
+    p_ft_select.add_argument(
+        "--parameter",
+        action="append",
+        metavar="KEY=VALUE",
         help=(
-            "The runs to draw from. Several merge into one table only when their features"
-            " compare (the method's merge keys agree); otherwise refused."
+            "Draw only on runs with this setting (repeatable). The method's runs over the"
+            " cohort must agree on the settings that make features comparable; when they"
+            " do not, the refusal lists the ones found to choose from."
         ),
     )
     select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
     select_cohort.add_argument(
-        "--study-idx", type=int, help="Every prep_sample of this study the runs processed."
+        "--study-idx", type=int, help="Every prep_sample of this study a matching run processed."
     )
     select_cohort.add_argument(
         "--prep-sample-idx",
         type=int,
         nargs="+",
-        help="Exactly these prep_samples; one the runs did not process is refused.",
+        help="Exactly these prep_samples; one no matching run processed is refused.",
     )
     p_ft_select.add_argument(
         "--format",

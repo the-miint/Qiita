@@ -1,14 +1,15 @@
 """A feature table of stored values: a selection over a cohort, answered as sparse COO.
 
 Unlike `feature-table build`, which computes its table from the whole cohort, this one
-selects values the lake already stores, one per (processed sample, feature), for one
-or more runs of a method in `SOURCES`. Features share one `feature_idx` space, so a
-feature two runs found is one row, named by its exported-feature handle; the
-sequences sidecar maps that handle to its sequence and md5.
+selects values the lake already stores, one per (processed sample, feature), from the
+runs of a method in `SOURCES`. Features share one `feature_idx` space, so a feature
+two runs found is one row, named by its exported-feature handle; the sequences
+sidecar maps that handle to its sequence and md5.
 
-Merging runs is that selection, provided they are runs whose features compare
+The caller names a method, its parameters and a cohort, never a run: which runs answer
+is the server's to choose, and they merge only when their features compare
 (`Source.merge_keys`). Three steps, each testable alone:
-  * `resolve_cohort` picks the processed samples the request names, each a column
+  * `resolve_cohort` picks the processed samples of the matching runs, each a column
     under its QM;
   * `fetch_table` reads their values, or their features' sequences, under one signed
     scope;
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import zipfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -39,8 +41,10 @@ from qiita_common.amplicon_constants import (
 from qiita_common.flight_stream import read_all_counted
 from qiita_common.models import MAX_COHORT_PREP_SAMPLE_IDX
 from qiita_common.models.feature_table import (
+    FeatureTableParameter,
     FeatureTableRequest,
     FeatureTableSample,
+    FeatureTableSamples,
     FeatureTableValueKind,
 )
 
@@ -48,7 +52,8 @@ from .auth.tickets import sign_ticket
 from .repositories.exported_feature import mint_observed_features
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
 
-ARROW_STREAM_MEDIA_TYPE = "application/vnd.apache.arrow.stream"
+# The most runs one table may merge, bounding the signed scope that lists them.
+MAX_FEATURE_TABLE_RUNS = 32
 
 
 @dataclass(frozen=True)
@@ -62,9 +67,10 @@ class Source:
     value_column: str
     # The table holding each feature's sequence, keyed by feature_idx.
     sequences_table: str
-    # The run params whose difference makes two runs' features incomparable.
+    # The run params whose difference makes two runs' features incomparable: the
+    # parameters a request may narrow the runs by.
     merge_keys: tuple[str, ...]
-    # What a feature is, for refusals ("these runs' ASVs ...").
+    # What a feature is, for refusals ("... so their ASVs are not comparable").
     noun: str
     # What a feature id is, for the bundle manifest.
     feature_id_note: str
@@ -73,11 +79,11 @@ class Source:
     mint: Callable[..., Awaitable[dict[int, str]]]
 
 
-# The registry of methods this endpoint can answer. A method belongs here when its
+# The registry of methods `/feature-table` can answer. A method belongs here when its
 # values are a persisted per-cell COO — one stored value per (sample, feature); the
 # metagenomic OGU table is cohort-pooled compute (served separately by
 # `feature-table build`), so it is not one here. Keyed on the `processing.workflow`
-# value `_source_of` reads off each run, so a key is a workflow name.
+# value, so a key is a workflow name.
 SOURCES: dict[str, Source] = {
     # The trim length is the ASV's length, and orientation decides which strand it
     # is read on: ASVs from runs differing in these are different features, so
@@ -96,6 +102,13 @@ SOURCES: dict[str, Source] = {
         mint=mint_observed_features,
     ),
 }
+
+# One `/feature-table` answer: a zip of the columns as JSON (`FeatureTableSamples`), and
+# the values and features as Arrow IPC streams.
+FEATURE_TABLE_MEDIA_TYPE = "application/zip"
+SAMPLES_MEMBER = "samples.json"
+VALUES_MEMBER = "values.arrows"
+FEATURES_MEMBER = "features.arrows"
 
 # Dictionary-encoded names: each sample and feature id is sent once, and each row
 # carries two small integer codes and its value. Plain strings would repeat the
@@ -133,6 +146,8 @@ class ProcessedSample:
 class Cohort:
     source: Source
     runs: list[int]
+    # The settings the runs share (`FeatureTableSamples.parameters`).
+    parameters: dict[str, FeatureTableParameter | None]
     samples: list[ProcessedSample]
 
     @property
@@ -145,93 +160,97 @@ def _params(row: asyncpg.Record) -> dict:
     return json.loads(params) if isinstance(params, str) else (params or {})
 
 
-def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
-    """The one method the runs share, or a refusal naming what is wrong."""
-    missing = sorted(p for p in runs if p not in found)
-    foreign = {
-        p: found[p]["workflow"] for p in runs if p in found and found[p]["workflow"] not in SOURCES
-    }
-    if missing or foreign:
-        # Name what each bad run IS, not only what it is not: a run of another
-        # method (e.g. long-read-assembly) belongs to a different feature table,
-        # and a missing idx is a different mistake again.
-        parts = []
-        if foreign:
-            parts.append("; ".join(f"{p} is {w}" for p, w in sorted(foreign.items())))
-        if missing:
-            parts.append(f"no run at {missing}")
-        raise CohortError(
-            404,
-            f"a feature table of stored values serves {', '.join(sorted(SOURCES))} runs only: "
-            + "; ".join(parts),
-        )
-    methods = {p: found[p]["workflow"] for p in runs}
-    if len(set(methods.values())) > 1:
-        detail = "; ".join(f"{p}: {m}" for p, m in methods.items())
-        raise CohortError(409, f"these runs are of different methods: {detail}")
-    source = SOURCES[next(iter(methods.values()))]
-    settings = {p: tuple(_params(found[p]).get(k) for k in source.merge_keys) for p in runs}
-    if len(set(settings.values())) > 1:
+def _shared_settings(
+    source: Source, processed: list[asyncpg.Record]
+) -> dict[str, FeatureTableParameter | None]:
+    """The merge-key settings every run in `processed` shares, or a refusal listing each
+    setting found, which the caller can name in `parameters` to choose one."""
+    found = {tuple(_params(r).get(k) for k in source.merge_keys) for r in processed}
+    if len(found) > 1:
         detail = "; ".join(
-            f"{p}: " + ", ".join(f"{k}={v}" for k, v in zip(source.merge_keys, s, strict=True))
-            for p, s in settings.items()
+            ", ".join(f"{k}={v}" for k, v in zip(source.merge_keys, setting, strict=True))
+            for setting in sorted(found, key=repr)
         )
         raise CohortError(
             409,
-            f"these runs' {source.noun} are not comparable"
-            f" ({', '.join(source.merge_keys)} differ): {detail}",
+            f"the cohort's {source.method} runs disagree on {', '.join(source.merge_keys)},"
+            f" so their {source.noun} are not comparable ({detail}); name one in parameters",
         )
-    return source
+    return dict(zip(source.merge_keys, found.pop(), strict=True))
 
 
 async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Cohort:
-    """The processed samples `request` names, each with its column name.
+    """The processed samples of `request.method` over the cohort, each with its column
+    name.
 
-    The runs must be runs of one method and comparable (`_source_of`). A processed
-    sample is a live QM (`exported_identifier`) of one of the runs — each workflow
-    mints one per sample it reported on — whose prep_sample is in the named study
-    (live link) or the named list, and not ENA-flagged. A named list that includes
-    a prep_sample none of the runs reported on is refused rather than trimmed.
+    A processed sample is a live QM (`exported_identifier`) of an active run of the
+    method whose params contain `request.parameters` (by value and type), and whose
+    prep_sample is in the named study (live link) or the named list, and not
+    ENA-flagged. Each workflow mints one per sample it reported on, so a prep_sample
+    two matching runs processed is two columns. The runs must agree on the method's
+    merge keys (`_shared_settings`). A named list that includes a prep_sample no
+    matching run processed is refused rather than trimmed.
     """
-    runs = sorted(set(request.processing_idx))
-    rows = await pool.fetch(
-        "SELECT processing_idx, workflow, params FROM qiita.processing"
-        " WHERE processing_idx = ANY($1::bigint[])",
-        runs,
-    )
-    source = _source_of(runs, {r["processing_idx"]: r for r in rows})
+    source = SOURCES.get(request.method)
+    if source is None:
+        raise CohortError(
+            422,
+            f"a feature table of stored values serves {', '.join(sorted(SOURCES))},"
+            f" not {request.method!r}",
+        )
+    unknown = sorted(set(request.parameters) - set(source.merge_keys))
+    if unknown:
+        raise CohortError(
+            422,
+            f"{source.method} takes the parameters {', '.join(source.merge_keys)};"
+            f" not {', '.join(unknown)}",
+        )
 
     processed = await pool.fetch(
-        "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id,"
+        "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id, p.params,"
         f"      {BIOSAMPLE_NAME_SQL} AS biosample"
         "  FROM qiita.exported_identifier ei"
+        "  JOIN qiita.processing p ON p.processing_idx = ei.processing_idx"
         "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
         "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
         f" {BIOSAMPLE_NAME_JOIN}"
         "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
-        " WHERE ei.processing_idx = ANY($1::bigint[]) AND NOT ei.retired"
-        "   AND ss.ena_status IS NULL"
-        "   AND ($2::bigint IS NULL OR EXISTS ("
+        " WHERE p.workflow = $1 AND p.status = 'active' AND p.params @> $2::jsonb"
+        "   AND NOT ei.retired AND ss.ena_status IS NULL"
+        "   AND ($3::bigint IS NULL OR EXISTS ("
         "     SELECT 1 FROM qiita.prep_sample_to_study pst"
-        "      WHERE pst.prep_sample_idx = ps.idx AND pst.study_idx = $2 AND NOT pst.retired))"
-        "   AND ($3::bigint[] IS NULL OR ps.idx = ANY($3::bigint[]))"
+        "      WHERE pst.prep_sample_idx = ps.idx AND pst.study_idx = $3 AND NOT pst.retired))"
+        "   AND ($4::bigint[] IS NULL OR ps.idx = ANY($4::bigint[]))"
         " ORDER BY ei.prep_sample_idx, ei.processing_idx",
-        runs,
+        source.method,
+        json.dumps(request.parameters),
         request.study_idx,
         request.prep_sample_idx,
     )
     if request.prep_sample_idx is not None:
-        uncounted = sorted(set(request.prep_sample_idx) - {r["prep_sample_idx"] for r in processed})
-        if uncounted:
+        unprocessed = sorted(
+            set(request.prep_sample_idx) - {r["prep_sample_idx"] for r in processed}
+        )
+        if unprocessed:
             raise CohortError(
                 404,
-                f"{len(uncounted)} named prep_sample(s) were not processed by these runs"
-                f" (prep_sample_idx {uncounted[:5]})",
+                f"{len(unprocessed)} named prep_sample(s) were not processed by a matching"
+                f" {source.method} run (prep_sample_idx {unprocessed[:5]})",
             )
     if not processed:
-        raise CohortError(404, "these runs processed none of the cohort's prep_samples")
+        raise CohortError(
+            404, f"no matching {source.method} run processed any of the cohort's prep_samples"
+        )
     if any(r["biosample"] is None for r in processed):
         raise RuntimeError("a processed sample's biosample has no accession and no QB")
+    parameters = _shared_settings(source, processed)
+    runs = sorted({r["processing_idx"] for r in processed})
+    if len(runs) > MAX_FEATURE_TABLE_RUNS:
+        raise CohortError(
+            413,
+            f"{len(runs)} {source.method} runs processed this cohort, over the"
+            f" {MAX_FEATURE_TABLE_RUNS} one table merges; narrow it by parameters or cohort.",
+        )
 
     samples = [
         ProcessedSample(
@@ -241,10 +260,10 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         )
         for r in processed
     ]
-    cohort = Cohort(source=source, runs=runs, samples=samples)
+    cohort = Cohort(source=source, runs=runs, parameters=parameters, samples=samples)
     # A named prep_sample request is already bounded (`PrepSampleCohort` caps it at
-    # MAX_COHORT_PREP_SAMPLE_IDX); a study cohort has no such bound, and the routes
-    # read the whole Flight stream into one response, so refuse one too large to sign
+    # MAX_COHORT_PREP_SAMPLE_IDX); a study cohort has no such bound, and the route
+    # reads the whole Flight stream into one response, so refuse one too large to sign
     # as a single ticket rather than buffer an unbounded table. Narrowing is the
     # caller's to do (by prep_sample or a smaller study), since the table's meaning is
     # the whole cohort.
@@ -379,9 +398,40 @@ def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.
     return table.cast(FEATURES_SCHEMA)
 
 
-def arrow_stream_bytes(table: pa.Table) -> bytes:
-    """`table` as an Arrow IPC stream: what the values and features routes send."""
+def _arrow_stream(table: pa.Table) -> bytes:
     sink = io.BytesIO()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return sink.getvalue()
+
+
+def pack_feature_table(cohort: Cohort, values: pa.Table, features: pa.Table) -> bytes:
+    """One `/feature-table` answer: the cohort's columns, `values` (`build_values`) and
+    `features` (`build_features`)."""
+    samples = FeatureTableSamples(
+        method=cohort.source.method,
+        value_kind=cohort.source.value_kind,
+        parameters=cohort.parameters,
+        samples=[s.column for s in cohort.samples],
+    )
+    sink = io.BytesIO()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(SAMPLES_MEMBER, samples.model_dump_json())
+        zf.writestr(VALUES_MEMBER, _arrow_stream(values))
+        zf.writestr(FEATURES_MEMBER, _arrow_stream(features))
+    return sink.getvalue()
+
+
+def unpack_feature_table(body: bytes) -> tuple[FeatureTableSamples, pa.Table, pa.Table]:
+    """`pack_feature_table`'s inverse: the columns, values and features."""
+    with zipfile.ZipFile(io.BytesIO(body)) as zf:
+        members = set(zf.namelist())
+        expected = {SAMPLES_MEMBER, VALUES_MEMBER, FEATURES_MEMBER}
+        if members != expected:
+            raise ValueError(
+                f"a feature table answer holds {sorted(expected)}, not {sorted(members)}"
+            )
+        samples = FeatureTableSamples.model_validate_json(zf.read(SAMPLES_MEMBER))
+        values = pa.ipc.open_stream(zf.read(VALUES_MEMBER)).read_all()
+        features = pa.ipc.open_stream(zf.read(FEATURES_MEMBER)).read_all()
+    return samples, values, features
