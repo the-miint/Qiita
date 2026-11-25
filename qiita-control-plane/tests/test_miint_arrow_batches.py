@@ -1,5 +1,5 @@
-"""`arrow_batches`, and the `filterwarnings` entries that keep a copying
-`execute(...).to_arrow_reader()` from coming back unnoticed."""
+"""`arrow_batches`, `converted_batches`, and the `filterwarnings` entries that keep a
+copying `execute(...).to_arrow_reader()` from coming back unnoticed."""
 
 from __future__ import annotations
 
@@ -80,8 +80,8 @@ def test_each_project_errors_on_arrow_from_execute(project):
 
 
 async def test_converted_batches_convert_each_non_empty_batch_off_the_event_loop():
-    """`convert` sees every row once, never an empty batch, and runs on a thread other
-    than the event loop's; so does the read, which runs beside it."""
+    """`convert` sees every row once and runs on a thread other than the event loop's;
+    the batch read runs in the same worker-thread call."""
     import threading
 
     loop_thread = threading.get_ident()
@@ -112,3 +112,21 @@ async def test_converted_batches_of_an_empty_result_yield_nothing():
         )
     ]
     assert got == []
+
+
+async def test_converted_batches_skip_an_empty_batch(monkeypatch):
+    """A zero-row batch between two others never reaches `convert`. DuckDB's reader
+    did not emit one for the queries tried, so a stub reader hands one over."""
+    import pyarrow as pa
+
+    from qiita_control_plane import miint
+
+    def batch(n):
+        return pa.record_batch({"x": pa.array(range(n), pa.int64())})
+
+    monkeypatch.setattr(miint, "arrow_batches", lambda *_: iter([batch(2), batch(0), batch(1)]))
+    got = [
+        rows
+        async for rows in converted_batches(duckdb.connect(), "unused", [], 2, lambda b: b.num_rows)
+    ]
+    assert got == [2, 1]
