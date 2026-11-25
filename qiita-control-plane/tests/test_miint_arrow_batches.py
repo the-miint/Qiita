@@ -115,8 +115,8 @@ async def test_converted_batches_of_an_empty_result_yield_nothing():
 
 
 async def test_converted_batches_skip_an_empty_batch(monkeypatch):
-    """A zero-row batch between two others never reaches `convert`. DuckDB's reader
-    did not emit one for the queries tried, so a stub reader hands one over."""
+    """A zero-row batch between two others never reaches `convert`; a stub reader
+    supplies it."""
     import pyarrow as pa
 
     from qiita_control_plane import miint
