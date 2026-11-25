@@ -147,8 +147,8 @@ _CHUNK_SIZE = 10_000
 _MINT_CHUNK_SIZE = 2_000
 _MINT_STATEMENT_TIMEOUT_SECONDS = 60.0
 
-# `mint_annotation_features`' annotation_map columns, in table order: the order its
-# per-batch Arrow append is built in.
+# The annotation_map columns `mint_annotation_features` copies from each batch's
+# RETURNING rows.
 _ANNOTATION_MAP_COLUMNS = (
     "annotation_idx",
     "feature_idx",
@@ -253,10 +253,15 @@ async def _mint_chunk(
 
 
 def _append_arrow(con: duckdb.DuckDBPyConnection, table: str, batch: pa.Table) -> None:
-    """Append `batch`, its columns in `table`'s order, to `con`'s `table` in one Arrow
-    insert. Measured on DuckDB 2.0.0 (macOS), 2,000 rows into a two-column table: a
-    per-row `executemany` took 350 ms, this insert 2.3 ms."""
-    con.from_arrow(batch).insert_into(table)
+    """Append `batch` to `con`'s `table` in one Arrow insert, matching columns by name; a
+    column `table` lacks raises. Measured on DuckDB 2.0.0 (macOS), 2,000 rows into a
+    two-column table: a per-row `executemany` took 350 ms, this append 1.1 ms (median
+    of 5)."""
+    con.register("_append_batch", batch)
+    try:
+        con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM _append_batch")
+    finally:
+        con.unregister("_append_batch")
 
 
 def _feature_map_batch(mapping: dict[UUID, int]) -> pa.Table:
@@ -660,8 +665,6 @@ async def mint_features(
             # duplicates collapse here; cross-batch duplicates are collapsed by
             # SELECT DISTINCT at COPY time below.
             if chunk_mapping:
-                # Off the event loop, which also serves the API: with five mints running
-                # on the loop, the control plane stopped answering `/health`.
                 await run_on_connection(
                     write_conn,
                     lambda: _append_arrow(
