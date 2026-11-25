@@ -119,10 +119,10 @@ def feature_taxonomy_sidecar_sql() -> str:
     """The feature-axis twin of `taxonomy_sidecar_sql`: one row per published feature,
     carrying its own ranks.
 
-    **No genome-representative reduction**, which is the whole difference: a feature of
-    this kind is the taxonomic unit, so its lineage is its own taxonomy row and the label
-    joins straight to it. LEFT, so a feature the reference does not place stays present
-    with NULL ranks, keeping the sidecar as wide as the table.
+    No genome-representative reduction: a feature of this kind is the taxonomic unit, so
+    the label joins straight to its own taxonomy row on `feature_idx`. LEFT, so a feature
+    the reference does not place stays present with NULL ranks, keeping the sidecar as
+    wide as the table.
     """
     return (
         f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
@@ -138,7 +138,8 @@ class TaxonomyClearance:
     count so a caller can report the size without counting it again. The alignment is
     established either by `check_taxonomy_diagnostics` (the genome build, over a raw
     taxonomy table) or by construction (a feature-axis sidecar scoped to the published
-    features, as wide as the table, carries the size alone).
+    features is as wide as the table, so its clearance is built from its row count, with
+    no diagnostics run).
 
     `taxonomy_copy_sql` takes one for the same reason `labelled_relation_sql` takes a
     `LabelClearance`: a sidecar that does not line up with the table it accompanies is

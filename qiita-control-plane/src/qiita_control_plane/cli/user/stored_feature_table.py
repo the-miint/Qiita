@@ -1,7 +1,8 @@
 """qiita user CLI — `qiita feature-table select`, a feature table of stored values.
 
 The control plane's `/feature-table` route answers the cohort's columns, its values as
-sparse COO `(sample, feature, value)` and its features' sequences, and this writes them
+sparse COO `(sample, feature, value)`, its features' sequences and, when a reference
+is named, their lineage, and this writes them
 as a bundle with `feature-table build`'s writer. The route is the one implementation;
 this writes what it answers.
 
@@ -24,6 +25,7 @@ from qiita_common.duckdb_relation import registered
 from qiita_common.models import EXPORT_ENTITY_ID
 from qiita_common.models.biosample import StudyLookupKey
 from qiita_common.models.feature_table import FeatureTableRequest
+from qiita_common.models.reference import ReferenceHandle
 
 from ...stored_feature_table import FEATURE_TABLE_MEDIA_TYPE, SOURCES, unpack_feature_table
 from .. import _common
@@ -48,6 +50,9 @@ SELECT_METHOD_CHOICES = tuple(sorted(SOURCES))
 SELECT_KEY_CHOICES = tuple(
     dict.fromkeys((EXPORT_ENTITY_ID, *get_args(StudyLookupKey), *_BIOSAMPLE_KEY_CHOICES))
 )
+
+# What each companion this command writes carries, for its closing summary.
+_CARRIES = {"sequences": "sequence", "taxonomy": "taxonomic lineage"}
 
 MAP_NOTE = (
     "This file maps each column of the table beside it, named by its QM (export_id), to"
@@ -74,7 +79,11 @@ def _request(args: argparse.Namespace) -> FeatureTableRequest:
         if args.study is not None
         else {"biosample": {**named, "values": args.biosample}}
     )
-    taxonomy = None if args.taxonomy is None else dict(zip(("name", "version"), args.taxonomy))
+    taxonomy = (
+        None
+        if args.taxonomy is None
+        else ReferenceHandle(name=args.taxonomy[0], version=args.taxonomy[1])
+    )
     return FeatureTableRequest(
         method=args.method,
         parameters=dict(_parameter(p) for p in args.parameter or ()),
@@ -224,6 +233,6 @@ def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.Argu
     print(f"and the map needed to read it: {map_path}")
     print(f"and the record of what produced it: {manifest_path}")
     for path in companions:
-        what = "taxonomic lineage" if path.name.endswith(".taxonomy.parquet") else "sequence"
-        print(f"and each feature's {what}: {path}")
+        name = next(c.name for c in _companions(*_CARRIES) if path.name.endswith(c.suffix))
+        print(f"and each feature's {_CARRIES[name]}: {path}")
     return 0

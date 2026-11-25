@@ -18,6 +18,9 @@ is the server's to choose, and they merge only when their features compare
   * `mint_feature_labels` names each feature, and `stage_values` / `stage_features`
     relabel the reads on `ft.FEATURE_AXIS` into public handles only.
 
+When the request names a reference, `resolve_reference` checks it before any read, and
+`fetch_taxonomy` / `build_taxonomy` add each feature's lineage under it.
+
 Nothing is made dense. Internal idxs are join keys and never reach the output.
 """
 
@@ -137,9 +140,8 @@ FEATURES_SCHEMA = pa.schema(
 
 
 # A feature's handle and its ranks (`RANK_COLUMNS`), coarsest first, with their source
-# `d__/p__/…` prefixes restored. A rank the reference does not resolve for a feature is
-# NULL, and a feature the reference does not place is a row of NULL ranks: the taxonomy is
-# a lookup, not a filter.
+# `d__/p__/…` prefixes restored; which features keep NULL ranks is
+# `ft.feature_taxonomy_sidecar_sql`'s.
 TAXONOMY_SCHEMA = pa.schema(
     [("feature", pa.string()), *((rank, pa.string()) for rank in RANK_COLUMNS)]
 )
@@ -396,7 +398,7 @@ def fetch_taxonomy(
         secret=signing_key,
     )
     with flight.FlightClient(data_plane_url) as client:
-        taxonomy = client.do_get(flight.Ticket(roster)).read_all()
+        taxonomy = read_all_counted(client, roster, name=TAXONOMY_SOURCE_TABLE)
         if taxonomy.num_rows:
             return taxonomy
         whole_reference = sign_ticket(
@@ -534,6 +536,7 @@ def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
         ft.refuse_repeated_features(repeated)
         duck.execute(ft.feature_taxonomy_sidecar_sql())
         table = duck.sql(
+            # Ordered so the answer is the same on every request.
             f"SELECT feature_id AS feature, {rank_columns_sql()}"
             f" FROM {ft.TAXONOMY_SIDECAR_RELATION} ORDER BY feature"
         ).to_arrow_table()

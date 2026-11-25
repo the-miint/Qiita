@@ -287,6 +287,11 @@ def _fetch(monkeypatch, responses):
         "qiita_control_plane.stored_feature_table.flight.FlightClient",
         lambda _url: _FakeFlightClient(responses),
     )
+    # The row-count check is `read_all_counted`'s own, tested in qiita-common.
+    monkeypatch.setattr(
+        "qiita_control_plane.stored_feature_table.read_all_counted",
+        lambda client, ticket, *, name: client.do_get(ticket).read_all(),
+    )
     return fetch_taxonomy(
         data_plane_url="grpc://x", signing_key=b"x" * 32, reference_idx=1, feature_idxs=[10]
     )
