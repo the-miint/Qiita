@@ -108,6 +108,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 ### 5. Verify
 
 - `[operator]` (#874) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin output-equivalence list` exits 0 and prints `0 output equivalence(s)` on stderr (the output-equivalence routes are mounted and the new table is readable).
+- `[operator]` (#dispatch-cap-env-and-route) As a system_admin with a PAT carrying `work_ticket:cancel`, `qiita-admin dispatch-cap` exits 0 and its stderr line reads `cap 8 (DISPATCH_MAX_INFLIGHT)`, or the value set in `control-plane.env` (the dispatch-cap route is mounted and the boot value was read).
 
 ### 6. After the deploy verifies green
 
@@ -353,6 +354,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `POST /work-ticket/{idx}/run` now applies the submit checks to the stored ticket: a caller who is neither the originator nor wet_lab_admin+ gets 404; otherwise, for a ticket in a redrivable state, the refusal a submit of that work would get (403/422). The ticket is checked against its action's current definition, so a ticket stored under a version since edited in place (a tighter `context_schema`, a lower `mem_ceiling_gb`) is refused with 422 and the work must be submitted again. Scripts that re-run other users' tickets need an admin token. (#902)
 - (#872) New field-exception routes `GET`/`PUT`/`DELETE /study/{S}/biosample/{B}/field-exception/{F}` and `.../sequenced-sample/{SS}/field-exception/{F}` (CLI `qiita biosample|sequenced-sample get-/set-/clear-field-exception`). Soft contract change: a field `PATCH` declaring `unique_in_study` now answers 409 when field exceptions are set on the field.
 - (#929) `GET /study/{idx}` gains a third `view`, `public`, for a caller whom only a study's `public` default admits. It carries only `export_entity_id`, title, alias, description, abstract, funding, the two accessions and `default_tier`: no `study_idx` or other idx, notes, `extra_metadata`, submission state or timestamps. In `GET /study` such a study's row has `record_view: "public"` and neither `study_idx` nor `updated_at` (key such rows on `export_entity_id`), and `q` matches it only on the public view's fields. A study that an ENA import creates is now `public`, so it is listed for every signed-in user.
+- (#dispatch-cap-env-and-route) New optional `DISPATCH_MAX_INFLIGHT` in `/etc/qiita/control-plane.env`: the process-wide cap on tickets running at once, one of 8, 12, 16, 24 (default 8, today's value; any other value keeps the unit down). It also sizes the control plane's Postgres pool, which grows above a cap of 12, so before setting 16 or 24 check the server's `max_connections` headroom. New `GET`/`PATCH /work-ticket/dispatch-cap` and `qiita-admin dispatch-cap [--set N | --reset]` (system_admin, `work_ticket:cancel`) read it and set an in-memory override up to what the boot pool carries (12 at a boot value of 8 or 12); a restart drops the override.
 
 ## Deployed history
 

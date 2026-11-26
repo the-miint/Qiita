@@ -432,6 +432,38 @@ def test_settings_default_adapter_reference_idx_rejects_invalid(monkeypatch):
             Settings.from_env()
 
 
+def test_settings_dispatch_max_inflight_defaults_to_8(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.delenv("DISPATCH_MAX_INFLIGHT", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().dispatch_max_inflight == 8
+
+
+@pytest.mark.parametrize("value", ["8", "12", "16", "24"])
+def test_settings_dispatch_max_inflight_from_env(monkeypatch, value):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", value)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().dispatch_max_inflight == int(value)
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", "10", "32", "x"])
+def test_settings_rejects_dispatch_max_inflight_outside_the_choices(monkeypatch, bad_value):
+    """A value outside the allowed set fails the boot: it would size the connection
+    pool to a number nobody has checked against Postgres max_connections."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="DISPATCH_MAX_INFLIGHT"):
+        Settings.from_env()
+
+
 def test_settings_ena_download_run_concurrency_unset_is_none(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     monkeypatch.delenv("ENA_DOWNLOAD_RUN_CONCURRENCY", raising=False)

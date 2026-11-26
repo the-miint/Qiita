@@ -464,6 +464,8 @@ from qiita_common.models.upload import (
 )
 from qiita_common.models.user import ORCID_PATTERN, UserCreate, UserResponse, UserUpdate
 from qiita_common.models.work_ticket import (
+    DEFAULT_DISPATCH_MAX_INFLIGHT,
+    DISPATCH_MAX_INFLIGHT_CHOICES,
     LIVE_STEP_PROGRESS_STATES,
     MAX_FANOUT_OVERRIDE,
     MAX_FOLLOW_ON_CHAIN_DEPTH,
@@ -479,6 +481,8 @@ from qiita_common.models.work_ticket import (
     BlockMaskPlanResponse,
     BlockPlanBlock,
     BlockPlanPartition,
+    DispatchCapOverrideRequest,
+    DispatchCapStatus,
     FailureType,
     FanoutCohortKind,
     FanoutCohortStatus,
@@ -852,6 +856,10 @@ __all__ = [
     "TERMINAL_STEP_PROGRESS_STATES",
     "StepType",
     "WorkTicket",
+    "DEFAULT_DISPATCH_MAX_INFLIGHT",
+    "DISPATCH_MAX_INFLIGHT_CHOICES",
+    "DispatchCapOverrideRequest",
+    "DispatchCapStatus",
     "FanoutCohortKind",
     "FanoutCohortStatus",
     "FanoutListResponse",

@@ -61,6 +61,7 @@ from qiita_common.actions import STEP_STDERR_FILENAME, STEP_STDOUT_FILENAME
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_CANCEL,
+    PATH_WORK_TICKET_DISPATCH_CAP,
     PATH_WORK_TICKET_FANOUT,
     PATH_WORK_TICKET_FANOUT_COHORT,
     PATH_WORK_TICKET_FANOUT_COHORT_PUMP,
@@ -72,8 +73,11 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
+    DISPATCH_MAX_INFLIGHT_CHOICES,
     NON_TERMINAL_WORK_TICKET_STATES,
     REDRIVABLE_WORK_TICKET_STATES,
+    DispatchCapOverrideRequest,
+    DispatchCapStatus,
     FailureType,
     FanoutCohortKind,
     FanoutListResponse,
@@ -97,7 +101,11 @@ from qiita_common.models import (
 from ..auth.guards import require_scope
 from ..auth.principal import Anonymous, Principal, get_current_principal
 from ..deps import get_db_pool
-from ..dispatch import schedule_dispatch
+from ..dispatch import (
+    dispatch_semaphore,
+    max_settable_dispatch_max_inflight,
+    schedule_dispatch,
+)
 from ..ena_import.registration import download_ticket_has_live_job, fetch_pool_download_ticket
 from ..ena_import.submit import DOWNLOAD_ENA_STUDY_ACTION_ID
 from ..fanout_dispatch import (
@@ -558,6 +566,55 @@ async def pump_fanout_cohort(
     is left to re-trigger it, and before this route only a CP restart would.
     """
     return await _pump_and_report(request, await _resolve_cohort(request, kind, key))
+
+
+def _dispatch_cap_status(request: Request) -> DispatchCapStatus:
+    semaphore = dispatch_semaphore(request.app)
+    return DispatchCapStatus(
+        default=semaphore.default,
+        override=semaphore.override,
+        max_inflight=semaphore.limit,
+        running=semaphore.running,
+        waiting=semaphore.waiting,
+        max_settable=max_settable_dispatch_max_inflight(semaphore.default),
+        choices=list(DISPATCH_MAX_INFLIGHT_CHOICES),
+    )
+
+
+@router.get(PATH_WORK_TICKET_DISPATCH_CAP, response_model=DispatchCapStatus)
+async def get_dispatch_cap(
+    request: Request,
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+) -> DispatchCapStatus:
+    """The process-wide dispatch cap: the cap in force, its boot default, any runtime
+    override, and how many dispatches hold a slot or wait for one."""
+    return _dispatch_cap_status(request)
+
+
+@router.patch(PATH_WORK_TICKET_DISPATCH_CAP, response_model=DispatchCapStatus)
+async def set_dispatch_cap(
+    body: DispatchCapOverrideRequest,
+    request: Request,
+    _scope: Principal = Depends(require_scope(Scope.WORK_TICKET_CANCEL)),
+) -> DispatchCapStatus:
+    """Set the dispatch cap's runtime override, or clear it with `max_inflight: null`.
+
+    Raising it starts queued dispatches at once. Lowering it cancels nothing: running
+    dispatches keep their slots and queued ones start as the excess finishes. The
+    override is in-memory, so a restart reverts to DISPATCH_MAX_INFLIGHT. 422 for a
+    value above `max_settable`, the most the connection pool built at boot can carry.
+    """
+    semaphore = dispatch_semaphore(request.app)
+    try:
+        semaphore.set_override(
+            body.max_inflight,
+            ceiling=max_settable_dispatch_max_inflight(semaphore.default),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    return _dispatch_cap_status(request)
 
 
 async def _fetch_visible_work_ticket(

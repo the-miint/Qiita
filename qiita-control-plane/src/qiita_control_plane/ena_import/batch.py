@@ -103,7 +103,7 @@ _log = logging.getLogger(__name__)
 # document whether that cap is per ENAClient instance (today's per-query client
 # construction would then let N concurrent studies reach ~3N req/s) or global.
 # The dispatch each item's submit fires runs outside this permit, under
-# dispatch's own process-wide cap — see dispatch._DISPATCH_CONCURRENCY.
+# dispatch's own process-wide cap — see dispatch.dispatch_cap_fits_pool.
 _STUDY_CONCURRENCY = 4
 
 # Failed runs a `completed_partial` item's failure_reason lists before "and N more".

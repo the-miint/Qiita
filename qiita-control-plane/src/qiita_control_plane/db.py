@@ -2,18 +2,18 @@
 
 import asyncpg
 
-# The production pool size main.py's lifespan builds `app.state.pool` with.
-# Named so a caller sizing a bound against it (e.g. ena_import's
-# `_STUDY_CONCURRENCY`) reads this constant instead of a default argument that
-# happens to match today.
-PRODUCTION_POOL_MAX_SIZE = 25
+# The smallest max_size main.py's lifespan builds `app.state.pool` with;
+# `dispatch.production_pool_max_size` grows it with the dispatch cap. Named so a
+# caller sizing a bound against the pool (e.g. ena_import's `_STUDY_CONCURRENCY`)
+# reads this constant instead of a default argument that happens to match today.
+PRODUCTION_POOL_FLOOR = 25
 
 
 async def get_pool(
     database_url: str,
     *,
     min_size: int = 2,
-    max_size: int = PRODUCTION_POOL_MAX_SIZE,
+    max_size: int = PRODUCTION_POOL_FLOOR,
     command_timeout: float = 10.0,
     connect_timeout: float = 5.0,
 ) -> asyncpg.Pool:

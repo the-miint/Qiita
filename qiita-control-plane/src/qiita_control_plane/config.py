@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from qiita_common.config import require_env
+from qiita_common.models import DEFAULT_DISPATCH_MAX_INFLIGHT, DISPATCH_MAX_INFLIGHT_CHOICES
 from qiita_common.models.ena_import import MAX_ENA_DOWNLOAD_RUN_CONCURRENCY
 
 from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
@@ -55,8 +56,9 @@ _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 # incident). The default (mirrors the operator throttle that recovered reference
 # 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
 # FANOUT_MAX_INFLIGHT once the data plane's headroom is known. A cohort gains
-# nothing above `dispatch._DISPATCH_CONCURRENCY` (8): its children dispatch
-# through the same shared process-wide slots, so they queue instead.
+# nothing above the dispatch cap (DISPATCH_MAX_INFLIGHT, or its runtime override):
+# its children dispatch through the same shared process-wide slots, so they queue
+# instead.
 _DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 
@@ -160,6 +162,18 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
     return _parse_positive_int_env(var, default=1)
 
 
+def _parse_dispatch_max_inflight() -> int:
+    """DISPATCH_MAX_INFLIGHT, which must be one of `DISPATCH_MAX_INFLIGHT_CHOICES`
+    because it also sizes the connection pool (`dispatch.production_pool_max_size`)."""
+    value = _parse_positive_int_env("DISPATCH_MAX_INFLIGHT", DEFAULT_DISPATCH_MAX_INFLIGHT)
+    if value not in DISPATCH_MAX_INFLIGHT_CHOICES:
+        raise RuntimeError(
+            f"DISPATCH_MAX_INFLIGHT must be one of {list(DISPATCH_MAX_INFLIGHT_CHOICES)},"
+            f" got {value}"
+        )
+    return value
+
+
 def _parse_ena_download_run_concurrency() -> int | None:
     value = _parse_optional_positive_int_env("ENA_DOWNLOAD_RUN_CONCURRENCY")
     if value is not None and value > MAX_ENA_DOWNLOAD_RUN_CONCURRENCY:
@@ -219,6 +233,9 @@ class Settings:
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
     # Per-cohort cap on concurrently-dispatched fan-out child work_tickets.
     fanout_max_inflight: int = _DEFAULT_FANOUT_MAX_INFLIGHT
+    # Process-wide cap on concurrently-running dispatches at boot; it also sizes the
+    # request pool. See `dispatch.dispatch_cap_fits_pool`.
+    dispatch_max_inflight: int = DEFAULT_DISPATCH_MAX_INFLIGHT
     # Runs fetched at once per batch-submitted download ticket; None keeps the job's default.
     ena_download_run_concurrency: int | None = None
     # Per-ticket workspace root the workflow runner mints under
@@ -438,6 +455,7 @@ class Settings:
                 "FANOUT_MAX_INFLIGHT",
                 _DEFAULT_FANOUT_MAX_INFLIGHT,
             ),
+            dispatch_max_inflight=_parse_dispatch_max_inflight(),
             ena_download_run_concurrency=_parse_ena_download_run_concurrency(),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,

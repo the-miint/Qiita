@@ -15,13 +15,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from qiita_common.models import DEFAULT_DISPATCH_MAX_INFLIGHT, DISPATCH_MAX_INFLIGHT_CHOICES
 
-from qiita_control_plane.db import PRODUCTION_POOL_MAX_SIZE
+from qiita_control_plane.db import PRODUCTION_POOL_FLOOR
 from qiita_control_plane.dispatch import (
-    _DISPATCH_CONCURRENCY,
     build_compute_backend_client,
     build_dispatch_semaphore,
+    dispatch_cap_fits_pool,
     drain_running_dispatches,
+    max_settable_dispatch_max_inflight,
+    production_pool_max_size,
     reconcile_inflight_tickets,
     schedule_dispatch,
 )
@@ -86,21 +89,57 @@ def test_schedule_dispatch_reads_the_semaphore_before_creating_a_task():
     assert app.state.running_dispatches == set()
 
 
-def test_dispatch_concurrency_stays_well_below_pool_max_size():
-    """Well below means at most half of `PRODUCTION_POOL_MAX_SIZE`, the same
-    constant main.py's `get_pool` call actually builds the pool with. Dispatch
-    and the ENA study gate also draw on that one pool with no joint accounting
-    anywhere else, so their sum is pinned here too."""
-    assert _DISPATCH_CONCURRENCY * 2 <= PRODUCTION_POOL_MAX_SIZE
-    assert _DISPATCH_CONCURRENCY + _STUDY_CONCURRENCY <= PRODUCTION_POOL_MAX_SIZE
+@pytest.mark.parametrize("cap", DISPATCH_MAX_INFLIGHT_CHOICES)
+def test_every_allowed_cap_stays_well_below_the_pool_it_sizes(cap):
+    """Well below means at most half of the pool main.py builds for that boot cap.
+    Dispatch and the ENA study gate also draw on that one pool with no joint
+    accounting anywhere else, so their sum is pinned here too. Spelled out rather
+    than through `dispatch_cap_fits_pool`, so a change to that predicate cannot
+    loosen the check it is checked by."""
+    pool_max_size = production_pool_max_size(cap)
+    assert pool_max_size >= PRODUCTION_POOL_FLOOR
+    assert cap * 2 <= pool_max_size
+    assert cap + _STUDY_CONCURRENCY <= pool_max_size
+    assert dispatch_cap_fits_pool(cap, pool_max_size)
+
+
+def test_pool_sizes_for_the_allowed_caps():
+    """The pool sizes whose Postgres connection budget was added up when the set
+    was chosen; a change to the formula or the set changes them and fails here."""
+    assert {c: production_pool_max_size(c) for c in DISPATCH_MAX_INFLIGHT_CHOICES} == {
+        8: 25,
+        12: 25,
+        16: 32,
+        24: 48,
+    }
+
+
+def test_dispatch_cap_fits_pool_rejects_a_cap_over_half_the_pool():
+    assert dispatch_cap_fits_pool(12, 25)
+    assert not dispatch_cap_fits_pool(13, 25)
+    assert not dispatch_cap_fits_pool(16, 25)
+
+
+@pytest.mark.parametrize(
+    ("boot", "settable"),
+    [(8, 12), (12, 12), (16, 16), (24, 24)],
+)
+def test_max_settable_override_is_what_the_boot_pool_carries(boot, settable):
+    """The pool is sized once at boot, so a runtime override can go only as high as
+    that pool allows: booted at 8 or 12 (pool 25) the most is 12."""
+    assert max_settable_dispatch_max_inflight(boot) == settable
+
+
+def test_default_dispatch_cap_is_an_allowed_value():
+    assert DEFAULT_DISPATCH_MAX_INFLIGHT in DISPATCH_MAX_INFLIGHT_CHOICES
 
 
 def test_dispatch_concurrency_reaches_one_cohort_at_its_default_cap():
     """A fan-out cohort at FANOUT_MAX_INFLIGHT's default must be schedulable on
-    its own: the process-wide cap shares its slots with every other dispatch,
-    so a cap below the per-cohort default would silently clamp the knob its own
-    docs tell operators to raise."""
-    assert DEFAULT_FANOUT_MAX_INFLIGHT <= _DISPATCH_CONCURRENCY
+    its own at any dispatch cap: the process-wide cap shares its slots with every
+    other dispatch, so a cap below the per-cohort default would silently clamp the
+    knob its own docs tell operators to raise."""
+    assert DEFAULT_FANOUT_MAX_INFLIGHT <= min(DISPATCH_MAX_INFLIGHT_CHOICES)
 
 
 @pytest.mark.asyncio
@@ -162,7 +201,7 @@ async def test_a_dispatch_queued_behind_the_cap_logs_the_wait(monkeypatch, caplo
     and the queue line is the only thing telling it apart from a dead one."""
     app = _fake_app()
     semaphore = app.state.dispatch_semaphore
-    for _ in range(_DISPATCH_CONCURRENCY):
+    for _ in range(semaphore.limit):
         await semaphore.acquire()
 
     started = asyncio.Event()
@@ -187,7 +226,7 @@ async def test_a_dispatch_queued_behind_the_cap_logs_the_wait(monkeypatch, caplo
                 await asyncio.sleep(0.01)
             assert _logged("queued behind the dispatch cap")
         finally:
-            for _ in range(_DISPATCH_CONCURRENCY):
+            for _ in range(semaphore.limit):
                 semaphore.release()
             await asyncio.wait_for(started.wait(), timeout=5)
             finish.set()

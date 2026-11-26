@@ -1,6 +1,6 @@
 """DB-bound guard for dispatch's process-wide concurrency cap.
 
-The sizing guards (`_DISPATCH_CONCURRENCY` vs the production pool, and vs the
+The sizing guards (each allowed dispatch cap vs the pool it sizes, and vs the
 fan-out default) are pure and live in test_dispatch.py. This one needs a real
 pool: it drives `schedule_dispatch` itself through a burst and shows a request
 can still take a connection while the cap's worth of dispatches hold theirs.
@@ -16,12 +16,9 @@ from types import SimpleNamespace
 
 import asyncpg
 import pytest
+from qiita_common.models import DEFAULT_DISPATCH_MAX_INFLIGHT
 
-from qiita_control_plane.dispatch import (
-    _DISPATCH_CONCURRENCY,
-    build_dispatch_semaphore,
-    schedule_dispatch,
-)
+from qiita_control_plane.dispatch import build_dispatch_semaphore, schedule_dispatch
 
 pytestmark = pytest.mark.db
 
@@ -32,10 +29,10 @@ async def test_request_acquires_a_connection_while_many_tickets_dispatch(postgre
     Each fake dispatch task holds a connection for its whole run, the worst
     case a real task approximates (a real one acquires per call, never for the
     workflow). Without the process-wide cap every scheduled ticket runs at once
-    and takes the pool; with it, at most `_DISPATCH_CONCURRENCY` hold and the
+    and takes the pool; with it, at most the cap's worth hold and the
     request's acquire below succeeds.
     """
-    bound = _DISPATCH_CONCURRENCY
+    bound = DEFAULT_DISPATCH_MAX_INFLIGHT
     # Sized from the constant rather than the shared fixture pool: that pool's
     # max_size sits below the production-shaped bound this exercises, so the
     # spare connection the assertion needs must be headroom over `bound`.

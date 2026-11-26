@@ -49,9 +49,9 @@ then each study's runs queue again behind anything already waiting.
    touches read data.
 
 That gate ends at submit. The background dispatch each submitted ticket starts runs
-past it under its own process-wide bound: at most **8** dispatch tasks run at once
-(`_DISPATCH_CONCURRENCY` in `qiita-control-plane/src/qiita_control_plane/dispatch.py`,
-download workflows included), so a large import queues its downloads rather than
+past it under its own process-wide bound, the dispatch cap (`DISPATCH_MAX_INFLIGHT`,
+retunable with `qiita-admin dispatch-cap`; see [Dispatch
+concurrency](../architecture/processing.md), download workflows included), so a large import queues its downloads rather than
 pressuring the control plane's connection pool. A ticket past the cap dispatches as
 soon as a slot frees — nothing fails while it waits — and logs `queued behind the
 dispatch cap` at INFO when it starts waiting, `dispatched after waiting` when it gets

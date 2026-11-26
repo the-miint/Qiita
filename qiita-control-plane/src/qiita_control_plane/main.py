@@ -23,13 +23,14 @@ from qiita_common.models import HealthResponse, HealthStatus
 from .auth.cli_login_code_sweeper import run_cli_login_code_sweeper
 from .auth.oidc import AuthRocketVerifier
 from .config import Settings
-from .db import PRODUCTION_POOL_MAX_SIZE, close_pool, get_pool
+from .db import close_pool, get_pool
 from .deps import get_db_pool
 from .dispatch import (
     build_compute_backend_client,
     build_dispatch_semaphore,
     dispatch_semaphore,
     drain_running_dispatches,
+    production_pool_max_size,
     reconcile_inflight_tickets,
 )
 from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
@@ -62,14 +63,19 @@ async def lifespan(app: FastAPI):
     # Unconditional, and the only proof from outside the process that app logging came
     # up: uvicorn's own `INFO:` lines reach the journal whether or not the root logger
     # was ever configured, so a check for them cannot tell a working CP from the bug
-    # this fixed. The fan-out default is here because it is the number an operator
-    # reconciles a `fanout list` reading against, and overrides revert to it on restart.
+    # this fixed. The fan-out and dispatch defaults are here because they are the
+    # numbers an operator reconciles a `fanout list` / `dispatch-cap` reading against,
+    # and overrides revert to them on restart.
+    pool_max_size = production_pool_max_size(settings.dispatch_max_inflight)
     _log.info(
-        "control-plane up: log_level=%s fanout_max_inflight=%d",
+        "control-plane up: log_level=%s fanout_max_inflight=%d dispatch_max_inflight=%d"
+        " pool_max_size=%d",
         log_level,
         settings.fanout_max_inflight,
+        settings.dispatch_max_inflight,
+        pool_max_size,
     )
-    app.state.pool = await get_pool(settings.database_url, max_size=PRODUCTION_POOL_MAX_SIZE)
+    app.state.pool = await get_pool(settings.database_url, max_size=pool_max_size)
     app.state.settings = settings
     # Build the OIDC verifier eagerly when AUTHROCKET_* is set.
     # AuthRocketVerifier.from_settings raises on missing env, which makes
@@ -89,7 +95,7 @@ async def lifespan(app: FastAPI):
         token_path=settings.cp_to_co_token_path,
     )
     app.state.running_dispatches = set()
-    app.state.dispatch_semaphore = build_dispatch_semaphore()
+    app.state.dispatch_semaphore = build_dispatch_semaphore(settings.dispatch_max_inflight)
     # Boot-time read: if the assignment above was removed or reordered, fail
     # here — before reconcile dispatches anything — rather than post-commit at
     # the first route, or in the fan-out pump where a raise strands a released

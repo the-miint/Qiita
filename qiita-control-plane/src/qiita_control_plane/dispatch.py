@@ -35,9 +35,16 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.models import NON_TERMINAL_WORK_TICKET_STATES
+from qiita_common.models import (
+    DEFAULT_DISPATCH_MAX_INFLIGHT,
+    DISPATCH_MAX_INFLIGHT_CHOICES,
+    NON_TERMINAL_WORK_TICKET_STATES,
+)
 from qiita_common.step_log import no_step_scope
 
+from .db import PRODUCTION_POOL_FLOOR
+from .dispatch_semaphore import DispatchSemaphore
+from .ena_import.batch import _STUDY_CONCURRENCY
 from .fanout_dispatch import cohort_for_work_ticket, held_cohorts, top_up_dispatch
 from .follow_on import submit_follow_on
 from .health import wait_for_data_plane
@@ -50,30 +57,67 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 # Process-wide bound on concurrently-running dispatch tasks, shared by every
-# dispatch path (route submit, ENA batch submit, startup reconcile) and across
-# every fan-out cohort at once. Each running task acquires pool connections per
-# call only (runner._base), but each is a concurrent acquirer — the count is
-# what must stay well below db.get_pool's max_size. (The exception that can
-# outlast a call's usual budget: the runner's `_stage_ena_run_roster`, parked
-# on the registration lock, holds its connection for the whole bounded wait,
-# `POOL_LOCK_WAIT_TIMEOUT_S`, rather than cycling it.) Sized the way
-# ena_import._STUDY_CONCURRENCY is; test_dispatch pins both the ratio and the
-# two semaphores' joint draw on the pool. 8 equals fanout's
-# DEFAULT_FANOUT_MAX_INFLIGHT on purpose: a single cohort at its default cap
-# stays reachable, and FANOUT_MAX_INFLIGHT tuned above 8 buys a cohort nothing
-# — its children queue for these same shared slots. What a slot covers, and the
-# workflow cap that follows from it, is documented on `schedule_dispatch`.
-_DISPATCH_CONCURRENCY = 8
+# dispatch path (route submit, ENA batch submit, startup reconcile, fan-out pump) and
+# across every fan-out cohort at once: `app.state.dispatch_semaphore`, whose limit is
+# DISPATCH_MAX_INFLIGHT at boot and can be retuned at runtime through
+# `PATCH /work-ticket/dispatch-cap`. Each running task acquires pool connections per
+# call only (runner._base), but each is a concurrent acquirer, so the cap is what must
+# stay well below the request pool's max_size. (The exception that can outlast a
+# call's usual budget: the runner's `_stage_ena_run_roster`, parked on the
+# registration lock, holds its connection for the whole bounded wait,
+# `POOL_LOCK_WAIT_TIMEOUT_S`, rather than cycling it.) `production_pool_max_size`
+# sizes the pool from the boot cap so that holds; test_dispatch pins it for every
+# allowed value. The smallest allowed cap equals fanout's DEFAULT_FANOUT_MAX_INFLIGHT,
+# so a single cohort at its default cap stays reachable, and FANOUT_MAX_INFLIGHT tuned
+# above the dispatch cap buys a cohort nothing — its children queue for these same
+# shared slots. What a slot covers, and the workflow cap that follows from it, is
+# documented on `schedule_dispatch`.
+
+
+def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
+    """Whether a dispatch cap of `max_inflight` stays well below a request pool of
+    `pool_max_size`: at most half of it, and with room left for the ENA study gate
+    (`ena_import._STUDY_CONCURRENCY`), which draws on the same pool with no joint
+    accounting anywhere else."""
+    return max_inflight * 2 <= pool_max_size and max_inflight + _STUDY_CONCURRENCY <= pool_max_size
+
+
+def production_pool_max_size(dispatch_max_inflight: int) -> int:
+    """The request pool's max_size for a boot-time DISPATCH_MAX_INFLIGHT: the smallest
+    size at or above `PRODUCTION_POOL_FLOOR` that `dispatch_cap_fits_pool` accepts.
+
+    Every connection the pool opens is a backend on the Postgres server, which may be
+    shared with the DuckLake catalog. A value that takes the pool above the floor has
+    to fit that server's max_connections alongside the data plane's pools and every
+    other client before it is offered in `DISPATCH_MAX_INFLIGHT_CHOICES`.
+    """
+    return max(
+        PRODUCTION_POOL_FLOOR,
+        dispatch_max_inflight * 2,
+        dispatch_max_inflight + _STUDY_CONCURRENCY,
+    )
+
+
+def max_settable_dispatch_max_inflight(dispatch_max_inflight: int) -> int:
+    """The largest runtime override the pool built for a boot-time
+    DISPATCH_MAX_INFLIGHT can carry. The pool's size is fixed at boot, so going
+    higher takes a larger DISPATCH_MAX_INFLIGHT and a restart."""
+    pool_max_size = production_pool_max_size(dispatch_max_inflight)
+    return max(c for c in DISPATCH_MAX_INFLIGHT_CHOICES if dispatch_cap_fits_pool(c, pool_max_size))
+
 
 _RESUME_RETRY_BASE_SECONDS = 1.0
 
 
-def build_dispatch_semaphore() -> asyncio.Semaphore:
-    """The process-wide cap `schedule_dispatch` binds every dispatch task to."""
-    return asyncio.Semaphore(_DISPATCH_CONCURRENCY)
+def build_dispatch_semaphore(
+    dispatch_max_inflight: int = DEFAULT_DISPATCH_MAX_INFLIGHT,
+) -> DispatchSemaphore:
+    """The process-wide cap `schedule_dispatch` binds every dispatch task to, at the
+    boot-time DISPATCH_MAX_INFLIGHT."""
+    return DispatchSemaphore(dispatch_max_inflight)
 
 
-def dispatch_semaphore(app: FastAPI) -> asyncio.Semaphore:
+def dispatch_semaphore(app: FastAPI) -> DispatchSemaphore:
     """Resolve dispatch's cap on `app.state`, or fail naming the wiring gap.
 
     Read once at boot by the lifespan (so an assignment that was removed or
@@ -218,8 +262,8 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
     by a done-callback when complete.
 
     The task body runs under `app.state.dispatch_semaphore`, the process-wide
-    cap of `_DISPATCH_CONCURRENCY` concurrently-running dispatches (what it is
-    sized against, and why 8, is on the constant). A task holds its slot for
+    cap on concurrently-running dispatches (what it is sized against is in the
+    comment above `dispatch_cap_fits_pool`). A task holds its slot for
     its whole workflow, an hours-long download poll included, so the cap is
     also a process-wide cap on in-flight workflows: tasks past it queue FIFO
     and start as slots free, logging the wait when they do. Startup reconcile
@@ -261,10 +305,12 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fals
         queued = semaphore.locked()
         if queued:
             _log.info(
-                "work_ticket %d queued behind the dispatch cap (%d running);"
-                " it starts when a slot frees",
+                "work_ticket %d queued behind the dispatch cap (%d running, cap %d,"
+                " %d already waiting); it starts when a slot frees",
                 work_ticket_idx,
-                _DISPATCH_CONCURRENCY,
+                semaphore.running,
+                semaphore.limit,
+                semaphore.waiting,
             )
         queued_at = time.monotonic()
         async with semaphore:
