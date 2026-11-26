@@ -427,11 +427,7 @@ def build_values(cohort: Cohort, values: pa.Table, labels: pa.Table) -> pa.Table
         stage_values(
             duck, source=cohort.source, names="names", values="stored_values", labels="labels"
         )
-        # Ordered so the dictionary-encoded `sample`/`feature` codes are assigned in a
-        # stable order, making the stream reproducible.
-        table = duck.sql(
-            f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature"
-        ).to_arrow_table()
+        table = duck.sql(f"SELECT sample, feature, value FROM {VALUE_RELATION}").to_arrow_table()
     return table.cast(VALUES_SCHEMA)
 
 
