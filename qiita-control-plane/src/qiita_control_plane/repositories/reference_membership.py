@@ -9,7 +9,7 @@ COUNT(DISTINCT shard_id) (or the sorted DISTINCT list) over the non-NULL rows.
 That derivation is a correctness invariant shared across the arc: the
 reference-add finalizer's completion threshold, the plan-shards resume gate, the
 shard-index-status route's `expected_shards`, and the alignment planner's
-shard-set all MUST agree on it. Centralising the two queries here removes the
+shard-set all MUST agree on it. Centralizing the two queries here removes the
 copy-paste drift hazard (a finalizer reading a different threshold than the one
 the planner assigned would fail *wrong*, not fail loud).
 

@@ -31,11 +31,11 @@ from .relations import (
 
 # What the sidecar carries: the SAME `feature_id` the table's rows are named with, and
 # the eight ranks. One file joinable to the other on one column, which is the whole
-# reason both are labelled from one mint.
+# reason both are labeled from one mint.
 #
 # No `genome_idx`, and no lineage string. The string form would be lossy in a way the
 # columns are not — see `qiita_common.taxonomy.genome_lineage_select_sql`.
-# Names only, unlike `TREE_SCHEMA` and `LABELLED_SCHEMA`: those carry types because a
+# Names only, unlike `TREE_SCHEMA` and `LABELED_SCHEMA`: those carry types because a
 # builder writes `CAST(NULL AS …)` from them for an empty result. The sidecar has no such
 # path — it is as wide as the table, and an empty table's sidecar is an empty COPY of a
 # relation that already has the right types.
@@ -117,7 +117,7 @@ class TaxonomyClearance:
     """Evidence that `check_taxonomy_diagnostics` ran and passed, plus the sidecar's row
     count so a caller can report the size without counting it again.
 
-    `taxonomy_copy_sql` takes one for the same reason `labelled_relation_sql` takes a
+    `taxonomy_copy_sql` takes one for the same reason `labeled_relation_sql` takes a
     `LabelClearance`: a sidecar that does not line up with the table it accompanies is
     a file people will join anyway.
     """
@@ -234,7 +234,7 @@ def shear_input_statements() -> tuple[str, ...]:
     published file, and could collide with a handle.
 
     **A tip whose feature is BLOCKED gets a NULL name for the same reason**, which is how
-    this recipe honours the exclusion contract the phylogeny defers to — see
+    this recipe honors the exclusion contract the phylogeny defers to — see
     `BLOCKED_FEATURE_TABLE`. Naming it, not dropping its row: the count has to stay equal
     to the tree's, since a difference is what reports a tip belonging to two genomes. It
     also means a genome with a second, unblocked tip publishes THAT one rather than being

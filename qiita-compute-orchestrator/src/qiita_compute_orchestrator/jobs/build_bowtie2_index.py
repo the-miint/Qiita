@@ -236,7 +236,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if sharded:
             # Read the shard's feature roster (small — one row per feature) to
             # scope the DoGet ticket, then stream that roster's chunks. The
-            # subject TABLE is materialised INSIDE the stream `with` (a blocking
+            # subject TABLE is materialized INSIDE the stream `with` (a blocking
             # agg that drains the stream) so the Flight client closes before the
             # long bowtie2 build.
             roster_sql = validate_parquet_path(inputs.shard_features)

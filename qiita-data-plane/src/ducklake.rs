@@ -467,7 +467,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- that means `every prep_sample`, so the macro has no whole-table form to
         -- construct. THIS IS THE ONE SITE THAT ENFORCES THAT, and every other
         -- comment on the subject points here. The control plane's mandatory-filter
-        -- invariant (routes/read_masked.py) stays as defence in depth but is no
+        -- invariant (routes/read_masked.py) stays as defense in depth but is no
         -- longer the only thing between a mis-signed ticket and every study's reads.
         --
         -- Needs DuckDB >= 1.5: on 1.4 this CREATE fails
@@ -616,7 +616,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- it — more when the read is longer than the contig and wraps past the
         -- origin more than once. Identity and mapq do not separate those records
         -- from any other good alignment; query coverage does, because each covers
-        -- only its own share of the read. Upstream documents the behaviour and
+        -- only its own share of the read. Upstream documents the behavior and
         -- ships the aggregate that pools it —
         -- https://the-miint.github.io/duckdb-miint/alignment_analysis/#circular-query-coverage
         -- — and `test_origin_spanning_read_splits_into_one_record_per_side` pins
@@ -752,7 +752,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// contract instead is that a tree consumer shears the tree to the keep-set
 /// (`tips WHERE feature_idx NOT IN reference_exclusion`) with miint's
 /// `shear_tree`, so no phylogeny view is built. The consumer today is the
-/// client-side `qiita feature-table build --tree`, which honours that keep-set by
+/// client-side `qiita feature-table build --tree`, which honors that keep-set by
 /// reading the blocklist over REST — this being the one read surface that cannot
 /// hand it an exclusion-aware view — and intersects it with the genomes its table
 /// publishes. Neither set implies the other: a curator can block one contig of a
@@ -787,7 +787,7 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Create the assembly-result tables in DuckLake — the assembly analogue of the
+/// Create the assembly-result tables in DuckLake — the assembly analog of the
 /// reference-sequence tables, following the SAME chunked + content-hashed model.
 ///
 /// A contig is stored ONCE, deduped by content hash and keyed by the CP-minted
@@ -2848,7 +2848,7 @@ mod tests {
         let _ = conn.execute_batch(&format!("DROP TYPE {enum_type};"));
 
         // Recorded either way: this is a fact about DuckDB we are pinning, not a
-        // behaviour we require. A change here is a signal to re-measure, which is
+        // behavior we require. A change here is a signal to re-measure, which is
         // why the failure message says so rather than just asserting.
         let domain = schema.field_with_name("domain").expect("domain column");
         assert!(
@@ -2869,7 +2869,7 @@ mod tests {
     /// through the join and showed 1-4 inversions; that is the distinction.
     ///
     /// Uses `stream_arrow`, the streaming form `stream_ducklake_batches` uses in
-    /// production — the materialising `query_arrow` is a different execution mode
+    /// production — the materializing `query_arrow` is a different execution mode
     /// and could order differently.
     ///
     /// This runs at DuckDB's default, `preserve_insertion_order=true`, which is
@@ -2892,7 +2892,7 @@ mod tests {
         .expect("create probe tables");
         // One INSERT per group, so each lands in its own DuckLake file — the
         // layout a partitioned writer produces, and the one a parallel scan can
-        // interleave. Large enough that DuckDB actually parallelises.
+        // interleave. Large enough that DuckDB actually parallelizes.
         const GROUPS: i64 = 16;
         const PER_GROUP: i64 = 100_000;
         for group in 0..GROUPS {

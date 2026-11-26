@@ -29,19 +29,19 @@ def get_db_pool(request: Request) -> asyncpg.Pool:
     that builds the app without lifespan)."""
     pool = getattr(request.app.state, "pool", None)
     if pool is None:
-        raise RuntimeError("Database pool not initialised — lifespan may not have run")
+        raise RuntimeError("Database pool not initialized — lifespan may not have run")
     return pool
 
 
 def get_settings(request: Request) -> Settings:
     """Return the Settings instance stashed on `app.state.settings` by
-    lifespan. Single source of truth for the runtime-not-initialised
+    lifespan. Single source of truth for the runtime-not-initialized
     guard; field-projection helpers (`get_flight_signing_key`,
     `get_data_plane_url`) delegate here so the check lives in one place.
     """
     settings = getattr(request.app.state, "settings", None)
     if settings is None:
-        raise RuntimeError("Settings not initialised — lifespan may not have run")
+        raise RuntimeError("Settings not initialized — lifespan may not have run")
     return settings
 
 

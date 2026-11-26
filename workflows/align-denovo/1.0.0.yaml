@@ -25,7 +25,7 @@ description: >
   reads or a mask still in flight.
 
   The gate applied to the alignments is the CIRCULAR-POOLED one: an assembler emits a
-  circular contig linearised, so a read crossing its origin arrives as one record per
+  circular contig linearized, so a read crossing its origin arrives as one record per
   side and a per-record coverage floor would drop it. The job pools a read's records
   against one contig and judges the read there, and records the reads it found
   origin-spanning in the DuckLake `alignment_origin_spanning` side table.

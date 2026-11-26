@@ -2,7 +2,7 @@
 
 Exercises count_reference_shards / reference_shard_ids — the two derivations of
 a reference's shard-set (COUNT(DISTINCT shard_id) and the sorted DISTINCT list
-over the non-NULL membership rows). These centralise a query that was
+over the non-NULL membership rows). These centralize a query that was
 byte-identical across the reference-add finalizer, the plan-shards resume gate,
 the shard-index-status route, and the alignment planner; the tests pin the
 count/list agreement (and the NULL-exclusion) a copy-paste drift would silently

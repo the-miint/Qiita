@@ -245,7 +245,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     before dying is read back and reused, and the step completes.
 
     This is what makes the step idempotent across runner retries. The prior
-    behaviour — 409 -> UNKNOWN_PERMANENT — is what turned an OOM-killed first
+    behavior — 409 -> UNKNOWN_PERMANENT — is what turned an OOM-killed first
     attempt into a permanent failure on the retry: it masked the OOM behind a mint
     conflict and defeated the runner's OOM memory escalation, which can only pay
     off if the escalated attempt gets past the mint. This is the exact sequence
@@ -531,7 +531,7 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     The gate is an ALLOWLIST — reuse is legitimate only while the minting ticket is
     still in flight — not a denylist of `completed`. A denylist would let a
     work_ticket_state added later fall through to the reuse path by default —
-    fail-open — and this parametrisation is what pins it: it walks EVERY terminal
+    fail-open — and this parametrization is what pins it: it walks EVERY terminal
     state, so a new one is covered the day it is added.
 
     Reachable if a stale attempt outlives the attempt that finished the ticket (an

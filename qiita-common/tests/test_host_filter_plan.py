@@ -60,7 +60,7 @@ _HOST_ABSENT = HostFilterResolution(
 def test_blank_is_depleted_against_the_pools_sole_host():
     """Every pool we hold is human-gut samples + blanks. The blank inherits the
     pool's host, which is what happens today (pool-wide filtering hits blanks
-    too), so this is not a behaviour change for blanks — it is the same answer,
+    too), so this is not a behavior change for blanks — it is the same answer,
     now derived rather than assumed."""
     plan = plan_pool_host_filter({"S1": _filter(), "S2": _filter(), "BLANK.1": _CONTROL})
 

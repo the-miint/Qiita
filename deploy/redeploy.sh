@@ -26,7 +26,7 @@
 #
 # The script only STOPS to ask when there is real work or a real decision — it
 # does not pause on no-ops:
-#   * the buckets 1 & 2 acknowledgement is skipped when both are empty in
+#   * the buckets 1 & 2 acknowledgment is skipped when both are empty in
 #     DEPLOY_CHECKLIST.md (nothing to apply out-of-band → nothing to confirm);
 #   * the two venv refreshes (steps 5 and 6) are NOT among the things it can skip.
 #     They run every time, and prompt only for a native checkout this script did

@@ -560,7 +560,7 @@ fn build_query_read_masked_requires_its_full_scope() {
     );
 
     // Extra columns are refused rather than silently appended as an outer
-    // filter: on this surface an unrecognised scope column is a CP bug.
+    // filter: on this surface an unrecognized scope column is a CP bug.
     let extra = filter_of(&[
         ("mask_idx", vec![serde_json::json!(7)]),
         ("prep_sample_idx", vec![serde_json::json!(11)]),
@@ -1242,7 +1242,7 @@ fn unknown_projection_column_is_rejected() {
 fn duplicate_projection_columns_are_rejected() {
     // A repeated name produces two identically-named Arrow fields, which
     // consumers collapse or reject inconsistently. Refuse to emit the
-    // ambiguous schema rather than pick a behaviour on their behalf.
+    // ambiguous schema rather than pick a behavior on their behalf.
     let cols = columns(&["feature_idx", "position", "feature_idx"]);
     assert!(
         build_query("alignment_visible", &alignment_scope(), &[], &cols).is_err(),

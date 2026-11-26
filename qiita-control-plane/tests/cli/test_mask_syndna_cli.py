@@ -234,7 +234,7 @@ def test_accession_names_need_no_data_plane(monkeypatch, tmp_path):
     assert {r[1] for r in _cells(out, "parquet")} == {_H1, _H2}
 
 
-def test_a_response_the_cli_does_not_recognise_is_one_error_line(monkeypatch, tmp_path, capsys):
+def test_a_response_the_cli_does_not_recognize_is_one_error_line(monkeypatch, tmp_path, capsys):
     """A syndna-read-count body that fails SyndnaReadCountResponse (e.g. from a
     control plane at a different version) is one stderr line, exit 1, no file."""
     monkeypatch.setenv("QIITA_TOKEN", "t")

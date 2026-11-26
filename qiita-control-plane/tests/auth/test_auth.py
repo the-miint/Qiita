@@ -166,7 +166,7 @@ def test_sign_ticket_members_selector():
     ``read_block`` carries members alone (an empty filter is legitimate there and
     only there); an explicitly EMPTY members list is refused, because it means
     the caller computed a block footprint and got nothing — a planning bug, never
-    a licence to read the whole table.
+    a license to read the whole table.
     """
     import json
 

@@ -1,4 +1,4 @@
-"""Recognising a data-plane Flight failure that a retry can clear.
+"""Recognizing a data-plane Flight failure that a retry can clear.
 
 Both services call the data plane over Flight and both have to decide whether a failure is
 the data plane's state or the caller's request. The classification cannot be shared as code

@@ -26,7 +26,7 @@ six contigs across one sample's real masked reads carried it. It is accepted as
 a well-formed value and routed to noLCG, which is both the safe direction and
 what the assay owner does by hand.
 
-Three further behaviours were probed and are relied on below:
+Three further behaviors were probed and are relied on below:
   * myloasm is DETERMINISTIC — two runs over the same reads gave byte-identical
     headers.
   * Across two read samplings of the SAME genome, `depth-` moved (32→31) and the
@@ -36,7 +36,7 @@ Three further behaviours were probed and are relied on below:
     primary FASTA after a zero exit as a contract violation, not an empty
     assembly.
 
-The behavioural tests here EXECUTE `myloasm_split.py` against the real miint
+The behavioral tests here EXECUTE `myloasm_split.py` against the real miint
 extension this component's conftest stages, so they prove the split works rather
 than that it is still spelled a certain way. Like the other real-miint smokes in
 this tree they carry no offline skip — a missing extension fails the session. The
@@ -83,7 +83,7 @@ def staged_miint() -> str:
     session-scoped `_stage_miint_extension` installs once into the stable
     per-component dir from `setup_miint_test_env("orchestrator")`, cached across
     runs on purpose. Re-downloading here would undo that for every `make test`,
-    and would pin the mirror URL in a second place instead of honouring
+    and would pin the mirror URL in a second place instead of honoring
     `MIINT_EXTENSION_REPO`.
 
     It is also the right SHAPE for these tests: a directory somebody else staged,
@@ -292,7 +292,7 @@ def test_malformed_input_fails_loud(
 ) -> None:
     """Every shape we cannot interpret exits 64 instead of producing a partial split.
 
-    Silence is the dangerous outcome: an unrecognised header simply fails to match
+    Silence is the dangerous outcome: an unrecognized header simply fails to match
     the circular pattern, so the step would exit 0 having classified every genome
     as linear. Fail-closed converts that into a step failure an operator sees.
 

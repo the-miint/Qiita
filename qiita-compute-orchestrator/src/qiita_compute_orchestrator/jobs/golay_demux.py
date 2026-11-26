@@ -1,5 +1,5 @@
 """Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
-table — the amplicon analogue of ingest_reads. It runs after bcl_convert, which
+table — the amplicon analog of ingest_reads. It runs after bcl_convert, which
 sent every decodable read to Undetermined (the dummy sheet) and emitted the Golay
 I1 index, and reads that convert_dir's I1/R1/R2 FASTQs directly.
 
@@ -89,8 +89,8 @@ def _bits_to_dna(word: int) -> str:
 
 
 def _golay_cloud_rows(max_errors: int) -> list[tuple[str, str, int]]:
-    """(raw, corrected, errors) for every codeword and its neighbours within
-    `max_errors` flips. neighbours are unique for max_errors<=3, so no dedup.
+    """(raw, corrected, errors) for every codeword and its neighbors within
+    `max_errors` flips. neighbors are unique for max_errors<=3, so no dedup.
     default threshold 1.5 gives radius 1 and 102,400 rows."""
     rows: list[tuple[str, str, int]] = []
     for message in range(4096):
@@ -193,7 +193,7 @@ def _run_demux(
     memory_gb: int,
 ) -> None:
     """demux the FASTQ to an intermediate parquet keyed by prep_sample_idx.
-    paths are inlined (sanitised); DuckDB rejects bound params in CREATE VIEW/SET."""
+    paths are inlined (sanitized); DuckDB rejects bound params in CREATE VIEW/SET."""
     i1 = validate_parquet_path(reads.index_reads_path)
     r1 = validate_parquet_path(reads.forward_reads_path)
     bc = validate_parquet_path(inputs.barcode_map)

@@ -56,7 +56,7 @@ qiita submit-pacbio-ingest \
   job is still running are reported `skipped`. A prep_sample whose job *failed*
   is re-driven with `qiita ticket run <idx>` instead; a fresh job for it stops
   and says so if the failed one had already numbered its reads. The pool is
-  recognised by the exact contents of the pre-flight file, so submit the same
+  recognized by the exact contents of the pre-flight file, so submit the same
   file again. Changed contents under the same file name are refused; under a new
   name they create a second pool. A prep_sample whose reads a completed job
   already loaded is reported `skipped` too, naming that job.

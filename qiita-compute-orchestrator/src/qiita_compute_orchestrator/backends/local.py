@@ -25,7 +25,7 @@ from ..jobs import flatten_native_inputs, run_native_job
 class LocalBackend(ComputeBackend):
     """Runs native-module steps in-process. Dev/test only.
 
-    The production analogue is `SlurmBackend`; that one still supports
+    The production analog is `SlurmBackend`; that one still supports
     `container:` steps (apptainer under SLURM), but no current workflow
     needs to exercise a container step in LocalBackend, so the surface
     here is module-only. A request that sets `container:` on a step is

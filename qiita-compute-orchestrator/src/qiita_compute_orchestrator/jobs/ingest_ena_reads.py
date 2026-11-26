@@ -13,7 +13,7 @@ reads) does not fail the pool when another run was stored: it is listed in the
 `run_outcomes` JSON for `persist-ena-run-outcomes` and the rest land. Any
 transient failure fails the step so the ticket retries; on its last attempt
 (`final_attempt`) the stored runs land and the transient failures are listed too. Any
-unrecognised error (OOM, local staging), or no run stored, fails the step.
+unrecognized error (OOM, local staging), or no run stored, fails the step.
 
 Gotchas specific to the ENA source:
 - md5 verification is miint's, not this job's: `read_ena_sequences`'s
@@ -171,7 +171,7 @@ def _classify_ena_fetch_error(
     """Classify a raised `duckdb.Error` from `_stage_run_reads`. Retriable: a
     network-shaped error, a transient or zero HTTP status, ENA's incomplete answer,
     a mid-stream failure, an md5 mismatch, a truncated gzip. Anything else is BAD_INPUT, which
-    `_is_permanent_fetch_error` then narrows to the recognised bad runs."""
+    `_is_permanent_fetch_error` then narrows to the recognized bad runs."""
     text = str(exc).lower()
     # A run that broke mid-download: its data is partial, which is not the same
     # as ENA being unreachable, so the reason does not carry

@@ -23,7 +23,7 @@ chunking is miint's native `sequence_split` (`UNNEST`ed) — never a hand-rolled
 Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so the whole
 manifest is one streaming scan — no sequence bytes through Python. The scan runs
 twice: pass 1 keeps only `(read_id, length, filepath)` for the sanity checks, so
-the full sequences are never materialised; pass 2 re-reads every file and streams
+the full sequences are never materialized; pass 2 re-reads every file and streams
 read → split → Parquet without landing sequences in a table (pass 2's comment
 in `execute` says why). Empty files are pre-filtered out (`read_fastx` raises on a
 0-record input, and one empty path aborts the scan).
@@ -82,7 +82,7 @@ _DUCKDB_MEMORY_GB = 30
 _DUCKDB_THREADS = 8
 
 # Byte budget for each `read_fastx` batch. Caps the read-side vector so a run of
-# multi-MB genome records can't materialise a 2048-row × 21 MB chunk before the
+# multi-MB genome records can't materialize a 2048-row × 21 MB chunk before the
 # chunking operator runs. One of three memory levers — the others are the
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
 # buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED_TRANSFER).
@@ -145,7 +145,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     emit the chunked Parquet part. Validates the manifest and each listed file,
     stages only `(read_id, length, filepath)` into a small temp table, fails fast on
     an empty-body record or a duplicate read_id, then re-scans and COPYs the
-    `sequence_split`/`UNNEST` chunking to Parquet without materialising the
+    `sequence_split`/`UNNEST` chunking to Parquet without materializing the
     sequences. Returns `{"fasta_path": <directory>}`.
     """
     if not inputs.fasta_manifest_path.is_absolute():
@@ -195,7 +195,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             # Pass 1 — lengths + filepath only; no sequence bytes retained, so
             # the sanity checks (empty-body, dup read_id) cost a tiny table
-            # instead of materialising every genome.
+            # instead of materializing every genome.
             # `max_batch_bytes` caps the read-side vector for genome-scale
             # records; `include_filepath` lets the dup report name the file.
             conn.execute(
@@ -252,7 +252,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # sequence splits into 64 KB pieces in a single linear pass; UNNEST
             # gives one row per chunk. Sequences flow read -> split -> parquet
             # without ever landing in a table. Re-reading each FASTA (2x
-            # decompress total) is far cheaper than materialising hundreds of
+            # decompress total) is far cheaper than materializing hundreds of
             # genomes only to spill them.
             part_out = validate_parquet_path(fasta_dir / "part_00000.parquet")
             conn.execute(

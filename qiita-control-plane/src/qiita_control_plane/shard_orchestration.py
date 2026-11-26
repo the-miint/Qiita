@@ -1,7 +1,7 @@
 """Sharded-index fan-out orchestration.
 
 Sits above the `plan_shards` assignment core (`actions.library`) and turns its
-output into N build tickets — the sharded analogue of
+output into N build tickets — the sharded analog of
 `block_planner.plan_and_submit_blocks`, minus the block stack's cover-map /
 completion-gate machinery. A shard is a clean partition of ONE reference (the
 reference IS the accounting unit), so this stays deliberately lighter:

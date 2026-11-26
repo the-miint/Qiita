@@ -1,4 +1,4 @@
-"""Pins two DuckDB memory behaviours that job code REASONS ABOUT in comments.
+"""Pins two DuckDB memory behaviors that job code REASONS ABOUT in comments.
 
 Both are load-bearing for `align_sharded`'s decision to materialize the aligner's
 query relation into an in-memory table (see the materialization note in
@@ -19,12 +19,12 @@ NOT spill — it raises OutOfMemoryException.** `stage_subject` is what both
 `build_minimap2_index` and `build_bowtie2_index` reassemble a shard's subject with,
 and each caps DuckDB's share under SLURM. Whether that cap is a graceful degradation
 or a hard ceiling on shard size turns entirely on this, and the two are opposite
-answers — behaviour 1 above shows a plain over-limit TABLE spilling, which is the
+answers — behavior 1 above shows a plain over-limit TABLE spilling, which is the
 easy thing to assume also holds here. It does not.
 
 Plain DuckDB, no miint extension and no staged indexes, so these run in the fast
 `make test` tier. Kept deliberately small: each builds a table a few times the
-memory limit it is tested against, which is enough to force the behaviour without
+memory limit it is tested against, which is enough to force the behavior without
 making the unit tier slow.
 """
 

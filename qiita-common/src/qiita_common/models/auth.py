@@ -183,7 +183,7 @@ class PrincipalSystemRoleUpdate(BaseModel):
 
     `use_enum_values=True` so `model_dump()` returns the lowercase string
     (e.g. `"user"`) rather than the `SystemRole` member — preserves the
-    JSON-serialised contract that pre-dated the StrEnum migration.
+    JSON-serialized contract that pre-dated the StrEnum migration.
     """
 
     model_config = ConfigDict(use_enum_values=True)

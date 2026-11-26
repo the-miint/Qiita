@@ -567,7 +567,7 @@ class GenomeMapEntry(BaseModel):
     """One (feature, genome) pair of a reference's genome map, with the genome's
     provenance. Both `source` and `source_id` ship because `qiita.genome`'s
     uniqueness is the composite `(source, source_id)` — `source_id` alone is
-    unique only within a source, so a consumer relabelling `genome_idx` to a
+    unique only within a source, so a consumer relabeling `genome_idx` to a
     public id needs the pair to assert no collision."""
 
     feature_idx: int

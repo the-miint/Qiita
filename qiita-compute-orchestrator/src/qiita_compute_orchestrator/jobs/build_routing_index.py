@@ -21,7 +21,7 @@ chunks must first land on disk where that separate connection can re-scan them.
 This is exactly the lazy-VIEW-over-Parquet shape `build_rype_index` uses in host
 mode; the only difference is the source (a stream persisted to the workspace
 rather than the ingest staging Parquet), so the whole-reference build stays
-memory-bounded (rype windows over the on-disk Parquet; DuckDB never materialises
+memory-bounded (rype windows over the on-disk Parquet; DuckDB never materializes
 the corpus into an in-memory table).
 
 The shard->bucket mapping rides a runner-staged `shard_mapping` Parquet
@@ -142,7 +142,7 @@ def _run_rype_index_create(
     (VARCHAR, quote-escaped), `k`/`w` (INTEGER, inlined int()), `salt` (UBIGINT,
     pinned constant), `orient` (BOOLEAN), `max_memory` (BIGINT). `chunk_table` /
     `mapping_table` are table NAMES the function resolves on its own connection.
-    orient=TRUE keeps both-strand matching — a read can minimise into a shard on
+    orient=TRUE keeps both-strand matching — a read can minimize into a shard on
     either strand, so it must route on both."""
     mapping_sql = mapping_table.replace("'", "''")
     row = conn.execute(

@@ -42,7 +42,7 @@ docs/duckdb-miint.md):
     `(read_id, bucket_id, bucket_name, score)`. We DISTINCT the `read_id` — the
     table-function interface does not guarantee one best-hit row per read — and
     append into a BIGINT accumulator column, which coerces rype's `read_id` to
-    BIGINT on insert. Signature and behaviour:
+    BIGINT on insert. Signature and behavior:
     https://the-miint.github.io/duckdb-miint/classification/#rype_classify
   - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` ->
     SAM-like rows (`read_id, flags, reference, ...`); `read_id` round-trips as

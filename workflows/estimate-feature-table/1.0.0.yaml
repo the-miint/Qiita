@@ -17,7 +17,7 @@ description: >
   sample against its own assembled contigs, with the de novo arm taking
   precedence for every read it placed. The two arms' genomes are rows of one
   `qiita.genome` space, so the result is one table over both. Absent that key the
-  behaviour is byte-identical to the reference-only form above.
+  behavior is byte-identical to the reference-only form above.
 
   The de novo arm's genomes are gated on their CheckM completeness / contamination
   (`min_completeness` / `max_contamination`, both optional). The gate filters the map

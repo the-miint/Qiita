@@ -1,7 +1,7 @@
 """Native job: re-key assembly_hash's hash-keyed outputs to feature_idx and write
 the DuckLake-shape staging Parquets register-files hands to the data plane.
 
-Tail of the long-read-assembly workflow, the assembly analogue of reference_load.
+Tail of the long-read-assembly workflow, the assembly analog of reference_load.
 It REUSES the shared `_feature_load` re-key writers verbatim — the shared
 `qiita.feature` space means an assembled contig and a reference sequence with the
 same bytes carry the same feature_idx, so the sequence + chunk writers are

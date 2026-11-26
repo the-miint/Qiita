@@ -13,7 +13,7 @@ Exercises every layer of the private CP → CO step path:
 
 In-process: the orchestrator FastAPI app is reached via httpx
 `ASGITransport`, not a uvicorn subprocess. Lifespan is bypassed in
-favour of setting `app.state` directly — same pattern the control-plane
+favor of setting `app.state` directly — same pattern the control-plane
 integration tests use to wire `app.state.pool`.
 """
 
@@ -77,7 +77,7 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
     workspace = tmp_path / "workspace"
 
     # Caller-supplied http_client takes its auth from its own headers
-    # (ComputeBackendClient honours that path); set Authorization here
+    # (ComputeBackendClient honors that path); set Authorization here
     # so the orchestrator's bearer compare passes.
     async with AsyncClient(
         transport=ASGITransport(app=orchestrator_app),

@@ -99,7 +99,7 @@ def denovo_map_table_sql(source: str) -> str:
     runs of the same prep_sample is one `feature_idx` under two genomes — one per run,
     which is what an assembly identity per run means — so an unscoped map double-counts
     a prep_sample against itself the same way the unscoped join double-counts it against
-    its neighbours. On the deploy 2026-09-10, `qiita.assembly_membership` held
+    its neighbors. On the deploy 2026-09-10, `qiita.assembly_membership` held
     10,536,595 distinct (prep_sample, run, contig) triples over 322 prep_samples and 4
     runs, 866,345 more than their (prep_sample, contig) pairs.
 

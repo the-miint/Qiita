@@ -84,7 +84,7 @@ steps:
     # the serial work one core has to absorb is small — TotalCPU p50 0.44, p99 1.14,
     # max 1.45 min, against an elapsed of p50 2.5, p99 10.0, max 23.9 min. Worst case
     # at cpu:1 is elapsed + 0.75 x TotalCPU (the CPU portion perfectly parallel across
-    # four cores, fully serialised onto one), which peaks at 24.7 min over all 987
+    # four cores, fully serialized onto one), which peaks at 24.7 min over all 987
     # against the PT2H limit.
     #
     # CPU efficiency TotalCPU/(Elapsed x AllocCPUS) is not the bound here: it peaks at

@@ -94,12 +94,12 @@ async def _cleanup(postgres_pool, *, reference_idx=None, feature_idxs=(), genome
 async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_update(postgres_pool):
     """The FORWARD PLAN comment in the migration says a further entity kind has to
     update five things. This is the mechanism behind that sentence: every other test in
-    this module is behavioural, so each one exercises a constraint it happens to trip
+    this module is behavioral, so each one exercises a constraint it happens to trip
     and none of them notices a constraint that was never created — or one added later
     without the reasoning. Adding a kind fails here first, which is where the list is.
 
     Follows the `pg_constraint` / `pg_index` pattern the other schema tests in this
-    suite use. Names only: the definitions are asserted behaviourally below, and pinning
+    suite use. Names only: the definitions are asserted behaviorally below, and pinning
     their text would break on a Postgres that renders an equivalent expression
     differently."""
     checks = {
@@ -138,7 +138,7 @@ async def test_the_constraint_and_index_set_is_exactly_what_a_new_kind_must_upda
 
     # The one index whose PREDICATE is the asymmetry the namespace depends on: a
     # retired genome releases its accession, a retired feature keeps it reserved.
-    # Behaviourally pinned by the two retirement tests below; pinned textually here
+    # Behaviorally pinned by the two retirement tests below; pinned textually here
     # because those two would both still pass if the predicate lost `NOT retired`.
     (namespace,) = [
         r["indexdef"]

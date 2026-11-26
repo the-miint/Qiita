@@ -99,7 +99,7 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # Deprecating a mask / withdrawing its runs is system_admin-only: it
             # decides that published results were produced by a filter we no
             # longer stand behind. Non-destructive, but not a
-            # judgement a service account or wet_lab_admin makes.
+            # judgment a service account or wet_lab_admin makes.
             Scope.MASK_DEFINITION_LIFECYCLE,
             # Deprecating an assembly run / withdrawing its per-sample results is
             # system_admin-only for the same reason as the mask twin above: it

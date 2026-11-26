@@ -537,7 +537,7 @@ def test_job_asks_for_exactly_the_columns_it_binds(tmp_path, monkeypatch):
 # that absent a de novo map nothing about the reference-only job changes. The
 # analytic's own rules (precedence, the sample-keyed map join, the length dedupe)
 # are pinned against real miint in
-# `qiita-common/tests/analytic/test_behaviour_miint.py`; re-asserting them here
+# `qiita-common/tests/analytic/test_behavior_miint.py`; re-asserting them here
 # would be a second copy that drifts.
 # ---------------------------------------------------------------------------
 
@@ -884,7 +884,7 @@ def test_a_denovo_map_without_its_run_fails_loudly(tmp_path, monkeypatch, thresh
 
 
 # ---------------------------------------------------------------------------
-# The de novo arm's quality gate. `analytic`'s behaviour suite owns what the gate
+# The de novo arm's quality gate. `analytic`'s behavior suite owns what the gate
 # COMPUTES; these own that the driver carries the knobs to it and what an omitted
 # action_context key resolves to.
 # ---------------------------------------------------------------------------
@@ -974,7 +974,7 @@ def test_an_unscored_genome_does_not_pass_the_gate(tmp_path, monkeypatch):
     predicate excludes a NULL rather than admitting it, because a caller told every
     genome cleared `min_completeness` must not be handed one nobody measured.
 
-    The resolver refuses such a run before the job runs, so this is the behaviour behind
+    The resolver refuses such a run before the job runs, so this is the behavior behind
     that refusal rather than a path a submission reaches.
     """
     from qiita_compute_orchestrator.jobs import estimate_feature_table as m

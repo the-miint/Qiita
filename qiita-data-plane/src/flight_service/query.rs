@@ -251,7 +251,7 @@ fn select_list_for(table: &str, columns: &[String]) -> Result<String, Status> {
 /// they are interpolated into SQL — the same defense-in-depth argument
 /// `ALLOWED_FILTER_COLUMNS` makes. A repeated name is refused rather than
 /// deduped: it produces two identically-named Arrow fields, which consumers
-/// collapse or reject inconsistently, and picking a behaviour for them would be
+/// collapse or reject inconsistently, and picking a behavior for them would be
 /// guessing.
 fn check_projection_columns(allowed: &[&str], columns: &[String]) -> Result<(), Status> {
     let mut seen: Vec<&str> = Vec::with_capacity(columns.len());
@@ -687,7 +687,7 @@ pub(super) fn build_query(
 /// `prep_sample_idx` set — which is what every control-plane signing site produces
 /// (deliberately not enumerated: the list drifts, and `grep 'read_masked'` on the
 /// control plane is exact). Any other column is refused rather than appended as an
-/// outer filter: on the human-read surface an unrecognised scope column is a
+/// outer filter: on the human-read surface an unrecognized scope column is a
 /// control-plane bug, and quietly reading "the macro's scope, plus whatever else"
 /// is how an under-scoped read would pass.
 fn build_read_masked_query(
@@ -771,7 +771,7 @@ fn build_assembly_run_query(
 /// A cohort where `build_assembly_run_query` takes one prep_sample: this table's rows
 /// are per subject rather than per contig, so a whole cohort answers in one
 /// stream. The rows carry `prep_sample_idx`, so a prep_sample that scored nothing is
-/// absent from the result rather than merged into a neighbour's rows.
+/// absent from the result rather than merged into a neighbor's rows.
 fn build_bin_quality_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
     let processing_idx = single_i64_filter(filter, "processing_idx")?;
     let prep_sample_idx = i64_list_filter(filter, "prep_sample_idx")?;

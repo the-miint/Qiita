@@ -27,7 +27,7 @@ from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
 
 _REFERENCE_LENGTH = 30_000
 
-# One read the linearised contig cut in two, and one it did not. Columns are the ones
+# One read the linearized contig cut in two, and one it did not. Columns are the ones
 # `circular_alignments_view_sql` renames ours into.
 #   (read_id, flags, reference, position, stop_position, cigar)
 _JUNCTION = [

@@ -223,7 +223,7 @@ async def test_reference_add_workflow_end_to_end(
     for name in chunk_parts:
         assert files[name] == "reference_sequence_chunks"
 
-    # Per-entry / per-attempt workspaces materialised the expected files.
+    # Per-entry / per-attempt workspaces materialized the expected files.
     # Layout is `<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
     # (see qiita_control_plane/runner.py:251). Happy-path smoke = attempt-0.
     workspace = workspace_root / str(work_ticket_idx)

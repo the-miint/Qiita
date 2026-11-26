@@ -34,7 +34,7 @@ Consumers that need contigs act only on `'completed'`. Absence of a state is
 never `'assembled'`.
 
 `'invalidated'` is per-RUN and `ProcessingStatus.DEPRECATED` is per-CONFIG; they
-are deliberately not the same judgement (the `assembly_lifecycle` migration
+are deliberately not the same judgment (the `assembly_lifecycle` migration
 header carries why).
 """
 
@@ -87,7 +87,7 @@ class Processing(BaseModel):
     params: dict[str, Any]
     created_at: AwareDatetime
     # Lifecycle. A deprecated run is still returned by every read route — the
-    # record of what assembled published contigs outlives the judgement that the
+    # record of what assembled published contigs outlives the judgment that the
     # run was wrong. The three provenance fields are set exactly when `status` is
     # DEPRECATED (a CHECK enforces the biconditional).
     status: ProcessingStatus
@@ -225,7 +225,7 @@ class AssemblySampleStatusUpdate(BaseModel):
     """Body for PATCH /api/v1/processing/{processing_idx}/sample-status.
 
     Withdraws (or restores) specific runs of one processing identity. Bulk because
-    that is the unit the judgement is made in, and applying it one call per sample
+    that is the unit the judgment is made in, and applying it one call per sample
     leaves a partially-withdrawn run for someone to reason about.
 
     `state` accepts only the two settable values; what happens to a row holding

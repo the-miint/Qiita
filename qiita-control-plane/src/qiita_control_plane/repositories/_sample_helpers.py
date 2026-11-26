@@ -617,7 +617,7 @@ def _fits_pg_numeric(value: Decimal) -> bool:
     arrives as caller text, so a value of a few bytes can name a width of
     gigabytes.
     """
-    # Infinity and every NaN flavour render to a fixed token, and carry a
+    # Infinity and every NaN flavor render to a fixed token, and carry a
     # string exponent that no digit bound can be compared against.
     if not value.is_finite():
         return True
@@ -637,14 +637,14 @@ def _pg_numeric_text(value: Decimal) -> str:
 
     Postgres expands exponent notation into plain digits and keeps whatever
     scale those digits carry, so fixed-point formatting matches it — except
-    that every NaN flavour collapses to one, and a negative zero loses its
+    that every NaN flavor collapses to one, and a negative zero loses its
     sign while keeping its scale.
     """
-    # Quiet, signalling, and signed NaN all store as the one unsigned form.
+    # Quiet, signaling, and signed NaN all store as the one unsigned form.
     if value.is_nan():
         return "NaN"
     text = format(value, "f")
-    # is_zero rather than == 0: a signalling NaN raises on comparison.
+    # is_zero rather than == 0: a signaling NaN raises on comparison.
     if value.is_signed() and value.is_zero():
         return text.lstrip("-")
     return text
@@ -1190,7 +1190,7 @@ def _decode_metadata_value(
     populated value_terminology_term_idx a TerminologyTermRef, both superseding
     data_type-driven decoding; otherwise the value_* column the data_type names
     is read. A data_type absent from GLOBAL_METADATA_VALUE_COLUMN raises
-    NotImplementedError (labelled by read_label) so it cannot silently surface
+    NotImplementedError (labeled by read_label) so it cannot silently surface
     a NULL value. The row must carry the METADATA_VALUE_COLUMNS_SELECT columns
     plus the METADATA_REF_PAYLOAD_SELECT aliases.
     """

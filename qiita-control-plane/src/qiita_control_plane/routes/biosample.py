@@ -1557,7 +1557,7 @@ def _biosample_core_row_dict(
 ) -> dict[str, object]:
     """Map a qiita.biosample row's columns to BiosampleResponse field names.
 
-    Centralises the column -> field mapping (the idx -> biosample_idx rename
+    Centralizes the column -> field mapping (the idx -> biosample_idx rename
     aside, every key matches its column; export_entity_id is read from
     qiita.exported_entity). last_metadata_change_at is
     `metadata_last_change`, when the response's own metadata values last

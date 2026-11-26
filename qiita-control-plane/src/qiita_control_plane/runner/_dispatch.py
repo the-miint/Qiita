@@ -776,7 +776,7 @@ async def _adopt_or_submit(
     loop and any later re-entry both see it. A synchronous (local) handle
     carries no job id and is returned as-is for the caller to finalize. A
     fresh submit retries in place on an infra-unreachable failure (CO down),
-    honouring the never-fail-on-CO-outage rule.
+    honoring the never-fail-on-CO-outage rule.
 
     The write-ahead 'submitting' window (find-by-name closer): if a prior
     process crashed between a successful `submit_step` and its

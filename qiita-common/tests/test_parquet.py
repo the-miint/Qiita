@@ -3,7 +3,7 @@
 The sets exist because their files have different lives, so these pin what tells them
 apart — the codec, and whether a compression level is set — and that the pinned DuckDB
 accepts each one in a real COPY. They also pin the data plane's Rust copies of these
-values, and the DuckDB behaviour the at-rest writers rest on: that a sorted COPY honours
+values, and the DuckDB behavior the at-rest writers rest on: that a sorted COPY honors
 the byte cap, and what `'64MB'` means.
 """
 
@@ -156,7 +156,7 @@ def test_data_plane_read_export_options_match_transfer_exactly():
 
 def _sorted_copy(con: duckdb.DuckDBPyConnection, tmp_path: Path, opts: str) -> Path:
     # ~20 MB of ~1 KB rows, scanned from a source of many row groups so the sort runs on
-    # several threads; the byte-cap behaviour below only shows with more than one.
+    # several threads; the byte-cap behavior below only shows with more than one.
     src = tmp_path / "src.parquet"
     con.execute(
         "COPY (SELECT range AS k, repeat('ACGT', 250) AS s FROM range(20000) ORDER BY random()) "
@@ -177,7 +177,7 @@ def _row_groups(con: duckdb.DuckDBPyConnection, path: Path) -> list[tuple[int, i
     ).fetchall()
 
 
-def test_a_sorted_copy_honours_the_byte_cap(tmp_path: Path):
+def test_a_sorted_copy_honors_the_byte_cap(tmp_path: Path):
     # If a bump makes this fail, DuckDB no longer applies the byte cap to a sorted COPY,
     # which the at-rest writers' sorted COPYs rely on (`qiita_common.parquet`).
     con = _connect()

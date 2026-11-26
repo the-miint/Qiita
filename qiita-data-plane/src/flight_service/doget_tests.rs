@@ -107,7 +107,7 @@ fn repeated_compression_header_is_rejected() {
 /// No codec must leave the encoder options structurally identical to the
 /// default the uncompressed encoder used before this existed.
 ///
-/// This is the mechanism behind "no header means today's behaviour byte for
+/// This is the mechanism behind "no header means today's behavior byte for
 /// byte": `do_get` always routes through `try_with_compression`, so the claim
 /// rests on that call being a no-op when the codec is `None`. Compared through
 /// `Debug` because `IpcWriteOptions` implements neither `PartialEq` nor field
@@ -414,7 +414,7 @@ fn send_query_batches_emits_one_schema_batch_for_an_empty_result() {
 
 // ------------------------------------------------------------------
 // DoGet IPC compression — the parser being right does not prove the encoder
-// honoured it, so these drive the real `do_get` end to end and assert on
+// honored it, so these drive the real `do_get` end to end and assert on
 // what the encoder stamped into each record-batch message.
 // ------------------------------------------------------------------
 
@@ -422,7 +422,7 @@ fn send_query_batches_emits_one_schema_batch_for_an_empty_result() {
 /// record-batch message and the total payload size.
 ///
 /// Reads the codec back out of each message's IPC header rather than
-/// trusting that the request was honoured — a codec the encoder silently
+/// trusting that the request was honored — a codec the encoder silently
 /// declined to apply would otherwise pass every test below.
 /// Returns the per-message codec stamps, the total body size, and every
 /// message's bytes (header ‖ body, concatenated) so a caller can compare two

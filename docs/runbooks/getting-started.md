@@ -397,7 +397,7 @@ reaches the file until `save_db_file`.
 
 ### Submit the same file every time
 
-Qiita recognises a pool by the exact contents of the pre-flight file you submit.
+Qiita recognizes a pool by the exact contents of the pre-flight file you submit.
 Submitting only reads the file — it never changes it, so a copy you cannot write
 to is fine — and a retry that sends the same file lands on the same pool.
 
@@ -447,7 +447,7 @@ no flags for them. One command creates the run, the pool and one prep_sample per
 pre-flight row, then queues the demultiplexing job. Re-running is safe: it reuses
 what it already made and adds only what is missing.
 
-Each prep_sample is labelled with the identifier the pre-flight file gives its
+Each prep_sample is labeled with the identifier the pre-flight file gives its
 row, which is also the prefix `bcl-convert` puts on that prep_sample's FASTQ
 files — so you can tell from a filename which one it belongs to. It is not the
 row's position in the sheet, so read it off the file rather than counting.

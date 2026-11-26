@@ -591,7 +591,7 @@ fn register_files<W: std::borrow::Borrow<LakeWriter>>(
     // A file already at its destination is from an earlier call that has not
     // committed, which may still be registering it, so the call fails closed.
     // The one exception is a call that committed before the ledger existed,
-    // recognised from the catalog: every file is at its destination and is a
+    // recognized from the catalog: every file is at its destination and is a
     // data file of its table. Judged by the destination, not the source:
     // `move_file` keeps a placed file when removing its staging source fails.
     let moved_before = placed.iter().filter(|f| f.dest.exists()).count();
@@ -1215,7 +1215,7 @@ const LAKE_FILE_TICKET_PREFIX: &str = "wt";
 ///   the same names: `register_files` then finds the files it placed before.
 ///
 /// Deterministic for a given (ticket, staging dir), so a replayed DoAction
-/// recomputes the same name, and `register_files` recognises a replay from it
+/// recomputes the same name, and `register_files` recognizes a replay from it
 /// (its replay check says how). A random name would hide the replay
 /// from it, and the tables outside `REPLACE_KEY_TABLES` (e.g.
 /// `reference_membership`), which have no replace-by-key to absorb a second

@@ -115,14 +115,14 @@ def enum_values_from_migrations() -> dict[str, set[str]]:
         for stmt in _ANY_ALTER_TYPE.findall(up):
             if not (_ADD_VALUE.search(stmt) or _RENAME_VALUE.search(stmt)):
                 raise AssertionError(
-                    f"{path.name}: unmodelled `ALTER TYPE` — {stmt.strip()!r}. "
+                    f"{path.name}: unmodeled `ALTER TYPE` — {stmt.strip()!r}. "
                     f"Teach enum_values_from_migrations() this form; leaving it "
                     f"unparsed would desync the no-DB parity check from Postgres."
                 )
 
-        # A DROP TYPE in an *up* half genuinely retires an enum. Unmodelled, it
+        # A DROP TYPE in an *up* half genuinely retires an enum. Unmodeled, it
         # would leave a phantom in the replay that no longer exists in Postgres —
-        # so honour it rather than letting the two drift.
+        # so honor it rather than letting the two drift.
         for name in _DROP_TYPE.findall(up):
             enums.pop(name, None)
 

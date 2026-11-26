@@ -12,7 +12,7 @@ full column list, so a projection that named the right columns in the wrong orde
 or typed one differently — fails here rather than on the cluster after the alignment
 has been paid for.
 
-The fixture is one 20 kb contig held linearised, the shape an assembler emits a
+The fixture is one 20 kb contig held linearized, the shape an assembler emits a
 circular contig in, plus a decoy contig belonging to a DIFFERENT assembly run of the
 same sample. The decoy is what makes the run scoping falsifiable: a read drawn from
 it must produce no alignment, because the signed pair names only the run under test.

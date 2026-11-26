@@ -367,7 +367,7 @@ fn delete_reference(conn: &LakeWriter, reference_idx: i64) -> Result<serde_json:
 /// feeds the GLOBAL `reference_exclusion` mirror both `_visible` views enforce
 /// against, so a redirected read of an attacker-planted Parquet's `feature_idx`
 /// column would mass-exclude arbitrary features system-wide. So — the read-path
-/// analogue of `export_select_to_parquet`'s parent-canonicalize on write — we
+/// analog of `export_select_to_parquet`'s parent-canonicalize on write — we
 /// canonicalize `dest` ITSELF (the file already exists; the CP wrote it before
 /// signing) and re-assert it resolves under the canonicalized scratch root
 /// before reading, then inline the CANONICALIZED path (re-checked for a single

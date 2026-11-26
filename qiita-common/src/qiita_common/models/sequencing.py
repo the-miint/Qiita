@@ -984,7 +984,7 @@ Consumers of masked reads act only on `'completed'`. Absence of a state is not
 `'pass'`: `MaskedReadExportSample.mask_state` is `None` when no gate row exists,
 and the DoGet ticket route 409s that case the same as `'pending'`.
 
-`'invalidated'` is per-RUN, and deliberately not the same judgement as
+`'invalidated'` is per-RUN, and deliberately not the same judgment as
 `MaskDefinitionStatus.DEPRECATED`, which is per-CONFIG: a sound config can
 produce an untrustworthy run (a job that OOM-escalated into a larger Arrow batch,
 say), and voiding the config to flag one such run would void every sound run
@@ -1072,7 +1072,7 @@ class MaskDefinition(BaseModel):
     params: dict[str, Any]
     created_at: AwareDatetime
     # Lifecycle. A deprecated mask is still returned by every read route — the
-    # record of what filtered published data outlives the judgement that the
+    # record of what filtered published data outlives the judgment that the
     # filter was wrong. The three provenance fields are set exactly when
     # `status` is DEPRECATED (a CHECK enforces the biconditional).
     status: MaskDefinitionStatus
@@ -1271,7 +1271,7 @@ class MaskSampleStatusUpdate(BaseModel):
     """Body for PATCH /api/v1/mask-definition/{mask_idx}/sample-status.
 
     Withdraws (or restores) specific runs of one mask. Bulk because that is the
-    unit the judgement is made in — "these N samples of this mask ran with a
+    unit the judgment is made in — "these N samples of this mask ran with a
     defect" — and applying it one call per sample leaves a partially-withdrawn
     mask for someone to reason about.
 
@@ -1543,7 +1543,7 @@ class PoolAlignmentSummary(BaseModel):
     copied a hash it never checked would be publishing a claim it cannot support.
 
     A deprecated alignment is still listed, with its `status` and the reason: the
-    record of what produced published data outlives the judgement that the config
+    record of what produced published data outlives the judgment that the config
     was wrong. No mint accepts it, and its cohort route refuses it.
     """
 
@@ -1617,7 +1617,7 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
     Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
     on the data plane's `read_masked` macro. Both identifiers are mandatory —
     they are the macro's required arguments — and the route refuses to sign a
-    ticket missing either, as defence in depth (the mandatory-filter invariant,
+    ticket missing either, as defense in depth (the mandatory-filter invariant,
     `routes/read_masked.py`).
 
     ``columns`` optionally narrows the stream to those of the macro's columns,

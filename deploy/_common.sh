@@ -1018,7 +1018,7 @@ qiita_split_conn_password() {
 
 # Extract the Env-vars + one-time-host-setup buckets (buckets 1 & 2) from a
 # DEPLOY_CHECKLIST.md and judge whether they are EMPTY. redeploy.sh uses this to
-# skip the "have buckets 1 & 2 been applied?" acknowledgement when there is
+# skip the "have buckets 1 & 2 been applied?" acknowledgment when there is
 # literally nothing to apply — the deploy stops only when the operator actually
 # has out-of-band steps to run. Pure (echo + return only) so the unit test in
 # test_deploy_scripts.py can exercise the emptiness logic directly.
@@ -1049,7 +1049,7 @@ qiita_buckets_12() {
 }
 
 # Pass/fail/skip row printers + counters for the read-only check scripts
-# (preflight.sh, verify.sh). The caller initialises `n_pass=0 n_fail=0 n_skip=0`
+# (preflight.sh, verify.sh). The caller initializes `n_pass=0 n_fail=0 n_skip=0`
 # (so the trailing summary + `[ "$n_fail" -eq 0 ]` are nounset-safe even when no
 # check ran) and these increment them. The byte-escapes are ✓ / ✗ / · in UTF-8.
 pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((${n_pass:-0} + 1)); }
@@ -1325,7 +1325,7 @@ wait_for_data_plane_idle() {
 # backend_type of another role's sessions only with pg_read_all_stats (without
 # it both are NULL), so the check fails rather than undercount when the role
 # lacks it. A Unix-socket session has no client_addr; its client_port is -1, and
-# it is labelled `local`.
+# it is labeled `local`.
 
 QIITA_CATALOG_SETTINGS_SQL="SELECT current_setting('max_connections'),
     current_setting('superuser_reserved_connections'),

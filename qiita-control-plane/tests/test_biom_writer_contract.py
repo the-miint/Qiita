@@ -2,7 +2,7 @@
 extension.
 
 Nothing else in this repo writes BIOM, so every claim the client-side feature-table
-recipe makes about it starts out unverified — and three of this writer's behaviours
+recipe makes about it starts out unverified — and three of this writer's behaviors
 are decisions it makes silently on our behalf (it sums, it drops, it ignores). Each
 test here corresponds to a line of `docs/duckdb-miint.md`'s BIOM entry and to a
 decision somewhere in `qiita_common.analytic`: if a future build changes one of
@@ -24,20 +24,20 @@ from qiita_common import analytic as ft
 
 from qiita_control_plane.miint import connect_with_miint
 
-# A relabelled table's three columns, with the types `LABELLED_SCHEMA` declares.
+# A relabeled table's three columns, with the types `LABELED_SCHEMA` declares.
 _TRIPLES = "sample_id, feature_id, value"
 
 
 def _staged(conn, rows: list[tuple[str, str, float]]) -> None:
     """Materialize `rows` as the relation the writers copy, typed from
-    `LABELLED_SCHEMA` — every one of those types is one the writer checks."""
+    `LABELED_SCHEMA` — every one of those types is one the writer checks."""
     if not rows:
-        casts = ", ".join(f"CAST(NULL AS {t}) AS {n}" for n, t in ft.LABELLED_SCHEMA.items())
-        conn.execute(f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT {casts} WHERE false")
+        casts = ", ".join(f"CAST(NULL AS {t}) AS {n}" for n, t in ft.LABELED_SCHEMA.items())
+        conn.execute(f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT {casts} WHERE false")
         return
     values = ", ".join("(?::VARCHAR, ?::VARCHAR, ?::DOUBLE)" for _ in rows)
     conn.execute(
-        f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES {values}) AS v({_TRIPLES})",
+        f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT * FROM (VALUES {values}) AS v({_TRIPLES})",
         [x for r in rows for x in r],
     )
 
@@ -50,7 +50,7 @@ def _write_and_read(rows, target) -> list[tuple]:
         return sorted(conn.execute(f"SELECT * FROM read_biom('{target}')").fetchall())
 
 
-def test_a_relabelled_table_round_trips(tmp_path):
+def test_a_relabeled_table_round_trips(tmp_path):
     """The baseline: what the writer takes is what the reader gives back, so nothing
     below is confused by an encoding surprise."""
     rows = [("QM1", "GCF_1", 1.0), ("QM1", "GCF_2", 2.5), ("QM2", "GCF_1", 3.0)]
@@ -58,7 +58,7 @@ def test_a_relabelled_table_round_trips(tmp_path):
 
 
 def test_duplicate_sample_feature_pairs_are_SUMMED(tmp_path):
-    """The behaviour `check_relabel_diagnostics` exists for. Two genomes relabelled to
+    """The behavior `check_relabel_diagnostics` exists for. Two genomes relabeled to
     one `source_id` produce two rows for one `(sample_id, feature_id)` pair, and this
     is what happens to them: they are added together, with nothing in the file saying
     so. Refusing the collision before the write is the only place it can be caught.
@@ -111,7 +111,7 @@ def test_the_parquet_copy_DOES_overwrite_silently(tmp_path):
         _staged(conn, [("QM1", "GCF_1", 1.0), ("QM2", "GCF_1", 2.0)])
         conn.execute("SET preserve_insertion_order=false")
         conn.execute(ft.parquet_copy_sql(target))
-        conn.execute(f"DELETE FROM {ft.LABELLED_RELATION} WHERE sample_id = 'QM2'")
+        conn.execute(f"DELETE FROM {ft.LABELED_RELATION} WHERE sample_id = 'QM2'")
         conn.execute(ft.parquet_copy_sql(target))
         assert conn.execute(f"SELECT count(*) FROM read_parquet('{target}')").fetchone()[0] == 1
 
@@ -121,7 +121,7 @@ def test_the_parquet_copy_DOES_overwrite_silently(tmp_path):
     [("NULL::VARCHAR", "NULL values not allowed"), ("''::VARCHAR", "empty sample_id")],
 )
 def test_an_unusable_identifier_is_refused_and_leaves_no_file(sample_id, expected, tmp_path):
-    """A NULL id is the fault `check_relabel_diagnostics`' unlabelled checks catch
+    """A NULL id is the fault `check_relabel_diagnostics`' unlabeled checks catch
     earlier — the writer would catch it too, but only after the analytic has run, and
     only for BIOM (the Parquet writer would record the NULL id happily). An empty
     string is the writer catching what neither our schema nor those checks constrain.
@@ -133,7 +133,7 @@ def test_an_unusable_identifier_is_refused_and_leaves_no_file(sample_id, expecte
     target = tmp_path / "unusable.biom"
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES "
+            f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT * FROM (VALUES "
             f"({sample_id}, 'GCF_1'::VARCHAR, 1.0::DOUBLE)) AS v({_TRIPLES})"
         )
         with pytest.raises(duckdb.InvalidInputException, match=expected):
@@ -144,12 +144,12 @@ def test_an_unusable_identifier_is_refused_and_leaves_no_file(sample_id, expecte
 @pytest.mark.parametrize("sql_type", ["BIGINT", "FLOAT", "DECIMAL(10,2)"])
 def test_the_value_column_must_be_DOUBLE_exactly(sql_type, tmp_path):
     """Not merely numeric: FLOAT and DECIMAL are refused as firmly as BIGINT. This is
-    what `LABELLED_SCHEMA`'s declared DOUBLE is for — an unquoted decimal literal in a
+    what `LABELED_SCHEMA`'s declared DOUBLE is for — an unquoted decimal literal in a
     hand-written VALUES list types as DECIMAL and would fail here, one step after the
     analytic that produced the numbers."""
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT 'QM1' AS sample_id, "
+            f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT 'QM1' AS sample_id, "
             f"'GCF_1' AS feature_id, 1::{sql_type} AS value"
         )
         with pytest.raises(duckdb.BinderException, match="'value' must be DOUBLE"):
@@ -161,8 +161,7 @@ def test_a_missing_required_column_names_itself(tmp_path):
     dropped one is a bind error rather than a partial file."""
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_RELATION} AS "
-            f"SELECT 'QM1' AS sample_id, 1.0::DOUBLE AS value"
+            f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT 'QM1' AS sample_id, 1.0::DOUBLE AS value"
         )
         with pytest.raises(duckdb.BinderException, match="requires 'feature_id' column"):
             conn.execute(ft.biom_copy_sql(tmp_path / "missing.biom"))
@@ -176,7 +175,7 @@ def test_an_EXTRA_column_is_silently_ignored(tmp_path):
     target = tmp_path / "extra.biom"
     with connect_with_miint() as conn:
         conn.execute(
-            f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES "
+            f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT * FROM (VALUES "
             f"('QM1'::VARCHAR, 'GCF_1'::VARCHAR, 1.0::DOUBLE, 400::BIGINT)) "
             f"AS v({_TRIPLES}, genome_idx)"
         )
@@ -199,6 +198,6 @@ def test_an_unknown_copy_option_is_rejected_not_ignored(tmp_path):
         _staged(conn, [("QM1", "GCF_1", 1.0)])
         with pytest.raises(duckdb.Error, match=r"(?i)(unknown|unrecognized) option"):
             conn.execute(
-                f"COPY {ft.LABELLED_RELATION} TO '{tmp_path / 'opt.biom'}' "
+                f"COPY {ft.LABELED_RELATION} TO '{tmp_path / 'opt.biom'}' "
                 f"(FORMAT BIOM, COMPRESSON 'gzip')"
             )

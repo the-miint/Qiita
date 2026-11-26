@@ -1,6 +1,6 @@
 """Repository functions for qiita.assembly_membership and qiita.assembly_sample.
 
-The assembly analogue of the reference_membership INSERT that
+The assembly analog of the reference_membership INSERT that
 `qiita_control_plane.actions.library.write_membership` performs inline: a bulk,
 idempotent link of a prep_sample's assembly RUN (processing_idx) contigs — each a
 qiita.feature minted via the SHARED mint-features path — to the bin they belong to
@@ -192,7 +192,7 @@ async def create_assembly_sample_pending(
     identity has not finished, so leaving it would have the gate answer for a run
     that is still going — and answer 'no_data' about a run that may go on to FAIL.
 
-    'invalidated' is left standing for a third reason: a withdrawal is a judgement
+    'invalidated' is left standing for a third reason: a withdrawal is a judgment
     someone made about a stored contig set, and a redrive does not quietly
     overturn it. The re-run proceeds, and its terminal write is what refuses —
     see `upsert_assembly_sample_completed`.
@@ -225,7 +225,7 @@ class AssemblySampleInvalidated(Exception):
     """Raised when an assembly run tries to complete a `(processing_idx,
     prep_sample)` pair whose previous run was withdrawn.
 
-    Withdrawal is a judgement someone made about a stored contig set, so a
+    Withdrawal is a judgment someone made about a stored contig set, so a
     redrive does not quietly overturn it: the fresh contigs land in DuckLake, the
     gate stays 'invalidated', and consumers keep refusing until someone restores
     the pair via PATCH /processing/{processing_idx}/sample-status. The
@@ -308,7 +308,7 @@ async def upsert_assembly_sample_no_data(
         there. The gate then reads 'completed' while the ticket that just ended
         reads NO_DATA over the same (run, sample).
       * 'invalidated' — someone withdrew this pair, and a re-run does not
-        overturn that judgement (`AssemblySampleInvalidated` states why for the
+        overturn that judgment (`AssemblySampleInvalidated` states why for the
         completing twin).
 
     Unlike the mask twin (`repositories.block.upsert_mask_sample_completed`) this
@@ -354,7 +354,7 @@ async def fetch_assembly_sample_state(
     'completed' at the terminal `finalize-assembly-sample` action, or 'no_data'
     when assembly_hash found no contig of any kind and the ticket ended NO_DATA.
     A fourth, 'invalidated', is written by an operator withdrawing a completed
-    run whose contigs are not trustworthy — a judgement about one RUN, distinct
+    run whose contigs are not trustworthy — a judgment about one RUN, distinct
     from deprecating the CONFIG (`ProcessingStatus`).
 
     The invariant: completion is read from this state, never from the presence of

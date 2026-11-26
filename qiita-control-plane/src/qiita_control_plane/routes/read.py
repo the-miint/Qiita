@@ -76,7 +76,7 @@ async def create_read_doget_ticket(
       ``work_ticket.alignment_idx`` column → 422 (an alignment_definition row
       removed mid-flight; see ``resolve_block_read_scope``);
     * a block or pool with no members → 422 (a planning bug, or a pool with no
-      ingested reads — never a licence to read unscoped).
+      ingested reads — never a license to read unscoped).
 
     Authorization is scope-only at this layer, matching the reference /
     read_masked / alignment doget routes: any service account holding

@@ -37,7 +37,7 @@ def _pump_path(kind: str, key: int) -> str:
     )
 
 
-def _summarise(status: dict) -> str:
+def _summarize(status: dict) -> str:
     """One line per cohort: identity, counts, effective cap, and the frozen flag."""
     cap = f"cap {status.get('max_inflight')}"
     if status.get("override") is not None:
@@ -71,7 +71,7 @@ def _render_list(body: dict | list) -> None:
     # have an override set, which is the whole point of listing them.
     print(f"{len(cohorts)} fan-out cohort(s):", file=sys.stderr)
     for status in cohorts:
-        print(_summarise(status), file=sys.stderr)
+        print(_summarize(status), file=sys.stderr)
 
 
 def _render_pump(body: dict | list) -> None:
@@ -81,7 +81,7 @@ def _render_pump(body: dict | list) -> None:
     released = body.get("released") or []
     status = body.get("status") or {}
     print(f"released {len(released)} ticket(s): {released}", file=sys.stderr)
-    print(_summarise(status), file=sys.stderr)
+    print(_summarize(status), file=sys.stderr)
     if not released and not status.get("fail_stopped"):
         # The other reason for a zero, spelled out so it isn't read as a failure.
         print(

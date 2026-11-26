@@ -3395,7 +3395,7 @@ def test_alignment_invalidate_and_restore_patch_sample_status(monkeypatch, capsy
     assert captured["json"] == {"prep_sample_idx": [11], "state": "completed"}
 
 
-def test_alignment_abandon_plan_posts_and_summarises(monkeypatch, capsys):
+def test_alignment_abandon_plan_posts_and_summarizes(monkeypatch, capsys):
     from qiita_common.api_paths import URL_ALIGNMENT_DEFINITION_ABANDON_PLAN
 
     from qiita_control_plane.cli import admin as cli

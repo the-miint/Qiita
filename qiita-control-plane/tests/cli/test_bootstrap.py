@@ -46,7 +46,7 @@ def test_classifier_false_for_generic_unrelated_message() -> None:
     assert _bootstrap._is_qiita_common_staleness(exc) is False
 
 
-# --- _run: import-time guard behaviour --------------------------------------
+# --- _run: import-time guard behavior --------------------------------------
 
 
 def test_run_translates_qiita_common_staleness_to_clean_exit(capsys) -> None:

@@ -62,7 +62,7 @@ prep_sample_idx  processing_idx  processed_prep_sample_idx
 
 Neither `study_idx` nor `biosample_idx` is embedded: a prep_sample maps to studies **many-to-many** (so files are never keyed by `study_idx` — see [Data Storage](storage.md#data-storage)), and its parent `biosample_idx` is a single-FK lookup; both are recovered at query time via control-plane joins (`prep_sample_to_study`, `prep_sample.biosample_idx`) rather than duplicated into every row.
 
-This sort order provides two compounding layers of query optimisation:
+This sort order provides two compounding layers of query optimization:
 
 - **DuckLake catalog** (`ducklake_file_column_stats`): min/max per column per file stored in Postgres. Any query filtering on identifier columns prunes whole files before DuckLake opens anything.
 - **Parquet row group statistics**: sorted data produces tight, non-overlapping min/max ranges per row group — predicate pushdown skips row groups with zero false positives for point lookups and range scans. Without sorting, row group ranges overlap and pushdown degrades to near-useless for selective queries.
@@ -78,7 +78,7 @@ Sample metadata — descriptive attributes of physical biosamples (specimen type
 Reasons:
 - Metadata is structured relational data tightly coupled to the identifier model already in the control plane
 - Schema validation against BioSample / MIMARKS compliance requirements is enforced at insert time
-- Metadata and processed measurement data have different update semantics — a metadata correction (e.g., fixing a mislabelled collection site) does not invalidate or require reprocessing of any Parquet files in the data plane
+- Metadata and processed measurement data have different update semantics — a metadata correction (e.g., fixing a mislabeled collection site) does not invalidate or require reprocessing of any Parquet files in the data plane
 - Access control decisions are already made in the control plane; metadata-driven filtering is a natural extension of the same authorization layer
 
 **Search pattern:** the control plane exposes search and filter endpoints over metadata. A client submits a query (e.g., "fecal samples from antibiotic-naive subjects in study X"), receives the authorized set of `prep_sample_idx` (or `processed_prep_sample_idx`) identifiers matching the criteria, and uses those IDs directly against the data plane. The control plane search is the access control gate — clients only receive IDs they are authorized to access. The data plane never evaluates metadata; it serves measurements for the requested IDs, relying on the sorted Parquet structure and DuckLake column statistics for efficient lookup.
@@ -301,7 +301,7 @@ study's record has three views:
 | **public** | no grant on a `public`-default study, which only its default admits the caller to | `export_entity_id`, title, alias, description, abstract, funding, `bioproject_accession`, `ena_study_accession`, `default_tier` |
 
 Anyone else gets nothing (403). The summary is what lets someone a study was
-shared with find it and recognise it, without the fields its tier does not
+shared with find it and recognize it, without the fields its tier does not
 reach. The public view is what a reader outside the study sees of a public
 study: what describes it, without its internal idxs, notes, extra metadata or
 submission state. It also leaves out `updated_at`, which moves when a field it
@@ -322,7 +322,7 @@ A SHA-256 fingerprint of uploaded raw data is recorded per `prep_sample_idx` at 
 
 - Warns users when uploaded data appears identical to an existing `prep_sample_idx`
 - Surfaces accidental duplicate uploads before compute is wasted
-- Provides the basis for storage deduplication (one physical file, multiple logical references) as a future optimisation
+- Provides the basis for storage deduplication (one physical file, multiple logical references) as a future optimization
 
 ## Processing Deduplication and Disallow-Without-Delete
 

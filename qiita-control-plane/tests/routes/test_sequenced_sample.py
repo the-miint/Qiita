@@ -1384,7 +1384,7 @@ def _expected_read_response(
     auto-generated timestamp from the actual response so the equality
     confirms presence-and-shape without pinning timing values.
 
-    Centralises the column-by-column expectation so the parameter list says
+    Centralizes the column-by-column expectation so the parameter list says
     only what varies between tests (owner / creator / role / metadata).
     """
     # last_metadata_change_at is set iff the response carries a metadata

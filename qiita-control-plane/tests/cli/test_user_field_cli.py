@@ -31,7 +31,7 @@ def test_list_global_fields_gets_the_registry_with_no_parameters(monkeypatch, su
 @pytest.mark.parametrize("surface", _FIELD_CLI_SURFACES)
 def test_list_fields_fills_the_path_from_study_idx(monkeypatch, surface):
     """Tests the case where the study-scoped list runs with --study-idx: the idx
-    fills the path template rather than travelling as a query param."""
+    fills the path template rather than traveling as a query param."""
     captured = _run(
         monkeypatch,
         [surface.subcommand, "list-fields", "--study-idx", "5"],

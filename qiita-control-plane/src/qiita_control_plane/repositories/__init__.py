@@ -39,7 +39,7 @@ _EXISTS_ENTITY_TABLES: dict[ExistsEntity, str] = {
 }
 
 # pg advisory-lock keys are int4; mask a bigint (idx, cohort id) into positive
-# int4 before pairing it with a lock class. A wrap collision only serialises
+# int4 before pairing it with a lock class. A wrap collision only serializes
 # two unrelated holders of the same key for a moment.
 INT4_MASK = 0x7FFF_FFFF
 

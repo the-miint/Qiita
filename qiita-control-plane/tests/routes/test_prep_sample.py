@@ -104,7 +104,7 @@ async def _retired_flag(ctx, prep_sample_idx: int) -> bool:
 
 async def test_retire_prep_sample_sets_flag(ctx):
     """A wet_lab_admin retire sets retired=true plus the audit columns
-    (retired_by_idx, retired_at), honouring the consistency CHECK."""
+    (retired_by_idx, retired_at), honoring the consistency CHECK."""
     owner_idx = ctx["wet_session"]["principal_idx"]
     prep_sample_idx = await seed_sample_linked_to_studies(
         ctx, spec=PREP_SAMPLE_METADATA_SPEC, owner_idx=owner_idx, study_idxs=[]

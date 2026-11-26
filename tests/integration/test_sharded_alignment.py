@@ -5,7 +5,7 @@ sharded-alignment path produces — the whole-reference rype ROUTER
 (`build_routing_index`) and the per-shard minimap2 + bowtie2 indexes
 (`build_{minimap2,bowtie2}_index` in shard mode, the `derived_store` layout) — then
 drives `align_sharded` over crafted reads and asserts the routing + alignment
-behaviour end to end.
+behavior end to end.
 
 A read set is uniformly single-end OR paired-end by construction, so the two modes
 are exercised as SEPARATE, uniform batches (never mixed — a mix is invalid input

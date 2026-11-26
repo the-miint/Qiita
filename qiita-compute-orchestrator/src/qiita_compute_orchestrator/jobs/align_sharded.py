@@ -3,13 +3,13 @@
 The consuming side of reference sharding. The reference build produces per-shard
 minimap2/bowtie2 indexes + a whole-reference rype router (`build_routing_index`);
 this job uses them to align a block of reads against only the shard(s) each read
-minimises into, rather than the whole backbone.
+minimizes into, rather than the whole backbone.
 
 The aligner is chosen by the read platform (Illumina short reads → bowtie2, PacBio
 HiFi / Nanopore long reads → minimap2); the control plane resolves it from
 `sequencing_run.platform` at align-plan time and passes it in `Inputs`.
 
-Pipeline (modelled on `host_filter`, same miint-connection rules):
+Pipeline (modeled on `host_filter`, same miint-connection rules):
   1. A query VIEW `(read_id = sequence_idx BIGINT, sequence1, sequence2)` over the
      block's reads, streamed from the data plane at runtime and bound by
      `read_source.bind_step_reads` in the shape
@@ -34,14 +34,14 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
      owner (a block spans many prep_samples).
   2. `read_to_shard` — one `rype_classify` pass against the whole-reference ROUTER
      emits `(read_id, bucket_name)` = `(sequence_idx, str(shard_id))`, ≥0 rows per
-     read (a read whose minimisers span K shards yields K rows). Materialised into
+     read (a read whose minimizers span K shards yields K rows). Materialized into
      a non-temp TABLE `(read_id BIGINT, shard_name VARCHAR)` — the exact shape
      `align_*_sharded` binds. Factored so a future multi-router just UNIONs more
      classify results into the same table.
   3. ONE `align_{minimap2,bowtie2}_sharded(query, shard_directory:=,
      read_to_shard:=, <params>)` call aligns each read against ONLY its routed
      shard(s), reporting ALL placements (bowtie2 `report_all`, the "modified SHOGUN"
-     set in `_BOWTIE2_ALIGN_PARAMS`; minimap2 `max_secondary := 100`, its analogue —
+     set in `_BOWTIE2_ALIGN_PARAMS`; minimap2 `max_secondary := 100`, its analog —
      the historical `-k 16` / `max_secondary := 0` primary-only collapse is gone, and
      dropping the arg entirely would silently fall back to a finite default). The
      aligner is handed a MATERIALIZED copy of the query relation rather than the view:
@@ -76,7 +76,7 @@ Pipeline (modelled on `host_filter`, same miint-connection rules):
 
      Phase 1 streams the aligner + the `_READ_META` join into a transient
      `alignment_unsorted.parquet` inside the DuckDB temp dir; phase 2 sorts that into
-     `alignment.parquet`. Neither phase materialises the aligner's output as a table.
+     `alignment.parquet`. Neither phase materializes the aligner's output as a table.
      The split exists because the sort is a BLOCKING operator that would otherwise
      hold the whole alignment set while the shard indexes and GPL-boundary daemons
      are still resident, and because a POOLED (paired-end) filter cannot read
@@ -121,7 +121,7 @@ miint contracts — qiita-verified against the team-mirror build via the
 `align_sharded` smoke (see docs/duckdb-miint.md):
   - `rype_classify` -> `(read_id, bucket_id, bucket_name, score)`, ≥0 rows per
     read (one per bucket above threshold — multi-bucket, so a read routes to every
-    shard it overlaps). Signature and behaviour:
+    shard it overlaps). Signature and behavior:
     https://the-miint.github.io/duckdb-miint/classification/#rype_classify
   - `align_minimap2_sharded(query_table, shard_directory:=, read_to_shard:=,
     [preset, max_secondary, include_shard_name, …])` and
@@ -205,7 +205,7 @@ _DUCKDB_RESERVE_GB = 1
 # Routing threshold for the read_to_shard classify. Deliberately LOW: over-routing
 # is safe (a read routed to a shard it does not actually align to simply produces
 # no alignment row), while under-routing would LOSE alignments. 0.1 is rype's own
-# default — a read routes to a shard when >=10% of its minimisers hit it. A
+# default — a read routes to a shard when >=10% of its minimizers hit it. A
 # whole-reference baseline oracle can later pin this threshold by test.
 _ROUTING_THRESHOLD = 0.1
 
@@ -228,7 +228,7 @@ _MINIMAP2_PRESET = "map-hifi"
 # Secondary-alignment cap for the minimap2 sharded align. Set arbitrarily HIGH
 # (not left at the miint default) so multi-mapping placements are captured rather
 # than silently truncated — dropping `max_secondary` does NOT mean "return all", it
-# falls back to a finite default. This is minimap2's analogue of bowtie2's
+# falls back to a finite default. This is minimap2's analog of bowtie2's
 # `report_all`: emit every placement and let the identity filter below prune the
 # noise. Cross-shard multiplicity (a distinct feature per shard) is unaffected —
 # that comes from routing, not from this cap.
@@ -320,7 +320,7 @@ _BOWTIE2_ALIGN_PARAMS = (
 # In-DuckDB relation names. The query is a VIEW; read-meta and read_to_shard are
 # TABLEs (read_to_shard has to be one — align's separate connection resolves it by
 # name). There is deliberately NO relation for the aligner's output: it is a SELECT
-# streamed straight into the phase-1 staging COPY, never a materialised table.
+# streamed straight into the phase-1 staging COPY, never a materialized table.
 #
 # `_QUERY_MATERIALIZED` is a TABLE copy of `_QUERY`, and is the relation handed to
 # the ALIGNER (either aligner — both re-read the query once per shard; see the
@@ -488,7 +488,7 @@ def _align_minimap2_sharded_sql(
     aligner). Returns the `(sql, params)` for a SELECT over the aligner's FULL
     output — it does NOT execute anything. `execute()` embeds the SQL as a
     subquery inside its staging COPY, so the aligner STREAMS into that write
-    instead of being materialised first (see the two-phase note in `execute()`).
+    instead of being materialized first (see the two-phase note in `execute()`).
     Isolated so unit tests stub the real align.
 
     `query_table` (positional) + `shard_directory` + `read_to_shard` (the table
@@ -501,7 +501,7 @@ def _align_minimap2_sharded_sql(
     `cigar_sequence_identity` returns NULL for a plain `M` CIGAR, so without `eqx`
     every minimap2 alignment would be silently dropped by the filter.
 
-    `max_secondary := _MINIMAP2_MAX_SECONDARY` (100) is minimap2's analogue of
+    `max_secondary := _MINIMAP2_MAX_SECONDARY` (100) is minimap2's analog of
     bowtie2's `report_all`: dropping `max_secondary` does NOT return all placements,
     it falls back to a finite miint default that would silently truncate multi-mapping
     reads, so we set it arbitrarily high and let the identity filter prune the noise.
@@ -669,7 +669,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 # nowhere because the block is genuinely empty (a completed
                 # host-depletion mask can carry 0 passing reads — a blank/control or
                 # fully host/QC-filtered sample the align planner still tiles) OR because
-                # none of its reads minimise into THIS reference. Either way, emit a
+                # none of its reads minimize into THIS reference. Either way, emit a
                 # valid empty (schema-correct) alignment.parquet and skip the aligner —
                 # register-files then registers 0 rows and reconcile flips the per-sample
                 # gate with no rows (it has no count-assertion, by design). Verified
@@ -684,7 +684,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     return {"alignment": alignment, "alignment_staging_dir": workspace}
 
                 # ONE sharded-align call, as a SELECT the seam hands back rather than a
-                # relation it materialises. An empty aligner OUTPUT is still valid here
+                # relation it materializes. An empty aligner OUTPUT is still valid here
                 # (every routed read failed to align) — only an empty read_to_shard
                 # INPUT is the case handled above.
                 # MATERIALIZE the query relation the aligner will read.
@@ -848,7 +848,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 #     indexes and GPL-boundary daemons are still resident; splitting
                 #     lets the aligner's out-of-heap footprint be released first, and
                 #     the aligner streams through a write whose memory is flat in row
-                #     count instead of being materialised.
+                #     count instead of being materialized.
                 #   * The _READ_META join MUST happen here, not in phase 2: it lives in
                 #     this connection's in-memory database, so the staging file has to
                 #     carry `prep_sample_idx` forward itself.

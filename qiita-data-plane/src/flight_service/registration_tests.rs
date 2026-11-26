@@ -385,7 +385,7 @@ fn replace_key_tables_names_each_table_once() {
 /// different ticket APPENDS rather than superseding. (A ticket's own earlier
 /// `read` rows are replaced, through `ticket_read_files_in_lake`, not through
 /// this table; `register_files_leaves_reads_another_ticket_registered` pins the
-/// end-to-end behaviour against a real catalog.)
+/// end-to-end behavior against a real catalog.)
 ///
 /// Pinned because `FORCE_RESUBMIT_EXPLANATION` (qiita-common
 /// `work_ticket_constants.py`) tells users a forced re-run stores the pool's
@@ -996,7 +996,7 @@ fn register_files_replayed_after_lake_gc_removed_its_files_registers_nothing() {
     }
 }
 
-/// A replay of a registration made before the ledger existed is recognised from
+/// A replay of a registration made before the ledger existed is recognized from
 /// the catalog while its files are registered there. Deleting the registration's
 /// ledger rows stands in for one made before it existed.
 #[test]
@@ -1392,7 +1392,7 @@ fn a_failed_registration_the_ledger_records_whole_is_answered_as_committed() {
     assert_eq!(membership_rows(&connstr, &data_path, ref_idx), 2);
 }
 
-/// The reason a replay must be recognised before registering: in the DuckLake
+/// The reason a replay must be recognized before registering: in the DuckLake
 /// we ship, adding a path the table already holds succeeds and counts its rows
 /// twice.
 #[test]

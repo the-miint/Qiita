@@ -128,7 +128,7 @@ def test_an_alignment_reporting_no_params_hash_is_refused():
 
 def test_params_without_a_reference_is_refused_rather_than_defaulted():
     """A `params` blob this old or this different is not something to guess around: the
-    reference decides which genome map the whole table is relabelled through."""
+    reference decides which genome map the whole table is relabeled through."""
     # A genuine digest for these params, so the integrity check passes and this test
     # reaches the refusal it is about.
     params = {"aligner": "minimap2"}

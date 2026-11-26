@@ -37,7 +37,7 @@ def _seed_reference_rows(data_plane):
         conn.close()
 
 
-# One assembly run, and the three neighbours a mis-scoped resolution would pick
+# One assembly run, and the three neighbors a mis-scoped resolution would pick
 # up. `ASSEMBLY_RUN` is the run under test; every other contig below is seeded
 # into the SAME two tables, interleaved by feature_idx, so nothing separates them
 # except which membership rows name them.
@@ -63,7 +63,7 @@ def _seed_assembly_rows(data_plane):
     Neither sequence table has a `prep_sample_idx` column — a contig is stored
     once, keyed by the content-deduped `feature_idx` — so "this run's contigs" is
     a fact only `assembly_membership` holds, and resolving it is what the data
-    plane's `build_assembly_run_query` does. Seeding all four neighbours into one
+    plane's `build_assembly_run_query` does. Seeding all four neighbors into one
     table is what makes that resolution falsifiable.
     """
     conn = ducklake_connect(data_plane["data_path"])

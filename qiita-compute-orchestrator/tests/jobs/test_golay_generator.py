@@ -1,7 +1,7 @@
 """tests for the in-job Golay decode-cloud generator.
 
 pin the correctness invariants without the vendored table (min distance 8, so
-k<=3 neighbours are unique and the counts are combinatorial), then assert the
+k<=3 neighbors are unique and the counts are combinatorial), then assert the
 generator reproduces the canonical duckdb-miint table EXACTLY on a committed
 golden subset (always runs). when the full 16.7M-row vendored table is present
 locally, also assert the exhaustive match for errors<=3.
@@ -25,7 +25,7 @@ from qiita_compute_orchestrator.jobs.golay_demux import (
 )
 
 # A committed deterministic subset of the canonical table: all 4096 codewords
-# plus strided samples of correctable neighbours (errors 1-3) and
+# plus strided samples of correctable neighbors (errors 1-3) and
 # non-correctable 12-mers (errors >3). Gzipped (it ships in CI) and read via
 # duckdb, whose CSV reader handles the compression natively.
 _GOLDEN_SUBSET = Path(__file__).resolve().parent / "data" / "golay_golden_subset.csv.gz"
@@ -70,8 +70,8 @@ def test_codeword_zero_is_all_c():
 
 def test_radius_1_cloud_shape():
     """Default threshold 1.5 → radius 1: 4096 codewords + 4096·24 single-bit
-    neighbours = 102,400 rows, and every raw maps to exactly one codeword (no
-    collisions — proof the neighbours stay inside disjoint Hamming balls)."""
+    neighbors = 102,400 rows, and every raw maps to exactly one codeword (no
+    collisions — proof the neighbors stay inside disjoint Hamming balls)."""
     rows = _golay_cloud_rows(1)
     assert len(rows) == 4096 + 4096 * 24 == 102400
     exact = [r for r in rows if r[2] == 0]
@@ -82,9 +82,9 @@ def test_radius_1_cloud_shape():
 
 
 @pytest.mark.parametrize("k", [0, 1, 2, 3])
-def test_neighbour_counts_are_combinatorial(k):
+def test_neighbor_counts_are_combinatorial(k):
     """errors=k rows number exactly 4096·C(24,k) — the disjoint-Hamming-ball
-    count, confirming no two codewords share a k-neighbour for k≤3."""
+    count, confirming no two codewords share a k-neighbor for k≤3."""
     rows = [r for r in _golay_cloud_rows(k) if r[2] == k]
     assert len(rows) == 4096 * math.comb(24, k)
 

@@ -1,5 +1,5 @@
 """`qiita study list`: the query it sends and how --all follows the cursor.
-The route behaviour is covered in tests/routes/test_study.py."""
+The route behavior is covered in tests/routes/test_study.py."""
 
 import json
 

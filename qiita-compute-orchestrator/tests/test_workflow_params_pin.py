@@ -63,10 +63,10 @@ def _baselines_every_version(workflow: str, step: str) -> list[tuple[str, FlatBa
     so nothing is re-checked here.
 
     Both `baseline_resources` populations resolve through
-    `ActionDefinition._labelled_baselines()` rather than being re-read out of the
+    `ActionDefinition._labeled_baselines()` rather than being re-read out of the
     raw YAML dict. That method already decides what each population means — a flat
     one contributes a single pair under the step's name, a `profiles:` lookup one
-    pair per profile labelled ``name[profile]`` — and it is the model the runner
+    pair per profile labeled ``name[profile]`` — and it is the model the runner
     dispatches on. A second copy of that rule here would be free to drift from it,
     and reading `["cpu"]` directly (which is what this did) raises a bare
     `KeyError` on a lookup, naming neither the workflow nor the step.
@@ -78,7 +78,7 @@ def _baselines_every_version(workflow: str, step: str) -> list[tuple[str, FlatBa
         action = ActionDefinition.model_validate(yaml.safe_load(yaml_path.read_text()))
         pairs = [
             (label, flat)
-            for label, flat in action._labelled_baselines()
+            for label, flat in action._labeled_baselines()
             if label == step or label.startswith(f"{step}[")
         ]
         where = str(yaml_path.relative_to(_REPO_ROOT))
@@ -353,7 +353,7 @@ def test_build_rype_index_cpu_stays_within_duckdb_threads():
     parallelism comes from the DuckDB thread pool. miint's rendered docs and its
     issue list (open and closed) were read first: duckdb-miint#182 enumerates the
     nine table functions exposing a `threads` parameter and `rype_index_create` is
-    not among them, and it records that DuckDB's thread count is honoured with or
+    not among them, and it records that DuckDB's thread count is honored with or
     without that parameter — but it also separates functions that hand a count to an
     embedded tool rather than to a DuckDB-scheduled loop, which is the class rype
     falls in. So the question survives the docs and the issues, and nothing here

@@ -97,7 +97,7 @@ def test_a_keyboard_interrupt_rolls_back_too(monkeypatch, tmp_path):
 def test_the_rollback_leaves_a_file_it_did_not_write_alone(tmp_path):
     """Only this commit's own paths are cleaned up. A file already at one of the final
     names is the caller's to refuse — see `_write_bundle` — not this helper's to
-    delete, and an unrelated neighbour is nobody's business.
+    delete, and an unrelated neighbor is nobody's business.
     """
     (tmp_path / "unrelated.txt").write_text("keep me")
     pairs = _pairs(tmp_path, "table.parquet")

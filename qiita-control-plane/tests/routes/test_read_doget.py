@@ -369,7 +369,7 @@ async def test_read_doget_alignment_deleted_mid_flight_422(ctx, env):
 
 
 async def test_read_doget_block_with_no_members_422(ctx):
-    """An empty block is a planning bug, never a licence to read unscoped. The
+    """An empty block is a planning bug, never a license to read unscoped. The
     route refuses before signing (sign_ticket and the data plane refuse again)."""
     wt_idx, *rest = await _seed_block_ticket(
         ctx["pool"], members=[], action_context={}, mask_idx=None

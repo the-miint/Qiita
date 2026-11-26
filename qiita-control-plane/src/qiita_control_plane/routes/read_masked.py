@@ -30,7 +30,7 @@ study), pushed into the query as a predicate so the narrowing happens in one
 round trip. Narrowing also restricts *which masks* the list returns, so a
 zero-tally row never reveals a mask whose samples were all filtered out.
 
-**Mandatory-filter invariant — now defence in depth, and keep it that way.**
+**Mandatory-filter invariant — now defense in depth, and keep it that way.**
 This route MUST inject a non-empty ``prep_sample_idx`` AND a ``mask_idx`` into
 every signed ticket. Pydantic's ``gt=0`` on both fields makes an empty/zero
 filter unrepresentable at the request layer; the route re-asserts non-empty
@@ -200,7 +200,7 @@ async def mint_mask_definition_route(
     ServiceAccount holding `read_masked:doget`.
 
     Maps repository-layer exceptions to HTTP status:
-      - asyncpg.ForeignKeyViolationError → 400 (unknown principal_idx; defence
+      - asyncpg.ForeignKeyViolationError → 400 (unknown principal_idx; defense
         in depth — the principal is the authenticated service account).
       - asyncpg.InvalidParameterValueError (SQLSTATE 22023) → 400 (a non-32-byte
         hash; the repository helper always passes a 32-byte digest).
@@ -685,7 +685,7 @@ async def update_mask_definition_status_route(
     under it. It changes nothing about data already masked: the mask keeps its
     rows, its GET keeps answering, and the per-sample runs keep whatever state they
     held. Withdrawing individual runs is the sample-status route below; the two are
-    different judgements.
+    different judgments.
 
     Deletion is the other tool and the wrong one here: `read_masked` is a
     query-time macro, so dropping read_mask removes the record of the filtering
@@ -743,12 +743,12 @@ async def update_mask_sample_status_route(
 
     A sound config can produce an untrustworthy run — the measured case being a
     job that OOM-escalated into a larger Arrow batch — so this is the granularity
-    the judgement is actually made at. An invalidated `(mask, sample)` stops being
+    the judgment is actually made at. An invalidated `(mask, sample)` stops being
     consumable immediately: every masked-read consumer proceeds only on
     `'completed'`, so a third state is refused by construction rather than by a
     check each of them had to remember.
 
-    Bulk, because the judgement is made per cohort. Idempotent, and the response
+    Bulk, because the judgment is made per cohort. Idempotent, and the response
     separates what changed from what already held the state, what has no gate row
     under this mask, and what is still `'pending'` (left alone — the masking
     pipeline owns that value and would overwrite a withdrawal).
@@ -800,7 +800,7 @@ async def create_read_masked_doget_ticket(
         "prep_sample_idx": [body.prep_sample_idx],
         "mask_idx": [body.mask_idx],
     }
-    # Defence in depth against the mandatory-filter invariant: never sign a
+    # Defense in depth against the mandatory-filter invariant: never sign a
     # read_masked ticket whose filter (or any filter value list) is empty.
     if not filter_ or any(not v for v in filter_.values()):
         raise HTTPException(

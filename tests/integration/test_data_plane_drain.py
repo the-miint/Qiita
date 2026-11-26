@@ -74,8 +74,8 @@ def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero_whe
         finally:
             client.close()
 
-    signaller = threading.Thread(target=signal_then_request)
-    signaller.start()
+    signaler = threading.Thread(target=signal_then_request)
+    signaler.start()
     client = flight.FlightClient(location)
     rows = 0
     reader = client.do_get(ticket)
@@ -87,7 +87,7 @@ def test_sigterm_finishes_an_open_stream_refuses_new_requests_and_exits_zero_whe
         time.sleep(READ_SLEEP_S)
     stream_ended_at = time.monotonic()
     client.close()
-    signaller.join()
+    signaler.join()
 
     assert proc.wait(timeout=60) == 0
     assert rows == N_ROWS

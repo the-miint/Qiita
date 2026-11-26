@@ -168,7 +168,7 @@ _CHUNK_SIZE = CHUNK_SIZE
 _CHUNK_ROWS_PER_BATCH = CHUNK_ROW_GROUP_SIZE
 
 # Byte budget per read_fastx batch. Caps the read-side vector so a run of
-# multi-MB genome records can't materialise a giant batch before `sequence_split`
+# multi-MB genome records can't materialize a giant batch before `sequence_split`
 # runs — the read-side memory lever (the DuckDB result streams to the
 # DoPut writer one bounded RecordBatch at a time via to_arrow_reader).
 _READ_FASTX_MAX_BATCH_BYTES = "64MB"
@@ -198,7 +198,7 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 
     Bounded memory regardless of record size: `max_batch_bytes` caps each
     read_fastx batch by bytes so a multi-MB GG2 genome record (~21 MB) can't
-    materialise a giant vector, and the result streams (proven: emits far more
+    materialize a giant vector, and the result streams (proven: emits far more
     output than the DuckDB `memory_limit` without spilling). chunks within a
     read carry their own `chunk_index`, so `hash_sequences` reconstructs by
     ORDER BY regardless of arrival order.
@@ -767,7 +767,7 @@ async def do_reference_load(
         # creation (no PATCH path), so we can't set it here. Verify the existing
         # reference is actually a host reference — otherwise host-reference-add
         # would build a rype index for a reference whose is_host=false, a silent
-        # metadata/behaviour mismatch. GET only on this path; a plain bind does
+        # metadata/behavior mismatch. GET only on this path; a plain bind does
         # not pay the round-trip.
         existing = await _get(http, token, URL_REFERENCE_BY_IDX.format(reference_idx=reference_idx))
         if not existing.get("is_host"):

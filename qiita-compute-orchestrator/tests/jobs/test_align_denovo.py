@@ -7,7 +7,7 @@ testable rather than assertable: every assertion below about a read reaching the
 output is also an assertion that nothing scanned the read stream a second time, since
 a second scan returns zero rows with no error.
 
-The fixture is a 20 kb contig held linearised, the shape an assembler emits a circular
+The fixture is a 20 kb contig held linearized, the shape an assembler emits a circular
 contig in. Its origin-spanning read is present on BOTH strands, because the reference
 interval the job derives is on the contig's forward axis and a strand-blind derivation
 reports the reverse copy as an ordinary interval instead of a wrap.

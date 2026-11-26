@@ -1,7 +1,7 @@
 """Fixtures for the analytic tests, and only for them.
 
 `qiita_common.analytic` is SQL text, and text is only worth what it does on a
-connection — so `test_behaviour_miint.py` and `test_circular_gate_contract.py` execute
+connection — so `test_behavior_miint.py` and `test_circular_gate_contract.py` execute
 it against real duckdb-miint. That needs the extension present before anything LOADs it.
 
 Scoped to this directory rather than to `tests/`: every other qiita-common test is pure

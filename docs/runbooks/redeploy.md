@@ -48,7 +48,7 @@ running or enabled, unless run with `QIITA_DP_DISABLE_REMOVED=1`
 print buckets 1 & 2 and pause for you to apply them (only when they hold real
 steps — see below) → `preflight` → migration gate → `local-deploy.sh` → native
 venv refresh → miint stage → checkout CLI-venv refresh → `verify`, then prints
-the deployed commit for the §8 archive hand-off. Key behaviours:
+the deployed commit for the §8 archive hand-off. Key behaviors:
 
 - It **reads `DATABASE_URL` from `control-plane.env` itself** (it is root) and
   hands it to the operator's `make migrate`, so the operator's shell needn't
@@ -58,7 +58,7 @@ the deployed commit for the §8 archive hand-off. Key behaviours:
   confirm — never silently). `activate.sh`'s guard is the backstop.
 - **It only stops to ask when there is real work or a real decision** — it does
   not pause on no-ops, and it does not prompt to do work it has already proven is
-  needed. The buckets 1 & 2 acknowledgement is skipped when both are empty in
+  needed. The buckets 1 & 2 acknowledgment is skipped when both are empty in
   `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to confirm). The
   two venv refreshes (§6, steps 5 and 6) are **not** skippable — they run every
   deploy, prompting only for a *separate* native checkout the script didn't pull;

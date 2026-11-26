@@ -367,7 +367,7 @@ def _validate_genome_map(duck: duckdb.DuckDBPyConnection, genome_map_path: Path)
     `genome_source` is outside the GenomeSource vocabulary, or if the
     qiita-origin rule is violated (prep_sample_idx set iff genome_source='qiita').
     Also requires a non-NULL `read_id` on every row. Scans only, so a
-    genome-scale map is never materialised.
+    genome-scale map is never materialized.
     """
     columns = {
         c[0]
@@ -470,7 +470,7 @@ async def _associate_genomes(
     sequence_hash — so feature_idx is resolved set-side in DuckDB rather than
     from an in-memory Python mapping. Rows whose read_id isn't in the manifest
     are dropped by the INNER JOIN (see `_check_genome_map`). Streamed in
-    `_CHUNK_SIZE` batches so a genome-scale map never materialises in Python.
+    `_CHUNK_SIZE` batches so a genome-scale map never materializes in Python.
 
     `has_prep` is `_check_genome_map`'s result; `mint_features` runs that check
     before minting.
@@ -589,7 +589,7 @@ async def mint_features(
     `output_dir` with columns (sequence_hash UUID, feature_idx BIGINT).
 
     Streaming is deliberate: this primitive runs in-process on the control
-    plane's single event loop, so it must never materialise the whole hash
+    plane's single event loop, so it must never materialize the whole hash
     set (a genome-scale reference is tens of millions of rows). Each batch is
     bounded, the per-batch upsert `await`s, and the manifest read
     (`converted_batches`), the per-batch feature_map insert and the final Parquet
@@ -786,7 +786,7 @@ async def _write_annotation_claims(
     and the honest outcome is a failed ticket rather than a silently under-claimed
     reference that later leaks features on delete.
 
-    **The zero-annotation early-out is not an optimisation, it is the common path.** Every
+    **The zero-annotation early-out is not an optimization, it is the common path.** Every
     reference-add reaches here, and almost none carry a GFF3. The join below would
     hash-build `feature_map.parquet` as its build side — the WHOLE reference, even against
     an empty annotation manifest — inside the control-plane process, on the event loop.
@@ -1230,7 +1230,7 @@ async def write_membership(
     `(read_id, sequence_hash, ...)`. DuckDB joins them on `sequence_hash` and
     reduces to one `(feature_idx, accession)` per feature via
     `MEMBERSHIP_ACCESSION_JOIN_SQL`, read chunked via the Arrow reader and
-    bulk-inserted into qiita.reference_membership — never materialising the
+    bulk-inserted into qiita.reference_membership — never materializing the
     full list in Python.
 
     Returns (linked, already_linked). Idempotent. Raises ValueError if any
@@ -1831,12 +1831,12 @@ async def write_assembly_membership(
     """Link a prep_sample's assembly-run contigs to qiita.assembly_membership, and
     mint the qiita.genome each of their subjects is.
 
-    The assembly analogue of `write_membership`. DuckDB JOINs `bin_map`
+    The assembly analog of `write_membership`. DuckDB JOINs `bin_map`
     (read_id -> kind, bin_id) against `manifest` (read_id -> sequence_hash) and
     the already-minted `feature_map` (sequence_hash -> feature_idx), resolving
     each contig set-side to `(kind, bin_id, feature_idx)`; the stream is read in
     `_CHUNK_SIZE` batches and bulk-inserted into qiita.assembly_membership with
-    `(prep_sample_idx, processing_idx)` stamped from this run. Never materialises
+    `(prep_sample_idx, processing_idx)` stamped from this run. Never materializes
     the whole mapping in Python — same streaming contract mint_features /
     write_membership follow. DuckDB does hold the grouped set (the constant's
     GROUP BY is a blocking operator), which is bounded by contig count rather than

@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
-from qiita_common.analytic import LABELLED_RELATION, biom_copy_sql, parquet_copy_sql
+from qiita_common.analytic import LABELED_RELATION, biom_copy_sql, parquet_copy_sql
 from qiita_common.api_paths import (
     PATH_MASK_DEFINITION_PREFIX,
     PATH_MASK_DEFINITION_SYNDNA_READ_COUNT,
@@ -330,12 +330,12 @@ def write_syndna_table(
     ]
     handle_column = f", {MASK_HANDLE_COLUMN} VARCHAR" if parquet else ""
     con.execute(
-        f"CREATE OR REPLACE TEMP TABLE {LABELLED_RELATION}"
+        f"CREATE OR REPLACE TEMP TABLE {LABELED_RELATION}"
         f" (sample_id VARCHAR, feature_id VARCHAR, value DOUBLE{handle_column})"
     )
     if rows:
         marks = ", ".join("?" * len(rows[0]))
-        con.executemany(f"INSERT INTO {LABELLED_RELATION} VALUES ({marks})", rows)
+        con.executemany(f"INSERT INTO {LABELED_RELATION} VALUES ({marks})", rows)
     partial = output.with_name(output.name + ".partial")
     sidecar_partial = sidecar.with_name(sidecar.name + ".partial")
     partial.unlink(missing_ok=True)

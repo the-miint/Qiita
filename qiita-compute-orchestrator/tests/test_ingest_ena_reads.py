@@ -772,7 +772,7 @@ def test_permanently_failed_run_does_not_block_the_good_runs(
     ],
     ids=["oom", "local-io", "http-403"],
 )
-def test_unrecognised_error_fails_the_step_beside_a_good_run(
+def test_unrecognized_error_fails_the_step_beside_a_good_run(
     fake_mint, monkeypatch, tmp_path, failure
 ):
     """The raw error propagates, not a BackendFailure, so a Slurm OOM traceback is
@@ -788,7 +788,7 @@ def test_unrecognised_error_fails_the_step_beside_a_good_run(
     assert not (tmp_path / "ws" / ingest_module.RUN_OUTCOMES_FILENAME).exists()
 
 
-def test_transient_failure_wins_over_an_unrecognised_error(fake_mint, monkeypatch, tmp_path):
+def test_transient_failure_wins_over_an_unrecognized_error(fake_mint, monkeypatch, tmp_path):
     def _fake(run_accession, download_method, intermediate_path, duckdb_tmp, memory_gb, threads):
         if run_accession == "ERR001":
             raise duckdb.OutOfMemoryException("Out of Memory Error: failed to allocate data")
@@ -930,7 +930,7 @@ def test_final_attempt_still_raises_when_no_run_was_stored(fake_mint, monkeypatc
     assert exc.value.transient is True
 
 
-def test_final_attempt_still_fails_the_step_on_an_unrecognised_error(
+def test_final_attempt_still_fails_the_step_on_an_unrecognized_error(
     fake_mint, monkeypatch, tmp_path
 ):
     monkeypatch.setattr(

@@ -146,7 +146,7 @@ impl ThreadsSource {
 /// the largest spill seen anywhere was 58 MiB written by an export that then
 /// failed its allocation. So this does not size expected spill; it bounds a shape
 /// nobody has measured. At the default pool size that is 8 × 4 GiB against the
-/// deploy host's 378 G of free root, and the measured behaviour when a connection
+/// deploy host's 378 G of free root, and the measured behavior when a connection
 /// reaches it is a clean error naming the setting, with nothing left behind.
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: &str = "4GiB";
 
@@ -383,7 +383,7 @@ impl Settings {
         // --- what one request may spend -------------------------------------
         // Absent these, every DuckDB database this process opens sizes itself
         // from the process's own cgroup — so each concurrent request
-        // authorises itself against the whole host, and N of them authorise N
+        // authorizes itself against the whole host, and N of them authorize N
         // times the host. Each env var is named after the DuckDB setting it
         // feeds; the defaults are derived here because this is the site that
         // divides the ceiling.

@@ -56,7 +56,7 @@ CIRCULAR_READ_PARTITION = "sequence_idx, alignment_is_read1(flags), feature_idx"
 
 # How many secondary alignments an aligner call asks for. A CAP, not a count: measured
 # 2026-08-25 against the deploy-staged miint build 9fc4d12 under the `map-hifi` preset,
-# 30 byte-identical 8 kb subjects and a 4 kb read, the realised number is
+# 30 byte-identical 8 kb subjects and a 4 kb read, the realized number is
 # min(cap, equally-good subjects - 1). A subject scoring materially below the best is not
 # reported at any cap; the knob deciding that is not exposed
 # (<https://github.com/the-miint/duckdb-miint/issues/189>).
@@ -104,7 +104,7 @@ class AlignmentGate:
     `circular` pools every record one read was split into against one reference and
     judges the read there, keeping every row of a group that clears
     `circular_min_coverage`, `circular_min_identity` and same-strandedness. A read
-    crossing the origin of a circular reference held as a linearised contig arrives as
+    crossing the origin of a circular reference held as a linearized contig arrives as
     two records covering half the read each, so a per-row coverage floor discards what
     pooled coverage scores 1.0. It replaces both CIGAR thresholds and the `paired`
     pooling rather than combining with them — `__post_init__` says why.
@@ -232,7 +232,7 @@ def _circular_terms(gate: AlignmentGate) -> list[tuple[str, float]]:
 
     `mixed_strand` is not among them and is not a knob: fragments on opposite strands are
     an inverted repeat, a chimera or a misassembly rather than one molecule
-    linearisation cut, so admitting them changes what the coverage number counts instead
+    linearization cut, so admitting them changes what the coverage number counts instead
     of relaxing a cutoff. It is spelled in the SQL alongside these terms.
 
     `max_ref_gap` is reported by the macro and not read here: it is what would separate a
@@ -632,7 +632,7 @@ def check_gate_diagnostics(
     answer instead of an error, and return the `GateClearance` that
     `gated_alignment_table_sql` requires. Takes `gate_diagnostics_sql(gate)`'s row.
 
-    Both consumers must refuse identically, which is why the judgement lives here
+    Both consumers must refuse identically, which is why the judgment lives here
     rather than in each of them.
 
     **What a partly-unscorable slice costs differs by axis, so the two treat it

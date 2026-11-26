@@ -331,7 +331,7 @@ async def test_create_sequencing_run_payload_mismatch_returns_409(ctx):
 async def test_create_sequencing_run_under_supply_on_retry_returns_200(ctx):
     # A retry that omits a previously-set field (supplied None) is treated
     # as "caller didn't override"; the field is not compared and the
-    # response is 200 with the existing idx. Matches the CLI's behaviour
+    # response is 200 with the existing idx. Matches the CLI's behavior
     # of leaving optional flags unset on a re-run.
     instrument_run_id = unique_instrument_id("UNDERSUPPLY")
     r1 = await _post_run(

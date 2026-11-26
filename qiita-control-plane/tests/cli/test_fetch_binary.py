@@ -1,6 +1,6 @@
 """Contract tests for `cli._common.fetch_binary` — the generic bulk-binary read.
 
-Nothing here is about the genome map; it is the transport helper's own behaviour,
+Nothing here is about the genome map; it is the transport helper's own behavior,
 pinned with a real socket server because the CLI's `httpx.Response` fakes yield a
 whole body as one chunk and so never exercise the loop.
 

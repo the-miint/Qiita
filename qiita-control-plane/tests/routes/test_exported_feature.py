@@ -38,7 +38,7 @@ async def _drop_identifiers(pool, *, genome_idxs=(), feature_idxs=()):
     )
 
 
-async def test_a_genome_is_labelled_with_its_accession(role_keyed_clients):
+async def test_a_genome_is_labeled_with_its_accession(role_keyed_clients):
     """Not with a minted handle. A reader can resolve `GCF_…`; `QF7` means nothing
     outside this system, which is why the accession wins whenever there is one."""
     db = role_keyed_clients["pool"]
@@ -141,7 +141,7 @@ async def test_a_collided_feature_accession_falls_back_instead_of_failing(role_k
         await cleanup_reference_graph(db, reference_idx=reference_idx, feature_idxs=[first, second])
 
 
-async def test_a_feature_is_labelled_with_the_accession_of_its_reference(role_keyed_clients):
+async def test_a_feature_is_labeled_with_the_accession_of_its_reference(role_keyed_clients):
     db = role_keyed_clients["pool"]
     reference_idx = await seed_bare_reference(db, label="expfeat-route-feat")
     feature_idx = await seed_bare_feature(db)
@@ -260,7 +260,7 @@ async def test_an_unknown_genome_is_refused_and_nothing_partial_is_returned(role
 
 async def test_a_feature_outside_the_named_reference_is_refused(role_keyed_clients):
     """It has no accession from that reference, so there is nothing to publish for
-    it — and labelling it anyway would put a row in the artifact that the reference
+    it — and labeling it anyway would put a row in the artifact that the reference
     does not contain."""
     db = role_keyed_clients["pool"]
     reference_idx = await seed_bare_reference(db, label="expfeat-route-outside")

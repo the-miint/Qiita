@@ -1,7 +1,7 @@
 """DB tests for the mask-definition read surface.
 
 Three GETs: the mask list with its per-mask sample tally, one mask's config, and
-the per-mask sample roster. Two behaviours carry most of the coverage here:
+the per-mask sample roster. Two behaviors carry most of the coverage here:
 
 * **State resolution.** Both masking paths write the `qiita.mask_sample` gate row,
   so a masked-complete sample always resolves from it. What the gate cannot show

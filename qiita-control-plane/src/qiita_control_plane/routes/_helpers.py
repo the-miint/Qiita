@@ -1889,7 +1889,7 @@ async def detail_for_slot_collision(
             f" the typed row must be deleted before a missing-reason"
             f" marker can be written"
         )
-    # Fallback: an unrecognised subclass means the exception hierarchy
+    # Fallback: an unrecognized subclass means the exception hierarchy
     # grew without the dispatch above being extended. Surface a generic
     # message rather than crashing the route; the maintainer can find
     # the missing branch via this string.

@@ -246,7 +246,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
         # Non-temp view (`_CHUNK_VIEW`) so rype's separate bind/execute connection
         # can resolve it by name and windows over the on-disk staging Parquet
-        # lazily (never materialised into an in-memory table). DuckDB rejects
+        # lazily (never materialized into an in-memory table). DuckDB rejects
         # prepared parameters inside CREATE VIEW, so the path is inlined;
         # validate_parquet_path rejects quote/backslash/control chars (the repo's
         # fail-fast escaping contract).

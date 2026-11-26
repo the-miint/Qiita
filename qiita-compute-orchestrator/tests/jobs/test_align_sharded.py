@@ -48,7 +48,7 @@ import pytest
 
 from qiita_compute_orchestrator.miint import open_miint_conn
 
-# The columns the stubbed align seam materialises, mimicking the real
+# The columns the stubbed align seam materializes, mimicking the real
 # align_*_sharded output (a representative subset of the full SAM columns — enough
 # to prove the mate columns pass through and the raw subject ids are dropped).
 # `reference`/`mate_reference` are VARCHAR subject ids (our feature_idx), matching
@@ -1224,7 +1224,7 @@ def test_align_sharded_se_placements_sharing_a_start_are_scored_separately(tmp_p
     semantics, so per-record is the deliberate answer here, not an accident of the
     refactor. Whether bowtie2 `report_all` can actually emit two rows sharing that key
     is not established (it would need a real aligner run); this pins our filter's
-    behaviour for the shape either way, because every other fixture in this file has
+    behavior for the shape either way, because every other fixture in this file has
     one placement per read and so cannot see the difference."""
     from qiita_compute_orchestrator.jobs import align_sharded
 

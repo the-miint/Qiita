@@ -734,7 +734,7 @@ def _resolved_decisions(
     block (what that sample WOULD get, from its own `host_taxon_id` metadata plus
     the run's platform). All that is left client-side is the POOL-level join: a
     blank has no host of its own, so what it gets depleted against comes from its
-    neighbours. That rule lives in `qiita_common.host_filter_plan` because the block
+    neighbors. That rule lives in `qiita_common.host_filter_plan` because the block
     planner needs the identical answer — two implementations would let one pool be
     masked two ways.
 
@@ -809,7 +809,7 @@ def _assert_pacbio_submission_coherent(
 
     LONG READS ARE RYPE-ONLY. The long-read host_filter chain binds no minimap2
     index, so a resolution that carries a minimap2 stage on a PacBio pool cannot be
-    honoured. Silently dropping the stage would mask against less than the profile
+    honored. Silently dropping the stage would mask against less than the profile
     declares, so it aborts. If long-read minimap2 ever becomes the intent, that is
     a change to the chain, not something to paper over here.
 
@@ -972,7 +972,7 @@ def _handle_submit_host_filter_pool(
 
         if args.force:
             # The escape hatch: ignore what the samples say and apply the operator's
-            # flags verbatim, pool-wide, blanks included. This is the old behaviour,
+            # flags verbatim, pool-wide, blanks included. This is the old behavior,
             # kept for the case where the metadata is wrong or absent and the
             # operator knows better. With no reference given it disables filtering
             # pool-wide — an explicit, deliberate pass-through.

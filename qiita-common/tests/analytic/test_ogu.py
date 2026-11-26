@@ -19,7 +19,7 @@ def test_survivor_join_is_in_the_ogu_input_statement_not_after_woltka():
     values, so a read hitting one surviving and one dropped genome must lose the
     dropped genome BEFORE woltka to renormalize to 1.0 on the survivor. Filtering
     woltka's OUTPUT strands it at 0.5 — a plausible number, not an error, which
-    is why this is asserted structurally here as well as behaviourally in the
+    is why this is asserted structurally here as well as behaviorally in the
     consumers' real-miint suites.
     """
     for scope in ft.CoverageScope:

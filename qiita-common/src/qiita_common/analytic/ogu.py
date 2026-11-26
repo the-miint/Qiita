@@ -1,6 +1,6 @@
-"""The OGU table flavour: what `woltka_ogu` reads, and what it returns.
+"""The OGU table flavor: what `woltka_ogu` reads, and what it returns.
 
-Today this is the one table flavour — genome-keyed counts via miint's `woltka_ogu`;
+Today this is the one table flavor — genome-keyed counts via miint's `woltka_ogu`;
 names carrying `ogu` denote that computation specifically, and taxonomy- and
 tree-derived tables join it later.
 
@@ -65,7 +65,7 @@ def ogu_input_table_sql(*, survivor_scope: CoverageScope | None, combined: bool 
     threshold applies** — at 0 every genome with any alignment qualifies, so there
     is no set to build or join. It must be the same scope `survivor_table_sql` was
     called with — pooled joins on the genome alone, per-sample on `(sample, genome)`,
-    which is the entire behavioural difference between the scopes. A mismatch names a
+    which is the entire behavioral difference between the scopes. A mismatch names a
     relation that was never created, so it is a bind error rather than a wrong
     number (see `_SURVIVOR_TABLES`).
 

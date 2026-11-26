@@ -9,7 +9,7 @@ or CTEs — hence every staging statement in this package creates a regular non-
 TABLE. **Some relations are exceptions, read only on the caller's own connection and
 VIEWs for the same reason** — materializing would duplicate a large relation
 in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the coverage
-macros), its de novo twin, and `LABELLED_RELATION` (read by one COPY).
+macros), its de novo twin, and `LABELED_RELATION` (read by one COPY).
 
 The releases at the bottom are the other half of the same subject: which relations
 are dead at which point, and what a caller runs to let go of them. On a client
@@ -83,10 +83,10 @@ OGU_OUTPUT_TABLE = "ogu_output"
 
 # The two label relations, each `internal key -> public handle`.
 #
-# **The row axis is a genome only because this table flavour is OGU.** A feature is not
+# **The row axis is a genome only because this table flavor is OGU.** A feature is not
 # always a genome — an amplicon sequence variant, a full-length 16S observed in a sample,
 # an assembled contig are all features with no genome to roll up to — so a row-keyed
-# flavour is a genuine second shape, not a variant spelling of this one. The identifier
+# flavor is a genuine second shape, not a variant spelling of this one. The identifier
 # layer is already ready for it: the mint behind `export_feature_id` publishes a genome
 # OR a `(reference, feature)` pair. What is genome-only is the roll-up, which counts what
 # `woltka_ogu` counts. This name says `genome` to be honest about that, rather than
@@ -100,7 +100,7 @@ SAMPLE_LABEL_TABLE = "sample_label"
 # Materializing would hold a second full copy of the output — two VARCHARs and a
 # DOUBLE per row, tens of millions of rows at cohort scale — alive at exactly the
 # moment the BIOM writer is building its sparse matrix.
-LABELLED_RELATION = "feature_table_labelled"
+LABELED_RELATION = "feature_table_labeled"
 
 # The reference's per-feature taxonomy, as streamed from the data plane's
 # exclusion-aware view. A real TABLE: the reduction reads it twice (once to pick
@@ -108,7 +108,7 @@ LABELLED_RELATION = "feature_table_labelled"
 # cannot be scanned twice.
 TAXONOMY_TABLE = "reference_taxonomy"
 
-# The published sidecar — a VIEW, for the reason `LABELLED_RELATION` is one: nothing
+# The published sidecar — a VIEW, for the reason `LABELED_RELATION` is one: nothing
 # reads it except the checks and the COPY, and materializing would hold a second copy of
 # the reduction's output for that. It IS evaluated twice, once per reader, which is the
 # price of not holding it; the reduction runs over one row per published genome, so that

@@ -364,7 +364,7 @@ async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
             " RETURNING feature_idx"
         )
 
-    # Modelled on what mint_annotation_features actually writes: a plasmid is a
+    # Modeled on what mint_annotation_features actually writes: a plasmid is a
     # MEMBER (it is what reads align to) and its insert is an ANNOTATION whose parent
     # is that same reference's member. An annotation whose parent the reference does
     # NOT own is unreachable through the ingest path, and `reference_annotation`'s

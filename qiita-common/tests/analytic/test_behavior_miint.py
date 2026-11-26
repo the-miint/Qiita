@@ -1,7 +1,7 @@
-"""Behavioural tests for `qiita_common.analytic` against REAL duckdb-miint.
+"""Behavioral tests for `qiita_common.analytic` against REAL duckdb-miint.
 
 The builders return SQL text and open no connection, so the sibling modules here
-assert on strings; the analytic's behaviour is pinned in this one and in the
+assert on strings; the analytic's behavior is pinned in this one and in the
 orchestrator's `test_estimate_feature_table.py`. The division: this module owns what
 the analytic COMPUTES — including the per-sample coverage scope, which no server-side
 caller uses, and the combined table's reconciliation; that one owns how its driver
@@ -661,7 +661,7 @@ def test_a_paired_gate_with_both_thresholds_scores_the_pooled_cigar():
 # The circular gate, against real miint
 #
 # The fixture is one 30 kb contig (feature 10, genome 100) and a 6 kb read the
-# linearisation cut in two: `3000=3000S` ending where the contig does, `3000H3000=`
+# linearization cut in two: `3000=3000S` ending where the contig does, `3000H3000=`
 # starting at its origin. Each record explains half the read; together they explain all
 # of it. `_INTERIOR_READ` is the same read placed away from the origin, in one record.
 # ---------------------------------------------------------------------------
@@ -966,7 +966,7 @@ def _relabel(conn) -> ft.LabelClearance:
     cursor = conn.execute(ft.relabel_diagnostics_sql())
     names = [d[0] for d in cursor.description]
     clearance = ft.check_relabel_diagnostics(**dict(zip(names, cursor.fetchone(), strict=True)))
-    conn.execute(ft.labelled_relation_sql(clearance=clearance))
+    conn.execute(ft.labeled_relation_sql(clearance=clearance))
     return clearance
 
 
@@ -1001,7 +1001,7 @@ def _public_table(
             handles=handles,
         )
         _relabel(conn)
-        return conn.execute(f"SELECT * FROM {ft.LABELLED_RELATION} ORDER BY 1, 2").fetchall()
+        return conn.execute(f"SELECT * FROM {ft.LABELED_RELATION} ORDER BY 1, 2").fetchall()
 
 
 def test_the_public_table_carries_handles_instead_of_our_identifiers():
@@ -1025,9 +1025,9 @@ def test_no_internal_identifier_survives_into_the_public_table():
         conn.execute(ft.ogu_output_table_sql(populated=populated))
         _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
         _relabel(conn)
-        described = conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()
+        described = conn.execute(f"DESCRIBE {ft.LABELED_RELATION}").fetchall()
 
-    assert [(r[0], r[1]) for r in described] == list(ft.LABELLED_SCHEMA.items())
+    assert [(r[0], r[1]) for r in described] == list(ft.LABELED_SCHEMA.items())
     assert not [name for name, *_ in described if "idx" in name]
 
 
@@ -1115,13 +1115,13 @@ def test_an_empty_cohort_relabels_to_the_same_columns_and_types():
         _stage_labels(conn, feature_handles=_feature_handles(_MAP), handles=_HANDLES)
         clearance = _relabel(conn)
         described = [
-            (r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELLED_RELATION}").fetchall()
+            (r[0], r[1]) for r in conn.execute(f"DESCRIBE {ft.LABELED_RELATION}").fetchall()
         ]
-        rows = conn.execute(f"SELECT count(*) FROM {ft.LABELLED_RELATION}").fetchone()[0]
+        rows = conn.execute(f"SELECT count(*) FROM {ft.LABELED_RELATION}").fetchone()[0]
 
     assert clearance.rows == 0
     assert rows == 0
-    assert described == list(ft.LABELLED_SCHEMA.items())
+    assert described == list(ft.LABELED_SCHEMA.items())
 
 
 # ---------------------------------------------------------------------------
@@ -1196,7 +1196,7 @@ def _shear(conn) -> ft.TreeClearance:
 
 
 @contextlib.contextmanager
-def _labelled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
+def _labeled(*, mapping=_MAP, lengths=_LENGTHS, threshold=0.01):
     """A connection carrying everything the shear needs: the roll-up done, the labels
     minted from its own output, and the relabel run — the client's order exactly."""
     with _miint_conn() as conn:
@@ -1217,7 +1217,7 @@ def test_the_sheared_tree_sums_the_branch_length_of_a_collapsed_ancestor(tmp_pat
     """The property that makes a sheared tree usable: `inner1` loses c30 and so has one
     child, collapse removes it, and c10's surviving branch is 0.2 + 0.1 — the whole tree's
     distance, not the pruned one's. A float sum, hence approximately."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path)
         clearance = _shear(conn)
         rows = _sheared(conn)
@@ -1235,7 +1235,7 @@ def test_the_sheared_tree_sums_the_branch_length_of_a_collapsed_ancestor(tmp_pat
 def test_an_unpublished_tip_is_sheared_away_rather_than_published_by_its_own_name(tmp_path):
     """c30's genome fails the coverage threshold, so it has no handle. Its tip must
     vanish, and its reference-internal name `c30` must not reach the artifact."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path)
         _shear(conn)
         rows = _sheared(conn)
@@ -1251,7 +1251,7 @@ def test_an_unpublished_tip_is_sheared_away_rather_than_published_by_its_own_nam
 
 def test_the_shear_releases_the_whole_reference_tree(tmp_path):
     """It is the largest relation in the recipe, and the write is still to come."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path)
         _shear(conn)
         live = {
@@ -1271,7 +1271,7 @@ def test_a_genome_owning_two_tips_is_refused_by_its_handle(tmp_path):
     both tips under one handle — a tree with duplicate tip names."""
     tree = "((c40:0.2,c41:0.3)G400:0.1,(c10:0.4,c20:0.5)inner:0.2);"
     tips = [("c10", 10), ("c20", 20), ("c40", 40), ("c41", 41)]
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path, newick=tree, tip_features=tips)
         with pytest.raises(ValueError, match="GCF_000000400"):
             _shear(conn)
@@ -1281,7 +1281,7 @@ def test_a_genome_whose_ONLY_tip_is_blocked_is_refused_by_its_handle(tmp_path):
     """The curator blocked c40, the one tip G400 has. G400 still publishes — c41 aligned
     and nothing blocked it — so the table is fine and only the tree is not: its single
     position for that organism comes from sequence the blocklist rejects."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path, blocked=[40])
         with pytest.raises(ValueError, match="GCF_000000400") as excinfo:
             _shear(conn)
@@ -1294,7 +1294,7 @@ def test_a_genome_keeps_its_UNBLOCKED_tip_when_a_sibling_contig_is_blocked(tmp_p
     one — so the tree publishes c41's position instead of being refused as ambiguous."""
     tree = "((c40:0.2,c41:0.3)G400:0.1,(c10:0.4,c20:0.5)inner:0.2);"
     tips = [("c10", 10), ("c20", 20), ("c40", 40), ("c41", 41)]
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path, newick=tree, tip_features=tips, blocked=[40])
         clearance = _shear(conn)
         rows = _sheared(conn)
@@ -1310,7 +1310,7 @@ def test_a_published_row_with_no_tip_in_the_tree_is_refused(tmp_path):
     """A tree that covers only some of what the table publishes reads as though the rest
     were left out of the analysis."""
     tree = "((c10:0.2,c30:0.5)inner1:0.1,c40:0.4);"
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path, newick=tree)
         with pytest.raises(ValueError, match="GCF_000000200"):
             _shear(conn)
@@ -1322,7 +1322,7 @@ def test_a_tip_shared_by_two_published_genomes_is_refused(tmp_path):
     tip by genome duplicates the node. The shear's own error names a node id; this names
     the reason."""
     shared = [*_MAP, (10, 200)]
-    with _labelled(mapping=shared) as conn:
+    with _labeled(mapping=shared) as conn:
         _stage_phylogeny(conn, tmp_path)
         with pytest.raises(ValueError, match="more than one genome"):
             _shear(conn)
@@ -1331,7 +1331,7 @@ def test_a_tip_shared_by_two_published_genomes_is_refused(tmp_path):
 def test_a_reference_with_no_phylogeny_is_refused(tmp_path):
     """An absent tree is an EMPTY stream, not an error, so the recipe has to notice. The
     shear's own message would name our staged relation instead."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path, tip_features=[])
         conn.execute(f"DELETE FROM {ft.PHYLOGENY_TABLE}")
         with pytest.raises(ValueError, match="no phylogeny"):
@@ -1341,7 +1341,7 @@ def test_a_reference_with_no_phylogeny_is_refused(tmp_path):
 def test_the_written_tree_carries_only_published_names_and_no_identifier_of_ours(tmp_path):
     """Asserted on the FILE, which is what somebody publishes: every tip label is one of
     the table's own `feature_id`s, and no column is one of ours."""
-    with _labelled() as conn:
+    with _labeled() as conn:
         _stage_phylogeny(conn, tmp_path)
         clearance = _shear(conn)
         conn.execute("SET preserve_insertion_order=false")
@@ -1405,7 +1405,7 @@ def test_a_tip_shared_with_an_UNPUBLISHED_genome_still_shears_cleanly(tmp_path):
     """
     shared_with_unpublished = [*_MAP, (40, 500), (99, 500)]
     lengths = [*_LENGTHS, (99, 1_000_000)]
-    with _labelled(mapping=shared_with_unpublished, lengths=lengths) as conn:
+    with _labeled(mapping=shared_with_unpublished, lengths=lengths) as conn:
         published = {
             name
             for (name,) in conn.execute(

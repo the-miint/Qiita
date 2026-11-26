@@ -5,7 +5,7 @@ Covers the route helpers — patching `httpx.request` for the JSON mints and
 `httpx.stream` for the two Parquet maps — what each response becomes once staged
 into DuckDB, and the relabel driver. The analytic and every refusal the relabel makes
 are pinned against real miint in `qiita-common`'s
-`tests/analytic/test_behaviour_miint.py`; what is specific here is the boundary
+`tests/analytic/test_behavior_miint.py`; what is specific here is the boundary
 between a REST response and a DuckDB relation, where a wrong column type or a lost
 row would surface as a confusing bind error two steps later.
 """
@@ -60,7 +60,7 @@ _IDENTIFIERS = [
 
 
 def _manifest_stub(files):
-    """Stands in for the manifest payload. This module owns the bundle's file behaviour —
+    """Stands in for the manifest payload. This module owns the bundle's file behavior —
     arity, refusals, all-or-nothing — and the manifest's CONTENT is asserted where the
     whole recipe runs (`test_feature_table_build_cli.py`). It still has to be a real
     document, so the file written here is the real thing."""
@@ -313,7 +313,7 @@ def test_the_relabel_driver_writes_the_public_table_and_reports_its_size():
             f"AS t({', '.join(ft.OUTPUT_COLUMNS)})"
         )
         clearance = ftc._relabel(conn)
-        rows = conn.execute(f"SELECT * FROM {ft.LABELLED_RELATION} ORDER BY 1").fetchall()
+        rows = conn.execute(f"SELECT * FROM {ft.LABELED_RELATION} ORDER BY 1").fetchall()
 
     assert clearance.rows == 2
     assert rows == [("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0)]
@@ -324,12 +324,12 @@ def test_the_relabel_driver_writes_the_public_table_and_reports_its_size():
 # ---------------------------------------------------------------------------
 
 
-def _labelled(conn, rows=(("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0))) -> None:
-    """Stage a relabelled table, as the relabel would leave it."""
+def _labeled(conn, rows=(("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0))) -> None:
+    """Stage a relabeled table, as the relabel would leave it."""
     values = ", ".join("(?::VARCHAR, ?::VARCHAR, ?::DOUBLE)" for _ in rows)
     conn.execute(
-        f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES {values}) "
-        f"AS v({', '.join(ft.LABELLED_COLUMNS)})",
+        f"CREATE TABLE {ft.LABELED_RELATION} AS SELECT * FROM (VALUES {values}) "
+        f"AS v({', '.join(ft.LABELED_COLUMNS)})",
         [x for r in rows for x in r],
     )
 
@@ -343,7 +343,7 @@ def test_the_bundle_is_the_table_AND_the_identifier_map(fmt, tmp_path):
     """
     table = tmp_path / f"gut-study-ogu.{fmt}"
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         written = ftc._write_bundle(
             conn,
             table_path=table,
@@ -366,7 +366,7 @@ def test_two_runs_can_share_a_directory(tmp_path):
     """What deriving the map's name from the table's buys: the pooled and per-sample
     builds of one cohort live side by side instead of colliding on a fixed name."""
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         first = ftc._write_bundle(
             conn,
             table_path=tmp_path / "pooled.parquet",
@@ -401,7 +401,7 @@ def test_a_name_that_contradicts_the_format_is_refused(tmp_path):
     alone.
     """
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(ValueError, match="named for biom"):
             ftc._write_bundle(
                 conn,
@@ -429,7 +429,7 @@ def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_pat
     rides the file, not just the terminal: a file outlives its scrollback.
     """
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         _, map_path, *_ = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.parquet",
@@ -449,7 +449,7 @@ def test_the_identifier_map_carries_the_join_key_and_says_not_to_ship_it(tmp_pat
 def test_the_written_table_carries_only_public_columns(tmp_path):
     """Read back rather than trusted: this is the file a user publishes."""
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         table_path, *_ = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.parquet",
@@ -461,7 +461,7 @@ def test_the_written_table_carries_only_public_columns(tmp_path):
         described = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{table_path}')").fetchall()
         rows = conn.execute(f"SELECT * FROM read_parquet('{table_path}') ORDER BY 1").fetchall()
 
-    assert [(r[0], r[1]) for r in described] == list(ft.LABELLED_SCHEMA.items())
+    assert [(r[0], r[1]) for r in described] == list(ft.LABELED_SCHEMA.items())
     assert rows == [("QM1", "GCF_100", 1.0), ("QM2", "GCF_400", 2.0)]
 
 
@@ -471,7 +471,7 @@ def test_a_failure_partway_through_leaves_NEITHER_file(tmp_path):
     nobody can join, published beside a missing map.
     """
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(TypeError):
             ftc._write_bundle(
                 conn,
@@ -494,7 +494,7 @@ def test_an_existing_artifact_is_refused_before_anything_is_written(tmp_path):
     table = tmp_path / "t.parquet"
     table.write_text("earlier run")
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(FileExistsError, match="t.parquet"):
             ftc._write_bundle(
                 conn,
@@ -515,7 +515,7 @@ def test_a_lone_survivor_is_reported_as_an_unfinished_run(tmp_path):
     let a user delete the wrong thing."""
     (tmp_path / "t.exported-identifier.json").write_text("{}")
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(FileExistsError, match="did not finish"):
             ftc._write_bundle(
                 conn,
@@ -534,7 +534,7 @@ def test_a_stale_partial_does_not_block_a_retry(tmp_path):
     """
     (tmp_path / "t.biom.partial").write_text("interrupted")
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         written = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.biom",
@@ -552,7 +552,7 @@ def test_a_missing_output_directory_is_named(tmp_path):
     """Rather than left to the writers: DuckDB's Parquet COPY and HDF5 report this
     differently, and one of them badly."""
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(FileNotFoundError, match="no such directory"):
             ftc._write_bundle(
                 conn,
@@ -566,7 +566,7 @@ def test_a_missing_output_directory_is_named(tmp_path):
 
 def test_an_unsupported_format_is_refused(tmp_path):
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         with pytest.raises(ValueError, match="tsv"):
             ftc._write_bundle(
                 conn,
@@ -623,7 +623,7 @@ def test_the_notes_a_user_reads_are_written_as_written(tmp_path):
     `json.dump` escapes non-ASCII by default — so the dashes in those sentences would
     arrive as `\\u2014`. Asserted on the BYTES, since that is where the escaping happens."""
     with connect_with_miint() as conn:
-        _labelled(conn)
+        _labeled(conn)
         table, map_path, manifest_path = ftc._write_bundle(
             conn,
             table_path=tmp_path / "t.parquet",

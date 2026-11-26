@@ -625,7 +625,7 @@ async def test_superseded_by_round_trips_and_a_re_deprecate_replaces_it(
 
     Without this, every assertion about `superseded_by` is a 422 — the column
     could be dropped from the UPDATE entirely and the refusal tests would still
-    pass. The second half pins the replace-whole-block behaviour the route
+    pass. The second half pins the replace-whole-block behavior the route
     documents: correcting a reason without re-supplying the replacement clears it,
     which is the shape a caller has to know about.
     """
@@ -906,7 +906,7 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
 ):
     """wet_lab_admin holds prep_sample:write but not processing:lifecycle —
     deciding that published contigs came from a run we no longer stand behind is a
-    system_admin judgement."""
+    system_admin judgment."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool

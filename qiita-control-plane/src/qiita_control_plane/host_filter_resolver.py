@@ -12,7 +12,7 @@ to the callers. Two seams it deliberately does not cross:
 
   * CONTROL is a MARKER, not a decision. A blank/control sample has no host of
     its own; what it should be filtered against is a property of the POOL it
-    rode in (the union of its neighbours' hosts). This module reports "this is a
+    rode in (the union of its neighbors' hosts). This module reports "this is a
     control" and stops; the pool-level union lives with the pool-level caller.
     A control is a control `qiita_sample_type` term (per `control_types.yml`) or the
     legacy `host_taxon_id` marker, and it wins over every `host_taxon_id` state.
@@ -113,15 +113,15 @@ async def _read_signals(
 def _has_control_marker(row: asyncpg.Record | None) -> bool:
     if row is None or row["value_terminology_term_idx"] is not None:
         return False
-    recognised = _RECOGNISED_MISSING_REASON.get(row["missing_reason"])
-    return recognised is not None and recognised[0] is HostFilterOutcome.CONTROL
+    recognized = _RECOGNIZED_MISSING_REASON.get(row["missing_reason"])
+    return recognized is not None and recognized[0] is HostFilterOutcome.CONTROL
 
 
 # The missing-reasons that say something DEFINITE about whether a host exists,
 # each with the outcome it means and the clause explaining it.
 #
 # A reason not listed here means a host we can't name, so it resolves UNRESOLVED.
-_RECOGNISED_MISSING_REASON: dict[str, tuple[HostFilterOutcome, str]] = {
+_RECOGNIZED_MISSING_REASON: dict[str, tuple[HostFilterOutcome, str]] = {
     MISSING_REASON_NOT_APPLICABLE: (
         HostFilterOutcome.PASS_THROUGH,
         "the sample deliberately has no host",
@@ -310,10 +310,10 @@ def _classify(
 
     # A missing-reason that says something definite: 'not applicable' (no host by
     # design) or 'missing: control sample' (pool decides). Anything else falls
-    # through — see _RECOGNISED_MISSING_REASON.
-    recognised = _RECOGNISED_MISSING_REASON.get(missing_reason)
-    if recognised is not None:
-        outcome, explanation = recognised
+    # through — see _RECOGNIZED_MISSING_REASON.
+    recognized = _RECOGNIZED_MISSING_REASON.get(missing_reason)
+    if recognized is not None:
+        outcome, explanation = recognized
         return _without_references(
             outcome, f"{BIOSAMPLE_FIELD_HOST_TAXON_ID} is {missing_reason!r}: {explanation}"
         )
@@ -329,7 +329,7 @@ def _classify(
             " terminology term nor a missing reason",
         )
 
-    # An unrecognised missing reason — "we don't know", which we refuse to read
+    # An unrecognized missing reason — "we don't know", which we refuse to read
     # as "no host".
     return _without_references(
         HostFilterOutcome.UNRESOLVED,

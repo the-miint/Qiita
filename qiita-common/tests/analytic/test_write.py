@@ -16,7 +16,7 @@ def test_the_public_schema_is_exactly_the_biom_writers_required_set():
     out of the file. It does insist on the types: `value` must be DOUBLE exactly, not
     FLOAT, DECIMAL or BIGINT.
     """
-    assert ft.LABELLED_SCHEMA == {
+    assert ft.LABELED_SCHEMA == {
         "sample_id": "VARCHAR",
         "feature_id": "VARCHAR",
         "value": "DOUBLE",
@@ -24,12 +24,12 @@ def test_the_public_schema_is_exactly_the_biom_writers_required_set():
 
 
 @pytest.mark.parametrize("build", [ft.parquet_copy_sql, ft.biom_copy_sql])
-def test_both_writers_copy_the_RELABELLED_relation(build, tmp_path):
+def test_both_writers_copy_the_RELABELED_relation(build, tmp_path):
     """Not `OGU_OUTPUT_TABLE`, which is the same numbers keyed by our own identifiers
     — and only one of these two relations may be written to a file a user
     publishes."""
     sql = build(tmp_path / "out")
-    assert f"COPY {ft.LABELLED_RELATION} TO " in sql
+    assert f"COPY {ft.LABELED_RELATION} TO " in sql
     assert ft.OGU_OUTPUT_TABLE not in sql
 
 

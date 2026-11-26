@@ -1,7 +1,7 @@
 """Route tests for the study-local field surface that hold for every
 sample-family entity alike.
 
-Parameterized over SAMPLE_FIELD_SURFACES so one statement of a behaviour covers
+Parameterized over SAMPLE_FIELD_SURFACES so one statement of a behavior covers
 both entities' routes; a case that needs one entity's own bindings belongs in
 that entity's own module instead.
 """

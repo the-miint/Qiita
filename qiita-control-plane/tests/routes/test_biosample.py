@@ -490,7 +490,7 @@ async def test_post_biosample_user_without_biosample_write_scope_403(
 # ===========================================================================
 # All ineligibility cases collapse to one 422 detail by design (avoids leaking
 # principal-state to callers probing arbitrary owner_idx values). Kept as one
-# parametrised test so each kind still locks in that the matching backend
+# parametrized test so each kind still locks in that the matching backend
 # code path emits 422 — a regression where one input accidentally yields
 # 500 / 409 / 201 still surfaces here.
 
@@ -2682,7 +2682,7 @@ async def test_patch_biosample_immutable_field_422(ctx):
 
 @pytest.mark.parametrize("kind", OWNER_INELIGIBILITY_KINDS)
 async def test_patch_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKind):
-    # Same eligibility surface as the import endpoint; one parametrised
+    # Same eligibility surface as the import endpoint; one parametrized
     # pass over every ineligibility shape pins that the PATCH route
     # collapses each to the shared 422 detail.
     bs_idx = await _seed_biosample_for_patch(ctx)
@@ -5789,7 +5789,7 @@ async def _setup_retired_link(ctx, case):
 
 # case -> (setup, expected status, expected detail fragment). Every by-unique-field
 # route resolves its sample through one helper, so these refusals are one
-# behaviour reached by several verbs rather than a behaviour per route. A case
+# behavior reached by several verbs rather than a behavior per route. A case
 # whose routes disagree does not belong here: a retired biosample is 404 on a
 # read and 409 on a write, so it stays a per-route test below.
 #

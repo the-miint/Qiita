@@ -4,7 +4,7 @@ Most of the file is about `binning.sh` and the coverage BAM (below), but it also
 pins `bin_refine.sh`'s `--write_bins` flag, `checkm.sh`'s TMPDIR shortening for the
 AF_UNIX socket, the genomes_dir basenames the entrypoints write and read against
 their Python constants, and the version constraints in `binning.def` /
-`bin_refine.def` that each entrypoint's behaviour depends on. All of it but the tests
+`bin_refine.def` that each entrypoint's behavior depends on. All of it but the tests
 that run lines of `binning.sh` under bash is the same kind of assertion: read the shipped
 file, check the command it pins is still there and still shaped correctly.
 
@@ -12,7 +12,7 @@ The coverage BAM: how `binning.sh` puts it where metaWRAP will read it.
 
 metaWRAP guards its own `bwa mem` AND its own `samtools sort` behind one
 `if [[ ! -f <out>/work_files/<sample>.bam ]]`. The workflow pre-places that BAM
-to skip bwa (a short-read aligner) in favour of a minimap2 pre-map -- which
+to skip bwa (a short-read aligner) in favor of a minimap2 pre-map -- which
 silently skips the sort along with it. So whatever is staged there must ALREADY be
 coordinate sorted; `jgi_summarize_bam_contig_depths` refuses anything else:
 
@@ -35,7 +35,7 @@ Why these read text
 Exercising the entrypoint means building a 517 MB metaWRAP image, so these are text
 assertions: they show the commands are present and shaped correctly, not that they
 succeed. They need no binary and run everywhere, including CI and a stock dev box.
-Correct-operation evidence is elsewhere: the behavioural test above, the consumer
+Correct-operation evidence is elsewhere: the behavioral test above, the consumer
 measurements in `docs/duckdb-miint.md`, and the deploy verify step.
 
 The exceptions are the tests that run `binning.sh`'s lines under bash, where no binary
@@ -155,7 +155,7 @@ def _code_lines(path: Path) -> list[str]:
 
 
 def _strip_comment(line: str) -> str:
-    """Drop a shell comment, honouring quotes.
+    """Drop a shell comment, honoring quotes.
 
     A `#` opens a comment only at the start of a word (preceded by whitespace or
     line start) and only outside quotes -- `echo "a#b"` and `x=a#b` are not
@@ -346,7 +346,7 @@ def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
     )
 
 
-def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
+def test_hifiasm_arm_fails_on_an_unrecognized_segment_name() -> None:
     """A GFA segment name matching neither shape stops the step.
 
     The call is stored per contig, so a name matching neither shape would write a
@@ -356,8 +356,8 @@ def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
     """
     code = "\n".join(_code_lines(_ASSEMBLE_SH))
     assert "LIN_RE='tg[0-9]+l$'" in code, (
-        "the hifiasm_meta arm no longer recognises the LINEAR name shape, so every "
-        "linear contig would be counted as unrecognised"
+        "the hifiasm_meta arm no longer recognizes the LINEAR name shape, so every "
+        "linear contig would be counted as unrecognized"
     )
     # One grammar for the attribute pass and both FASTA writers: the circular
     # pattern is defined once and every user reads that variable, so the router
@@ -370,7 +370,7 @@ def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
         "pass and the FASTA writers can now drift apart"
     )
     assert re.search(r"exit 65", code), (
-        "nothing in assemble.sh exits non-zero for an unrecognised segment name; "
+        "nothing in assemble.sh exits non-zero for an unrecognized segment name; "
         "a fall-through stores a circularity nobody determined"
     )
 
@@ -986,13 +986,13 @@ def test_checkm_shortens_tmpdir_for_the_afunix_socket() -> None:
 
 @pytest.mark.parametrize("package", ["samtools", "metabat2", "maxbin2"])
 def test_binning_image_pins_version_bound_tools(package: str) -> None:
-    """The three tools whose VERSION the workflow's behaviour depends on are pinned.
+    """The three tools whose VERSION the workflow's behavior depends on are pinned.
 
     None is cosmetic:
       maxbin2 <2.2.6 ships `MaxBin` rather than the `run_MaxBin.pl` metaWRAP
         invokes -- see binning.def for the full rationale.
       samtools provides the `samtools faidx` that reorders the assembly, whose
-        region-order and missing-region behaviour the reorder's guard rests on,
+        region-order and missing-region behavior the reorder's guard rests on,
         and the `samtools index` metaWRAP's concoct block runs.
       metabat2 owns `jgi_summarize_bam_contig_depths`, which rejects an unsorted
         BAM and whose depth matrix must agree with the assembly's contig order --

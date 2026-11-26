@@ -1,7 +1,7 @@
 """Tests for widening a study-local field to text: the type flip, the value
 move that must accompany it, and the shapes the function refuses.
 
-Parameterized over SPECS so one statement of a behaviour covers both
+Parameterized over SPECS so one statement of a behavior covers both
 sample-family stacks; pytest reports ids as [biosample] / [prep_sample].
 """
 

@@ -1,7 +1,7 @@
 """Contract tests for the genome map's Parquet form — the properties that make
 it safe to serve uncapped, pinned so they cannot quietly stop holding.
 
-No database: these are the format's own properties. The route behaviour (the cap,
+No database: these are the format's own properties. The route behavior (the cap,
 the 404, the agreement with `export_member_genome`) lives beside the JSON route's
 tests, which are `db`; `tests/cli/test_fetch_binary.py` holds the transport
 helper's.

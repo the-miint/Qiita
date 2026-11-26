@@ -12,7 +12,7 @@
 # READ_ONLY is a DuckDB-level guard, not a database grant: the credentials it
 # reads are the services' read-write ones. It performs no catalog writes at all
 # (verified against a SELECT-only role with the data dir read-only), so a site
-# wanting defence in depth can point it at a SELECT-only role.
+# wanting defense in depth can point it at a SELECT-only role.
 #
 # Two catalogs, so one query can join lake data to control-plane metadata:
 #   qiita_lake   DuckLake   qiita_lake.read, .alignment, .reference_* …

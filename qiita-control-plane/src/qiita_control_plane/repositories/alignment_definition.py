@@ -106,7 +106,7 @@ async def mint_alignment_definition(
     params_hash = canonical_params_hash(params)
     await assert_params_survive_storage(conn, params, params_hash)
     # asyncpg encodes a dict bound to a jsonb parameter via the JSON codec; pass
-    # the serialized string explicitly so the behaviour is independent of
+    # the serialized string explicitly so the behavior is independent of
     # whether a JSON codec is registered on the connection.
     try:
         return await conn.fetchrow(

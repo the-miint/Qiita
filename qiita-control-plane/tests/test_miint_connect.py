@@ -8,8 +8,8 @@ and the service account's home is `/dev/null`, so it dies with a DuckDB
 `IO Error: Can't find the home directory` that names neither the variable to
 set nor the service that needs it.
 
-These tests pin that contract, including the `$HOME` behaviour itself
-(CLAUDE.local.md: establish third-party behaviour by running it, then pin the
+These tests pin that contract, including the `$HOME` behavior itself
+(CLAUDE.local.md: establish third-party behavior by running it, then pin the
 finding as a test).
 """
 

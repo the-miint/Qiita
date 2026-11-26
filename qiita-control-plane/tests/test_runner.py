@@ -161,7 +161,7 @@ class FakeBackendClient(_LocalLikeBackendMixin):
 def library_spy(monkeypatch):
     """Patch every LIBRARY entry with a recording stub.
 
-    Each spy materialises any 'output' Parquet the runner expects on disk
+    Each spy materializes any 'output' Parquet the runner expects on disk
     so downstream entries' input checks pass. Returns the call log; tests
     set `fail_on` to make a primitive raise to exercise failure paths.
     """
@@ -1354,7 +1354,7 @@ class _RecordingBackendClient(_RetryingBackendClient):
     """`_RetryingBackendClient` that also records the resources each attempt was
     dispatched at. The parent drops `baseline_resources`; the escalation tests
     assert on exactly that, since the size a step is submitted at is the whole
-    observable behaviour of the floor."""
+    observable behavior of the floor."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -1462,7 +1462,7 @@ async def test_oom_escalation_persists_the_memory_floor(
     )
     await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
 
-    # The observable behaviour: each retry was submitted at the grown size.
+    # The observable behavior: each retry was submitted at the grown size.
     assert [mem for mem, _wall in backend.sizes_for("hash")] == [1, 2, 4]
     # ... and the last floor learned is on the ticket, not just in memory.
     assert await _escalated_floor(postgres_pool, work_ticket_idx) == {"hash": {"mem_gb": 4}}
@@ -1534,7 +1534,7 @@ async def test_walltime_escalation_merges_without_clobbering_memory(
 async def test_seeded_floor_at_the_ceiling_fails_fast_without_climbing(
     postgres_pool, escalating_work_ticket, library_spy, tmp_path
 ):
-    """The flip side of resuming the ladder, and the most visible new behaviour:
+    """The flip side of resuming the ladder, and the most visible new behavior:
     a ticket whose persisted floor is already AT the action ceiling no longer
     re-climbs to it before failing. It runs once at the ceiling, the escalation
     returns the floor unchanged (saturation), and the OOM is reclassified
@@ -1715,7 +1715,7 @@ async def test_unwrapped_exception_marks_failed_as_permanent(
 async def test_transient_db_error_marks_failed_as_retriable(
     postgres_pool, pending_work_ticket, library_spy, tmp_path, monkeypatch
 ):
-    """A transient CP-DB error on one of the runner's OWN DB calls — modelled
+    """A transient CP-DB error on one of the runner's OWN DB calls — modeled
     here as a bare `asyncio.TimeoutError` (exactly how asyncpg surfaces a
     `command_timeout`) from the step's write-ahead `record_submitting` — is
     recorded `failure_type='retriable'`, NOT 'permanent'. That is the #214 fix:
@@ -4835,7 +4835,7 @@ class FakeSlurmBackendClient:
     a StepStatus to return, or a BackendFailure to raise — e.g. an
     ORCHESTRATOR_UNREACHABLE to simulate the CO being down mid-poll);
     `result_step` replays `result_script` (a `{output_name: filename}` dict to
-    materialise + return, or a BackendFailure to raise — e.g. a job that ended
+    materialize + return, or a BackendFailure to raise — e.g. a job that ended
     FAILED). Drives the runner's poll loop without a real orchestrator."""
 
     def __init__(

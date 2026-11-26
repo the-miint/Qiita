@@ -167,7 +167,7 @@ class BackendFailure(Exception):
     `stage` is the coarse lifecycle stage (DB-persisted as failure_stage).
     `step_name` is the YAML entry's `.name`; required iff stage=STEP_RUN
     so DB-side `work_ticket_failure_step_name_consistent` CHECK is
-    honoured. `reason` is the human-readable explanation persisted in
+    honored. `reason` is the human-readable explanation persisted in
     failure_reason.
 
     Use as a normal exception:

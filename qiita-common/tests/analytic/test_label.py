@@ -12,9 +12,9 @@ from qiita_common.analytic import label
 def _relabel_check(
     *,
     output_rows=100,
-    labelled_rows=100,
-    unlabelled_genome_rows=0,
-    unlabelled_sample_rows=0,
+    labeled_rows=100,
+    unlabeled_genome_rows=0,
+    unlabeled_sample_rows=0,
     genomes=10,
     feature_ids=10,
     samples=5,
@@ -22,12 +22,12 @@ def _relabel_check(
 ) -> ft.LabelClearance:
     """`check_relabel_diagnostics` over a clean row, with one field overridable per
     test — the defaults describe 100 rows of 10 genomes across 5 samples, all
-    labelled and all labels distinct."""
+    labeled and all labels distinct."""
     return ft.check_relabel_diagnostics(
         output_rows=output_rows,
-        labelled_rows=labelled_rows,
-        unlabelled_genome_rows=unlabelled_genome_rows,
-        unlabelled_sample_rows=unlabelled_sample_rows,
+        labeled_rows=labeled_rows,
+        unlabeled_genome_rows=unlabeled_genome_rows,
+        unlabeled_sample_rows=unlabeled_sample_rows,
         genomes=genomes,
         feature_ids=feature_ids,
         samples=samples,
@@ -42,8 +42,8 @@ def test_the_public_schema_carries_no_internal_identifier():
     the minted `export_feature_id`. Asserted on the schema rather than on one builder's text
     because this is the property every writer downstream inherits.
     """
-    assert set(ft.LABELLED_SCHEMA) & set(ft.OUTPUT_SCHEMA) == {"value"}
-    assert not [name for name in ft.LABELLED_SCHEMA if name.endswith("_idx")]
+    assert set(ft.LABELED_SCHEMA) & set(ft.OUTPUT_SCHEMA) == {"value"}
+    assert not [name for name in ft.LABELED_SCHEMA if name.endswith("_idx")]
 
 
 def test_both_public_identifiers_are_varchar():
@@ -52,17 +52,17 @@ def test_both_public_identifiers_are_varchar():
     cosmetic rename. A relabel that carried an integer id through would fail at the
     writer, one phase later, on a table that looks otherwise complete.
     """
-    assert ft.LABELLED_SCHEMA["sample_id"] == "VARCHAR"
-    assert ft.LABELLED_SCHEMA["feature_id"] == "VARCHAR"
+    assert ft.LABELED_SCHEMA["sample_id"] == "VARCHAR"
+    assert ft.LABELED_SCHEMA["feature_id"] == "VARCHAR"
 
 
-def test_the_labelled_table_projects_exactly_the_public_columns():
+def test_the_labeled_table_projects_exactly_the_public_columns():
     """The projection is the enforcement: both `_idx` columns are joined ON and then
     dropped, so nothing downstream can read one out of this relation even by mistake.
     """
-    sql = ft.labelled_relation_sql(clearance=_relabel_check())
+    sql = ft.labeled_relation_sql(clearance=_relabel_check())
     projection = sql.split(" FROM ", 1)[0]
-    assert projection.endswith(", ".join(ft.LABELLED_COLUMNS))
+    assert projection.endswith(", ".join(ft.LABELED_COLUMNS))
     for internal in ("prep_sample_idx", "genome_idx"):
         assert internal not in projection, internal
 
@@ -92,9 +92,9 @@ def test_the_diagnostics_and_the_relabel_read_THE_SAME_join():
     the rows written. Two copies could drift into a check that clears a join the
     relabel does not perform.
     """
-    joined = label._labelled_select_sql()
+    joined = label._labeled_select_sql()
     assert joined in ft.relabel_diagnostics_sql()
-    assert joined in ft.labelled_relation_sql(clearance=_relabel_check())
+    assert joined in ft.labeled_relation_sql(clearance=_relabel_check())
 
 
 def test_the_labels_are_left_joined_so_a_missing_one_is_visible():
@@ -102,12 +102,12 @@ def test_the_labels_are_left_joined_so_a_missing_one_is_visible():
     shortening the table; LEFT keeps the row with a NULL id, which is what the
     diagnostics detect and refuse.
     """
-    joined = label._labelled_select_sql()
+    joined = label._labeled_select_sql()
     assert joined.count("LEFT JOIN") == 2
     assert "JOIN" not in joined.replace("LEFT JOIN", "")
 
 
-def test_the_diagnostics_measure_the_unlabelled_rows_of_both_axes():
+def test_the_diagnostics_measure_the_unlabeled_rows_of_both_axes():
     sql = ft.relabel_diagnostics_sql()
     assert "FILTER (WHERE feature_id IS NULL)" in sql
     assert "FILTER (WHERE sample_id IS NULL)" in sql
@@ -123,19 +123,19 @@ def test_check_refuses_a_label_join_that_fanned_out():
     comparison catches all of them.
     """
     with pytest.raises(ValueError, match="changed the table's size"):
-        _relabel_check(output_rows=100, labelled_rows=140)
+        _relabel_check(output_rows=100, labeled_rows=140)
 
 
-def test_check_refuses_an_unlabelled_genome():
-    """Matched on the column that would go NULL, so the two unlabelled messages cannot
+def test_check_refuses_an_unlabeled_genome():
+    """Matched on the column that would go NULL, so the two unlabeled messages cannot
     stand in for each other."""
     with pytest.raises(ValueError, match="NULL feature_id"):
-        _relabel_check(unlabelled_genome_rows=3)
+        _relabel_check(unlabeled_genome_rows=3)
 
 
-def test_check_refuses_an_unlabelled_sample():
+def test_check_refuses_an_unlabeled_sample():
     with pytest.raises(ValueError, match="NULL sample_id"):
-        _relabel_check(unlabelled_sample_rows=3)
+        _relabel_check(unlabeled_sample_rows=3)
 
 
 def test_check_refuses_a_feature_id_collision():
@@ -159,39 +159,39 @@ def test_check_refuses_an_export_id_collision():
 
 
 @pytest.mark.parametrize(
-    ("unlabelled", "distinct"),
+    ("unlabeled", "distinct"),
     [
-        ({"unlabelled_genome_rows": 1}, {"genomes": 10, "feature_ids": 9}),
-        ({"unlabelled_sample_rows": 1}, {"samples": 5, "sample_ids": 4}),
+        ({"unlabeled_genome_rows": 1}, {"genomes": 10, "feature_ids": 9}),
+        ({"unlabeled_sample_rows": 1}, {"samples": 5, "sample_ids": 4}),
     ],
 )
-def test_check_reports_unlabelled_rows_before_testing_for_a_collision(unlabelled, distinct):
-    """`count(DISTINCT x)` skips NULLs, so an unlabelled row depresses the distinct-label
+def test_check_reports_unlabeled_rows_before_testing_for_a_collision(unlabeled, distinct):
+    """`count(DISTINCT x)` skips NULLs, so an unlabeled row depresses the distinct-label
     count and looks EXACTLY like a collision — both conditions are true here. The
-    unlabelled checks therefore run first, and this pins that order on both axes.
+    unlabeled checks therefore run first, and this pins that order on both axes.
 
-    Matched on `no public handle`, which only the unlabelled messages carry: the word
+    Matched on `no public handle`, which only the unlabeled messages carry: the word
     "genome" appears in the collision message too, so a looser match would be satisfied
     by the very swap this test exists to catch.
     """
     with pytest.raises(ValueError, match="no public handle"):
-        _relabel_check(**unlabelled, **distinct)
+        _relabel_check(**unlabeled, **distinct)
 
 
 def test_check_passes_a_clean_join_and_returns_the_row_count():
     """The clearance carries what it cleared, so a caller can report the size of the
     table it is about to write without recounting it."""
-    clearance = _relabel_check(output_rows=100, labelled_rows=100)
+    clearance = _relabel_check(output_rows=100, labeled_rows=100)
     assert isinstance(clearance, ft.LabelClearance)
     assert clearance.rows == 100
 
 
 def test_check_passes_an_empty_table():
     """An empty cohort is a legitimate result — every genome dropped by the threshold,
-    an all-16S reference — and has nothing to collide or go unlabelled."""
+    an all-16S reference — and has nothing to collide or go unlabeled."""
     assert (
         _relabel_check(
-            output_rows=0, labelled_rows=0, genomes=0, feature_ids=0, samples=0, sample_ids=0
+            output_rows=0, labeled_rows=0, genomes=0, feature_ids=0, samples=0, sample_ids=0
         ).rows
         == 0
     )
@@ -202,4 +202,4 @@ def test_the_relabel_sql_is_unreachable_without_a_clearance():
     catch are silent, so "check first" has to be a type error rather than a docstring.
     """
     with pytest.raises(TypeError):
-        ft.labelled_relation_sql()
+        ft.labeled_relation_sql()

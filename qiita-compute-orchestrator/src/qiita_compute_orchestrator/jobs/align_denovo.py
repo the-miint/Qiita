@@ -32,7 +32,7 @@ aligner's `reference` column IS the feature, and it arrives BIGINT because
 
 The gate is the circular-pooled one, and that choice fixes two call parameters.
 
-An assembler emits a circular contig as a linearised sequence, so a read crossing its
+An assembler emits a circular contig as a linearized sequence, so a read crossing its
 origin is reported as one SAM record per side, each covering only its own share of the
 read, and a per-record query-coverage floor drops both.
 `qiita_common.analytic.gate`'s circular mode pools a read's records against one contig
