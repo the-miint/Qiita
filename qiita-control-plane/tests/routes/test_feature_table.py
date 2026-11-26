@@ -748,7 +748,7 @@ async def test_a_table_with_no_features_has_an_empty_taxonomy(
 
 @pytest.mark.parametrize(
     "taxonomy",
-    [{"name": "greengenes2"}, {"name": "", "version": "2024.09"}, {"reference_idx": 1}],
+    [{"name": "a-reference"}, {"name": "", "version": "1.0"}, {"reference_idx": 1}],
     ids=["no version", "blank name", "internal idx"],
 )
 async def test_a_malformed_reference_is_422(role_keyed_clients, amplicon_run, taxonomy):

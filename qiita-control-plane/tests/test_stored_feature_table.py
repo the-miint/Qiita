@@ -171,7 +171,7 @@ def test_a_taxonomy_travels_with_the_reference_that_classified_it():
         _labels([(10, "QF10")]),
         _taxonomy([(10, "Bacteria", None, None, None, None, None, None, None)]),
     )
-    reference = ReferenceHandle(name="greengenes2", version="2024.09")
+    reference = ReferenceHandle(name="a-reference", version="1.0")
     answer = unpack_feature_table(
         pack_feature_table(cohort, values, features, taxonomy=(reference, taxonomy))
     )
