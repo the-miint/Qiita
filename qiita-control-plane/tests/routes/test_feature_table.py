@@ -707,18 +707,6 @@ async def test_a_reference_that_cannot_classify_is_refused_before_any_read(
     assert amplicon_run["fetched"] == [] and seen == []
 
 
-async def test_a_reference_with_no_taxonomy_loaded_409s(
-    role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
-):
-    ref = taxonomy_reference
-    _stub_taxonomy(monkeypatch, None)
-    resp = await _post(
-        role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
-    )
-    assert resp.status_code == 409, resp.text
-    assert "has no taxonomy loaded" in resp.json()["detail"]
-
-
 async def test_a_table_with_no_features_has_an_empty_taxonomy(
     role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
 ):

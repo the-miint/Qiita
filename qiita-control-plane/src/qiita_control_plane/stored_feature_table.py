@@ -371,42 +371,18 @@ def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, tabl
         return read_all_counted(client, ticket, name=table)
 
 
-def _reference_has_taxonomy(client: flight.FlightClient, ticket: bytes) -> bool:
-    """Whether the reference has any taxonomy at all, read only until the first non-empty
-    batch."""
-    for chunk in client.do_get(flight.Ticket(ticket)):
-        if chunk.data.num_rows:
-            return True
-    return False
-
-
 def fetch_taxonomy(
     *, data_plane_url: str, signing_key: bytes, reference_idx: int, feature_idxs: list[int]
-) -> pa.Table | None:
-    """The reference's taxonomy rows for `feature_idxs`, or None when the reference has no
-    taxonomy loaded, so that "not loaded" is never answered as "classifies none of
-    these". Blocking (Flight is synchronous); callers run it off the event loop.
-
-    The first ticket is scoped to the reference and the table's features; only when it
-    matches nothing does a second, scoped to the reference, check whether it has any
-    taxonomy at all."""
-    roster = sign_ticket(
+) -> pa.Table:
+    """The reference's taxonomy rows for `feature_idxs`, under a ticket scoped to both.
+    Blocking (Flight is synchronous); callers run it off the event loop."""
+    ticket = sign_ticket(
         table=TAXONOMY_SOURCE_TABLE,
         filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
         secret=signing_key,
     )
     with flight.FlightClient(data_plane_url) as client:
-        taxonomy = read_all_counted(client, roster, name=TAXONOMY_SOURCE_TABLE)
-        if taxonomy.num_rows:
-            return taxonomy
-        whole_reference = sign_ticket(
-            table=TAXONOMY_SOURCE_TABLE,
-            filter={"reference_idx": [reference_idx]},
-            secret=signing_key,
-        )
-        if not _reference_has_taxonomy(client, whole_reference):
-            return None
-    return taxonomy
+        return read_all_counted(client, ticket, name=TAXONOMY_SOURCE_TABLE)
 
 
 # The relation `stage_values` creates on the caller's connection (`stage_features`

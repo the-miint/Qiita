@@ -153,10 +153,18 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         )
         if args.classified_only:
             # fetchall, not fetchone: a pending result would block the next `register`.
-            [(dropped,)] = con.execute(
-                "SELECT (SELECT count(DISTINCT feature) FROM stored_values)"
-                f" - (SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION})"
+            [(asked, kept)] = con.execute(
+                "SELECT (SELECT count(DISTINCT feature) FROM stored_values),"
+                f" (SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION})"
             ).fetchall()
+            # A reference whose taxonomy is not loaded classifies nothing, and would
+            # empty the table without a word; `feature-table build` has no filter to empty.
+            if asked and not kept:
+                raise ValueError(
+                    f"the reference classified none of this table's {asked} feature(s);"
+                    " is its taxonomy loaded?"
+                )
+            dropped = asked - kept
         if taxonomy is not None:
             # The table's features only, so equal counts below mean equal sets.
             con.execute(

@@ -3,7 +3,6 @@ fixture runs are amplicon."""
 
 import hashlib
 import io
-import types
 import zipfile
 
 import pyarrow as pa
@@ -20,7 +19,6 @@ from qiita_control_plane.stored_feature_table import (
     build_features,
     build_taxonomy,
     build_values,
-    fetch_taxonomy,
     pack_feature_table,
     unpack_feature_table,
 )
@@ -235,82 +233,6 @@ def test_a_reference_with_two_rows_for_one_feature_is_refused():
                 ]
             ),
         )
-
-
-# --- fetch_taxonomy: the two-ticket readiness logic, over a fake Flight stream ---
-
-
-class _FakeStream:
-    """A FlightStreamReader stand-in: `read_all()` for the roster read, and iteration
-    (chunks with `.data.num_rows`) for the whole-reference readiness probe."""
-
-    def __init__(self, table):
-        self._table = table
-
-    def read_all(self):
-        return self._table
-
-    def __iter__(self):
-        for batch in self._table.to_batches():
-            yield types.SimpleNamespace(data=batch)
-
-
-class _FakeFlightClient:
-    """Answers `do_get` from a queue of tables, in call order (roster, then, only if the
-    roster was empty, the whole-reference probe)."""
-
-    def __init__(self, responses):
-        self._responses = list(responses)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def do_get(self, _ticket):
-        return _FakeStream(self._responses.pop(0))
-
-
-def _tax(n):
-    """A reference_taxonomy answer with `n` rows (0 = empty)."""
-    return pa.table(
-        {
-            "feature_idx": pa.array(list(range(n)), pa.int64()),
-            "domain": pa.array(["d__X"] * n, pa.string()),
-        }
-    )
-
-
-def _fetch(monkeypatch, responses):
-    monkeypatch.setattr(
-        "qiita_control_plane.stored_feature_table.flight.FlightClient",
-        lambda _url: _FakeFlightClient(responses),
-    )
-    # The row-count check is `read_all_counted`'s own, tested in qiita-common.
-    monkeypatch.setattr(
-        "qiita_control_plane.stored_feature_table.read_all_counted",
-        lambda client, ticket, *, name: client.do_get(ticket).read_all(),
-    )
-    return fetch_taxonomy(
-        data_plane_url="grpc://x", signing_key=b"x" * 32, reference_idx=1, feature_idxs=[10]
-    )
-
-
-def test_fetch_taxonomy_returns_the_roster_rows_when_they_match(monkeypatch):
-    out = _fetch(monkeypatch, [_tax(2)])
-    assert out is not None and out.num_rows == 2
-
-
-def test_fetch_taxonomy_returns_empty_when_loaded_but_nothing_classified(monkeypatch):
-    # Roster empty, but the reference carries taxonomy: a real (empty) answer, not None.
-    out = _fetch(monkeypatch, [_tax(0), _tax(3)])
-    assert out is not None and out.num_rows == 0
-
-
-def test_fetch_taxonomy_returns_none_when_no_taxonomy_is_loaded(monkeypatch):
-    # Roster empty and the reference has no taxonomy at all: not loaded yet, so None.
-    assert _fetch(monkeypatch, [_tax(0), _tax(0)]) is None
 
 
 async def test_features_are_named_by_the_methods_own_mint():

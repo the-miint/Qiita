@@ -403,3 +403,19 @@ def test_a_table_feature_with_no_sequence_is_refused(monkeypatch, tmp_path, caps
     )
     assert "error:" in capsys.readouterr().err
     assert not out.exists()
+
+
+def test_classified_only_refuses_a_reference_that_classifies_nothing(monkeypatch, tmp_path, capsys):
+    """An unloaded taxonomy classifies nothing; narrowing by it would write an empty
+    table, so it is refused instead."""
+    out, _ = _run(
+        monkeypatch,
+        tmp_path,
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT")]),
+        ["--taxonomy", "silva", "2024.09", "--classified-only"],
+        taxonomy=(_SILVA, _lineage([("QF1", None)])),
+        rc=1,
+    )
+    assert "is its taxonomy loaded" in capsys.readouterr().err
+    assert not out.exists()

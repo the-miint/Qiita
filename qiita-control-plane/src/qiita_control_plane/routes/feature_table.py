@@ -32,7 +32,6 @@ from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE
 from qiita_common.auth_constants import Scope
 from qiita_common.flight_stream import StreamRowCountMismatch
 from qiita_common.models.feature_table import FeatureTableRequest
-from qiita_common.models.reference import ReferenceHandle
 
 from ..auth.guards import (
     COHORT_MIN_TIER,
@@ -145,7 +144,7 @@ async def feature_table(
     # ticket with an empty feature list.
     if request.taxonomy is not None and labels.num_rows:
         reference_taxonomy = await _read_taxonomy(
-            labels, request.taxonomy, reference_idx, data_plane_url, signing_key
+            labels, reference_idx, data_plane_url, signing_key
         )
 
     def build() -> bytes:
@@ -169,18 +168,11 @@ async def feature_table(
 
 
 async def _read_taxonomy(
-    labels: pa.Table,
-    reference: ReferenceHandle,
-    reference_idx: int,
-    data_plane_url: str,
-    signing_key: bytes,
+    labels: pa.Table, reference_idx: int, data_plane_url: str, signing_key: bytes
 ) -> pa.Table:
-    """The reference's taxonomy rows for each labelled feature (`fetch_taxonomy`),
-    refusing a reference with no taxonomy loaded. `feature-table build --taxonomy` writes
-    an unloaded reference as all-NULL lineage; this refuses, because a caller may narrow
-    the table by this lineage (`--classified-only`), and an all-NULL one would empty it."""
+    """The reference's taxonomy rows for each labelled feature (`fetch_taxonomy`)."""
     try:
-        taxonomy = await asyncio.to_thread(
+        return await asyncio.to_thread(
             lambda: fetch_taxonomy(
                 data_plane_url=data_plane_url,
                 signing_key=signing_key,
@@ -192,9 +184,3 @@ async def _read_taxonomy(
         raise HTTPException(
             status_code=502, detail=f"data plane read of the reference taxonomy failed: {exc}"
         ) from exc
-    if taxonomy is None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"reference ({reference.name!r}, {reference.version!r}) has no taxonomy loaded",
-        )
-    return taxonomy
