@@ -434,4 +434,5 @@ through the same `qiita_common.analytic` relabel the client-side table uses
 (JSON) and the values and features (Arrow IPC), with each feature's lineage when the
 request names a reference. Authorization, the identifier mints and
 the ticket scope are the ones described above; the CLI writes the bundle with
-`feature-table build`'s writer.
+`feature-table build`'s writer. Narrowing the table by that lineage (`--classified-only`)
+is the client's, over the answer, so the server never computes a filtered table.

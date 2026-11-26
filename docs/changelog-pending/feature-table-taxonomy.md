@@ -6,7 +6,8 @@
   handle the table uses, with the reference's ranks `(domain … strain)` and their
   `d__/p__…` prefixes, and records which reference classified it. A feature's
   `feature_idx` joins straight to the reference's taxonomy, so a feature the reference does
-  not place keeps its row with NULL ranks rather than being dropped. An unknown reference
+  not classify keeps its row with NULL ranks rather than being dropped. An unknown reference
   is a 404; one that is not `active`/`indexing`, or that has no taxonomy loaded, is a 409.
   `qiita feature-table select --taxonomy NAME VERSION` writes it beside the bundle as
-  `<stem>.taxonomy.parquet` and records the reference in the manifest.
+  `<stem>.taxonomy.parquet` and records the reference in the manifest; `--classified-only`
+  keeps only the features the reference classifies, narrowed on the client over the answer.

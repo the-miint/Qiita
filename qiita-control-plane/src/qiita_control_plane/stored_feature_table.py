@@ -139,9 +139,8 @@ FEATURES_SCHEMA = pa.schema(
 )
 
 
-# A feature's handle and its ranks (`RANK_COLUMNS`), coarsest first, with their source
-# `d__/p__/…` prefixes restored; which features keep NULL ranks is
-# `ft.feature_taxonomy_sidecar_sql`'s.
+# The taxonomy part's columns: a feature's handle and its ranks (`RANK_COLUMNS`),
+# coarsest first, with their `d__/p__/…` prefixes restored.
 TAXONOMY_SCHEMA = pa.schema(
     [("feature", pa.string()), *((rank, pa.string()) for rank in RANK_COLUMNS)]
 )
@@ -375,8 +374,7 @@ def fetch_table(*, data_plane_url: str, signing_key: bytes, cohort: Cohort, tabl
 
 def _reference_has_taxonomy(client: flight.FlightClient, ticket: bytes) -> bool:
     """Whether the reference has any taxonomy at all, read only until the first non-empty
-    batch: the readiness probe that tells a reference whose taxonomy is not loaded (no
-    rows) from one that is loaded and places none of these features."""
+    batch."""
     for chunk in client.do_get(flight.Ticket(ticket)):
         if chunk.data.num_rows:
             return True
@@ -387,11 +385,12 @@ def fetch_taxonomy(
     *, data_plane_url: str, signing_key: bytes, reference_idx: int, feature_idxs: list[int]
 ) -> pa.Table | None:
     """The reference's taxonomy rows for `feature_idxs`, or None when the reference has no
-    taxonomy loaded. Blocking (Flight is synchronous); callers run it off the event loop.
+    taxonomy loaded, so that "not loaded" is never answered as "classifies none of
+    these". Blocking (Flight is synchronous); callers run it off the event loop.
 
-    Two tickets, both scoped, since an unscoped one would authorize a whole-table dump: the
-    first to the table's features, and the second, only when the first matched nothing, to
-    the whole reference, to tell "not loaded" from "places none of these"."""
+    The first ticket is scoped to the reference and the table's features; only when it
+    matches nothing does a second, scoped to the reference, check whether it has any
+    taxonomy at all."""
     roster = sign_ticket(
         table=TAXONOMY_SOURCE_TABLE,
         filter={"reference_idx": [reference_idx], "feature_idx": feature_idxs},
@@ -521,26 +520,19 @@ def build_features(cohort: Cohort, sequences: pa.Table, labels: pa.Table) -> pa.
 def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
     """The taxonomy `(feature, <ranks>)` as Arrow: each feature `labels` names (the mint
     response) under its handle, with the reference's ranks for it. `taxonomy` is the
-    reference's rows for those features. The join is the shared feature-axis sidecar, so
-    serving and a client-written sidecar are one definition."""
+    reference's rows for those features."""
     with duckdb.connect() as duck:
         duck.register("labels", labels)
         duck.register("reference_taxonomy", taxonomy)
         duck.execute(ft.feature_label_table_sql("labels", ft.FEATURE_AXIS))
         duck.execute(ft.taxonomy_table_sql("reference_taxonomy"))
-        # No representative reduction on this axis, so a duplicate row would fan a
-        # feature into two answer rows.
-        (repeated,) = duck.execute(
-            f"SELECT count(*) - count(DISTINCT feature_idx) FROM {ft.TAXONOMY_TABLE}"
-        ).fetchone()
+        [(repeated,)] = duck.execute(ft.repeated_features_sql()).fetchall()
         ft.refuse_repeated_features(repeated)
         duck.execute(ft.feature_taxonomy_sidecar_sql())
-        table = duck.sql(
-            # Ordered so the answer is the same on every request.
+        return duck.sql(
             f"SELECT feature_id AS feature, {rank_columns_sql()}"
-            f" FROM {ft.TAXONOMY_SIDECAR_RELATION} ORDER BY feature"
+            f" FROM {ft.TAXONOMY_SIDECAR_RELATION}"
         ).to_arrow_table()
-    return table.cast(TAXONOMY_SCHEMA)
 
 
 def _arrow_stream(table: pa.Table) -> bytes:

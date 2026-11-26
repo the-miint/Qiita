@@ -2,9 +2,9 @@
 
 The control plane's `/feature-table` route answers the cohort's columns, its values as
 sparse COO `(sample, feature, value)`, its features' sequences and, when a reference
-is named, their lineage, and this writes them
-as a bundle with `feature-table build`'s writer. The route is the one implementation;
-this writes what it answers.
+is named, their lineage, and this writes them as a bundle with `feature-table build`'s
+writer. The route is the one implementation; this writes what it answers, narrowed on
+this machine by `--classified-only` to the features that lineage classifies.
 
 The table is written straight from its COO rows — BIOM and Parquet both take
 `(feature_id, sample_id, value)` — so it is never made dense on the way to disk.
@@ -26,6 +26,7 @@ from qiita_common.models import EXPORT_ENTITY_ID
 from qiita_common.models.biosample import StudyLookupKey
 from qiita_common.models.feature_table import FeatureTableRequest
 from qiita_common.models.reference import ReferenceHandle
+from qiita_common.taxonomy import RANK_COLUMNS
 
 from ...stored_feature_table import FEATURE_TABLE_MEDIA_TYPE, SOURCES, unpack_feature_table
 from .. import _common
@@ -117,28 +118,57 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         raise RuntimeError(f"/feature-table answered {content_type!r}, not a feature table")
     answer = unpack_feature_table(body)
     columns, values, features = answer.samples, _decoded(answer.values), _decoded(answer.features)
-    with registered(con, "stored_values", values):
+    taxonomy = answer.taxonomy
+
+    # The features the table keeps: all of them, or under --classified-only those the
+    # reference gives any rank, so the sequences and lineage beside it narrow with it.
+    kept = "SELECT feature FROM stored_features"
+    if args.classified_only:
+        ranked = " OR ".join(f'"{rank}" IS NOT NULL' for rank in RANK_COLUMNS)
+        kept = f"SELECT feature FROM stored_taxonomy WHERE {ranked}"
+    clearances: dict[str, Any] = {}
+    with (
+        registered(con, "stored_values", values),
+        registered(con, "stored_features", features),
+        (
+            contextlib.nullcontext()
+            if taxonomy is None
+            else registered(con, "stored_taxonomy", taxonomy)
+        ),
+    ):
+        con.execute(f"CREATE TEMP TABLE kept_feature AS {kept}")
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
             " SELECT feature AS feature_id, sample AS sample_id, value"
-            " FROM stored_values"
+            " FROM stored_values SEMI JOIN kept_feature USING (feature)"
         )
-    with registered(con, "stored_features", features):
         con.execute(
-            f"CREATE TEMP TABLE {ft.FEATURE_SEQUENCE_TABLE} AS SELECT * FROM stored_features"
+            f"CREATE TEMP TABLE {ft.FEATURE_SEQUENCE_TABLE} AS"
+            " SELECT * FROM stored_features SEMI JOIN kept_feature USING (feature)"
         )
-    clearances: dict[str, Any] = {}
-    if answer.taxonomy is not None:
-        with registered(con, "stored_taxonomy", answer.taxonomy):
-            # Scoped to the published features, so the sidecar is as wide as the table
-            # by construction, which is the clearance it carries.
+        # fetchall, not fetchone: a pending result would block the next `register`.
+        [(asked, published)] = con.execute(
+            "SELECT (SELECT count(DISTINCT feature) FROM stored_values),"
+            f" (SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION})"
+        ).fetchall()
+        if taxonomy is not None:
             con.execute(
                 f"CREATE TEMP TABLE {ft.TAXONOMY_SIDECAR_RELATION} AS"
                 " SELECT t.feature AS feature_id, t.* EXCLUDE (feature) FROM stored_taxonomy t"
                 f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = t.feature"
             )
-        (rows,) = con.execute(f"SELECT count(*) FROM {ft.TAXONOMY_SIDECAR_RELATION}").fetchone()
-        clearances["taxonomy"] = ft.TaxonomyClearance(rows=rows)
+            [(repeated, rows, feature_ids, unnamed)] = con.execute(
+                "SELECT (SELECT count(*) - count(DISTINCT feature) FROM stored_taxonomy),"
+                " count(*), count(DISTINCT feature_id), count(*) FILTER (WHERE feature_id IS NULL)"
+                f" FROM {ft.TAXONOMY_SIDECAR_RELATION}"
+            ).fetchall()
+            clearances["taxonomy"] = ft.check_taxonomy_diagnostics(
+                published_rows=published,
+                repeated_features=repeated,
+                taxonomy_rows=rows,
+                taxonomy_feature_ids=feature_ids,
+                unnamed_rows=unnamed,
+            )
     cur = con.execute(ft.sequences_diagnostics_sql())
     clearances["sequences"] = ft.check_sequences_diagnostics(
         **dict(zip((c[0] for c in cur.description), cur.fetchone(), strict=True))
@@ -166,6 +196,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             # the features are the same whichever reference names them, so this is what
             # makes the lineage reproducible.
             "taxonomy": None if columns.taxonomy is None else columns.taxonomy.model_dump(),
+            # How many features --classified-only dropped, when it was asked.
+            "classified_only": (
+                {"dropped_features": asked - published} if args.classified_only else None
+            ),
             "feature_id": SOURCES[columns.method].feature_id_note,
             # Each column's QM, not the request's idxs: a published manifest carries
             # only handles a reader can resolve. Sorted so the record does not depend
@@ -205,6 +239,10 @@ def _handle_feature_table_select(args: argparse.Namespace, parser: argparse.Argu
         # The refusals that need only the flags, before a connection or a read; the
         # write checks the whole bundle again.
         _request(args)
+        if args.classified_only and args.taxonomy is None:
+            raise ValueError(
+                "--classified-only keeps what --taxonomy's reference classifies; name one"
+            )
         companions = ("sequences", "taxonomy") if args.taxonomy else ("sequences",)
         _bundle_targets(args.output, args.format, companions=_companions(*companions))
         with contextlib.closing(connect_with_miint()) as con:

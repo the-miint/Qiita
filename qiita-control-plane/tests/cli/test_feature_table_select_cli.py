@@ -7,10 +7,12 @@ import json
 import duckdb
 import httpx
 import pyarrow as pa
+import pytest
 from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_ROOT
 from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER
 from qiita_common.models.feature_table import FeatureTableSample
 from qiita_common.models.reference import ReferenceHandle
+from qiita_common.taxonomy import RANK_COLUMNS
 
 from qiita_control_plane.cli.user.stored_feature_table import MAP_NOTE
 from qiita_control_plane.stored_feature_table import (
@@ -243,7 +245,7 @@ def test_an_occupied_sequences_file_is_refused_before_anything_is_read(
 def test_a_named_reference_writes_each_features_lineage_beside_the_table(monkeypatch, tmp_path):
     """`--taxonomy NAME VERSION` asks the one request to classify the features, writes
     the lineage as `<stem>.taxonomy.parquet`, and records the reference in the manifest."""
-    reference = ReferenceHandle(name="greengenes2", version="2024.09")
+    reference = ReferenceHandle(name="silva", version="2024.09")
     lineage = pa.table(
         {
             "feature": ["QF1"],
@@ -255,18 +257,26 @@ def test_a_named_reference_writes_each_features_lineage_beside_the_table(monkeyp
         tmp_path,
         _values([("QM1", "QF1", 5.0)]),
         _features([("QF1", "ACGT")]),
-        ["--taxonomy", "greengenes2", "2024.09"],
+        ["--taxonomy", "silva", "2024.09"],
         taxonomy=(reference, lineage),
     )
-    assert sent[0]["taxonomy"] == {"name": "greengenes2", "version": "2024.09"}
+    assert sent[0]["taxonomy"] == {"name": "silva", "version": "2024.09"}
     with duckdb.connect() as con:
         rows = con.execute(
             "SELECT feature_id, domain FROM read_parquet(?)",
             [str(out.with_name("table.taxonomy.parquet"))],
         ).fetchall()
     assert rows == [("QF1", None)]
+    # The same columns `feature-table build --taxonomy` writes.
+    with duckdb.connect() as con:
+        described = con.execute(
+            "DESCRIBE SELECT * FROM read_parquet(?)",
+            [str(out.with_name("table.taxonomy.parquet"))],
+        ).fetchall()
+    assert [r[0] for r in described] == ["feature_id", *RANK_COLUMNS]
     manifest = json.loads(out.with_name("table.manifest.json").read_text())
-    assert manifest["taxonomy"] == {"name": "greengenes2", "version": "2024.09"}
+    assert manifest["taxonomy"] == {"name": "silva", "version": "2024.09"}
+    assert manifest["classified_only"] is None
 
 
 def test_an_occupied_taxonomy_file_is_refused_before_anything_is_read(
@@ -282,8 +292,83 @@ def test_an_occupied_taxonomy_file_is_refused_before_anything_is_read(
         tmp_path,
         None,
         None,
-        ["--taxonomy", "greengenes2", "2024.09"],
+        ["--taxonomy", "silva", "2024.09"],
         fetch_binary=fetch_binary,
         rc=1,
     )
     assert "table.taxonomy.parquet" in capsys.readouterr().err
+
+
+def _lineage(rows):
+    """A taxonomy part: (feature, domain), every other rank NULL."""
+    return pa.table(
+        {
+            "feature": [r[0] for r in rows],
+            "domain": pa.array([r[1] and f"d__{r[1]}" for r in rows], pa.string()),
+            **{r: pa.array([None] * len(rows), pa.string()) for r in TAXONOMY_SCHEMA.names[2:]},
+        }
+    ).cast(TAXONOMY_SCHEMA)
+
+
+def _read(path, columns):
+    with duckdb.connect() as con:
+        return con.execute(
+            f"SELECT {columns} FROM read_parquet(?) ORDER BY 1", [str(path)]
+        ).fetchall()
+
+
+_SILVA = ReferenceHandle(name="silva", version="2024.09")
+
+
+def test_classified_only_keeps_the_features_the_reference_classifies(monkeypatch, tmp_path):
+    """Narrowed on this machine, over the answer: the table, its sequences and its lineage
+    lose the unclassified feature; every column stays, and the manifest says how many
+    features went."""
+    out, _ = _run(
+        monkeypatch,
+        tmp_path,
+        _values([("QM1", "QF1", 5.0), ("QM1", "QF2", 1.0), ("QM2", "QF2", 3.0)]),
+        _features([("QF1", "ACGT"), ("QF2", "TTTT")]),
+        ["--taxonomy", "silva", "2024.09", "--classified-only"],
+        taxonomy=(_SILVA, _lineage([("QF1", "Bacteria"), ("QF2", None)])),
+    )
+    assert _read(out, "feature_id, sample_id, value") == [("QF1", "QM1", 5.0)]
+    assert _read(out.with_name("table.sequences.parquet"), "feature_id") == [("QF1",)]
+    assert _read(out.with_name("table.taxonomy.parquet"), "feature_id, domain") == [
+        ("QF1", "d__Bacteria")
+    ]
+    manifest = json.loads(out.with_name("table.manifest.json").read_text())
+    assert manifest["classified_only"] == {"dropped_features": 1}
+    identifiers = json.loads(out.with_name("table.exported-identifier.json").read_text())
+    assert identifiers["identifiers"] == _SAMPLES
+
+
+def test_classified_only_without_a_reference_is_refused_before_anything_is_read(
+    monkeypatch, tmp_path, capsys
+):
+    def fetch_binary(*_, **__):
+        raise AssertionError("nothing should be read for a request that cannot be filtered")
+
+    _run(monkeypatch, tmp_path, None, None, ["--classified-only"], fetch_binary=fetch_binary, rc=1)
+    assert "--taxonomy" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [[], [("QF1", "Bacteria"), ("QF1", "Archaea")]],
+    ids=["short", "repeated"],
+)
+def test_a_lineage_not_one_row_per_feature_is_refused(monkeypatch, tmp_path, capsys, rows):
+    """A short lineage would read as unclassified features, and a repeated one as two
+    lineages for one feature; either is refused and nothing is written."""
+    out, _ = _run(
+        monkeypatch,
+        tmp_path,
+        _values([("QM1", "QF1", 5.0)]),
+        _features([("QF1", "ACGT")]),
+        ["--taxonomy", "silva", "2024.09"],
+        taxonomy=(_SILVA, _lineage(rows)),
+        rc=1,
+    )
+    assert "error:" in capsys.readouterr().err
+    assert not out.exists()

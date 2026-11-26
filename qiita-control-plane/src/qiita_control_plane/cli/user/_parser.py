@@ -1815,7 +1815,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Also write <stem>.taxonomy.parquet: each feature's lineage under the reference"
             " with this name and version (`qiita reference list`). A feature the reference"
-            " does not place has NULL ranks rather than being left out."
+            " does not classify has NULL ranks rather than being left out."
+        ),
+    )
+    p_ft_select.add_argument(
+        "--classified-only",
+        action="store_true",
+        help=(
+            "Keep only the features the --taxonomy reference classifies (gives any rank),"
+            " in the table, its sequences and its lineage. Done on this machine, over the"
+            " answer; every column stays, and the manifest records how many features were"
+            " dropped."
         ),
     )
     p_ft_select.add_argument(

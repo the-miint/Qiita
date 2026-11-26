@@ -10,6 +10,7 @@ import pyarrow as pa
 import pytest
 from qiita_common.models.feature_table import FeatureTableSample
 from qiita_common.models.reference import ReferenceHandle
+from qiita_common.taxonomy import RANK_COLUMNS
 
 from qiita_control_plane.stored_feature_table import (
     SOURCES,
@@ -22,8 +23,6 @@ from qiita_control_plane.stored_feature_table import (
     pack_feature_table,
     unpack_feature_table,
 )
-
-_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
 
 
 def build_coo(cohort, values, sequences, labels):
@@ -190,7 +189,7 @@ def test_a_body_without_every_part_is_refused():
 def _taxonomy(rows):
     """A reference_taxonomy answer: (feature_idx, <unprefixed ranks>)."""
     cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
-    for i, rank in enumerate(_RANKS, start=1):
+    for i, rank in enumerate(RANK_COLUMNS, start=1):
         cols[rank] = pa.array([r[i] for r in rows], pa.string())
     return pa.table(cols)
 
@@ -200,7 +199,7 @@ def test_taxonomy_keys_each_feature_by_handle_and_restores_rank_prefixes():
         _labels([(10, "QF10")]),
         _taxonomy([(10, "Bacteria", "Bacillota", None, None, None, None, None, None)]),
     )
-    assert table.column_names == ["feature", *_RANKS]
+    assert table.column_names == ["feature", *RANK_COLUMNS]
     row = table.to_pylist()[0]
     assert row["feature"] == "QF10"
     # Prefixes restored; an unresolved rank stays NULL, not a bare "c__".
@@ -209,7 +208,7 @@ def test_taxonomy_keys_each_feature_by_handle_and_restores_rank_prefixes():
     assert row["class"] is None
 
 
-def test_taxonomy_keeps_a_feature_the_reference_does_not_place():
+def test_taxonomy_keeps_a_feature_the_reference_does_not_classify():
     # A feature (20) with no taxonomy row survives with all-NULL ranks: the query is a
     # lookup, not a filter.
     table = build_taxonomy(
@@ -302,7 +301,7 @@ def test_fetch_taxonomy_returns_the_roster_rows_when_they_match(monkeypatch):
     assert out is not None and out.num_rows == 2
 
 
-def test_fetch_taxonomy_returns_empty_when_loaded_but_nothing_placed(monkeypatch):
+def test_fetch_taxonomy_returns_empty_when_loaded_but_nothing_classified(monkeypatch):
     # Roster empty, but the reference carries taxonomy: a real (empty) answer, not None.
     out = _fetch(monkeypatch, [_tax(0), _tax(3)])
     assert out is not None and out.num_rows == 0
@@ -335,3 +334,11 @@ async def test_features_are_named_by_the_methods_own_mint():
         {"feature_idx": 3, "export_feature_id": "QF3"},
         {"feature_idx": 9, "export_feature_id": "QF9"},
     ]
+
+
+@pytest.mark.parametrize("field", ["name", "version"])
+def test_a_reference_handle_is_bounded_like_the_reference_it_names(field):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ReferenceHandle(**{"name": "a-reference", "version": "1", field: "x" * 10_000})

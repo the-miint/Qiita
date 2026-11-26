@@ -21,6 +21,8 @@ from qiita_common.amplicon_constants import (
 )
 from qiita_common.api_paths import URL_FEATURE_TABLE
 from qiita_common.flight_stream import StreamRowCountMismatch
+from qiita_common.models.reference import ReferenceStatus
+from qiita_common.taxonomy import RANK_COLUMNS
 
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.stored_feature_table import (
@@ -580,20 +582,20 @@ async def test_requires_auth(role_keyed_clients, amplicon_run):
 
 # --- taxonomy -------------------------------------------------------------------------
 
-_RANKS = ("domain", "phylum", "class", "order", "family", "genus", "species", "strain")
-
 
 @pytest.fixture
 async def taxonomy_reference(role_keyed_clients, pool_alignment_seed):
     """A reference the request names by its public (name, version) handle; the route
     resolves it to the internal reference_idx, which stays server-side."""
     db, seed = role_keyed_clients["pool"], pool_alignment_seed
-    name, version = f"greengenes2-{uuid.uuid4().hex[:8]}", "2024.09"
+    name, version = f"reference-{uuid.uuid4().hex[:8]}", "1.0"
     reference_idx = await db.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-        " VALUES ($1, $2, 'taxonomy_authority', 'active', $3) RETURNING reference_idx",
+        " VALUES ($1, $2, $3, $4, $5) RETURNING reference_idx",
         name,
         version,
+        "taxonomy_authority",
+        ReferenceStatus.ACTIVE,
         seed["owner_idx"],
     )
     yield {"name": name, "version": version, "reference_idx": reference_idx}
@@ -603,7 +605,7 @@ async def taxonomy_reference(role_keyed_clients, pool_alignment_seed):
 def _taxonomy_table(rows):
     """A reference_taxonomy_visible answer: (feature_idx, <unprefixed ranks>)."""
     cols = {"feature_idx": pa.array([r[0] for r in rows], pa.int64())}
-    for i, rank in enumerate(_RANKS, start=1):
+    for i, rank in enumerate(RANK_COLUMNS, start=1):
         cols[rank] = pa.array([r[i] for r in rows], pa.string())
     return pa.table(cols)
 
@@ -664,7 +666,7 @@ async def test_a_named_reference_classifies_each_feature(
     assert table["class"] == [None]
 
 
-async def test_a_feature_the_reference_does_not_place_keeps_null_ranks(
+async def test_a_feature_the_reference_does_not_classify_keeps_null_ranks(
     role_keyed_clients, amplicon_run, taxonomy_reference, monkeypatch
 ):
     ref = taxonomy_reference
@@ -680,7 +682,7 @@ async def test_a_feature_the_reference_does_not_place_keeps_null_ranks(
 
 @pytest.mark.parametrize(
     ("version", "status"),
-    [("9999.9", None), (None, "loading")],
+    [("9999.9", None), (None, ReferenceStatus.LOADING)],
     ids=["unknown version", "not servable"],
 )
 async def test_a_reference_that_cannot_classify_is_refused_before_any_read(
@@ -714,7 +716,7 @@ async def test_a_reference_with_no_taxonomy_loaded_409s(
         role_keyed_clients["wet"], _classified(amplicon_run, ref["name"], ref["version"])
     )
     assert resp.status_code == 409, resp.text
-    assert "carries no taxonomy" in resp.json()["detail"]
+    assert "has no taxonomy loaded" in resp.json()["detail"]
 
 
 async def test_a_table_with_no_features_has_an_empty_taxonomy(
@@ -740,7 +742,7 @@ async def test_a_table_with_no_features_has_an_empty_taxonomy(
     assert resp.status_code == 200, resp.text
     taxonomy = unpack_feature_table(resp.content).taxonomy
     assert taxonomy.num_rows == 0
-    assert taxonomy.column_names == ["feature", *_RANKS]
+    assert taxonomy.column_names == ["feature", *RANK_COLUMNS]
     assert seen == []
 
 

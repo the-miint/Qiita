@@ -116,13 +116,13 @@ def taxonomy_sidecar_sql() -> str:
 
 
 def feature_taxonomy_sidecar_sql() -> str:
-    """The feature-axis twin of `taxonomy_sidecar_sql`: one row per published feature,
+    """The feature-axis twin of `taxonomy_sidecar_sql`: one row per labelled feature,
     carrying its own ranks.
 
     No genome-representative reduction: a feature of this kind is the taxonomic unit, so
     the label joins straight to its own taxonomy row on `feature_idx`. LEFT, so a feature
-    the reference does not place stays present with NULL ranks, keeping the sidecar as
-    wide as the table.
+    the reference does not classify stays present with NULL ranks, keeping the sidecar as
+    wide as the label set.
     """
     return (
         f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
@@ -134,12 +134,8 @@ def feature_taxonomy_sidecar_sql() -> str:
 
 @dataclass(frozen=True)
 class TaxonomyClearance:
-    """Evidence that the sidecar lines up with the table it accompanies, plus its row
-    count so a caller can report the size without counting it again. The alignment is
-    established either by `check_taxonomy_diagnostics` (the genome build, over a raw
-    taxonomy table) or by construction (a feature-axis sidecar scoped to the published
-    features is as wide as the table, so its clearance is built from its row count, with
-    no diagnostics run).
+    """Evidence that `check_taxonomy_diagnostics` ran and passed, plus the sidecar's row
+    count so a caller can report the size without counting it again.
 
     `taxonomy_copy_sql` takes one for the same reason `labelled_relation_sql` takes a
     `LabelClearance`: a sidecar that does not line up with the table it accompanies is
@@ -154,8 +150,7 @@ def taxonomy_diagnostics_sql() -> str:
     must match."""
     return (
         f"SELECT (SELECT count(*) FROM {GENOME_LABEL_TABLE}) AS published_rows, "
-        f"(SELECT count(*) - count(DISTINCT feature_idx) FROM {TAXONOMY_TABLE}) "
-        f"    AS repeated_features, "
+        f"({repeated_features_sql()}) AS repeated_features, "
         f"count(*) AS taxonomy_rows, "
         f"count(DISTINCT feature_id) AS taxonomy_feature_ids, "
         f"count(*) FILTER (WHERE feature_id IS NULL) AS unnamed_rows "
@@ -163,11 +158,17 @@ def taxonomy_diagnostics_sql() -> str:
     )
 
 
+def repeated_features_sql() -> str:
+    """How many rows `TAXONOMY_TABLE` holds beyond one per feature, for
+    `refuse_repeated_features`."""
+    return f"SELECT count(*) - count(DISTINCT feature_idx) FROM {TAXONOMY_TABLE}"
+
+
 def refuse_repeated_features(repeated_features: int) -> None:
     """Refuse a taxonomy that holds more than one row for some feature: a malformed
-    reference. Both axes would fan a duplicate out silently if unchecked (the genome axis
-    into an arbitrary representative, the feature axis into one answer row per duplicate),
-    so both guard here."""
+    reference. Two rows for one feature need not agree, and silently picking one (the
+    genome axis's representative) or answering both (the feature axis) would publish an
+    arbitrary lineage."""
     if repeated_features:
         raise ValueError(
             f"this reference's taxonomy holds more than one row for {repeated_features} "
@@ -190,8 +191,8 @@ def check_taxonomy_diagnostics(
 
     Every fault here is silent in the file: a short sidecar reads as "those rows are
     unclassified", a duplicated one double-counts under any join, and a NULL name joins
-    to nothing. An unclassified genome is NOT one of these — it is present with NULL
-    ranks, which is a different statement and a legitimate one.
+    to nothing. An unclassified row is NOT one of these — it is present with NULL ranks,
+    which is a different statement and a legitimate one.
     """
     # Checked on the STREAMED taxonomy rather than on the sidecar, because the reduction
     # resolves a repeat to one row and so cannot show it downstream; see
@@ -207,7 +208,7 @@ def check_taxonomy_diagnostics(
         raise ValueError(
             f"the taxonomy sidecar describes {taxonomy_rows} rows but the table "
             f"publishes {published_rows}. A sidecar shorter than its table reads as "
-            f"though the missing rows were unclassified — an unclassified genome is "
+            f"though the missing rows were unclassified — an unclassified row is "
             f"present here with NULL ranks — and a longer one describes rows nobody "
             f"can find."
         )
@@ -215,9 +216,9 @@ def check_taxonomy_diagnostics(
         raise ValueError(
             f"{taxonomy_rows} taxonomy rows carry only {taxonomy_feature_ids} distinct "
             f"feature_ids, so joining the sidecar to the table would multiply the rows "
-            f"it duplicates. Each published row has exactly one representative member, "
-            f"so a repeat means the reference's taxonomy holds more than one row for "
-            f"one feature."
+            f"it duplicates. Each published row takes its lineage from one feature, so a "
+            f"repeat means the reference's taxonomy holds more than one row for one "
+            f"feature."
         )
     return TaxonomyClearance(rows=taxonomy_rows)
 
