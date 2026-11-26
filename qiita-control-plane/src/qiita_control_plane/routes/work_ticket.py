@@ -942,7 +942,7 @@ async def run_work_ticket(
         # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets
         # retry_count to 0 (operator override of the auto-retry budget)
         # and clears the failure_* columns so the
-        # work_ticket_failure_consistent DB CHECK is honoured (failure_*
+        # work_ticket_failure_consistent DB CHECK is honored (failure_*
         # all NULL when state != failed; a CANCELLED ticket already carries
         # NULLs, so the clear is a harmless no-op there). The ticket reset, the
         # dead step-row drop, and the scope-target reset are ONE transaction so

@@ -662,7 +662,7 @@ async def test_abandon_purge_payload_deletes_a_split_sample_across_blocks(data_p
     prep_sample_idx more than once (one member per covering block). The block
     replace step never sends that shape, so this pins that the data plane accepts it
     and deletes exactly the union: both halves of the split sample go, and a
-    neighbouring sample under the same alignment stays."""
+    neighboring sample under the same alignment stays."""
     from qiita_control_plane.actions.library import delete_alignment_block_data
 
     alignment_idx = 981_300

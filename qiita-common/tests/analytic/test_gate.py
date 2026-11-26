@@ -89,7 +89,7 @@ def test_the_pooled_partition_keys_on_the_placement_not_just_the_read():
     """The window must pool a PLACEMENT, not a read — see `PAIRED_PLACEMENT_PARTITION`
     for why each part of the key is there. Asserted here because the alternative
     (pooling by read) is valid SQL that scores a concatenation of unrelated
-    placements; the behavioural half is in the control-plane suite.
+    placements; the behavioral half is in the control-plane suite.
     """
     sql = _gated_sql(ft.AlignmentGate(min_identity=0.9, paired=True))
     partition = sql.split("PARTITION BY")[1]
@@ -285,7 +285,7 @@ def test_the_gate_sql_is_unreachable_without_a_clearance():
 
 
 @pytest.mark.parametrize("threshold", [0.0, 1.0])
-def test_a_zero_or_one_threshold_is_honoured_not_treated_as_absent(threshold):
+def test_a_zero_or_one_threshold_is_honored_not_treated_as_absent(threshold):
     """0.0 is falsy but not absent: it keeps only rows the scorer can score, which is
     a real filter (it drops NULL-identity rows). Every check in this module tests
     `is not None` for exactly this reason, and a "simplification" to truthiness would

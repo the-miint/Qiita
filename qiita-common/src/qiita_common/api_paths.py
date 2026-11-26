@@ -3,7 +3,7 @@
 Shared by routes, tests, and clients so a deploy-time URL change or a
 new library primitive lands in one place.
 
-Two flavours per path:
+Two flavors per path:
 
 - ``PATH_*`` — sub-path relative to the router prefix (and the router
   prefix itself, ``PATH_<TAG>_PREFIX``). Used by FastAPI route decorators
@@ -15,7 +15,7 @@ Two flavours per path:
   via ``client.post(URL_MEMBERSHIP.format(reference_idx=42), ...)`` or
   by f-string composition for unparameterized paths.
 
-Adding a route requires both flavours so the router and its callers
+Adding a route requires both flavors so the router and its callers
 stay in lockstep; removing one without the other will surface as a name
 error at import time rather than a silent route mismatch at runtime.
 
@@ -82,7 +82,7 @@ PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 # The same rows as GENOME_MAP, as a Parquet body, with no cap. A sub-resource
 # segment rather than an Accept header on the path above: the two forms differ in
 # more than encoding — this one has no size ceiling and therefore no 413 — and one
-# path with one behaviour is what the api_paths triple can express. Param path,
+# path with one behavior is what the api_paths triple can express. Param path,
 # 3 segments, no literal shadow.
 PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
 # Operator maintenance: give one reference's phylogeny rows the edge numbering
@@ -150,7 +150,7 @@ class LibraryPrimitive(StrEnum):
     # write-membership. See qiita_control_plane.actions.library.mint_annotation_features.
     MINT_ANNOTATION_FEATURES = "mint-annotation-features"
     WRITE_MEMBERSHIP = "write-membership"
-    # Assembly analogue of write-membership: link a prep_sample's assembly RUN
+    # Assembly analog of write-membership: link a prep_sample's assembly RUN
     # (processing_idx) contigs — already minted against the shared qiita.feature —
     # to qiita.assembly_membership, tagged by (kind, bin_id). See
     # qiita_control_plane.actions.library.write_assembly_membership.
@@ -485,7 +485,7 @@ PATH_MASK_DEFINITION_PREP_SAMPLE = "/{mask_idx}/prep-sample"  # GET the per-samp
 # PATH_REFERENCE_STATUS; a deprecated config cannot be minted against.
 PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
 # PATCH specific RUNS of the config (completed <-> invalidated), naming the
-# prep_samples in the body. Bulk because the judgement is made per cohort, not per
+# prep_samples in the body. Bulk because the judgment is made per cohort, not per
 # sample. Distinct from the route above: config lifecycle and run lifecycle are
 # different questions (see qiita_common.models.MaskDefinitionStatus).
 PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
@@ -701,7 +701,7 @@ PATH_PROCESSING_PREP_SAMPLE = "/{processing_idx}/prep-sample"  # GET the per-sam
 # PATH_MASK_DEFINITION_STATUS; a deprecated run cannot be minted against.
 PATH_PROCESSING_STATUS = "/{processing_idx}/status"
 # PATCH specific RUNS of the config (completed <-> invalidated), naming the
-# prep_samples in the body. Bulk because the judgement is made per cohort, not
+# prep_samples in the body. Bulk because the judgment is made per cohort, not
 # per sample. Distinct from the route above, which is the CONFIG's lifecycle.
 PATH_PROCESSING_SAMPLE_STATUS = "/{processing_idx}/sample-status"
 

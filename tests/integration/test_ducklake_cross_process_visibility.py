@@ -4,7 +4,7 @@ next query, both on a connection it opens then and on one it attached earlier.
 Data-plane instances are separate processes on one catalog, and each serves
 requests from a pool of connections attached once and reused (`pool.rs`), so a
 read routed to one instance after a write through another depends on this. It is
-DuckDB and DuckLake behaviour, pinned here against the versions this repo ships.
+DuckDB and DuckLake behavior, pinned here against the versions this repo ships.
 The writer opens a fresh in-memory connection per write and calls
 `ducklake_add_data_files`, the call `register_files` makes; the reader checks
 with a fresh connection and with one it keeps attached, as a pool member does.

@@ -9,7 +9,7 @@ here:
   read out of the map.
 
   Both of those need no database, so they run in the pure-unit tier.
-* the behaviour that follows, per member: an external source publishes its
+* the behavior that follows, per member: an external source publishes its
   source_id as `export_feature_id`, an internal one gets `QF<idx>`, a NULL
   `accession` and `accession_published` false.
 

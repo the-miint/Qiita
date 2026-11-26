@@ -6,7 +6,7 @@ one that matters most, because the signed cohort IS the authorization boundary:
 the data plane serves exactly the prep_sample_idx list the ticket carries and
 knows nothing about studies or users. Every control-plane check is therefore the
 only check there is, and this test is what proves the ticket the CP actually
-signs is the one the DP actually honours.
+signs is the one the DP actually honors.
 
 The shape is one pool spanning two studies — `ps_readable` in a study the user
 holds Tier.VIEWER on, `ps_hidden` in one they do not. Both have alignment rows

@@ -2,7 +2,7 @@
 
 These are pure-Python apart from the last one, which opens an in-memory DuckDB
 to pin its out-of-memory message; none needs the staged extension, so they all
-run in the fast ``make test`` tier. They pin the behaviour that makes the per-run
+run in the fast ``make test`` tier. They pin the behavior that makes the per-run
 ``--mem-gb`` override actually reach a job's in-process memory caps:
 ``SLURM_MEM_PER_NODE`` (the real cgroup) wins over the YAML-baseline literal
 under SLURM, while off SLURM the literal is a ceiling bounded by detected

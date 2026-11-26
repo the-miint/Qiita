@@ -335,7 +335,7 @@ async def test_record_completed_is_idempotent(postgres_pool):
 
 
 async def test_in_process_entry_rejects_job_id_at_db(postgres_pool):
-    """Defence-in-depth: handing a job id to an in-process (control_plane)
+    """Defense-in-depth: handing a job id to an in-process (control_plane)
     entry trips the slurm-fields CHECK loudly instead of recording a
     nonsensical row."""
     wt_idx, *rest = await _seed_work_ticket(postgres_pool)

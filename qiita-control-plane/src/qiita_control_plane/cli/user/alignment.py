@@ -83,7 +83,7 @@ def _alignment_summary(alignments: dict, *, alignment_idx: int) -> dict:
 
     **The verification is the reason this is a function rather than a dict lookup.**
     Everything downstream is read off `params` — which reference the whole table is
-    relabelled through, and the record a published manifest makes of how the table was
+    relabeled through, and the record a published manifest makes of how the table was
     produced — but `params` arrive as JSON, and a client that trusted them without
     checking would derive all of that from whatever survived the round trip.
     Recomputing the server's own dedup digest costs one hash and turns that into a
@@ -131,7 +131,7 @@ def _alignment_reference_idx(summary: dict) -> int:
     This is why `feature-table build` has no `--reference-idx` to get wrong. A
     user-supplied one that disagreed would fetch the genome map for a different
     reference, every `feature_idx` would miss it, and the relabel would then refuse on
-    unlabelled genomes — loud, but a mistake the surface need not permit at all.
+    unlabeled genomes — loud, but a mistake the surface need not permit at all.
 
     Takes a **summary `_alignment_summary` returned**, not the pool listing, because a
     build reads several things off one alignment — the reference, the digest a manifest

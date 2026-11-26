@@ -29,7 +29,7 @@ What's exercised end-to-end:
 
 The assertion surface mirrors the remote smoke: reference reaches `active`, the
 right number of feature/membership rows exist, the work_ticket reaches
-COMPLETED, and the local stager's parts directory materialised in its workspace.
+COMPLETED, and the local stager's parts directory materialized in its workspace.
 """
 
 import uuid
@@ -221,7 +221,7 @@ async def test_local_reference_add_workflow_end_to_end(
     for name in chunk_parts:
         assert files[name] == "reference_sequence_chunks"
 
-    # The local stager's parts directory materialised in its per-entry workspace
+    # The local stager's parts directory materialized in its per-entry workspace
     # (attempt-0), and hash_sequences consumed it into manifest.parquet. Assert
     # the directory AND a part: hash_sequences hands the directory itself to
     # `read_parquet`, so an empty directory would satisfy `.exists()` while

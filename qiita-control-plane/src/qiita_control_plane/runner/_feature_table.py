@@ -21,7 +21,7 @@ When ``action_context`` carries ``denovo_alignment_idx`` the ticket asks for a
 COMBINED table and the resolver does all three again for the de novo arm: it
 validates that alignment addresses assemblies at the reference arm's mask, applies
 the per-sample arm gate (``_ARM_GATE``), and stages a second map. Absent that key
-nothing below runs and the resolver's behaviour is unchanged.
+nothing below runs and the resolver's behavior is unchanged.
 
 That arm also stages a THIRD Parquet the reference arm has no counterpart for — the
 assembled genomes' CheckM scores — and it is the one thing here that reads the data
@@ -304,7 +304,7 @@ def _write_denovo_genome_quality(
     prep_sample.** It is a refined bin's FASTA stem for a MAG and the assembler's
     contig id for an LCG, and both restart per prep_sample — every one of them has a
     `bin.1`, and contig ids collide the same way — so without that term one
-    prep_sample's scores land on its neighbour's genome. (A different reason from the
+    prep_sample's scores land on its neighbor's genome. (A different reason from the
     one `reconcile.denovo_map_join` gives for its own prep_sample term: that one is
     about a content-addressed `feature_idx`, which does not apply to a key made of
     names.)

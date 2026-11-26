@@ -279,7 +279,7 @@ def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys)
     database at all — the operator pointed at the CSV, or at a truncated copy.
 
     Uses a real `argparse.ArgumentParser` rather than `RaisingParser`,
-    because the assertion is the argparse behaviour itself: one stderr line and exit
+    because the assertion is the argparse behavior itself: one stderr line and exit
     2, not a traceback. Pins the message, since a load failure and a query failure
     are reported differently and the operator's next move differs."""
     not_a_db = tmp_path / "preflight.db"

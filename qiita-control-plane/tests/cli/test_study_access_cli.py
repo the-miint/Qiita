@@ -1,5 +1,5 @@
 """`qiita study access list|grant|set-tier|revoke`: each subcommand's method,
-URL, and body. The route behaviour is covered in tests/routes/test_study_access.py."""
+URL, and body. The route behavior is covered in tests/routes/test_study_access.py."""
 
 import httpx
 import pytest

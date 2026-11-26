@@ -1,7 +1,7 @@
 """Native job: convert a BAM/SAM/CRAM into a Parquet of reads, keyed by a
 CP-minted `sequence_idx` BIGINT.
 
-The BAM analogue of `fastq_to_parquet`, and structurally near-identical to it:
+The BAM analog of `fastq_to_parquet`, and structurally near-identical to it:
 miint's `read_sequences_sam` emits the SAME read_fastx-compatible schema
 (`sequence_index, read_id, sequence1, qual1, sequence2, qual2`) that `read_fastx`
 does, so this job is fastq_to_parquet with the reader swapped — same B-staged
@@ -81,7 +81,7 @@ YAML_STEP_NAME = "bam"
 #
 # Peak memory is flat in the read set's size: the reads are written in bounded batches (see
 # _write_read_parts), and the parse streams (read_sequences_sam projects the aux tags
-# away rather than materialising them). The one term that still scales with the input
+# away rather than materializing them). The one term that still scales with the input
 # is `count(DISTINCT read_id)` — a blocking hash aggregate, O(distinct read_ids). At a
 # few million HiFi reads that is small; a 20M-read ONT run is what the ceiling covers.
 _DUCKDB_MEMORY_GB = 7

@@ -523,7 +523,7 @@ async def create_alignment_cohort_doget_ticket(
 
     **The signed cohort IS the authorization boundary.** The data plane serves
     exactly the prep_sample_idx list this ticket carries and knows nothing about
-    studies or users, so there is no second line of defence behind this
+    studies or users, so there is no second line of defense behind this
     function; every check below is the only one there is.
 
     Validation is `authorize_completed_alignment_cohort`, whose docstring is the

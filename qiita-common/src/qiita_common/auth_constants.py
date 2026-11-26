@@ -71,7 +71,7 @@ class Scope(StrEnum):
     # would have put a human PAT on the worker path — and it is deliberately
     # absent from every role ceiling precisely so that cannot happen.
     #
-    # On every role ceiling, unlike its neighbours: for a plain user the
+    # On every role ceiling, unlike its neighbors: for a plain user the
     # per-study tier check is the real boundary, so the role does not need to be.
     # That argument is honest only for `user`. `wet_lab_admin` and `system_admin`
     # are at or above the cohort gate's `bypass_role`
@@ -100,7 +100,7 @@ class Scope(StrEnum):
     # pass-set, which TICKET_DOGET already classes as not raw human/host reads —
     # plus `bin_quality`, the run's per-subject CheckM rows, which the service
     # route does not sign (its privacy argument is on the data plane's
-    # `ALLOWED_TABLES` entry). The privacy-sensitive neighbours (READ_MASKED_DOGET,
+    # `ALLOWED_TABLES` entry). The privacy-sensitive neighbors (READ_MASKED_DOGET,
     # READ_DOGET) are for the read surfaces and are untouched by it.
     ASSEMBLY_DOGET = "assembly:doget"
     # DoGet against the data plane's masked-read surface (`read_masked`).
@@ -114,7 +114,7 @@ class Scope(StrEnum):
     # `read_masked_block`) — one block's `(prep_sample_idx, sequence_idx
     # sub-range)` members, streamed to a block-scoped compute job.
     #
-    # Distinct from BOTH neighbours, and strictly the most privileged of the
+    # Distinct from BOTH neighbors, and strictly the most privileged of the
     # three. `read_block` streams RAW `read` rows: host/human sequence that the
     # `read_masked` macro exists to exclude, so it is a strict superset of what
     # READ_MASKED_DOGET covers. Riding TICKET_DOGET would let any service account
@@ -125,7 +125,7 @@ class Scope(StrEnum):
     # Mask LIFECYCLE: deprecate a config so it can no longer be minted against, and
     # withdraw individual runs of a sound config. A mask is kept as the record of
     # what filtered published data; deprecation preserves it and adds the
-    # judgement. Separate from the minting capability (READ_MASKED_DOGET) because
+    # judgment. Separate from the minting capability (READ_MASKED_DOGET) because
     # a service account that mints masks must not be able to void them.
     # system_admin only, in ROLE_IMPLIED_SCOPES.
     MASK_DEFINITION_LIFECYCLE = "mask_definition:lifecycle"

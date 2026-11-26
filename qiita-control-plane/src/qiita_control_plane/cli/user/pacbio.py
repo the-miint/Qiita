@@ -1,6 +1,6 @@
 """qiita user CLI — PacBio HiFi ingest submission.
 
-`submit-pacbio-ingest` is the PacBio analogue of `submit-bcl-convert`
+`submit-pacbio-ingest` is the PacBio analog of `submit-bcl-convert`
 (cli/user/pool.py): one operator gesture that stands up the sequencing_run /
 sequenced_pool / sequenced_sample roster from a kl-run-preflight blob and then
 ingests each sample's reads. It differs from bcl-convert in two structural ways,
@@ -22,7 +22,7 @@ rather than as a single BCL run bcl-convert demuxes in-workflow:
      is `pacbio_sample_idx`, never the barcode; the barcode is only the BAM key.)
 
 Preflight read: per-sample PacBio facts come from kl-run-preflight's
-`get_pacbio_sample_info` (the analogue of the Illumina `get_illumina_sample_info`
+`get_pacbio_sample_info` (the analog of the Illumina `get_illumina_sample_info`
 that `pool._read_preflight_rows` uses) — see `_read_pacbio_preflight_rows`.
 """
 
@@ -102,7 +102,7 @@ def _read_pacbio_preflight_rows(
 ) -> list[_PacbioPreflightRow]:
     """Load the preflight SQLite and return one `_PacbioPreflightRow` per `pacbio_sample` row.
 
-    Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of
+    Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analog of
     `get_illumina_sample_info` that `pool._read_preflight_rows` uses): per sample it
     returns the biosample's and primary/secondary projects' identifiers and a
     `PacbioSampleRow` (barcode, twist, syndna, smrt_cell, movie_context). It raises
@@ -322,7 +322,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        from the sample's own host_taxon_id metadata, not from the blob.
     4. GET the pool roster and create only the MISSING sequenced-samples
        (`sequenced_pool_item_id = pacbio_sample_idx`, the sample's unique preflight
-       id — the exact analogue of bcl-convert's illumina_sample_idx; the barcode is
+       id — the exact analog of bcl-convert's illumina_sample_idx; the barcode is
        NOT used here, it is not unique across PacBio protocols). The composer 409s
        on a duplicate (pool, item_id), so create-missing (not blind-POST) is what
        makes a retry converge instead of aborting on the first already-created sample.

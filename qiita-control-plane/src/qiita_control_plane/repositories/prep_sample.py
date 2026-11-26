@@ -103,7 +103,7 @@ async def set_prep_sample_retired(
 
     Reversible operator disposition (the column already exists; the completion
     rollup already excludes retired rows). Both directions are written so the
-    `prep_sample_retirement_consistent` CHECK is honoured:
+    `prep_sample_retirement_consistent` CHECK is honored:
 
       * retire (retired=true): retired_at=now(), retired_by_idx=actor,
         retire_reason=reason (nullable).

@@ -212,7 +212,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # exceeds any reasonable DuckDB cap. We batch by chunk-count
             # budget: Python first collects (read_id, n_chunks) for every
             # read (cheap count(*) aggregate, ~10 MB transfer), bin-packs
-            # reads into batches each totalling ≤ CHUNK_BUDGET_PER_BATCH
+            # reads into batches each totaling ≤ CHUNK_BUDGET_PER_BATCH
             # chunks, and each batch's string_agg + native md5 runs
             # inside DuckDB. DuckDB still does the heavy lifting (native
             # md5, parallel string_agg); Python only carries the small
@@ -431,7 +431,7 @@ def _write_annotation_manifest(
     table, is a second schema declaration that drifts the moment `read_gff`'s column
     types change.
 
-    `read_gff` honours the `##FASTA` directive (duckdb-miint#186), so the embedded
+    `read_gff` honors the `##FASTA` directive (duckdb-miint#186), so the embedded
     genome prokka and bakta always append never reaches us and needs no filtering.
 
     GFF3 LANDMARK rows (`region`, `chromosome`, `contig`, ...) declare the extent of

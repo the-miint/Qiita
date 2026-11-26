@@ -1043,7 +1043,7 @@ async def update_sequenced_pool_preflight_blob(
 
 
 def _encode_jsonb(value: dict[str, Any] | None) -> str | None:
-    """Serialise a Python dict to a JSON string for the JSONB cast.
+    """Serialize a Python dict to a JSON string for the JSONB cast.
 
     asyncpg does not register a default jsonb codec, so values destined for
     a JSONB column must be passed as a string and cast on the SQL side via

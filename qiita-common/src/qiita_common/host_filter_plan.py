@@ -3,7 +3,7 @@
 The resolver answers one sample at a time, and for most samples that is the whole
 answer. But a CONTROL (a blank) is deliberately NOT answered there: it has no host
 of its own, so what it should be depleted against is a property of the POOL it
-rode in — its neighbours' host. That join is what this module does.
+rode in — its neighbors' host. That join is what this module does.
 
 It is pure, and it lives in the contract layer, because there are TWO submitters
 that must not disagree about the same pool: the per-sample CLI fan-out
@@ -78,7 +78,7 @@ class PoolHostFilterPlan:
 def plan_pool_host_filter(
     resolutions: dict[str, HostFilterResolution],
 ) -> PoolHostFilterPlan:
-    """Resolve a pool's blanks against its neighbours and return the per-sample plan.
+    """Resolve a pool's blanks against its neighbors and return the per-sample plan.
 
     `resolutions` maps an opaque per-sample key (the caller's — the CLI uses
     `sequenced_pool_item_id`, the block planner would use `prep_sample_idx`) to

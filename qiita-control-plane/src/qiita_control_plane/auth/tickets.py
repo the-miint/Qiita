@@ -220,7 +220,7 @@ def sign_ticket(
     if members is not None and not members:
         # Distinct from "no members at all": an explicitly empty selector means
         # the caller computed a block footprint and got nothing, which is a
-        # planning bug — never a licence to read the whole table.
+        # planning bug — never a license to read the whole table.
         raise ValueError("sign_ticket rejects an empty members selector")
     if not filter and not members:
         raise ValueError(

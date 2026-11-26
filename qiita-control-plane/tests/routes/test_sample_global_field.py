@@ -1,8 +1,8 @@
 """Integration tests for the global sample-field registry routes.
 
 Both entities' registries are read by the same handler shape over the same
-generic repository read, so every behaviour is asserted once here and
-parametrised over the two entity surfaces rather than duplicated per entity.
+generic repository read, so every behavior is asserted once here and
+parametrized over the two entity surfaces rather than duplicated per entity.
 """
 
 import secrets

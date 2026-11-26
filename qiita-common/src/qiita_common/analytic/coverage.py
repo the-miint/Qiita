@@ -112,7 +112,7 @@ def _alignments_view_sql(view: str, source: str) -> str:
     NULL coordinates are excluded. `compress_intervals`, which both macros run
     internally, drops such rows silently rather than erroring, so filtering here is
     what makes the exclusion visible to a reader rather than implicit in an
-    aggregate's behaviour.
+    aggregate's behavior.
 
     A VIEW, not a table: only this connection reads it, so materializing would
     duplicate the alignment slice in RAM.

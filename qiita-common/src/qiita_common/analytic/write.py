@@ -13,7 +13,7 @@ from pathlib import Path
 # is what every writer below uses, BIOM included.
 from ..parquet import PARQUET_OPTS_TRANSFER, validate_parquet_path
 from ..taxonomy import QUOTED_RANK_COLUMNS
-from .relations import LABELLED_RELATION, TAXONOMY_SIDECAR_RELATION, TREE_TABLE
+from .relations import LABELED_RELATION, TAXONOMY_SIDECAR_RELATION, TREE_TABLE
 from .sidecar import TaxonomyClearance, TreeClearance
 
 # BIOM's `generated-by` attribute. The writer's own default is `miint`, which names
@@ -27,23 +27,23 @@ BIOM_GENERATED_BY = "qiita-miint"
 
 
 def parquet_copy_sql(path: Path) -> str:
-    """COPY the relabelled table to Parquet with the transfer option set: the file leaves
+    """COPY the relabeled table to Parquet with the transfer option set: the file leaves
     the job but is never registered into the lake.
 
     `PARQUET_OPTS_TRANSFER`' `ROW_GROUP_SIZE_BYTES` requires `SET preserve_insertion_order =
     false` on the writing connection — DuckDB errors at bind time otherwise — which is
     the caller's to set (see `parquet.py`).
     """
-    return f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
+    return f"COPY {LABELED_RELATION} TO '{validate_parquet_path(path)}' ({PARQUET_OPTS_TRANSFER})"
 
 
 def biom_copy_sql(path: Path) -> str:
-    """COPY the relabelled table to a BIOM 2.1 (HDF5) file.
+    """COPY the relabeled table to a BIOM 2.1 (HDF5) file.
 
-    The writer requires exactly `LABELLED_SCHEMA` — `feature_id`/`sample_id` VARCHAR
+    The writer requires exactly `LABELED_SCHEMA` — `feature_id`/`sample_id` VARCHAR
     and `value` DOUBLE, looked up BY NAME — and **silently ignores any other column**,
-    so it is `labelled_relation_sql`'s projection, not this writer, that keeps our
-    identifiers out of the file. Behaviours it does enforce, and two it applies
+    so it is `labeled_relation_sql`'s projection, not this writer, that keeps our
+    identifiers out of the file. Behaviors it does enforce, and two it applies
     without asking, are recorded in `docs/duckdb-miint.md` and pinned by the
     control-plane's BIOM contract test; the one that shapes callers most is that it
     **refuses to overwrite an existing file**, unlike the Parquet COPY.
@@ -54,7 +54,7 @@ def biom_copy_sql(path: Path) -> str:
     internal identifier, which must not ride a published file.
     """
     return (
-        f"COPY {LABELLED_RELATION} TO '{validate_parquet_path(path)}' "
+        f"COPY {LABELED_RELATION} TO '{validate_parquet_path(path)}' "
         f"(FORMAT BIOM, COMPRESSION 'gzip', GENERATED_BY '{BIOM_GENERATED_BY}')"
     )
 

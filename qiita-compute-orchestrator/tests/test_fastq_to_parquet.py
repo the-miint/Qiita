@@ -499,7 +499,7 @@ def test_execute_reuses_range_left_by_a_crashed_attempt(monkeypatch, tmp_path):
     before dying is read back and reused, and the step completes.
 
     This is what makes the step idempotent across runner retries. The prior
-    behaviour — 409 -> UNKNOWN_PERMANENT — turned every transient mid-step failure
+    behavior — 409 -> UNKNOWN_PERMANENT — turned every transient mid-step failure
     (an OOM kill, a walltime kill) into a permanent one on the next attempt, masked
     the real cause behind a mint conflict, and defeated the runner's OOM memory
     escalation (the escalated attempt could never get past the mint to benefit)."""

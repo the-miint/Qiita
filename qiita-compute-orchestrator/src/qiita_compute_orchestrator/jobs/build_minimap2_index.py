@@ -23,7 +23,7 @@ Both modes reassemble the per-feature contig into a `(read_id, sequence1)` subje
 via the shared `subject.stage_subject` (`string_agg(chunk_data ORDER BY
 chunk_index)` GROUP BY feature_idx) — the index is built from exactly the bytes
 stored in the data plane, no raw-FASTA side channel. The subject is a non-temp
-TABLE because that reassembly is a blocking aggregation worth materialising once;
+TABLE because that reassembly is a blocking aggregation worth materializing once;
 `stage_subject` owns that reason. `save_minimap2_index` itself resolves a TEMP
 TABLE or a registered Arrow relation fine (measured; see docs/duckdb-miint.md).
 
@@ -86,7 +86,7 @@ _DUCKDB_THREADS = 4
 # it against the first real human-reference build's MaxRSS (sacct) and bump if
 # the build still OOMs.
 _MINIMAP2_HOST_RESERVE_GB = 16
-# SHARD mode — one shard of a many-genome catalogue, far smaller than a whole
+# SHARD mode — one shard of a many-genome catalog, far smaller than a whole
 # reference. Measured on the reference-18 build (196,062 genomes): MaxRSS over
 # 987 shard builds was p50 6.2, p90 10.3, max 17.1 GiB. 82.2% of those shards
 # were at or under 1 Gbp and so ran at 29 GiB, where DuckDB's limit was
@@ -104,7 +104,7 @@ _MINIMAP2_SHARD_RESERVE_GB = 8
 # the old arithmetic ever produced (32 - 4 - 16), so every shard size now resolves
 # to the limit it resolved to before. Shards are planned by COUNT
 # (`shard_planner._SHARD_COUNT`), not by a bp budget, so shard size scales with the
-# catalogue and that band is reachable; reference-18 did not reach it (its shards
+# catalog and that band is reachable; reference-18 did not reach it (its shards
 # ran at 29-31 GiB, i.e. at most 3 Gbp).
 #
 # It does NOT bound the reassembly's working set, and this is not the safe-because-
@@ -267,7 +267,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if sharded:
             # Read the shard's feature roster (small — one row per feature) to
             # scope the DoGet ticket, then stream that roster's chunks. The
-            # subject TABLE is materialised INSIDE the stream `with` (a blocking
+            # subject TABLE is materialized INSIDE the stream `with` (a blocking
             # agg that drains the stream) so the Flight client closes before the
             # long minimap2 build.
             roster_sql = validate_parquet_path(inputs.shard_features)

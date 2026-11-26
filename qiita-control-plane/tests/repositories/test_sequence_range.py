@@ -135,7 +135,7 @@ async def test_mint_sequence_range_sequential_disjoint(parent_chain):
 
 async def test_mint_sequence_range_concurrent_disjoint(parent_chain):
     """asyncio.gather two mints on separate connections — the advisory
-    lock in qiita.mint_sequence_range must serialise them so the two
+    lock in qiita.mint_sequence_range must serialize them so the two
     returned ranges never overlap."""
     pool = parent_chain["pool"]
     # Seed a second prep_sample so the two mints don't collide on the

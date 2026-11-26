@@ -2,7 +2,7 @@
 
 metaWRAP computes binning coverage by self-aligning the reads with **bwa**, a
 short-read aligner, and `metawrap binning` has no aligner-selection flag. Its one
-documented-by-behaviour seam is the alignment cache: it guards its own `bwa mem`
+documented-by-behavior seam is the alignment cache: it guards its own `bwa mem`
 behind `if [[ ! -f <out>/work_files/<sample>.bam ]]` and skips it when that file
 already exists, then derives depth from `work_files/*.bam`. qp-pacbio uses exactly
 that seam — it pre-maps with `minimap2 -x map-hifi` and drops the sorted BAM into
@@ -21,11 +21,11 @@ in containers too; that is not the reason this is native — the reason is that 
 already have the tool natively, like `assembly_hash` / `assembly_load`.)
 
 The one cost is that the BAM crosses a step boundary as a file path — the
-intermediate-materialisation the repo's streaming rule warns about. It is forced
+intermediate-materialization the repo's streaming rule warns about. It is forced
 by metaWRAP's interface (which *is* "a BAM at work_files/<sample>.bam"), not
 chosen, and is the thing to design away if metaWRAP is ever replaced.
 
-Behaviours of miint's BAM writer this step depends on. The parameters are
+Behaviors of miint's BAM writer this step depends on. The parameters are
 documented upstream (<https://the-miint.github.io/duckdb-miint/writing/>); the
 notes below are what a probe against the shipped build adds on top:
 
@@ -203,7 +203,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     bam = workspace / _BAM_NAME
     # A COPY target is a SQL string literal and cannot be bound, so it is
-    # sanitised instead — same helper every other COPY in `jobs/` uses. Named for
+    # sanitized instead — same helper every other COPY in `jobs/` uses. Named for
     # Parquet, but format-agnostic: it rejects quotes/backslashes/control chars.
     bam_sql = validate_parquet_path(bam)
     reads_sql = validate_parquet_path(inputs.masked_reads_fastq)
@@ -240,7 +240,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # relation names on a SEPARATE connection, which sees neither.
             #
             # The reads are VIEWs and the contigs a TABLE, deliberately. A HiFi
-            # read set is tens of GB; materialising it would spend the whole
+            # read set is tens of GB; materializing it would spend the whole
             # memory_limit — the failure `bam_to_parquet` documents hitting on the
             # first real PacBio run. It is read TWICE (once by the aligner, once by
             # the writer's SEQUENCE_DATA lookup), so the view re-decodes the FASTQ
@@ -254,7 +254,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 [str(nolcg)],
             )
             # Interpolated, not bound: DuckDB refuses a prepared parameter in a
-            # VIEW body ("Unexpected prepared parameter"). Sanitised with the same
+            # VIEW body ("Unexpected prepared parameter"). Sanitized with the same
             # helper the COPY target uses.
             # The writer's SEQUENCE_DATA lookup wants read_id / sequence1 / qual1
             # (`read_fastx` emits qual1 as the UTINYINT[] it expects).

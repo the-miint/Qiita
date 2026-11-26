@@ -2,8 +2,8 @@
 and both Flight streams faked — real miint, real analytic, real writers.
 
 The pieces this wires are pinned elsewhere: the analytic against real miint in
-`qiita-common`'s `tests/analytic/test_behaviour_miint.py`, the maps / relabel / bundle in
-`tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviours in
+`qiita-common`'s `tests/analytic/test_behavior_miint.py`, the maps / relabel / bundle in
+`tests/cli/test_feature_table_cli.py`, the BIOM writer's own behaviors in
 `tests/test_biom_writer_contract.py`. **What is only testable here is the wiring**:
 which columns ride the ticket, which scope reaches the survivor set, whether the
 lengths stream is opened at all, and that every refusal the recipe can make comes
@@ -127,7 +127,7 @@ _ALIGNMENT_TYPES = {
 def _alignment_reader(columns: list[str], rows: list[tuple]) -> pa.RecordBatchReader:
     """The alignment slice as the data plane would stream it: **exactly the projected
     columns**, in the ticket's order. A wider stream would hide the projection drift
-    the signed column list exists to prevent, so the fake honours it."""
+    the signed column list exists to prevent, so the fake honors it."""
     padded = [tuple(r) + (None,) * (8 - len(r)) for r in rows]
     named = dict(zip(_ALIGNMENT_TYPES, zip(*padded, strict=True), strict=True))
     table = pa.table(

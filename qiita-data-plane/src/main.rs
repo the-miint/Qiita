@@ -144,7 +144,7 @@ fn build_service_name(sha: Option<&str>) -> Result<Option<String>, String> {
 /// Resolves on SIGTERM (what `systemctl stop` / `restart` sends) or SIGINT, which
 /// starts tonic's graceful shutdown: the listener closes, so a new connection is
 /// refused, and `serve_with_shutdown` returns once every request already in flight
-/// has finished. A DoGet stream, a DoPut and a `register_files` signalled mid-call
+/// has finished. A DoGet stream, a DoPut and a `register_files` signaled mid-call
 /// each ran to completion and the process exited 0 (tonic 0.14.5). How long a stop
 /// waits on that drain before SIGKILL is the unit's `TimeoutStopSec`.
 async fn drain_signal() {

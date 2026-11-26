@@ -48,9 +48,9 @@ its top-up is covered.
 Concurrency: `top_up_dispatch` takes a per-cohort Postgres transaction-level
 advisory lock, so two pumps for the same cohort can't both read the same
 free-slot count and over-release. The lock identity is (class, key); a distinct
-class per cohort type keeps e.g. reference_idx=5 and mask_idx=5 from serialising
+class per cohort type keeps e.g. reference_idx=5 and mask_idx=5 from serializing
 against each other. Key collisions across DIFFERENT cohorts are harmless (they'd
-only serialise two unrelated pumps briefly) because every query is still scoped
+only serialize two unrelated pumps briefly) because every query is still scoped
 by the cohort's own predicate — the lock is a correctness aid for same-cohort
 races only.
 """
@@ -86,7 +86,7 @@ _LOCK_CLASS_READ_MASK_BLOCK = 0x0FA0_0002
 _LOCK_CLASS_ALIGN_BLOCK = 0x0FA0_0003
 
 # pg advisory-lock keys are int4; mask the (bigint) cohort id with the shared
-# INT4_MASK (repositories). A wrap collision here only serialises two unrelated
+# INT4_MASK (repositories). A wrap collision here only serializes two unrelated
 # cohorts of the SAME type for a moment — harmless (see module docstring).
 
 # The only two ticket predicates `_cohorts_matching` will interpolate. Constants, not
@@ -129,7 +129,7 @@ _OVERRIDES: dict[tuple[str, int], int] = {}
 class FanoutCohort:
     """One fan-out's child-ticket set: a SQL predicate over qiita.work_ticket
     (positional ``$1..`` placeholders, filled by ``args``) plus the advisory-lock
-    identity that serialises pumps for it. The predicate must select exactly the
+    identity that serializes pumps for it. The predicate must select exactly the
     fan-out's children and nothing else.
 
     ``(kind, key)`` is the cohort's exact identity — what the override registry
@@ -338,17 +338,17 @@ async def top_up_dispatch(
     ``max_inflight`` is the *default*: a runtime override set for this cohort
     (`set_override`) wins over it. Resolving here rather than at the call sites
     means all three trigger paths — the initial fan-out fill, the per-child
-    completion hook, and startup reconcile — honour it without threading it
+    completion hook, and startup reconcile — honor it without threading it
     through.
 
-    Idempotent to redundant calls: the per-cohort advisory lock serialises
+    Idempotent to redundant calls: the per-cohort advisory lock serializes
     concurrent pumps, and the returned set is exactly the rows this call flipped
     from held to released. Dispatch fires post-commit, so a released ticket is
     durable before its background task starts."""
     where = cohort.where_sql
     limit_placeholder = len(cohort.args) + 1
     async with pool.acquire() as conn, conn.transaction():
-        # Serialise pumps for THIS cohort so two can't both see the same free
+        # Serialize pumps for THIS cohort so two can't both see the same free
         # slots and over-release. Transaction-scoped: auto-released on commit.
         await conn.execute(
             "SELECT pg_advisory_xact_lock($1, $2)", cohort.lock_class, cohort.lock_key
@@ -442,7 +442,7 @@ async def cohort_status(
     """Count `cohort`'s tickets by disposition and resolve its effective cap.
 
     Returns the wire model directly — there is no internal shape worth keeping
-    separate from what the route serialises.
+    separate from what the route serializes.
 
     `total` is every ticket the cohort predicate matches, terminal ones included:
     it is how a caller distinguishes a cohort that has finished from one that never

@@ -55,7 +55,7 @@ from .cp_client import make_cp_client
 # possible. The warning is cosmetic (8-byte-aligned buffers are valid on
 # all modern x86_64/ARM) but floods logs on every batch. Set the alignment
 # handling policy to `ignore` to silence it; operators can override via the
-# env var if they want the paranoid `reallocate` behaviour.
+# env var if they want the paranoid `reallocate` behavior.
 os.environ.setdefault("ACERO_ALIGNMENT_HANDLING", "ignore")
 
 

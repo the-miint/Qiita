@@ -6,7 +6,7 @@ the auth matrix (HumanUser 403, SA-without-scope 403, anonymous 401),
 the membership and presence 404/422 paths (unknown run, unknown pool,
 pool-in-wrong-run, pool with no preflight populated), and a base64
 round-trip that pins byte-equality between the on-disk blob and the
-deserialised response body.
+deserialized response body.
 
 POST .../preflight/update-lane (wet_lab_admin+ server-side lane edit): the
 wet_lab_admin happy path that round-trips a real run_preflight SQLite through

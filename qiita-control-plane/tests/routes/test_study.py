@@ -3,7 +3,7 @@ bulk lookup-by-accession endpoint.
 
 POST: covers happy-path creation across the three caller-role variants,
 the lab-tech-on-behalf rule, auth / scope guards, the collapsed
-owner-eligibility 422 surface (parametrised across the six
+owner-eligibility 422 surface (parametrized across the six
 ineligibility shapes), Pydantic validation, and the route's
 exception-mapping path (PI FK 422, owner non-user 422).
 
@@ -351,7 +351,7 @@ async def test_post_study_user_without_study_write_scope_403(ctx, no_study_write
 # ===========================================================================
 # Like the biosample handler, all ineligibility cases collapse to the
 # same 422 detail to avoid leaking principal-state to callers probing
-# arbitrary owner_idx values. Kept as one parametrised test so each kind
+# arbitrary owner_idx values. Kept as one parametrized test so each kind
 # still locks in that the matching backend code path emits 422 — a
 # regression where one input accidentally yields 500 / 409 / 201 still
 # surfaces here.

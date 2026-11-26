@@ -3,7 +3,7 @@ HUMAN-callable alignment mint, where the caller names the cohort directly.
 
 The signed cohort IS the authorization boundary: the data plane serves exactly
 the prep_sample_idx list the ticket carries and knows nothing about studies or
-users. There is no second line of defence, so every one of these tests is
+users. There is no second line of defense, so every one of these tests is
 guarding against a straight data leak, not a usability wart.
 
 Two decisions this file exists to pin:

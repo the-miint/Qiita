@@ -109,7 +109,7 @@ _MM2_PRESET = "map-hifi"
 # NEGATIVE on a deletion-heavy alignment.
 #
 # `blast` is chosen because it is what coverm computes (identity derived from NM), and
-# matching the assay's existing coverm behaviour is the standing instruction. Be aware
+# matching the assay's existing coverm behavior is the standing instruction. Be aware
 # what it costs, because it is not a rounding difference: BLAST charges a deletion PER
 # BASE, gap-compressed charges it ONCE. A spike-in read carrying a single 200 bp
 # deletion (cigar `899=200D901=`, NM 200) scores
@@ -154,7 +154,7 @@ _IDENTITY_METHOD = "blast"
 # establish: coverm's `count` is a per-contig quantification and this predicate is a
 # per-read origin boolean over the union of inserts, so they are not the same question —
 # what was measured is that coverm does not credit a reference on a supplementary
-# alignment, which is the behaviour being ported.
+# alignment, which is the behavior being ported.
 #
 # THE COST, which is a real trade and not free: the rule is now "the read's BEST
 # alignment is a spike-in at >= MIN_IDENTITY", not "ANY alignment is". A read whose
@@ -262,7 +262,7 @@ def _run_align_minimap2(
 
     Isolated as a seam so unit tests stub the real aligner.
     """
-    # Materialise the ALIGNMENT, not a boolean. Every column coverage depth needs —
+    # Materialize the ALIGNMENT, not a boolean. Every column coverage depth needs —
     # `reference` (which plasmid), `position`/`stop_position`, `cigar` — is computed by
     # miint here; the old `SELECT DISTINCT read_id` threw all of it away one line after it
     # existed, which is precisely what made per-insert quantification impossible.

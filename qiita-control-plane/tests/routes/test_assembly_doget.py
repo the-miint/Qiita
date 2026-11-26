@@ -115,7 +115,7 @@ async def env(postgres_pool):
 
     `qiita.assembly_membership` FKs prep_sample, processing and feature, so none
     of the three can be invented. Three runs exist — (A, a), (A, b), (B, a) — so
-    the route's existence gate cannot be satisfied by a neighbour agreeing on
+    the route's existence gate cannot be satisfied by a neighbor agreeing on
     only one half of the key, and the ticket it signs cannot silently drop
     either half.
 
@@ -290,7 +290,7 @@ async def test_doget_signs_the_run_pair_and_no_contig(ctx, env):
     ],
 )
 async def test_doget_signs_the_pair_it_was_given(ctx, env, sample, run):
-    """Neither identifier is dropped or defaulted: the ticket for a neighbouring
+    """Neither identifier is dropped or defaulted: the ticket for a neighboring
     run differs from the one above in exactly the component the body changed."""
     resp = await ctx["sa"].post(URL_ASSEMBLY_DOGET, json=_body(env, sample=sample, run=run))
     assert resp.status_code == 201, resp.text

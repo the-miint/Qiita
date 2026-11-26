@@ -378,7 +378,7 @@ async def test_a_restart_drops_overrides_asymmetrically(
     `settings.fanout_max_inflight`. Both arms run the same code with only the override's
     direction differing, which is what isolates the asymmetry.
 
-    Pinning current behaviour, not asserting an ideal: the overrides are deliberately
+    Pinning current behavior, not asserting an ideal: the overrides are deliberately
     in-memory (an incident knob, not durable state). This test exists so that stays a
     decision rather than a surprise — the whole design rests on these semantics.
     """

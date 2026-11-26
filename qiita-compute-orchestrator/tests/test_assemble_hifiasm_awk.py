@@ -156,7 +156,7 @@ def test_the_awk_writes_one_row_per_segment_with_the_declared_columns(tmp_path: 
     assert "1 of 3 GFA segment(s) carried no dp:f tag" in result.stderr
 
 
-def test_an_unrecognised_segment_name_exits_65_and_names_it(tmp_path: Path) -> None:
+def test_an_unrecognized_segment_name_exits_65_and_names_it(tmp_path: Path) -> None:
     """A name matching neither shape stops the step.
 
     The circularity call is stored per contig, so routing such a name to noLCG

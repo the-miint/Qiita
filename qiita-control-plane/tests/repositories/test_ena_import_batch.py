@@ -1,7 +1,7 @@
 """Repository-layer tests for qiita.ena_import_batch / qiita.ena_import_batch_item.
 
 Exercises the SQL in `repositories.ena_import_batch` directly against Postgres. Orchestration
-behaviour (the resolve/register/submit flow, the per-item state machine, the
+behavior (the resolve/register/submit flow, the per-item state machine, the
 `fetch_batch_status` rollup) is covered by the batch orchestration tests; this file
 pins the query shapes these functions issue.
 """
@@ -871,7 +871,7 @@ async def test_fetch_ena_import_batches_since_is_inclusive(eib):
     assert [r["ena_import_batch_idx"] for r in rows] == [after, at]
 
 
-async def test_fetch_ena_import_batches_honours_limit(eib):
+async def test_fetch_ena_import_batches_honors_limit(eib):
     batches = [await _new_batch(eib) for _ in range(3)]
 
     rows = await fetch_ena_import_batches(

@@ -2,7 +2,7 @@
 
 Covers the POST mint endpoint (service-account + scope guarded), the
 GET read endpoint, the auth matrix on both, the FK / unique / cap /
-cascade error paths, and concurrent-mint behaviour through the HTTP surface.
+cascade error paths, and concurrent-mint behavior through the HTTP surface.
 """
 
 import asyncio
@@ -626,7 +626,7 @@ async def test_get_sa_without_mint_or_read_scope_403(ctx, sa_no_mint_client):
 
 
 # ---------------------------------------------------------------------------
-# Cascade behaviour through the HTTP surface
+# Cascade behavior through the HTTP surface
 # ---------------------------------------------------------------------------
 
 

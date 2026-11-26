@@ -128,7 +128,7 @@ async def test_fetch_raises_http_error_on_5xx():
 
 
 async def test_fetch_raises_http_error_on_401():
-    """401 = bad/missing SA token. Surfaces as HTTPStatusError, signalling
+    """401 = bad/missing SA token. Surfaces as HTTPStatusError, signaling
     a misconfigured deployment rather than a transient failure."""
 
     def handler(request: httpx.Request) -> httpx.Response:

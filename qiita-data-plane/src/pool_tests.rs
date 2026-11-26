@@ -1,4 +1,4 @@
-//! Pool behaviour that needs no catalog: the in-flight bound, what a returned
+//! Pool behavior that needs no catalog: the in-flight bound, what a returned
 //! connection carries, and that the settings reach DuckDB. The real ATTACH is
 //! exercised by the integration tier.
 

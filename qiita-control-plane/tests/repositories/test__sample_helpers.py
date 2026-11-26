@@ -1939,7 +1939,7 @@ def test_parse_text_for_data_type_numeric_canonicalizes(text_value, expected_sto
     """Tests the case where NUMERIC text arrives in a form the database
     normalizes on input: the parsed Decimal already carries the stored
     representation, so exponent notation resolves to plain digits, every NaN
-    flavour collapses to one, and a negative zero drops its sign while keeping
+    flavor collapses to one, and a negative zero drops its sign while keeping
     its scale. Asserted on the rendered text because Decimal equality ignores
     scale and reports two representations of one number as equal.
     """
@@ -3633,7 +3633,7 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
     # Seed an entity not yet linked to ctx['study_idx'].
     entity_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
 
-    # Write the (entity, study) link via the parameterised helper.
+    # Write the (entity, study) link via the parameterized helper.
     async with ctx["pool"].acquire() as conn:
         returned_created_at = await insert_entity_to_study(
             conn,
@@ -3669,7 +3669,7 @@ async def test_insert_entity_to_study_links_entity(ctx, spec):
     ids=["biosample", "prep_sample"],
 )
 async def test_insert_entity_to_study_rejects_duplicate(ctx, spec):
-    # First link succeeds via the parameterised helper.
+    # First link succeeds via the parameterized helper.
     entity_idx = await _seed_unlinked_entity_for_spec(ctx, spec)
     async with ctx["pool"].acquire() as conn:
         await insert_entity_to_study(
@@ -5597,7 +5597,7 @@ async def test_write_sample_metadata_global_internal_names_echoes_caller_key(ctx
         )
     ]
 
-    # The minted study-local alias is labelled with the global's display_name,
+    # The minted study-local alias is labeled with the global's display_name,
     # never the internal name the caller keyed on.
     alias_display = await ctx["pool"].fetchval(
         "SELECT sf.display_name FROM qiita.biosample_study_field sf"

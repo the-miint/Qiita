@@ -255,7 +255,7 @@ async def _guarded_state_update(
     """Run a TOCTOU-safe work_ticket state UPDATE.
 
     Applies `set_clause` only when the row's current state is one of
-    `allowed_states`. Coupling the caller MUST honour: `set_clause` references
+    `allowed_states`. Coupling the caller MUST honor: `set_clause` references
     exactly $1..$len(set_params); the helper appends the WHERE's $n+1
     (work_ticket_idx) and $n+2 (allowed_states) after them. If nothing matched, reads the
     actual state and raises — surfacing a stuck/racing ticket loudly instead of
@@ -358,7 +358,7 @@ async def _transition_to_failed(
     """Atomic transition into FAILED with all four failure_* columns
     populated in one UPDATE. The DB's `work_ticket_failure_consistent`
     CHECK enforces all-or-nothing; doing it in one statement keeps that
-    invariant honoured.
+    invariant honored.
 
     Accepts transition from any non-terminal state — the runner may be
     in PROCESSING (most common) or QUEUED (if a retry's QUEUED → PROCESSING
@@ -397,7 +397,7 @@ async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> No
     legitimately produced no data (an empty FASTQ well).
 
     Distinct from `_transition_to_failed`: NO_DATA is not a failure, so all four
-    failure_* columns are explicitly written NULL (honouring the DB's
+    failure_* columns are explicitly written NULL (honoring the DB's
     `work_ticket_failure_consistent` all-or-nothing CHECK from the
     none-populated side) and the transient-retry marker is cleared. Accepts a
     transition from any non-terminal state (PROCESSING most commonly, or QUEUED

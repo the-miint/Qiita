@@ -1544,7 +1544,7 @@ def test_verify_dp_pool_row_greps_what_the_data_plane_actually_logs() -> None:
     the source that writes them.
 
     This pins the strings, not the row's logic — `bash -n` and shellcheck cover the
-    shell, and the behaviour needs a host with systemd."""
+    shell, and the behavior needs a host with systemd."""
     verify = (_DEPLOY / "verify.sh").read_text()
     dp_src = _REPO_ROOT / "qiita-data-plane" / "src"
     for string, writer in (

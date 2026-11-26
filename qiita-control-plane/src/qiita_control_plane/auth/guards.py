@@ -111,7 +111,7 @@ def require_role_at_least(role: str) -> Callable[..., Principal]:
     they don't fit the human hierarchy).
 
     `role` accepts either a SystemRole member or its bare string value.
-    Normalised to `str(role)` at factory time so the 403 detail renders
+    Normalized to `str(role)` at factory time so the 403 detail renders
     `'system_admin'` not `<SystemRole.SYSTEM_ADMIN: 'system_admin'>`.
     """
     role_str = str(role)
@@ -206,7 +206,7 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s if the principal's
     token scope set does not include `scope`.
 
-    Accepts a Scope member or bare string; normalised so the 403 detail
+    Accepts a Scope member or bare string; normalized so the 403 detail
     renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`. When the
     caller's live role grants the scope but their token doesn't carry it, the
     detail carries an actionable re-login hint (see `_stale_token_hint`).
@@ -242,7 +242,7 @@ def require_any_scope(*scopes: str) -> Callable[..., Principal]:
 
     Use for a route reachable by two distinct capabilities. This guard
     decides scope only; a route needing a per-row check adds its own.
-    Accepts Scope members or bare strings; normalised so the 403 detail
+    Accepts Scope members or bare strings; normalized so the 403 detail
     renders the plain values.
     """
     scope_strs = tuple(str(s) for s in scopes)

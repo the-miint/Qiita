@@ -94,7 +94,7 @@ def configure_logging(level: str | None = None) -> str:
     return name
 
 
-# Match an Authorization header value in any reasonable string serialisation
+# Match an Authorization header value in any reasonable string serialization
 # (key=value, "key": "value", JSON, repr, dict, etc.). The capture group is
 # the full string up to and including "Bearer ", which we keep verbatim;
 # everything after is replaced with <redacted>.

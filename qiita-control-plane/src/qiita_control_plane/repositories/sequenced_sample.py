@@ -547,7 +547,7 @@ async def fetch_pool_members(
     """the pool's read-block members: `(prep_sample_idx, lo, hi)` per active
     sample with stored reads, each sample's full range, not tiled.
 
-    the pool analogue of `fetch_block_members` for the amplicon read ticket.
+    the pool analog of `fetch_block_members` for the amplicon read ticket.
     deblur needs each sample whole, so members aren't split like block tiling.
     the inner join drops un-ingested samples; retired and ena_status-flagged
     samples are excluded."""

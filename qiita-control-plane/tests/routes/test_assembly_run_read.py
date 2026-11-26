@@ -291,7 +291,7 @@ async def test_genome_map_returns_the_runs_pairs_scoped_to_that_run(ctx, run):
 
 async def test_genome_map_carries_the_genome_provenance(ctx, run):
     """`source` and `source_id` ship for the reason the reference map's do:
-    `qiita.genome` is unique on the PAIR, so a consumer relabelling `genome_idx` to
+    `qiita.genome` is unique on the PAIR, so a consumer relabeling `genome_idx` to
     a public handle needs both to assert no collision. An assembled subject's source
     is `qiita`, which is also how a consumer tells the two arms' genomes apart."""
     resp = await ctx["admin"].get(_map_url(run["prep_sample_idx"], run["minted_run"]))

@@ -819,11 +819,11 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     // Unique ids so leftover rows never collide with other serial tests.
     let all_null: i64 = 974_210;
     let partial: i64 = 974_211;
-    let neighbour: i64 = 974_212;
+    let neighbor: i64 = 974_212;
     // Never inserted under: the "reference exists but has no tree" case.
     let no_rows: i64 = 974_213;
 
-    for id in [all_null, partial, neighbour] {
+    for id in [all_null, partial, neighbor] {
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
         ))
@@ -858,7 +858,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     conn.execute_batch(&format!(
         "INSERT INTO qiita_lake.reference_phylogeny
            (reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)
-         VALUES ({neighbour}, 0, 'root', 0.0, NULL, NULL, false);"
+         VALUES ({neighbor}, 0, 'root', 0.0, NULL, NULL, false);"
     ))
     .unwrap();
 
@@ -920,7 +920,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     );
 
     // Scoping: none of the above touched another reference.
-    assert_eq!(edge_ids(neighbour), vec![None]);
+    assert_eq!(edge_ids(neighbor), vec![None]);
 
     // A reference with no rows at all is reported, not mistaken for a done tree.
     let empty = mint_phylogeny_edge_id(&attached_writer(&connstr, &data_path), no_rows)
@@ -928,7 +928,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
     assert_eq!(empty["phylogeny_rows"], 0);
     assert_eq!(empty["minted_rows"], 0);
 
-    for id in [all_null, partial, neighbour] {
+    for id in [all_null, partial, neighbor] {
         conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = {id};"
         ))

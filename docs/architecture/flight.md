@@ -69,7 +69,7 @@ the same `max_connections`.
 
 A DoGet client may ask for a zstd-compressed Arrow IPC body by sending the
 `qiita-ipc-compression: zstd` gRPC metadata header. **The default is
-uncompressed**, and an unrecognised value is rejected rather than ignored —
+uncompressed**, and an unrecognized value is rejected rather than ignored —
 a client that asked for compression and silently did not get it would draw the
 wrong conclusion about its own transfer. `zstd` is the only codec offered; LZ4
 measured at roughly half its ratio on every production shape.
@@ -179,7 +179,7 @@ can happen: **the signed cohort is the authorization boundary.** The data plane
 verifies the signature and serves exactly the identifiers the ticket names — it
 holds no notion of studies, users, or tiers, by the same design that makes it
 Intentionally "dumb" in the component map above. There is no second line of
-defence behind the mint, so a control-plane bug that signs an unauthorized
+defense behind the mint, so a control-plane bug that signs an unauthorized
 `prep_sample_idx` is a data leak, not a caught error.
 
 Two consequences worth stating, because both look like over-engineering until
@@ -369,7 +369,7 @@ explained at exactly one place:
 |---|---|
 | the coverage survivor set joins **before** woltka, not after its output | `ogu_input_table_sql` |
 | a CIGAR gate filters the coverage calculation as well as the counts | `gated_alignment_table_sql` |
-| the relabel precedes the write and is what makes BIOM writable at all | `LABELLED_SCHEMA`, `labelled_relation_sql` |
+| the relabel precedes the write and is what makes BIOM writable at all | `LABELED_SCHEMA`, `labeled_relation_sql` |
 | the coverage scope rides the *relation name*, so a scope mismatch is a bind error | `_SURVIVOR_TABLES` |
 | a genome speaks through its lowest **classified** member, not its lowest | `genome_representative_taxonomy_select_sql` |
 | the tree's **tips are renamed before the shear**, not its output after | `shear_input_statements` |

@@ -490,7 +490,7 @@ async def test_a_dangling_symlink_among_the_wells_is_skipped(
 
     The walk that catches an unreadable well has to stat every entry, so it
     meets whatever else the run folder holds — including a link whose target is
-    gone. That is the glob's own behaviour (it skips it), not a 500.
+    gone. That is the glob's own behavior (it skips it), not a 500.
     """
     token, _ = wet_lab_admin_token
     run = ingest_root / "dangling-link-run"

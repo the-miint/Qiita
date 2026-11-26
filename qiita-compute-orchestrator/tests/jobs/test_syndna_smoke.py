@@ -211,7 +211,7 @@ def test_syndna_smoke_the_chimera_really_does_produce_a_high_identity_supplement
 
 
 def test_syndna_smoke_high_identity_supplementary_alignment_is_not_a_spikein(tmp_path):
-    """THE supplementary test, and a behaviour change: `_READ_CHIMERA`'s only
+    """THE supplementary test, and a behavior change: `_READ_CHIMERA`'s only
     at-or-above-threshold alignment is SUPPLEMENTARY, so the read is NOT a spike-in.
 
     Scoring identity per row and DISTINCT-ing to a read would mark it — a short local

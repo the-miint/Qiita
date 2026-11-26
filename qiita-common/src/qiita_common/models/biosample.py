@@ -327,18 +327,18 @@ BIOSAMPLE_DISPLAY_HOST_TAXON_ID = "host taxon id"
 BIOSAMPLE_DISPLAY_TAXON_ID = "taxon id"
 BIOSAMPLE_DISPLAY_QIITA_SAMPLE_TYPE = "qiita sample type"
 
-# The two `qiita.missing_value_reason` names the host-filter resolver RECOGNISES
+# The two `qiita.missing_value_reason` names the host-filter resolver RECOGNIZES
 # — i.e. the two that say something definite about whether a host exists.
 #
 # Deliberately not an exhaustive enum of the INSDC vocabulary. The other reasons
 # ('not collected', 'restricted access', …) exist in the DB and
-# have no constant here ON PURPOSE: recognising a reason is an explicit act that
+# have no constant here ON PURPOSE: recognizing a reason is an explicit act that
 # promotes it from "abort" to "proceed", and an enum listing every reason would
 # invite exactly the mechanical widening the fail-closed rule is there to stop.
 MISSING_REASON_NOT_APPLICABLE = "not applicable"
 MISSING_REASON_CONTROL_SAMPLE = "missing: control sample"
 
-# Written by the ENA import for a taxon it cannot fill; the resolver does not recognise it.
+# Written by the ENA import for a taxon it cannot fill; the resolver does not recognize it.
 MISSING_REASON_NOT_PROVIDED = "not provided"
 
 # The terminology `taxon_id` / `host_taxon_id` name their terms in, and the term_ids of
@@ -364,7 +364,7 @@ NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
 
 
 class MissingReasonRef(BaseModel):
-    """Resolved-once shape for a metadata text value recognised as a marker
+    """Resolved-once shape for a metadata text value recognized as a marker
     for an intentionally-missing entry. Carries the qiita.missing_value_reason
     row's idx (the FK target on *_metadata.value_missing_reason_idx) and
     the matched reason name. `kind` discriminates this variant from other

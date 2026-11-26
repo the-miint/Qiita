@@ -532,7 +532,7 @@ async def test_lifecycle_patches_require_the_lifecycle_scope(
 ):
     """wet_lab_admin holds prep_sample:write but not mask_definition:lifecycle —
     deciding that published results came from a filter we no longer stand behind is
-    a system_admin judgement."""
+    a system_admin judgment."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool

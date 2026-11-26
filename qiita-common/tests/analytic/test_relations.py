@@ -24,7 +24,7 @@ _CREATE_BUILDERS = {
     "ogu_output_table_sql": lambda: ft.ogu_output_table_sql(populated=True),
     "genome_label_table_sql": lambda: ft.genome_label_table_sql("mint_src"),
     "sample_label_table_sql": lambda: ft.sample_label_table_sql("mint_src"),
-    "labelled_relation_sql": lambda: ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=10)),
+    "labeled_relation_sql": lambda: ft.labeled_relation_sql(clearance=ft.LabelClearance(rows=10)),
     "taxonomy_table_sql": lambda: ft.taxonomy_table_sql("taxonomy_stream"),
     "taxonomy_sidecar_sql": ft.taxonomy_sidecar_sql,
     "denovo_map_table_sql": lambda: ft.denovo_map_table_sql("read_parquet('d.parquet')"),
@@ -55,9 +55,9 @@ def test_coverage_input_is_a_view_and_woltka_input_is_a_table():
     assert "CREATE TABLE" in ft.alignment_table_sql("s")
 
 
-def test_the_labelled_relation_is_a_view():
+def test_the_labeled_relation_is_a_view():
     """Its one reader is a COPY on the caller's own connection, so materializing would
     hold a second full copy of the output alive exactly while the writer builds its
     own — the same reason `cov_alignments` is a view."""
-    sql = ft.labelled_relation_sql(clearance=ft.LabelClearance(rows=3))
-    assert sql.startswith(f"CREATE VIEW {ft.LABELLED_RELATION} ")
+    sql = ft.labeled_relation_sql(clearance=ft.LabelClearance(rows=3))
+    assert sql.startswith(f"CREATE VIEW {ft.LABELED_RELATION} ")

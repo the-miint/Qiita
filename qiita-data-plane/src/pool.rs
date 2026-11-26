@@ -360,7 +360,7 @@ impl LakePool {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PoolState> {
         // Nothing under this guard can panic: the work is a `Vec` pop or push and
         // a counter, with every build and reset done outside the lock. The
-        // recovery is here because honouring a poison flag we cannot explain
+        // recovery is here because honoring a poison flag we cannot explain
         // would turn one unexplained panic into a data plane that refuses every
         // request for the life of the process.
         self.state

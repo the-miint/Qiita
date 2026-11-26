@@ -85,7 +85,7 @@ async def mint_exported_identifier_map(
 
     There is deliberately no refusal for a missing `biosample_accession`. The
     label this route replaced could not be composed without one; an `export_id`
-    always can, so an unaccessioned sample is now labellable rather than a 422.
+    always can, so an unaccessioned sample is now labelable rather than a 422.
     """
     cohort = (
         await authorize_completed_alignment_cohort(

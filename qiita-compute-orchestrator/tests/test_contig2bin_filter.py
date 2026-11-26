@@ -78,7 +78,7 @@ def _run(rows: list[tuple[str, ...]], tmp_path: Path) -> tuple[list[str], list[s
 def test_a_numbered_bin_passes_through_carrying_its_id(tmp_path: Path) -> None:
     """The kept row is the input row: contig in column 1, bin id in column 2.
 
-    This is the `$4` regression stated as behaviour. Reading the id from a column
+    This is the `$4` regression stated as behavior. Reading the id from a column
     the table does not have does not fail — it yields a row whose bin id is the
     empty string, which is a valid-looking table naming one bin.
     """

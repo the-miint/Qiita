@@ -904,7 +904,7 @@ async def run_workflow(
             bound.update(outputs)
 
         # Anything below this line is "finalize" stage — failures here
-        # must classify as FINALIZE (with NULL step_name) to honour the
+        # must classify as FINALIZE (with NULL step_name) to honor the
         # `work_ticket_failure_step_name_consistent` DB CHECK. The inner
         # try wraps the success path so a BackendFailure raised by
         # `_atomic_transition` (e.g. PROCESSING → COMPLETED couldn't fire
@@ -1178,7 +1178,7 @@ async def _run_entry_with_retry(
     attempt = 0
     # How many already-terminal attempts this invocation skipped past. Non-zero
     # only on a resume/redrive, and it means the fresh submit below was never
-    # authorised by the retry budget — see the guard after the skip branches.
+    # authorized by the retry budget — see the guard after the skip branches.
     skipped_terminal_attempts = 0
     # Escalating memory floor: starts at the HIGHER of the ticket's static
     # override and whatever a prior run's ladder already escalated this step to
@@ -1261,7 +1261,7 @@ async def _run_entry_with_retry(
             attempt += 1
             continue
         # Skipping dead attempts lands us on a FRESH submit, which the retry
-        # budget has not authorised: `max_retries` is enforced in the
+        # budget has not authorized: `max_retries` is enforced in the
         # `except BackendFailure` arm below, and we never went through it. The
         # gap is reachable when a prior process recorded the attempt `failed`
         # and died before transitioning the ticket — reconcile then re-drives a

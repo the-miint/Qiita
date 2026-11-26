@@ -4,7 +4,7 @@ that MINTED it — and to nothing else.
 The guard this feeds (`mint_or_reuse_sequence_range`) reuses an orphaned range only
 when it was minted by the SAME work_ticket. So a mis-attribution is not a cosmetic
 bug: stamping a range with a ticket that merely COLLIDED with it (mint → 409 →
-FAILED) makes that ticket "recognise" the range as its own on a later `ticket run`,
+FAILED) makes that ticket "recognize" the range as its own on a later `ticket run`,
 reuse it, and register the sample's reads a SECOND time. DuckLake has no uniqueness,
 so the duplication is silent and permanent.
 
@@ -277,7 +277,7 @@ async def test_backfill_refuses_when_a_pool_ingest_also_could_have_minted(sample
     which mints a range per sample. It also carries a stray per-sample loader ticket
     created BEFORE that — so the range postdates the stray ticket, and a count that
     only looked at per-sample loaders would see exactly one candidate and credit it.
-    A later `ticket run` on that stray ticket would then "recognise" the range as its
+    A later `ticket run` on that stray ticket would then "recognize" the range as its
     own, reuse it, and register the sample's reads a SECOND time.
 
     Both shapes are candidates, so the count is 2 → ambiguous → NULL → fails closed.

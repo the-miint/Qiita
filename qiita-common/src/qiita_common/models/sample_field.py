@@ -1,7 +1,7 @@
 """Entity-agnostic wire shapes for the sample field surfaces — the study-local
 field create/read shapes and the global field registry read shape.
 
-Each sample-family-specific entity specialises these by redeclaring only the idx
+Each sample-family-specific entity specializes these by redeclaring only the idx
 fields that carry its entity-qualified name on the wire; every other column,
 and the purely-local vs globally-linked mode coupling, lives here.
 """

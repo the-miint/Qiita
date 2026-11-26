@@ -320,7 +320,7 @@ async def update_assembly_sample_status_route(
 ) -> AssemblySampleStatusUpdateResponse:
     """Withdraw (or restore) specific RUNS of one processing identity.
 
-    Bulk, because the judgement is made per cohort. Idempotent, and the response
+    Bulk, because the judgment is made per cohort. Idempotent, and the response
     separates what changed from what already held the state, what has no gate row
     under this run, and the two states left alone; which states those are, and
     why, is on `repositories.processing.set_assembly_sample_states`.

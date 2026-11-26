@@ -138,7 +138,7 @@ _TWO_COLOR_MODEL_SUBSTRINGS = ("nextseq", "novaseq", "miniseq")
 # SCALAR, evaluated inline on this connection, so a regular view is the simplest
 # named relation each seam can target. There is no output accumulator table: the
 # two seams' SELECTs are UNION ALL'd straight into the final COPY so DuckDB
-# streams the whole transform to Parquet without materialising it.
+# streams the whole transform to Parquet without materializing it.
 _SE = "qc_se"
 _PE = "qc_pe"
 
@@ -331,7 +331,7 @@ def _qc_se_select(
     are NULL (no mate). The reason comes from `filter_read` on the TRIMMED
     sequence (so a too-short trimmed read is qc_too_short, never pass). Struct
     fields use bracket syntax (`s['field']`), unambiguous against a column alias."""
-    # `inner` materialises the trim struct(s) as named columns so the outer
+    # `inner` materializes the trim struct(s) as named columns so the outer
     # SELECT can read the trimmed seq/qual, the per-end trim counts, and the
     # filter_read result without re-evaluating the trim functions. polyG is a
     # 3'-only second pass on the adapter-trimmed seq; when off, the trimmed

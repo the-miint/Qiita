@@ -205,7 +205,7 @@ async def run_native_job(
     traceback goes to the stderr narrative), and leaves the final kind to
     the backend's state-based classification.
     Every pyarrow and Flight exception that
-    `is_data_plane_transient` does not recognise propagates for the same reason, which is
+    `is_data_plane_transient` does not recognize propagates for the same reason, which is
     what the pyarrow arm's placement above the builtin arms buys: an
     `ArrowInvalid` is a `ValueError` and an `ArrowNotImplementedError` is a
     `NotImplementedError`, and neither is the thing those arms describe.

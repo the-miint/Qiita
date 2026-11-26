@@ -324,7 +324,7 @@ async def plan_and_submit_alignments(
     route uses) resolves it FROM THE PLATFORM via `_BLOCK_TARGET_READS_BY_PLATFORM` —
     10M for short reads, 1M for long reads, whose per-shard re-scan is byte-driven and
     would otherwise blow the align step's walltime. An explicit value overrides that,
-    which exists as a test seam for tiling behaviour at sizes a fixture can reach
+    which exists as a test seam for tiling behavior at sizes a fixture can reach
     (`test_align_plan_explicit_target_reads_overrides_the_platform`); no production
     caller passes it.
 

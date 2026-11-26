@@ -36,7 +36,7 @@ The modules, in the order a recipe reaches them:
 | `reconcile` | the de novo arm's own relations, and precedence between the two arms |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
 | `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
-| `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
+| `ogu` | `woltka_ogu`'s input and output — today's one table flavor |
 | `label` | the relabel to public handles |
 | `sidecar` | the taxonomy sidecar and the sheared tree |
 | `write` | the Parquet / BIOM / tree writers |
@@ -81,12 +81,12 @@ from .gate import (
     streamed_alignment_table_sql,
 )
 from .label import (
-    LABELLED_COLUMNS,
-    LABELLED_SCHEMA,
+    LABELED_COLUMNS,
+    LABELED_SCHEMA,
     LabelClearance,
     check_relabel_diagnostics,
     genome_label_table_sql,
-    labelled_relation_sql,
+    labeled_relation_sql,
     published_membership_sql,
     relabel_diagnostics_sql,
     sample_label_table_sql,
@@ -128,7 +128,7 @@ from .relations import (
     FEATURE_TOPOLOGY_VIEW,
     GENOME_LABEL_TABLE,
     GENOME_LENGTHS_TABLE,
-    LABELLED_RELATION,
+    LABELED_RELATION,
     MAP_TABLE,
     OGU_INPUT_TABLE,
     OGU_OUTPUT_TABLE,
@@ -203,9 +203,9 @@ __all__ = [
     "GENOME_LABEL_TABLE",
     "GENOME_LENGTHS_TABLE",
     "GateClearance",
-    "LABELLED_COLUMNS",
-    "LABELLED_RELATION",
-    "LABELLED_SCHEMA",
+    "LABELED_COLUMNS",
+    "LABELED_RELATION",
+    "LABELED_SCHEMA",
     "LabelClearance",
     "MAP_TABLE",
     "OGU_INPUT_TABLE",
@@ -270,7 +270,7 @@ __all__ = [
     "gated_alignment_table_sql",
     "genome_label_table_sql",
     "genome_lengths_table_sql",
-    "labelled_relation_sql",
+    "labeled_relation_sql",
     "map_table_sql",
     "ogu_input_count_sql",
     "ogu_input_statements",

@@ -130,7 +130,7 @@ def _route_settings(ingest_root):
     it (`test_landing.py` does exactly that). Under `pytest -n auto --dist worksteal`
     the worker assignment shifts with the test set, so that leak is load-bearing and
     invisible: add tests anywhere in the suite and a route test can start 500ing with
-    "Settings not initialised" for reasons entirely unrelated to it.
+    "Settings not initialized" for reasons entirely unrelated to it.
 
     This makes the route tests own their Settings instead of inheriting one by
     accident. Save/restore the prior value so we don't leak in turn.
@@ -1423,7 +1423,7 @@ async def fail_safe_client(postgres_pool):
     test instead of re-raising the underlying exception. Use when the test
     deliberately drives a route to a 500 (e.g., atomicity tests injecting
     an audit failure). Depends on postgres_pool so the app's pool state is
-    initialised before the request runs."""
+    initialized before the request runs."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool

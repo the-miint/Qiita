@@ -558,7 +558,7 @@ async def test_positive_controls_are_not_expected_empty_wells(ctx):
 # ---------------------------------------------------------------------------
 # is_control_sample — the zero-read read-mask classifier
 # ---------------------------------------------------------------------------
-# Shares _RECOGNISED_MISSING_REASON + the metadata read with resolve_host_filter,
+# Shares _RECOGNIZED_MISSING_REASON + the metadata read with resolve_host_filter,
 # so the "is this a control" answer here can never drift from the CONTROL outcome
 # above. These pin that the read-mask reads binder can tell a blank apart from an
 # unexpected-empty data well when a sample yields zero stored reads.
@@ -741,8 +741,8 @@ async def test_batch_agrees_with_single_sample_for_every_outcome(ctx):
     biosamples["control"] = await _make_biosample(ctx)
     await _set_host_missing_reason(ctx, biosamples["control"], MISSING_REASON_CONTROL_SAMPLE)
 
-    biosamples["unrecognised_reason"] = await _make_biosample(ctx)
-    await _set_host_missing_reason(ctx, biosamples["unrecognised_reason"], "not collected")
+    biosamples["unrecognized_reason"] = await _make_biosample(ctx)
+    await _set_host_missing_reason(ctx, biosamples["unrecognized_reason"], "not collected")
 
     biosamples["absent"] = await _make_biosample(ctx)
 

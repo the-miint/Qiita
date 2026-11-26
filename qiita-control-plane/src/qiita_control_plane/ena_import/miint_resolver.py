@@ -116,7 +116,7 @@ def _query_ena_sample_attributes(
 ) -> list[tuple[str, dict[str, list[str]]]]:
     """One `(sample_accession, attributes)` row per sample, mapping each tag to its distinct
     non-NULL values sorted, for a study or a list of samples. Entries are tag-ordered so a
-    collision of normalised tags resolves the same way every run."""
+    collision of normalized tags resolves the same way every run."""
     with connect_with_miint_staged() as con:
         return con.execute(
             "SELECT sample_accession,"

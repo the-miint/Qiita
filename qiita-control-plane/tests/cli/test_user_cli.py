@@ -4580,7 +4580,7 @@ def test_render_pool_completion_summarizes_fully_processed(capsys):
 
 def test_render_pool_completion_flags_incomplete_and_stranded(capsys):
     """A pool with stranded (never-submitted) samples reads NOT fully processed
-    with the never-submitted count front-and-centre, instead of the operator
+    with the never-submitted count front-and-center, instead of the operator
     having to spot it in the raw JSON (the stranded-samples incident that
     motivated this surface was originally found only by hand-written SQL)."""
     from qiita_control_plane.cli.user.pool import _render_pool_completion
@@ -5278,7 +5278,7 @@ def test_pacbio_submission_requires_syndna_reference(capsys):
 
 def test_pacbio_submission_rejects_a_resolved_minimap2_stage(capsys):
     """Long reads are rype-only: the chain binds no minimap2 index, so a resolution
-    that carries a minimap2 stage on a PacBio pool cannot be honoured. Silently
+    that carries a minimap2 stage on a PacBio pool cannot be honored. Silently
     dropping it would mask against less than the profile declares, so it aborts and
     points at the profile to fix."""
     from qiita_control_plane.cli.user.pool import _assert_pacbio_submission_coherent

@@ -106,7 +106,7 @@ async def links(postgres_pool):
 
 async def test_batched_lookup_matches_the_per_sample_one(links):
     """The batched result must equal the single-sample function, sample for
-    sample. That equivalence is the entire licence to use the fast path in the
+    sample. That equivalence is the entire license to use the fast path in the
     access gate; if it ever drifts, the gate authorizes against a different set
     of studies than the one a reader would check by hand."""
     pool = links["pool"]

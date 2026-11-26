@@ -58,7 +58,7 @@ class HostFilterOutcome(StrEnum):
     PASS_THROUGH = "pass_through"
     # A control/blank. It has no host of its own, but it is not "pass-through"
     # either: what it gets filtered against is decided at the pool level, by its
-    # neighbours. A marker for the caller, not an answer.
+    # neighbors. A marker for the caller, not an answer.
     CONTROL = "control"
     # We cannot tell. Abort unless the caller supplies an explicit override.
     UNRESOLVED = "unresolved"

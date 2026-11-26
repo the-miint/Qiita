@@ -6,7 +6,7 @@ container, after the splitter, and writes each `read_myloasm_*` table verbatim i
 declared output, so no later step can read it; this dump is how its read placements
 reach `assembly_load`.
 
-The behavioural tests run the script against the real miint this component's
+The behavioral tests run the script against the real miint this component's
 conftest stages, over committed myloasm 0.6.0 and 0.7.0 output
 (`tests/data/myloasm/`). The static pins cover the wiring that only runs inside the
 built image.

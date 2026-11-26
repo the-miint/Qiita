@@ -180,7 +180,7 @@ def write_feature_sequence_chunks(
 
     **Cost tradeoff.** Each batch re-scans the full input glob, filtered
     by `WHERE rc.sequence_hash = ANY(?)` (applied during the Parquet scan
-    via late materialisation). Scan dominates per-batch wall time, so the
+    via late materialization). Scan dominates per-batch wall time, so the
     number of batches matters more than per-batch size — the bin-pack
     keeps it to one batch per ~`CHUNK_BUDGET_PER_BATCH` chunks."""
     parts_glob = str(reference_sequence_chunks_path / "part_*.parquet")
@@ -227,7 +227,7 @@ def write_feature_sequence_chunks(
             # side to one batch of hashes (so it's the hash-join build and
             # chunk_data streams through the probe, never into the build); the
             # `WHERE ... = ANY(...)` on the input column keeps the filter on the
-            # Parquet scan so late materialisation skips chunk_data for
+            # Parquet scan so late materialization skips chunk_data for
             # non-matching rows. The insert is bounded by the batch and spills
             # to temp_directory under pressure.
             conn.execute(
@@ -244,7 +244,7 @@ def write_feature_sequence_chunks(
                 [batch_hashes, parts_glob, batch_hashes],
             )
             # Phase 2 — sort THIS part in isolation and write it. The sort sees
-            # only the materialised batch (≤ CHUNK_BUDGET_PER_BATCH chunks),
+            # only the materialized batch (≤ CHUNK_BUDGET_PER_BATCH chunks),
             # never the 30 GB glob, so it fits the cap (spilling if needed). The
             # per-part `ORDER BY feature_idx` clusters row groups so a
             # `WHERE feature_idx IN (...)` DoGet prunes row groups WITHIN a part;

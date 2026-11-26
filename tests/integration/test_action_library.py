@@ -270,7 +270,7 @@ async def test_library_write_membership_raises_on_unknown_feature_idx(
 # =============================================================================
 # Edge-case contracts inherited from the deleted test_feature_minting.py
 # =============================================================================
-# These cover behaviours the pre-Parquet route exercised explicitly:
+# These cover behaviors the pre-Parquet route exercised explicitly:
 # mixed novel/reused counts, cross-call dedup, genome-write idempotency,
 # and the new contract for shapes the old route rejected at HTTP 422
 # (empty input, within-batch duplicate hashes, half-set genome metadata).

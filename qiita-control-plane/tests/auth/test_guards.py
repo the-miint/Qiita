@@ -1,5 +1,5 @@
 """Unit tests for guards. Guards are FastAPI deps; we exercise them by
-synthesising the dep input directly (no FastAPI request needed).
+synthesizing the dep input directly (no FastAPI request needed).
 
 Most guards in this module operate purely on a passed-in Principal and
 require no DB. `require_study_access` is the exception — it takes the
@@ -404,7 +404,7 @@ def test_require_complete_profile_422_when_incomplete():
 # require_study_access (DB-bound)
 # ---------------------------------------------------------------------------
 # Resource-access guards consult the DB; tests below seed real rows. Each
-# test calls the dep directly with a synthesised Principal and the
+# test calls the dep directly with a synthesized Principal and the
 # postgres_pool fixture instead of going through a FastAPI request.
 
 
@@ -427,7 +427,7 @@ async def _seed_user_for_study(pool, *, suffix: str, role: SystemRole = SystemRo
 
 def _human_with_idx(principal_idx: int, role: SystemRole = SystemRole.USER):
     """HumanUser pinned to a given principal_idx. Required for DB tests
-    where the synthesised principal must match a real seeded user."""
+    where the synthesized principal must match a real seeded user."""
     from qiita_control_plane.auth.principal import HumanUser
 
     return HumanUser(
@@ -975,7 +975,7 @@ async def test_tier_on_all_studies_compares_by_rank_not_string(study_access_ctx,
 
 @pytest.mark.db
 async def test_tier_on_all_studies_admin_wrapper_is_unchanged(study_access_ctx):
-    """The ADMIN-specific entry point keeps its exact behaviour and message.
+    """The ADMIN-specific entry point keeps its exact behavior and message.
 
     Its two production call sites (routes/sequenced_sample.py, and
     work_ticket_submit.py via _check_prep_sample_study_access) must not notice

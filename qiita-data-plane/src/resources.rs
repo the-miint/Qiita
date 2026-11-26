@@ -3,7 +3,7 @@
 //! Nothing here is read by DuckDB. DuckDB sizes every database it opens from
 //! the process's own cgroup — `memory_limit` at about 80% of it, `threads` from
 //! `cpu.max` — so without a ceiling of our own, each concurrently open database
-//! sizes itself against the whole host and N of them authorise N times the host.
+//! sizes itself against the whole host and N of them authorize N times the host.
 //! The pool needs one number to divide instead.
 //!
 //! The precedence is the one `the-miint/RYpe` uses in `src/memory.rs`
@@ -18,7 +18,7 @@
 //! The compute orchestrator sizes its own DuckDB sessions from a cgroup too
 //! (`qiita_compute_orchestrator.miint`), and takes the tightest limit across the
 //! ancestor chain for the same reason. The two converge on that and on nothing
-//! else: it collects v2 and v1 files together and minimises over both, where this
+//! else: it collects v2 and v1 files together and minimizes over both, where this
 //! reads v2 and falls to v1 only when the unified line names no path; it reads the
 //! mount root even when the process's own path is `/`, where `cgroup_v2_path`
 //! declines; it treats a v1 value at or above the host total as unlimited, where

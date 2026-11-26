@@ -84,7 +84,7 @@ def resolve_blob_input(
 
     A raw companion file is returned unchanged. A chunked-BLOB upload Parquet is
     stitched into `out_path` in `chunk_index` order, fetched in batches so a
-    multi-GB jplace never materialises in memory.
+    multi-GB jplace never materializes in memory.
     """
     if not _is_chunked_blob_upload(conn, path):
         return path

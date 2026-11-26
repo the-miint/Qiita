@@ -693,7 +693,7 @@ def _sequenced_sample_core_row_dict(
     """Map a JOIN(sequenced_sample, prep_sample) row's columns to
     SequencedSampleResponse field names.
 
-    Centralises the column -> field mapping (ss.idx -> sequenced_sample_idx,
+    Centralizes the column -> field mapping (ss.idx -> sequenced_sample_idx,
     GREATEST(...) -> effective_updated_at). last_metadata_change_at is
     `metadata_last_change`, as on the biosample reads. Excludes the metadata
     dicts and caller_system_role. Runs no DB queries.

@@ -1,7 +1,7 @@
 """Native job: a fastqc-equivalent per-sample QC summary over a reads.parquet.
 
 A pure `reads.parquet -> qc_report.json` reporting step — it reads but never
-mutates the reads, so it changes no filtering behaviour. It computes a
+mutates the reads, so it changes no filtering behavior. It computes a
 single-pass summary (per-mate read/base counts, mean quality, GC and N content,
 length stats) plus three distributions (per-sequence mean-quality, GC-percent,
 and length histograms) straight from the decoded `qual1`/`qual2` arrays and the

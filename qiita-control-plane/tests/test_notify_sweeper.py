@@ -521,19 +521,19 @@ async def test_digest_says_nothing_active_when_batch_is_done(env):
 
 
 async def test_active_count_is_scoped_to_the_originator(env):
-    # A busy neighbour's in-flight tickets must not inflate my count.
+    # A busy neighbor's in-flight tickets must not inflate my count.
     me = await env.user()
-    neighbour = await env.user()
+    neighbor = await env.user()
     mine = await env.ticket(originator=me)
     await env.inflight(originator=me, state="processing")
     for _ in range(5):
-        await env.inflight(originator=neighbour, state="processing")
+        await env.inflight(originator=neighbor, state="processing")
     lo, hi = await env.minmax([mine])
     transport = CaptureTransport()
 
     await sweep_once(env.pool, _settings(), transport, now=hi + timedelta(seconds=200))
 
-    assert len(transport.sent) == 1  # the neighbour has nothing terminal to report
+    assert len(transport.sent) == 1  # the neighbor has nothing terminal to report
     _to, rendered, _mid = transport.sent[0]
     assert "1 still active (1 processing)." in rendered.text
 

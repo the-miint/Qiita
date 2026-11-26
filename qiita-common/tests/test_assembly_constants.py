@@ -2,7 +2,7 @@
 
 `register_contig_attribute_table` builds SQL and executes it on a caller's
 connection, so — following this package's convention for `analytic` — its
-behaviour is pinned here rather than in either consumer's suite. Both writers of
+behavior is pinned here rather than in either consumer's suite. Both writers of
 `qiita.assembly_membership` go through it, and neither can observe a
 misread: the values land in nullable columns nothing else cross-checks.
 """
@@ -99,7 +99,7 @@ def test_a_reordered_header_is_rejected_rather_than_silently_transposed(tmp_path
         _read(tmp_path, "\t".join(swapped) + "\ns1\tyes\trawA\t29\t1.5\n")
 
 
-def test_an_unrecognised_header_is_rejected(tmp_path):
+def test_an_unrecognized_header_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="header"):
         _read(tmp_path, "a\tb\tc\td\te\ns1\trawA\tyes\t29\t1.5\n")
 

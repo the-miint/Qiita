@@ -416,7 +416,7 @@ async def test_align_plan_explicit_target_reads_overrides_the_platform(ctx, plan
     Asserted through the RESULT rather than by recording the argument: a target of 100
     against the fixture's 300 reads must tile into 3 blocks of exactly 100, which
     neither the platform default (1M here — the run is long-read) nor the short-read
-    10M could ever produce. So this pins that the value is honoured end to end, not
+    10M could ever produce. So this pins that the value is honored end to end, not
     merely passed along."""
     from qiita_control_plane.main import app
 

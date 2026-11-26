@@ -184,7 +184,7 @@ impl QiitaFlightService {
 /// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
 ///
 /// - `register_files` — the dest name is deterministic for the registration
-///   (see `lake_dest_filename`), so a replay recognises the earlier call's
+///   (see `lake_dest_filename`), so a replay recognizes the earlier call's
 ///   files: it returns a committed registration without writing, and fails
 ///   closed otherwise (the replay check in `register_files` has the cases).
 /// - `delete_reference` / `delete_pool_reads` /

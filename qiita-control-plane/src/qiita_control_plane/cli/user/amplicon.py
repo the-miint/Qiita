@@ -1,4 +1,4 @@
-"""submit-golay-demux — the amplicon (Rapid 16S) analogue of submit-bcl-convert.
+"""submit-golay-demux — the amplicon (Rapid 16S) analog of submit-bcl-convert.
 
 The submitter names a run id; the control plane resolves it to the BCL run
 folder (POST /run-folder/inspect) and reads the instrument identity from its

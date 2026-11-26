@@ -3,7 +3,7 @@
 The analytic itself is `qiita_common.analytic`, shared with the server-side
 compute job; this module is the half that only a client has: fetching the two
 identifier maps over REST, staging every input into the user's own DuckDB,
-relabelling the result to public handles, and writing the bundle — the table plus
+relabeling the result to public handles, and writing the bundle — the table plus
 the map needed to read it — as one all-or-nothing commit.
 
 Nothing here reaches the database. The three data inputs arrive as Flight streams
@@ -292,7 +292,7 @@ def _assembly_genome_map_or_none(
 
     **A 404 here is the design's graceful path, not an error.** A sample whose
     assembly produced no contigs has no de novo arm; the combined table degrades to
-    plain reference alignment for it, which is the stated behaviour rather than a
+    plain reference alignment for it, which is the stated behavior rather than a
     state to refuse. Every other status still propagates — a 422 on an unminted map
     and a 413 over the cap are refusals whose whole point is that they are not
     silently absorbed.
@@ -912,18 +912,18 @@ def _published_genome_idxs(con) -> list[int]:
 
 def _relabel(con) -> ft.LabelClearance:
     """Attach the public handles to the counts, refusing anything that would publish a
-    wrong table, and write `LABELLED_RELATION`. Returns the clearance, whose `rows` is the
+    wrong table, and write `LABELED_RELATION`. Returns the clearance, whose `rows` is the
     size of the table now written.
 
     Returns the clearance, whose `rows` is the size of the relation now defined.
     """
     clearance = _cleared(con, ft.relabel_diagnostics_sql(), ft.check_relabel_diagnostics)
-    con.execute(ft.labelled_relation_sql(clearance=clearance))
+    con.execute(ft.labeled_relation_sql(clearance=clearance))
     return clearance
 
 
 # The two table formats, and the one to reach for by default. They carry the same
-# numbers — the relabelled table is `(sample_id, feature_id, value)` either way — so
+# numbers — the relabeled table is `(sample_id, feature_id, value)` either way — so
 # this is a choice of who reads the file next, never of what it contains: Parquet is
 # what the rest of this system and every dataframe tool read, BIOM is for the
 # microbiome tools that require it. One or the other, never both.
@@ -1289,7 +1289,7 @@ def _write_bundle(
     manifest: Callable[[list[Path]], dict[str, Any]],
     clearances: dict[str, Any],
 ) -> list[Path]:
-    """Write the bundle — the relabelled table at `table_path`, the exported-identifier map
+    """Write the bundle — the relabeled table at `table_path`, the exported-identifier map
     and the manifest beside it, and one file per companion in `clearances` — and return the
     files written.
 
@@ -2052,7 +2052,7 @@ def _run_build(
     pools = _pools(args)
     listing, per_pool = _pool_listings(args.base_url, token, pools)
     # One verified summary per alignment, read several times: the reference the table is
-    # relabelled through, the digest the manifest cites, the aligner it names. Verifying
+    # relabeled through, the digest the manifest cites, the aligner it names. Verifying
     # it once and reading it is what keeps those three from being three separate acts of
     # trust.
     anchor_summary = _alignment_summary(listing, alignment_idx=args.alignment_idx)

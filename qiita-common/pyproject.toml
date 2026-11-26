@@ -11,7 +11,7 @@ dependencies = [
     "pyyaml>=6.0",
     # `qiita_common.analytic` builds SQL text and opens no connection, but the
     # analytic it describes only means anything against duckdb+miint, so its
-    # behaviour is pinned by tests that execute it here rather than in a
+    # behavior is pinned by tests that execute it here rather than in a
     # consumer's suite. Exact, and equal to every other DuckDB pin in the repo:
     # see tests/test_duckdb_version_sync.py.
     "duckdb==2.0.0",

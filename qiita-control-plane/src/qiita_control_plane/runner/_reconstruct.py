@@ -305,7 +305,7 @@ def _staged_register_files(staging_dir: Path) -> dict[str, str]:
         file's stem (single-file table).
       - Top-level subdirs containing `*.parquet` files register each part as the
         table named after the directory (multi-file table). The filename carries
-        the subdir prefix relative to staging_dir; the data plane normalises to
+        the subdir prefix relative to staging_dir; the data plane normalizes to
         basename when placing each part in the permanent per-table directory.
 
     The multi-file form exists for `reference_sequence_chunks` — at GG2 scale a
@@ -393,7 +393,7 @@ async def _dispatch_action(
     A primitive raising (plain Python or BackendFailure) marks this attempt's
     progress row failed before the exception propagates to the retry / outer
     handler — which owns the work_ticket-level FAILED transition. A data-plane
-    failure `is_data_plane_transient` recognises is raised as a transient
+    failure `is_data_plane_transient` recognizes is raised as a transient
     `DATA_PLANE_TRANSIENT` BackendFailure, so the retry loop re-runs the entry;
     any other exception is re-raised unchanged."""
     await step_progress.record_submitting(
@@ -586,7 +586,7 @@ async def _run_action_primitive(
         return {}
 
     if entry.name == LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP:
-        # Assembly analogue of write-membership: link this prep_sample's
+        # Assembly analog of write-membership: link this prep_sample's
         # assembly-run contigs to qiita.assembly_membership, tagged by
         # (kind, bin_id). Inputs are resolved by their fixed binding names — not
         # positionally — so a YAML reorder can't silently swap them. bin_map +

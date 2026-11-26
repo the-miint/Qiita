@@ -340,7 +340,7 @@ async def test_a_skeleton_job_is_still_reported_as_unimplemented(monkeypatch, tm
 
 async def test_a_pyarrow_error_that_is_not_a_data_plane_condition_propagates(monkeypatch, tmp_path):
     """A job's own Arrow or Parquet failure is not a data-plane condition, so it keeps
-    propagating uncaught rather than being relabelled retriable."""
+    propagating uncaught rather than being relabeled retriable."""
     import pyarrow
 
     async def execute(inputs, workspace):
@@ -397,7 +397,7 @@ async def test_unknown_exception_propagates(monkeypatch, tmp_path):
     """Exceptions outside the classified set (FileNotFoundError,
     ValueError, NotImplementedError) propagate uncaught so the
     orchestrator's logs surface them with full traceback rather than
-    silently re-labelling them."""
+    silently re-labeling them."""
 
     class CustomError(Exception):
         pass

@@ -779,7 +779,7 @@ async def create_masked_read_export_ticket(
 
     Gated by system_admin PLUS admin:masked_read_export. Both identifiers are
     mandatory (Pydantic gt=0), so the signed filter is always non-empty; the
-    route re-asserts that before signing as defence in depth — the data plane's
+    route re-asserts that before signing as defense in depth — the data plane's
     empty-filter path would otherwise dump every sample's pass reads. Minted at
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).

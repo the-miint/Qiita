@@ -178,7 +178,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # every raw read, or — when an upstream mask is bound — only its `pass`
             # reads (the spike-ins were never exported). A spike-in must NOT reach
             # infer_trim: absent from lima's output, it would come back NULL/NULL and
-            # be mislabelled twist_no_adaptor. Its row is carried verbatim instead.
+            # be mislabeled twist_no_adaptor. Its row is carried verbatim instead.
             # `_ORIG` is exactly the reads lima_export sent to lima: every raw read,
             # or — when an upstream mask is bound — only its `pass` reads (spike-ins
             # were never exported). It exposes `read_id` (the key lima's output is

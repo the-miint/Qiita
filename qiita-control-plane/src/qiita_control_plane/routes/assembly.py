@@ -122,7 +122,7 @@ async def create_assembly_doget_ticket(
     # all. What it newly exposes: `assembled_sequence` is the first
     # sample-derived sequence surface that scope reaches — every other table it
     # opens is reference data or the derived per-read `alignment` slice. The
-    # privacy-sensitive neighbours (Scope.READ_MASKED_DOGET, Scope.READ_DOGET)
+    # privacy-sensitive neighbors (Scope.READ_MASKED_DOGET, Scope.READ_DOGET)
     # are for READ surfaces; these bytes are assembled from the `read_masked`
     # pass-set, which is the assembly workflow's only read input.
     _sa: ServiceAccount = Depends(require_service_with_scope(Scope.TICKET_DOGET)),

@@ -2,7 +2,7 @@
 
 Each test mounts a small ad-hoc FastAPI app with a single /resolve endpoint
 that calls the resolver dep and returns a JSON view of the result. Testing
-the resolver through a dedicated test endpoint isolates its behaviour from
+the resolver through a dedicated test endpoint isolates its behavior from
 route logic.
 """
 

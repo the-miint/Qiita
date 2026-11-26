@@ -31,7 +31,7 @@ def stage_subject(
     *,
     subject_table: str,
 ) -> int:
-    """Materialise a `(read_id, sequence1)` subject TABLE from feature-keyed
+    """Materialize a `(read_id, sequence1)` subject TABLE from feature-keyed
     chunk rows and return its row count.
 
     `source` is any FROM-able relation operand carrying `(feature_idx,
@@ -46,7 +46,7 @@ def stage_subject(
     reference.
 
     A non-temp TABLE (not a VIEW or TEMP): the `GROUP BY` reassembly is a blocking
-    aggregation, so materialise once rather than recompute on every scan the aligner
+    aggregation, so materialize once rather than recompute on every scan the aligner
     issues. Visibility is no longer part of the reason — `save_minimap2_index`
     resolves a TEMP TABLE and a registered Arrow relation as readily as a base table
     (measured; see docs/duckdb-miint.md).

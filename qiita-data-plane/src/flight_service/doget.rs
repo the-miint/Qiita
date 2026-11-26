@@ -30,7 +30,7 @@ const IPC_COMPRESSION_NONE: &str = "none";
 /// even see the client's address. So the default is off and the client opts in
 /// per call. The break-even arithmetic is in `docs/architecture/flight.md`.
 ///
-/// An unrecognised value is an **error, not a fallback**. A client that asked
+/// An unrecognized value is an **error, not a fallback**. A client that asked
 /// for compression, silently did not get it, and measured the result would draw
 /// the wrong conclusion about its own transfer. `lz4` is rejected along with
 /// everything else rather than served as a quietly worse stream.

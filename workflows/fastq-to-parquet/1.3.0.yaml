@@ -98,7 +98,7 @@ context_schema:
     # qiita.sequencing_run. The qc step gates polyG trimming on a 2-color model
     # (NextSeq/NovaSeq/MiniSeq); absent/unknown → polyG OFF. Passed to the qc job
     # via the step's `params:` (instrument_model -> qc.Inputs.instrument_model),
-    # and folded into the mask identity (different polyG behaviour → different mask).
+    # and folded into the mask identity (different polyG behavior → different mask).
     instrument_model:
       type: string
       minLength: 1

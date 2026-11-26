@@ -124,7 +124,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
     assert meta["params"] == {"k": 64, "w": 20, "bucket_name": f"reference_{reference_idx}"}
 
 
-def test_build_rype_index_honours_bucket_name_override(tmp_path, monkeypatch):
+def test_build_rype_index_honors_bucket_name_override(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))

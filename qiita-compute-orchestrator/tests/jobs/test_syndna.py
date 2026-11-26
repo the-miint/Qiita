@@ -74,7 +74,7 @@ def _run(tmp_path, reads, index):
 
 
 def _stub_hits(monkeypatch, hits: list[int]):
-    """Stub align_minimap2: materialise an ALIGNMENT for the flagged reads.
+    """Stub align_minimap2: materialize an ALIGNMENT for the flagged reads.
 
     The seam no longer returns a boolean hit set — it returns the alignment, and the
     identity + aligned-fraction gate is applied downstream (in `_coverage`, shared with

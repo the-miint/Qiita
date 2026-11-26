@@ -397,7 +397,7 @@ async def test_sync_reference_exclusion_primitive_still_raises_non_transient(tmp
 def test_do_action_raises_a_busy_refusal_as_a_flight_error(monkeypatch):
     """A busy refusal leaves `_do_action` as a `FlightUnavailableError` carrying the
     refusal's text, so every caller that catches `FlightError` handles it and the
-    transient classifier still recognises it."""
+    transient classifier still recognizes it."""
     import pyarrow as pa
     import pyarrow.flight as flight
     import pytest

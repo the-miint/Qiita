@@ -13,7 +13,7 @@ Sharding strategy: sort the sharding units lexicographically by their taxonomy
 of approximately even size. This is the mirror image of the read-block planner
 (`block_planner`, fixed target *size* / variable *count*): here the *count* is
 fixed and the size varies. Sorting by lineage keeps taxonomically-adjacent units
-in the same or neighbouring shards, which is what makes classification-based
+in the same or neighboring shards, which is what makes classification-based
 routing tractable.
 
 The tiler is deliberately GENERIC over what a "unit" is — it tiles opaque
@@ -55,7 +55,7 @@ def tile_by_lineage(
     The units are sorted by `(lineage, item_id)` and the sorted sequence is cut
     into `num_shards` contiguous groups of approximately equal size (sizes differ
     by at most one). Because the cut is positional over the lineage-sorted tape,
-    taxonomically-adjacent units land in the same or neighbouring shards.
+    taxonomically-adjacent units land in the same or neighboring shards.
 
     Deterministic and re-derivable from the same `items` + `num_shards`: the
     tiler sorts internally (with `item_id` as a stable tiebreak for units sharing

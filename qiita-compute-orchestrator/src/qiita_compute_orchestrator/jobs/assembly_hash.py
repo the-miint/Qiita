@@ -289,7 +289,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # Reduce the UNBINNED rows to the RESIDUE: drop the noLCG contigs a
             # refined bin already claims, matched on the canonical sequence_hash
             # (module docstring: why the residue and not the whole file, and why
-            # that key and not the contig id). The MAG hash set is materialised
+            # that key and not the contig id). The MAG hash set is materialized
             # first so the DELETE never reads the table it writes; it is narrow
             # (one UUID per distinct binned sequence, no bytes).
             #

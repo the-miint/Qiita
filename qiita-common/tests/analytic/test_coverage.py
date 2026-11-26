@@ -58,7 +58,7 @@ def test_each_scope_calls_its_own_miint_macro(combined):
 def test_every_arm_divides_by_the_same_lengths_relation(scope):
     """Both scopes and both arms hand the macro `GENOME_LENGTHS_TABLE`, so one
     threshold means the same thing wherever a genome came from. That the relation
-    holds the FULL genome length is pinned behaviourally
+    holds the FULL genome length is pinned behaviorally
     (`test_the_denominator_is_the_full_genome_length_in_both_scopes`)."""
     sql = ft.survivor_table_sql(scope, combined=True)
     assert f"{ft.COVERAGE_ALIGNMENTS_VIEW}, {ft.GENOME_LENGTHS_TABLE}, {ft.MAP_TABLE})" in sql
@@ -71,7 +71,7 @@ def test_every_arm_divides_by_the_same_lengths_relation(scope):
 def test_coverage_input_excludes_null_coordinates():
     """A NULL coordinate cannot contribute an interval. `compress_intervals` drops
     such rows silently rather than erroring, so filtering here is what makes the
-    exclusion visible to a reader instead of implicit in an aggregate's behaviour.
+    exclusion visible to a reader instead of implicit in an aggregate's behavior.
     """
     sql = ft.coverage_alignments_view_sql()
     assert "position IS NOT NULL" in sql
@@ -93,7 +93,7 @@ def test_coverage_input_carries_the_sample_key_for_both_scopes(view_sql):
 def test_threshold_is_a_bound_parameter_in_both_scopes():
     """The threshold is bound, never interpolated — no builder takes a float. Both
     scopes compare with `>=`, so a genome sitting exactly on the threshold is kept
-    (pinned behaviourally in the control-plane tier)."""
+    (pinned behaviorally in the control-plane tier)."""
     for scope in ft.CoverageScope:
         sql = ft.survivor_table_sql(scope)
         assert "?" in sql, scope

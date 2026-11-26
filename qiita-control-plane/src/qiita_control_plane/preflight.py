@@ -187,7 +187,7 @@ def pacbio_protocol_by_sample_idx(conn: sqlite3.Connection) -> dict[str, PacbioP
     Keyed on `str(pacbio_sample_idx)` because THAT is the `sequenced_pool_item_id`
     the PacBio composer assigns (see `cli/user/pacbio.py` — the barcode is only the
     BAM-locating key, and it is not unique across PacBio protocols), so this map
-    joins the pool roster directly. The Illumina analogue keys on
+    joins the pool roster directly. The Illumina analog keys on
     `str(illumina_sample_idx)`.
 
     Returns `{}` when the blob is not a PacBio pre-flight, so a caller can probe

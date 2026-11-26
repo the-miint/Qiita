@@ -720,7 +720,7 @@ async def test_teardown_ena_study_graph_leaves_another_accessions_run(postgres_p
     """Tests the case where a second run is named for a different accession.
 
     The runs are the one thing this matches by string rather than by foreign
-    key, so a neighbouring accession sharing the prefix must stay out of range.
+    key, so a neighboring accession sharing the prefix must stay out of range.
     """
     other_accession = f"{ena_graph['accession']}-other"
     other_run_idx = await postgres_pool.fetchval(

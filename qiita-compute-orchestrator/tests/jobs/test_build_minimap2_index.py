@@ -473,7 +473,7 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
 
     The reserve bounds DuckDB, not minimap2 — it is the slack between DuckDB's
     limit and the allocation — so the two modes reaching the same allocation with
-    different limits is the whole behaviour. Run at one allocation so the only
+    different limits is the whole behavior. Run at one allocation so the only
     variable is the mode.
 
     Both arms are asserted against the constants rather than literals, and the
@@ -531,7 +531,7 @@ def test_build_minimap2_index_reserve_differs_by_mode(tmp_path, monkeypatch):
     assert shard_mem < alloc_gb - headroom - build_minimap2_index._MINIMAP2_SHARD_RESERVE_GB
     assert host_mem != shard_mem, (
         "host and shard mode resolved the same DuckDB limit — the per-mode split "
-        "has collapsed back to a single behaviour"
+        "has collapsed back to a single behavior"
     )
 
 

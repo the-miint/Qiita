@@ -1,6 +1,6 @@
 """Pure-unit tests for `align_planner`'s per-platform sizing tables.
 
-The planner's HTTP wiring, mask selection, and 4xx behaviour are covered by the
+The planner's HTTP wiring, mask selection, and 4xx behavior are covered by the
 DB-tier route tests (`tests/routes/test_align_plan.py`). What lives here needs no
 database: the two platform→(aligner, block size) maps and their resolvers, which are
 plain dicts and would otherwise only be exercised incidentally.

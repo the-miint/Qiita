@@ -153,7 +153,7 @@ def _log_level_unset(monkeypatch):
 
     These tests exercise the env-reading path, so an exported LOG_LEVEL decides what
     they assert: `test_configure_logging_defaults_to_info` asserts INFO while calling
-    the very code that would honour a `LOG_LEVEL=DEBUG` in the developer's shell, and
+    the very code that would honor a `LOG_LEVEL=DEBUG` in the developer's shell, and
     failed there for a reason that has nothing to do with the code under test. The
     tests that want the env path set it themselves — this only pins the baseline."""
     monkeypatch.delenv("LOG_LEVEL", raising=False)
@@ -179,7 +179,7 @@ def test_configure_logging_defaults_to_info():
         _restore_root(saved_handlers, saved_level)
 
 
-def test_configure_logging_honours_an_explicit_level():
+def test_configure_logging_honors_an_explicit_level():
     from qiita_common.log import configure_logging
 
     root = logging.getLogger()

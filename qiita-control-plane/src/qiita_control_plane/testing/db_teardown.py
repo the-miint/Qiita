@@ -139,9 +139,9 @@ def _reject_non_identifiers(caller: str, *names: str) -> None:
 
 
 def _as_idx_list(idxs: int | Iterable[int]) -> list[int]:
-    """Normalise a scalar idx, or an iterable of them, into a list.
+    """Normalize a scalar idx, or an iterable of them, into a list.
 
-    Materialising here is what lets an empty run be told from a non-empty one:
+    Materializing here is what lets an empty run be told from a non-empty one:
     an unconsumed iterator reads as truthy whatever it holds.
     """
     if isinstance(idxs, int):
@@ -153,7 +153,7 @@ async def delete_idxs(pool: _Executor, table: str, idxs: int | Iterable[int]) ->
     """Delete rows by idx from qiita.<table>.
 
     `idxs` may be a scalar int or an iterable of ints; an empty iterable is a
-    no-op. The scalar form is normalised so callers can pass a single
+    no-op. The scalar form is normalized so callers can pass a single
     auto-seeded idx without wrapping it in a list. `table` is interpolated into
     the statement, so it must be a literal the caller wrote, never input.
     """

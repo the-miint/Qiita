@@ -738,11 +738,11 @@ class ActionDefinition(BaseModel):
             raise ValueError(f"{LibraryPrimitive.PERSIST_QC_CHECKS} must come after {gate}")
         return self
 
-    def _labelled_baselines(self) -> list[tuple[str, FlatBaselineResources]]:
+    def _labeled_baselines(self) -> list[tuple[str, FlatBaselineResources]]:
         """Every step's baseline flattened to (label, resources) pairs.
 
         A flat population contributes one pair under the step's own name; a
-        lookup population contributes one per profile, labelled
+        lookup population contributes one per profile, labeled
         ``name[profile]``, because a lookup step can be correctly sized on one
         profile and mis-sized on another — collapsing them would hide exactly the
         case that matters. `action:` entries declare no resources and
@@ -767,13 +767,13 @@ class ActionDefinition(BaseModel):
         """Label → the subset of ``axes`` where ``holds(baseline, ceiling)`` is
         False, dropping labels with no failing axis.
 
-        Shared by the two public queries below so the labelling and the
+        Shared by the two public queries below so the labeling and the
         drop-the-empties rule stay identical between them; they differ only in
         which axes they inspect and what they require of each.
         """
         return {
             label: failed
-            for label, flat in self._labelled_baselines()
+            for label, flat in self._labeled_baselines()
             if (
                 failed := tuple(
                     axis

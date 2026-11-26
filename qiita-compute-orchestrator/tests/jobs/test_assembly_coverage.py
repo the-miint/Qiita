@@ -1,6 +1,6 @@
 """Real-miint contract test for `assembly_coverage` (align_minimap2 NOT stubbed).
 
-Behaviours of miint's BAM writer this step DEPENDS on, pinned here because they are
+Behaviors of miint's BAM writer this step DEPENDS on, pinned here because they are
 not in its docs:
 
   - **Zero-coverage contigs still get an @SQ line.** That is what makes jgi report
@@ -86,7 +86,7 @@ def _empty_alignment_table(conn, name: str) -> None:
 
     Derived from the function rather than hand-declared: miint's BAM writer
     validates its input columns before anything else, so a hand-written stub
-    fails on a schema complaint and masks the behaviour under test.
+    fails on a schema complaint and masks the behavior under test.
     """
     seq = _rand_seq(random.Random(7), 400)
     conn.execute(
@@ -313,7 +313,7 @@ def test_written_bam_is_tid_monotonic(scrambled_assembly, tmp_path):
 
 @pytest.mark.skipif(
     shutil.which("samtools") is None,
-    reason="needs samtools; the behaviour it pins is relied on by binning.sh's "
+    reason="needs samtools; the behavior it pins is relied on by binning.sh's "
     "contig-set-drift guard, which runs inside the long-read-assembly binning image",
 )
 def test_faidx_exits_nonzero_on_a_missing_region(tmp_path):
@@ -324,7 +324,7 @@ def test_faidx_exits_nonzero_on_a_missing_region(tmp_path):
     the entrypoint's `set -e`) fail the step — that is the guard's "@SQ name not in
     noLCG" direction, which the static count check cannot catch (faidx pads a header
     for the missing name, so `grep -c '^>'` counts stay equal). Pin that faidx
-    behaviour directly, rather than leaving it a comment. SKIPPED without samtools
+    behavior directly, rather than leaving it a comment. SKIPPED without samtools
     (CI, dev boxes); it holds inside the binning image where samtools is present.
     """
     fa = tmp_path / "asm.fa"

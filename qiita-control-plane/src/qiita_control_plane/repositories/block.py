@@ -272,7 +272,7 @@ async def fetch_mask_sample_state(
     the per-sample mask-model workflows (read-mask, fastq-to-parquet) write
     'completed' at their `finalize-mask-sample` terminal step. The third,
     'invalidated', is written by an operator withdrawing a completed run whose
-    output is not trustworthy — a judgement about one RUN, distinct from
+    output is not trustworthy — a judgment about one RUN, distinct from
     deprecating the CONFIG (`MaskDefinitionStatus`). So absence (`None`) means "no
     mask has completed for this (mask_idx, prep_sample)" — NOT an exempt sample.
 
@@ -302,7 +302,7 @@ class MaskSampleInvalidated(Exception):
     """Raised when a masking run tries to complete a `(mask_idx, prep_sample)` pair
     whose previous run was withdrawn.
 
-    Withdrawal is a judgement someone made about a stored pass-set, so a redrive
+    Withdrawal is a judgment someone made about a stored pass-set, so a redrive
     does not quietly overturn it: the fresh read_mask rows land, the gate stays
     'invalidated', and consumers keep refusing until someone restores the pair via
     PATCH /mask-definition/{mask_idx}/sample-status. That is deliberate — the
@@ -351,7 +351,7 @@ async def finalize_mask_sample(
     re-run, or a concurrent finalizer that won the race).
 
     Raises `MaskSampleInvalidated` when the row was withdrawn. Completing over it
-    would both violate the invalidation CHECK and undo a human judgement about a
+    would both violate the invalidation CHECK and undo a human judgment about a
     pass-set; see the exception for the operator's path forward."""
     require_transaction(conn)
     updated = await conn.fetchval(

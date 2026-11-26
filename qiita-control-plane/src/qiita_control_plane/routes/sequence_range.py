@@ -87,7 +87,7 @@ async def mint_sequence_range_route(
         both cases collapse to one observable surface so the route
         doesn't leak the kind discriminator to clients probing idxs).
       - asyncpg.InvalidParameterValueError (SQLSTATE 22023) → 400.
-        Unreachable post-Pydantic in normal flow; kept as defence in
+        Unreachable post-Pydantic in normal flow; kept as defense in
         depth, with a static detail so an unexpected SQLSTATE path
         cannot leak Postgres internals.
       - Any other asyncpg.PostgresError → 500 with a generic detail.

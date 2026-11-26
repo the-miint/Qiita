@@ -33,7 +33,7 @@ async def insert_principal(
 ) -> int:
     """Insert a principal row and return its idx.
 
-    Centralises the (display_name, system_role, created_by_idx) INSERT used
+    Centralizes the (display_name, system_role, created_by_idx) INSERT used
     by the OIDC first-login path, admin user creation, and admin
     service-account creation.
     """
