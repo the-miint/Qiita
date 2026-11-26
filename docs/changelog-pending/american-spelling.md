@@ -1,6 +1,6 @@
 ### Changed
 
-- **The code and docs use American spelling (#N).** British forms (`behaviour`,
+- **The code and docs use American spelling (#952).** British forms (`behaviour`,
   `labelled`, `recognise`, `serialise`, …) are rewritten in comments, docs, test names
   and internal identifiers, including the feature-table relabel's `LABELED_*` names.
   No API field, stored value, CLI flag or output file name changes: the work-ticket
