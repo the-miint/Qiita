@@ -89,7 +89,7 @@ def taxonomy_table_sql(source: str) -> str:
     `source` is the caller's stream relation. Projected to `feature_idx` plus the eight
     ranks: the stream also carries `reference_idx` and `ncbi_taxon_id` (always NULL
     today), and holding a whole reference's worth of columns nothing reads is the kind
-    of cost that only shows up at the scale of the largest references.
+    of cost that grows with one row per feature of the reference.
     """
     return (
         f"CREATE TABLE {TAXONOMY_TABLE} AS SELECT feature_idx, {rank_columns_sql()} FROM {source}"
@@ -119,10 +119,10 @@ def feature_taxonomy_sidecar_sql() -> str:
     """The feature-axis twin of `taxonomy_sidecar_sql`: one row per labelled feature,
     carrying its own ranks.
 
-    No genome-representative reduction: a feature of this kind is the taxonomic unit, so
+    No genome-representative reduction: on this axis the feature is the taxonomic unit, so
     the label joins straight to its own taxonomy row on `feature_idx`. LEFT, so a feature
-    the reference does not classify stays present with NULL ranks, keeping the sidecar as
-    wide as the label set.
+    the reference does not classify stays present with NULL ranks, keeping one row per
+    label.
     """
     return (
         f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
@@ -166,9 +166,7 @@ def repeated_features_sql() -> str:
 
 def refuse_repeated_features(repeated_features: int) -> None:
     """Refuse a taxonomy that holds more than one row for some feature: a malformed
-    reference. Two rows for one feature need not agree, and silently picking one (the
-    genome axis's representative) or answering both (the feature axis) would publish an
-    arbitrary lineage."""
+    reference, on either axis."""
     if repeated_features:
         raise ValueError(
             f"this reference's taxonomy holds more than one row for {repeated_features} "
@@ -194,8 +192,8 @@ def check_taxonomy_diagnostics(
     to nothing. An unclassified row is NOT one of these — it is present with NULL ranks,
     which is a different statement and a legitimate one.
     """
-    # Checked on the STREAMED taxonomy rather than on the sidecar, because the reduction
-    # resolves a repeat to one row and so cannot show it downstream; see
+    # Checked on the streamed taxonomy rather than on the sidecar, because the genome
+    # axis's reduction resolves a repeat to one row and so cannot show it downstream; see
     # `genome_representative_taxonomy_select_sql`.
     refuse_repeated_features(repeated_features)
     if unnamed_rows:
@@ -228,8 +226,9 @@ def phylogeny_table_sql(source: str) -> str:
 
     **A tip's own name is dropped on the way in.** Nothing downstream reads it — the
     shear renames every tip from the mint, and an unpublished one is left nameless — and
-    on the largest references the tip labels ARE the tree: half its ~660k nodes, and
-    the bulk of 407 MB of Newick, held for the length of the run for nothing. It also
+    on a large reference the tip labels are most of the tree: in a tree of about 660k
+    nodes they are half the nodes and the bulk of 407 MB of Newick, held for the length
+    of the run for nothing. It also
     makes the promise that no reference-internal FASTA header can reach a published file
     structural rather than a property of one CASE expression downstream.
     """

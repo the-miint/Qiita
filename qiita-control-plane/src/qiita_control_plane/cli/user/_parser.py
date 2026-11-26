@@ -1822,10 +1822,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--classified-only",
         action="store_true",
         help=(
-            "Keep only the features the --taxonomy reference classifies (gives any rank),"
-            " in the table, its sequences and its lineage. Done on this machine, over the"
-            " answer; every column stays, and the manifest records how many features were"
-            " dropped."
+            "Keep only the features the --taxonomy reference classifies at one rank or"
+            " more, in the table, its sequences and its lineage. Done on this machine, on"
+            " the table it downloaded; the identifier map still names every column, and"
+            " the manifest records how many features were dropped."
         ),
     )
     p_ft_select.add_argument(

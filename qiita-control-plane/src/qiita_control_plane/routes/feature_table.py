@@ -176,15 +176,16 @@ async def _read_taxonomy(
     signing_key: bytes,
 ) -> pa.Table:
     """The reference's taxonomy rows for each labelled feature (`fetch_taxonomy`),
-    refusing a reference with no taxonomy loaded."""
-    feature_idxs = labels.column("feature_idx").to_pylist()
+    refusing a reference with no taxonomy loaded. `feature-table build --taxonomy` writes
+    an unloaded reference as all-NULL lineage; this refuses, because a caller may narrow
+    the table by this lineage (`--classified-only`), and an all-NULL one would empty it."""
     try:
         taxonomy = await asyncio.to_thread(
             lambda: fetch_taxonomy(
                 data_plane_url=data_plane_url,
                 signing_key=signing_key,
                 reference_idx=reference_idx,
-                feature_idxs=feature_idxs,
+                feature_idxs=labels.column("feature_idx").to_pylist(),
             )
         )
     except (flight.FlightError, StreamRowCountMismatch) as exc:

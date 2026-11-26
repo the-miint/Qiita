@@ -8,6 +8,7 @@ import zipfile
 
 import pyarrow as pa
 import pytest
+from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
 from qiita_common.models.feature_table import FeatureTableSample
 from qiita_common.models.reference import ReferenceHandle
 from qiita_common.taxonomy import RANK_COLUMNS
@@ -336,9 +337,13 @@ async def test_features_are_named_by_the_methods_own_mint():
     ]
 
 
-@pytest.mark.parametrize("field", ["name", "version"])
-def test_a_reference_handle_is_bounded_like_the_reference_it_names(field):
+@pytest.mark.parametrize(
+    ("field", "cap"), [("name", MAX_NAME_LENGTH), ("version", MAX_VERSION_LENGTH)]
+)
+def test_a_reference_handle_is_bounded_like_the_reference_it_names(field, cap):
     from pydantic import ValidationError
 
+    handle = {"name": "a-reference", "version": "1"}
+    assert getattr(ReferenceHandle(**{**handle, field: "x" * cap}), field) == "x" * cap
     with pytest.raises(ValidationError):
-        ReferenceHandle(**{"name": "a-reference", "version": "1", field: "x" * 10_000})
+        ReferenceHandle(**{**handle, field: "x" * (cap + 1)})

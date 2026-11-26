@@ -300,12 +300,22 @@ def test_an_occupied_taxonomy_file_is_refused_before_anything_is_read(
 
 
 def _lineage(rows):
-    """A taxonomy part: (feature, domain), every other rank NULL."""
+    """A taxonomy part from (feature, domain[, genus]) rows, every other rank NULL."""
+    genus = [r[2] if len(r) > 2 else None for r in rows]
     return pa.table(
         {
             "feature": [r[0] for r in rows],
-            "domain": pa.array([r[1] and f"d__{r[1]}" for r in rows], pa.string()),
-            **{r: pa.array([None] * len(rows), pa.string()) for r in TAXONOMY_SCHEMA.names[2:]},
+            **{
+                rank: pa.array(
+                    [r[1] and f"d__{r[1]}" for r in rows]
+                    if rank == "domain"
+                    else [g and f"g__{g}" for g in genus]
+                    if rank == "genus"
+                    else [None] * len(rows),
+                    pa.string(),
+                )
+                for rank in TAXONOMY_SCHEMA.names[1:]
+            },
         }
     ).cast(TAXONOMY_SCHEMA)
 
@@ -327,15 +337,22 @@ def test_classified_only_keeps_the_features_the_reference_classifies(monkeypatch
     out, _ = _run(
         monkeypatch,
         tmp_path,
-        _values([("QM1", "QF1", 5.0), ("QM1", "QF2", 1.0), ("QM2", "QF2", 3.0)]),
-        _features([("QF1", "ACGT"), ("QF2", "TTTT")]),
+        _values(
+            [("QM1", "QF1", 5.0), ("QM1", "QF2", 1.0), ("QM2", "QF2", 3.0), ("QM2", "QF3", 2.0)]
+        ),
+        _features([("QF1", "ACGT"), ("QF2", "TTTT"), ("QF3", "GGGG")]),
         ["--taxonomy", "silva", "2024.09", "--classified-only"],
-        taxonomy=(_SILVA, _lineage([("QF1", "Bacteria"), ("QF2", None)])),
+        # QF3 is classified at genus alone: any rank keeps a feature.
+        taxonomy=(
+            _SILVA,
+            _lineage([("QF1", "Bacteria"), ("QF2", None), ("QF3", None, "Bacillus")]),
+        ),
     )
-    assert _read(out, "feature_id, sample_id, value") == [("QF1", "QM1", 5.0)]
-    assert _read(out.with_name("table.sequences.parquet"), "feature_id") == [("QF1",)]
+    assert _read(out, "feature_id, sample_id, value") == [("QF1", "QM1", 5.0), ("QF3", "QM2", 2.0)]
+    assert _read(out.with_name("table.sequences.parquet"), "feature_id") == [("QF1",), ("QF3",)]
     assert _read(out.with_name("table.taxonomy.parquet"), "feature_id, domain") == [
-        ("QF1", "d__Bacteria")
+        ("QF1", "d__Bacteria"),
+        ("QF3", None),
     ]
     manifest = json.loads(out.with_name("table.manifest.json").read_text())
     assert manifest["classified_only"] == {"dropped_features": 1}
@@ -368,6 +385,20 @@ def test_a_lineage_not_one_row_per_feature_is_refused(monkeypatch, tmp_path, cap
         _features([("QF1", "ACGT")]),
         ["--taxonomy", "silva", "2024.09"],
         taxonomy=(_SILVA, _lineage(rows)),
+        rc=1,
+    )
+    assert "error:" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_a_table_feature_with_no_sequence_is_refused(monkeypatch, tmp_path, capsys):
+    """Whether or not a reference is named, a feature the table counts but the answer
+    gives no sequence for is refused, not dropped."""
+    out, _ = _run(
+        monkeypatch,
+        tmp_path,
+        _values([("QM1", "QF1", 5.0), ("QM1", "QF2", 1.0)]),
+        _features([("QF1", "ACGT")]),
         rc=1,
     )
     assert "error:" in capsys.readouterr().err

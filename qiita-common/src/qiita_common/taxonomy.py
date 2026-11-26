@@ -1,8 +1,8 @@
 """The taxonomy rank shape, and the per-genome reduction its two consumers share.
 
 **SQL text only** — like the `analytic` package, this module opens no connection; a caller
-executes what it returns. The rank constants have a third importer (reference ingest),
-which takes the shape without the reduction.
+executes what it returns. Other importers, reference ingest among them, take the rank
+shape without the reduction.
 
 Two callers reduce a reference's per-feature taxonomy to one row per genome, for
 different reasons: the shard planner tiles genomes by lineage so a shard holds

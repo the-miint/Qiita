@@ -432,7 +432,9 @@ over the cohort, it reads the values over Flight, relabels them in its own DuckD
 through the same `qiita_common.analytic` relabel the client-side table uses
 (`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers one zip of the columns
 (JSON) and the values and features (Arrow IPC), with each feature's lineage when the
-request names a reference. Authorization, the identifier mints and
-the ticket scope are the ones described above; the CLI writes the bundle with
-`feature-table build`'s writer. Narrowing the table by that lineage (`--classified-only`)
-is the client's, over the answer, so the server never computes a filtered table.
+request names a reference. Authorization and the identifier mints are the ones described
+above, and the values ticket is scoped to the cohort; the lineage ticket is scoped to the
+reference and the table's features. The CLI writes the bundle with `feature-table
+build`'s writer. Narrowing the table by that lineage (`--classified-only`) happens on the
+caller's machine, from the table it downloaded, so the server never computes a filtered
+table.

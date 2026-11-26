@@ -344,8 +344,7 @@ async def resolve_cohort(
 
 async def resolve_reference(pool: asyncpg.Pool, handle: ReferenceHandle) -> int:
     """The `reference_idx` of the reference `handle` names, refusing one that does not
-    exist (404) or whose data is not servable (409). The idx stays server-side: it is
-    signed into the taxonomy ticket and never returned."""
+    exist (404) or whose data is not servable (409)."""
     row = await pool.fetchrow(
         "SELECT reference_idx, status FROM qiita.reference WHERE name = $1 AND version = $2",
         handle.name,
@@ -523,9 +522,9 @@ def build_taxonomy(labels: pa.Table, taxonomy: pa.Table) -> pa.Table:
     reference's rows for those features."""
     with duckdb.connect() as duck:
         duck.register("labels", labels)
-        duck.register("reference_taxonomy", taxonomy)
+        duck.register("streamed_taxonomy", taxonomy)
         duck.execute(ft.feature_label_table_sql("labels", ft.FEATURE_AXIS))
-        duck.execute(ft.taxonomy_table_sql("reference_taxonomy"))
+        duck.execute(ft.taxonomy_table_sql("streamed_taxonomy"))
         [(repeated,)] = duck.execute(ft.repeated_features_sql()).fetchall()
         ft.refuse_repeated_features(repeated)
         duck.execute(ft.feature_taxonomy_sidecar_sql())
