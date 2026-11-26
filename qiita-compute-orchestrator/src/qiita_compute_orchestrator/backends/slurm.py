@@ -54,6 +54,7 @@ from ..backend import (
     StepStatusInfo,
     assert_container_scope_supported,
 )
+from ..config import node_local_job_env
 from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
@@ -199,6 +200,7 @@ class SlurmBackend(ComputeBackend):
         path_scratch: str = "",
         path_derived: str = "",
         data_plane_url: str = "",
+        path_node_local: str | None = None,
     ) -> None:
         self._client = client
         self._partition = partition
@@ -244,6 +246,8 @@ class SlurmBackend(ComputeBackend):
         # the launcher's get_settings() on the compute node needs the real
         # value, not the $TMPDIR/qiita/derived dev fallback.
         self._path_derived = path_derived
+        # PATH_NODE_LOCAL, forwarded like PATH_DERIVED (node_local_job_env).
+        self._path_node_local = path_node_local
         # Data-plane gRPC origin, propagated for the same reason as PATH_DERIVED:
         # a native job that streams reference chunks (Flight DoGet) resolves it
         # via the launcher's get_settings() on the compute node, so it needs the
@@ -562,6 +566,7 @@ class SlurmBackend(ComputeBackend):
         # RAISES if either is unset — a doomed job is never submitted. Single-sourced
         # with the compute-readiness probe so the diagnostic and real jobs can't drift.
         extra_env.update(miint_job_env())
+        extra_env.update(node_local_job_env(self._path_node_local))
 
         # For container steps, expose the parent directory of every
         # YAML-declared input path so the entrypoint can read it via

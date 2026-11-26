@@ -1,0 +1,34 @@
+action_id: reference-index-activate
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Make a registered krepp build the reference's active one, retiring the reference's
+  previous active build (docs/runbooks/krepp-index.md). The build was checked at
+  registration.
+
+  The reference itself does not change state, so the action carries no
+  success_status or failure_status.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required: [reference_index_idx]
+  properties:
+    reference_index_idx: {type: integer, minimum: 1}
+
+steps:
+  - action: activate-krepp-build
+    inputs: []
+    outputs: []
+
+action_ceiling:
+  cpu: 1
+  mem_gb: 1
+  walltime: PT10M

@@ -14,6 +14,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INDEX_TYPE_BOWTIE2,
+    INDEX_TYPE_KREPP,
     INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
     ReferenceStatus,
@@ -74,6 +75,11 @@ async def _resolve_reference_index_path(
         but no `index_type` index exists yet. Narrower than the not-active case
         so `_resolve_host_filter_indexes` can treat a single missing index type
         as "skip that stage" while still hard-failing a non-active reference."""
+    if index_type == INDEX_TYPE_KREPP:
+        # A krepp row's fs_path is relative and its build has a lifecycle; this
+        # newest-row lookup would serve a registered or retired build, and its path is
+        # relative to the orchestrator's PATH_DERIVED, not a host path.
+        raise ValueError("a krepp build is not resolved by _resolve_reference_index_path")
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )

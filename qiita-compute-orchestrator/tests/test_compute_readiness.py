@@ -289,14 +289,14 @@ def test_probe_script_checks_ena_reachability_from_compute():
     assert "ena-from-compute=fail err=$MODULE_PROBE_ERR" in script
 
 
-def test_probe_script_runs_both_module_probes_through_one_helper():
-    """native-import and ena-from-compute share one capture path, so they cannot
+def test_probe_script_runs_every_module_probe_through_one_helper():
+    """native-import, ena-from-compute and node-cache share one capture path, so they cannot
     drift into different ideas of what reaches the operator's `err=` field. The
     row names stay literals at the call sites — `_parse_probe_log` and the
     script-vs-parser parity test both read them out of the script's text."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert script.count("run_module_probe() {") == 1
-    assert script.count("run_module_probe qiita_compute_orchestrator.") == 2
+    assert script.count("run_module_probe qiita_compute_orchestrator.") == 3
     # No call site re-implements the capture the helper owns.
     assert "-P -m" not in script.split("run_module_probe() {", 1)[1].split("}", 1)[1]
 
@@ -707,3 +707,17 @@ def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "0 fail" in out
+
+
+def test_probe_script_maps_the_node_cache_probe_exit_codes():
+    """node_cache.probe's exit code is the node-cache row's status: unset skips; a
+    root that is not a writable directory on the probe's node, or the module
+    failing, fails the deploy."""
+    from qiita_compute_orchestrator import node_cache as nc
+
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "run_module_probe qiita_compute_orchestrator.node_cache" in script
+    for code, value in ((nc.PROBE_OK, "ok"), (nc.PROBE_SKIP, "skip")):
+        assert f'{code}) echo "{cr._PROBE_LINE_PREFIX} node-cache={value}' in script
+    assert '*) echo "' + cr._PROBE_LINE_PREFIX + " node-cache=fail" in script
+    assert nc.PROBE_FAIL not in (nc.PROBE_OK, nc.PROBE_SKIP)

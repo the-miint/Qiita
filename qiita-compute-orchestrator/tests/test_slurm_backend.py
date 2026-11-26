@@ -76,6 +76,7 @@ def _make_backend(
     path_scratch: str = "",
     path_derived: str = "",
     data_plane_url: str = "",
+    path_node_local: str | None = None,
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -96,6 +97,7 @@ def _make_backend(
         path_scratch=path_scratch,
         path_derived=path_derived,
         data_plane_url=data_plane_url,
+        path_node_local=path_node_local,
     )
 
 
@@ -509,6 +511,39 @@ async def test_run_step_propagates_path_derived_into_job_env(jwt_path, baseline,
     )
     env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
     assert env["PATH_DERIVED"] == "/scratch/persistent"
+
+
+@pytest.mark.asyncio
+async def test_run_step_propagates_path_node_local_into_job_env(jwt_path, baseline, tmp_path):
+    """A job reads sealed folders through the node cache at PATH_NODE_LOCAL on the
+    compute node; the slurmrestd env is an allowlist, so the backend forwards it."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler), jwt_path, path_node_local="/scratch/qiita-miint"
+    )
+    _write_completed_output(tmp_path)
+    await _run_step_via_trio(
+        backend,
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["PATH_NODE_LOCAL"] == "/scratch/qiita-miint"
 
 
 @pytest.mark.asyncio

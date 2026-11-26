@@ -46,12 +46,14 @@ from qiita_common.assembly_constants import (
 from qiita_common.data_plane_errors import is_data_plane_busy
 from qiita_common.flight_stream import counted_doget
 from qiita_common.models import (
+    INDEX_TYPE_KREPP,
     INDEX_TYPE_RYPE_ROUTER,
     FeatureHashEntry,
     GenomeSource,
     QcCheckResult,
     ReadMaskBucket,
     ReadMaskReason,
+    ReferenceIndexState,
     ReferenceStatus,
     read_mask_reason_sql_list,
 )
@@ -107,6 +109,7 @@ from ..repositories.block import (
 from ..repositories.exported_identifier import mint_processing_exported_identifiers
 from ..repositories.prep_sample_qc_check import upsert_qc_checks
 from ..repositories.reference_exclusion import resolve_excluded_features
+from ..repositories.reference_index import activate_krepp_build
 from ..repositories.reference_membership import (
     GENOME_MAP_PAIRS_SQL,
     GENOME_MAP_ROWS_SQL,
@@ -2014,6 +2017,7 @@ async def register_index(
     fs_path: str,
     params: dict[str, Any],
     shard_id: int | None = None,
+    state: ReferenceIndexState = ReferenceIndexState.ACTIVE,
 ) -> int:
     """Record a built search index (e.g. a rype `.ryxdi`) for a reference in
     qiita.reference_index. `fs_path` is the on-disk location; `params` is the
@@ -2023,6 +2027,10 @@ async def register_index(
     `shard_id` is recorded verbatim: None for an unsharded whole-reference index
     (host `rype`/`minimap2`), or the shard's index (0..N-1) for a sharded
     analysis index that writes one row per shard.
+
+    `state` defaults to what every index type but krepp is: a served index. A krepp
+    build is registered `ReferenceIndexState.REGISTERED`, with a path relative to
+    PATH_DERIVED (NODE_CACHED_INDEX_TYPES), and only activation serves it.
 
     Returns the reference_index_idx. Idempotent on
     (reference_idx, index_type, fs_path): a workflow retried from the start
@@ -2038,10 +2046,22 @@ async def register_index(
     preserve that shard->path bijection. This guards the sequential re-run path;
     truly concurrent registrations of the same reference are not expected (one
     workflow runs per reference at a time).
+
+    For krepp the existing row is returned only when it is the same build: its
+    `params` equal these (they carry the build's `SHA256SUMS` hash) and it is
+    still `registered` or `active`. A folder edited after registration, or one
+    registered again after its build was retired or removed, raises ValueError —
+    a rebuild takes a new folder name.
     """
+    if index_type == INDEX_TYPE_KREPP and state != ReferenceIndexState.REGISTERED:
+        raise ValueError(
+            f"a krepp build is registered in state {ReferenceIndexState.REGISTERED.value},"
+            f" not {state.value}; only activation moves it on"
+        )
     row = await pool.fetchrow(
-        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params, shard_id)"
-        " SELECT $1, $2, $3, $4::jsonb, $5"
+        "INSERT INTO qiita.reference_index"
+        " (reference_idx, index_type, fs_path, params, shard_id, state)"
+        " SELECT $1, $2, $3, $4::jsonb, $5, $6"
         " WHERE NOT EXISTS ("
         "   SELECT 1 FROM qiita.reference_index"
         "   WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3)"
@@ -2051,16 +2071,56 @@ async def register_index(
         fs_path,
         json.dumps(params),
         shard_id,
+        state.value,
     )
     if row is not None:
         return row["reference_index_idx"]
-    return await pool.fetchval(
-        "SELECT reference_index_idx FROM qiita.reference_index"
+    existing = await pool.fetchrow(
+        "SELECT reference_index_idx, params, state FROM qiita.reference_index"
         " WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3",
         reference_idx,
         index_type,
         fs_path,
     )
+    if index_type == INDEX_TYPE_KREPP:
+        if json.loads(existing["params"]) != params:
+            raise ValueError(
+                f"reference {reference_idx} already has a krepp build at {fs_path!r}"
+                f" (reference_index_idx {existing['reference_index_idx']}) with different"
+                " params; the folder changed after it was registered. Register the new"
+                " build under a new folder name."
+            )
+        if existing["state"] not in (ReferenceIndexState.REGISTERED, ReferenceIndexState.ACTIVE):
+            raise ValueError(
+                f"the krepp build at {fs_path!r} (reference_index_idx"
+                f" {existing['reference_index_idx']}) is {existing['state']}; a build is not"
+                " registered again after it has been retired or removed. Register it under"
+                " a new folder name."
+            )
+    return existing["reference_index_idx"]
+
+
+async def activate_krepp_build_of_reference(
+    pool: asyncpg.Pool, reference_idx: int, reference_index_idx: int
+) -> None:
+    """Make a registered krepp build of the ticket's reference its active build
+    (`repositories.reference_index.activate_krepp_build` says what is refused and how
+    the previous active build is retired). Raises when the row is not a krepp build of
+    this reference."""
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            "SELECT reference_idx, index_type FROM qiita.reference_index"
+            " WHERE reference_index_idx = $1",
+            reference_index_idx,
+        )
+        if row is None or row["index_type"] != INDEX_TYPE_KREPP:
+            raise ValueError(f"reference_index_idx {reference_index_idx} is not a krepp build")
+        if row["reference_idx"] != reference_idx:
+            raise ValueError(
+                f"krepp build {reference_index_idx} belongs to reference {row['reference_idx']},"
+                f" not {reference_idx}"
+            )
+        await activate_krepp_build(conn, reference_index_idx)
 
 
 async def finalize_shard(
@@ -3681,6 +3741,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP: write_assembly_membership,
     LibraryPrimitive.MINT_GENE_FEATURES: mint_gene_features,
     LibraryPrimitive.EXPORT_SUBJECT_GENOME_MAP: export_subject_genome_map,
+    LibraryPrimitive.ACTIVATE_KREPP_BUILD: activate_krepp_build_of_reference,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PLAN_SHARDS: plan_shards,

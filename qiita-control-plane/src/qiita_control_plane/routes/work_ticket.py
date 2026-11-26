@@ -116,6 +116,7 @@ from ..repositories.alignment_definition import (
 )
 from ..repositories.block import BLOCK_ABANDONED
 from ..repositories.mask_definition import MaskDefinitionDeprecated, lock_active_mask
+from ..repositories.reference_index import removed_build_of_ticket
 from ..runner import _fetch_action
 from ..step_progress import StepProgressMismatch, check_step_progress, load_step_progress
 from ..ticket_redrive import (
@@ -993,6 +994,16 @@ async def run_work_ticket(
                             " redriven"
                         ),
                     ) from exc
+            removed_build = await removed_build_of_ticket(conn, work_ticket_idx)
+            if removed_build is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"work_ticket {work_ticket_idx} is fixed to krepp build"
+                        f" {removed_build}, which was removed; it is not redriven."
+                        " Submit the work again"
+                    ),
+                )
             # Locked so an abandon-plan, which locks the block too, either commits
             # before this read or waits for this redrive to commit and then refuses it
             # as running. An abandoned block's prep_samples have been handed to a

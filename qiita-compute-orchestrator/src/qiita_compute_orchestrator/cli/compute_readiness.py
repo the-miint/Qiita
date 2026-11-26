@@ -68,8 +68,10 @@ from ..config import (
     CORRECT_COMPUTE_READINESS_INVOCATION,
     ORCHESTRATOR_ENV_PATH,
     Settings,
+    node_local_job_env,
 )
 from ..native_import_check import MAX_DETAIL
+from ..node_cache import PROBE_OK, PROBE_SKIP
 from ..slurm.client import (
     SlurmrestdClient,
     SlurmrestdError,
@@ -278,12 +280,14 @@ fi
 #
 # The row name stays a literal at each call site: the script-vs-parser parity
 # test reads `<key>=<value>` out of this script's text.
+#
+# MODULE_PROBE_RC keeps the module's exit code for a probe whose codes mean more than
+# ok/fail (node-cache), and MODULE_PROBE_ERR keeps its output on success too.
 run_module_probe() {{
-    if MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"; then
-        return 0
-    fi
+    MODULE_PROBE_ERR="$("$PYTHON" -P -m "$1" 2>&1)"
+    MODULE_PROBE_RC=$?
     MODULE_PROBE_ERR="$(printf '%s' "$MODULE_PROBE_ERR" | tr -s '[:space:]' ' ')"
-    return 1
+    [ "$MODULE_PROBE_RC" -eq 0 ]
 }}
 
 # The SAME check redeploy.sh runs on the head node after `uv sync`, invoked as a
@@ -573,6 +577,15 @@ else
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 
+# The node cache root on this node; the exit code is the row's status
+# (qiita_compute_orchestrator.node_cache.probe).
+run_module_probe qiita_compute_orchestrator.node_cache
+case "$MODULE_PROBE_RC" in
+    {PROBE_OK}) echo "{_PROBE_LINE_PREFIX} node-cache=ok detail=$MODULE_PROBE_ERR" ;;
+    {PROBE_SKIP}) echo "{_PROBE_LINE_PREFIX} node-cache=skip detail=$MODULE_PROBE_ERR" ;;
+    *) echo "{_PROBE_LINE_PREFIX} node-cache=fail err=$MODULE_PROBE_ERR" ;;
+esac
+
 # Outbound HTTPS from this compute node to the ENA archives — why the deploy
 # checks it at all, and what a green row does and does not prove, is on
 # `ena_reachability_check` itself.
@@ -608,6 +621,7 @@ def build_probe_submit_payload(
     # single source for which miint vars a remote job needs — SlurmBackend feeds
     # its real jobs from the same helper, so probe and jobs can't drift.
     env.update(miint_job_env())
+    env.update(node_local_job_env(settings.path_node_local))
     if settings.cp_url:
         env["QIITA_CP_URL"] = settings.cp_url
     if settings.co_to_cp_token:
@@ -765,6 +779,7 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
       - shared-fs-visible=yes/no           → pass / fail
       - shared-fs-writable=yes/no          → pass / fail
       - cp-from-compute=ok/fail/skip       → pass / fail / skip
+      - node-cache=ok/fail/skip            → pass / fail / skip
       - hostname / uid / user              → informational (pass with detail)
     """
     results: list[CheckResult] = []

@@ -162,6 +162,13 @@ class Settings:
     # YAML's bare `container:` filename at submit time). None on the
     # launcher path and on LocalBackend-only deploys.
     path_derived_images: Path | None = None
+    # Node cache root (PATH_NODE_LOCAL): a directory on each compute node's own disk
+    # that `node_cache` copies sealed folders into on first use. Optional; unset,
+    # jobs read them from PATH_DERIVED. Must be absolute when set
+    # (`_resolve_path_node_local`); its existence is not checked here, because it is
+    # not on the orchestrator's host. On the launcher path it is read from the job
+    # env, which `node_local_job_env` writes.
+    path_node_local: str | None = None
 
     @classmethod
     def from_env(cls, *, require_cp_to_co_token: bool = True) -> Settings:
@@ -192,6 +199,7 @@ class Settings:
         path_derived_images = (
             _resolve_path_derived_images() if backend_type == BACKEND_SLURM else None
         )
+        path_node_local = _resolve_path_node_local()
         return cls(
             backend_type=backend_type,
             path_scratch=os.environ.get(
@@ -208,7 +216,24 @@ class Settings:
             data_plane_url=os.environ.get("DATA_PLANE_URL", DEFAULT_DATA_PLANE_URL),
             slurm=slurm,
             path_derived_images=path_derived_images,
+            path_node_local=path_node_local,
         )
+
+
+def _resolve_path_node_local() -> str | None:
+    """PATH_NODE_LOCAL, or None when unset. A set value must be absolute: it names
+    the same directory on every compute node, whatever the job's working directory."""
+    raw = os.environ.get("PATH_NODE_LOCAL") or None
+    if raw is not None and not Path(raw).is_absolute():
+        raise RuntimeError(f"orchestrator: PATH_NODE_LOCAL must be absolute, got {raw!r}")
+    return raw
+
+
+def node_local_job_env(path_node_local: str | None) -> dict[str, str]:
+    """The job-env entry that carries PATH_NODE_LOCAL to a compute node (the
+    slurmrestd env is an allowlist). Every job submission uses it, so no two can
+    forward different values. Empty when it is unset."""
+    return {"PATH_NODE_LOCAL": path_node_local} if path_node_local else {}
 
 
 def _resolve_slurm_settings() -> SlurmSettings:

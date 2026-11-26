@@ -21,6 +21,15 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
+- `[admin]` Optional, not needed for this deploy: once the cluster admins have created
+  `/scratch/qiita-miint` on every compute node, writable by the SLURM job user, set
+  `PATH_NODE_LOCAL` in `/etc/qiita/compute-orchestrator.env` (absolute; the orchestrator refuses a
+  relative one at boot) and restart the orchestrator. It turns on the node cache; no workflow
+  reads through it in this deploy. (#937)
+  ```bash
+  sudo bash -c 'grep -q "^PATH_NODE_LOCAL=" /etc/qiita/compute-orchestrator.env || echo "PATH_NODE_LOCAL=/scratch/qiita-miint" >> /etc/qiita/compute-orchestrator.env'
+  ```
+
 - `[operator]` **Before the restart, run the host-taxon backfill.** From the restart a biosample
   with no `host_taxon_id` passes through host filtering undepleted, so skipping `--execute` lets
   residue biosamples (taxa the curated table does not cover) pass through undepleted. `--execute`
@@ -99,6 +108,8 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - `[operator]` (#929) `make migrate` applies `20261120000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 - `[operator]` (#854) Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate) and `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers). No out-of-band setup; applies with the standard migrate step.
 
+- `20261123000000_krepp_index_lifecycle` adds `state` (existing rows `active`) to `qiita.reference_index`, admits `krepp` in its `index_type` CHECK with a one-active-krepp-build-per-reference unique index and CHECKs that keep every non-krepp row `active` and every krepp row's `fs_path` relative (no existing row can fail them), and adds a nullable `reference_index_idx` to `qiita.work_ticket`; no other row changes. `dbmate` applies it. (#937)
+
 ### 4. Deploy
 
 - `[admin]` **Data planes on other hosts run this build before jobs resume.** Native jobs, the control plane and the CLIs now call the data plane's new `count_doget` before every stream, and a data plane on the previous build refuses it, failing the call. If `QIITA_DATA_PLANE_PEERS` in `/etc/qiita/data-plane.env` names other hosts, deploy this build to them in the same window, since `activate.sh` does not restart peers. A native job that starts between the checkout update (step 1 of `make redeploy`) and the deploy's verify can fail the same way, or on importing the new `qiita_common` before the native venv is refreshed; after the deploy verifies, list failed tickets with `qiita ticket list --state failed --all --limit 500`, and re-run each one whose `updated_at` falls between the pull and the verify with `qiita ticket run <work_ticket_idx>`. **Also, before starting `make redeploy`, drain `align-denovo`**: ask the lab to submit no `align-denovo` until the deploy verifies, and wait until `qiita ticket list --active --all --action-id align-denovo` lists nothing. A job already running keeps the old code, without the count check, and bucket 6 selects only the samples completed before the restart. (#936)
@@ -107,6 +118,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 5. Verify
 
+- `[operator]` (#937) `make verify-deploy`'s action list shows `reference-index-register` 1.0.0 and `reference-index-activate` 1.0.0, and its compute-readiness report has a `probe/node-cache` row reading `skip` (`PATH_NODE_LOCAL` unset) or `pass`.
 - `[operator]` (#874) As a system_admin with a PAT carrying `mask_definition:lifecycle`, `qiita-admin output-equivalence list` exits 0 and prints `0 output equivalence(s)` on stderr (the output-equivalence routes are mounted and the new table is readable).
 
 ### 6. After the deploy verifies green
@@ -344,6 +356,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 - (#874) `qiita feature-table build` manifest: `processing.parts` / `processing.sample_part` (and the same under `table.denovo`) replace `processing.export_processing_id` / `params_hash` / `aligner` and `denovo.requested_alignment_idx` / `processing_idx`, and the manifest gains `schema_version` (2) and `table.left_out`; a script reading the old keys must be updated. Without `--prep-sample-idx` the build now leaves out incomplete and not-processed prep_samples (listed on stderr, recorded in `table.left_out`) instead of refusing, and fails only when none is processed.
 - (#874) `POST /definition-group/resolve`, `GET /admin/sequenced-pool/{idx}/masked-read-export`, `POST /admin/masked-read-export/ticket`, `GET /mask-definition/{idx}/syndna-read-count` and `POST /alignment/{idx}/ticket/doget` take an optional `as_of_event` (a `sha256:` decision-set token; 422 when it names no decision set) and return `decisions` (the decision set they resolved under, without output-equivalence or event idxs). The feature-table manifest gains top-level `decisions`, each masked-read export manifest entry and the SynDNA `<output>.metadata.json` gain `decisions`; `qiita feature-table build`, `qiita-admin masked-read-export` and `qiita mask syndna-read-count` gain `--as-of-event`.
 - (#874) `POST /work-ticket/cancel` marks the ticket (`reap_pending_since`, `reap_note`) before it scancels the ticket's SLURM jobs; a reap without error clears the mark, a failed reap keeps it with the error, and a cancel interrupted mid-reap leaves it until the next cancel's reap clears it. While marked, `POST /work-ticket/{idx}/run` and `POST /alignment-definition/{idx}/rerun-block` refuse the ticket (409, `reason` `reap_pending`). The ticket GETs gain `reap_pending_since` and `reap_note` (`reap_note` is None unless the caller is a system_admin).
+- (#937) krepp index builds: `reference-index-register` and `reference-index-activate` 1.0.0 arrive through the usual `qiita-admin actions sync`; `qiita-admin krepp-index remove`; procedure in `docs/runbooks/krepp-index.md`. No workflow places contigs with a build. New route `POST /api/v1/reference/{idx}/index/{reference_index_idx}/remove` (`reference:delete`); `GET /api/v1/reference/{idx}/index` rows gain `state`; `DELETE /api/v1/reference/{idx}` returns 409 while the reference has a krepp build not yet removed, even with `force`; `POST /api/v1/work-ticket/{idx}/run` returns 409 for a ticket whose krepp build was removed. compute-readiness gains a `node-cache` row, which fails when `PATH_NODE_LOCAL` is set but not a writable directory on the probe's node and skips when it is unset.
 - `.env.compute-orchestrator.example`'s `MIINT_GPL_BOUNDARY_PATH` comment now names the tools behind the boundary (bowtie2, FastTree, Prodigal) and the 0.5.0 minimum; no live env change. (#888)
 - New DuckLake tables `gene_call` / `gene_call_contig`, and a `genome_idx` column on `assembly_membership` and `bin_quality`, created by the data plane at start. long-read-assembly 1.0.2 (edited in place) and the new `assembly-gene-call-recover` 1.0.0 arrive through the deploy's usual `qiita-admin actions sync`; no new image. (#888)
 - The staged miint must have `prodigal_proteins` (duckdb-miint `2b215901` or later); the miint stage step restages when the mirror's build changes, and compute-readiness's `miint-gpl-boundary` probe fails on a build without it. (#888)

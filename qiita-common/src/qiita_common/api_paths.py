@@ -90,6 +90,9 @@ PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
 # (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
 # to read. Param path, 3 segments, no literal shadow.
 PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
+# Operator: mark a registered or retired krepp build removed. A verb segment on one
+# index row. Param path, 4 segments, no literal shadow.
+PATH_REFERENCE_INDEX_REMOVE = "/{reference_idx}/index/{reference_index_idx}/remove"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -106,6 +109,7 @@ URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOM
 URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
     f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
 )
+URL_REFERENCE_INDEX_REMOVE = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX_REMOVE}"
 
 # =============================================================================
 # /host-filter-profile/*
@@ -165,6 +169,7 @@ class LibraryPrimitive(StrEnum):
     EXPORT_SUBJECT_GENOME_MAP = "export-subject-genome-map"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
+    ACTIVATE_KREPP_BUILD = "activate-krepp-build"
     # Reference sharding: assign a reference's genome-bearing features to N
     # lineage-sorted shards (reference_membership.shard_id). A CP-side primitive
     # (its inputs — feature_genome, reference_membership, taxonomy — are

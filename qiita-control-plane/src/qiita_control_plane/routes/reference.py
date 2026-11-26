@@ -33,6 +33,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
+    PATH_REFERENCE_INDEX_REMOVE,
     PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
@@ -107,6 +108,11 @@ from ..repositories.reference_exclusion import (
     add_exclusion,
     list_for_reference,
     remove_exclusion,
+)
+from ..repositories.reference_index import (
+    KreppBuildNotFound,
+    KreppBuildTransitionRefused,
+    remove_krepp_build,
 )
 from ..repositories.reference_membership import (
     count_genome_map,
@@ -203,6 +209,43 @@ async def list_references(
     return [ReferenceResponse(**dict(r)) for r in rows]
 
 
+@router.post(PATH_REFERENCE_INDEX_REMOVE, status_code=200)
+async def remove_reference_krepp_build(
+    reference_idx: Annotated[int, Field(gt=0)],
+    reference_index_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_DELETE)),
+) -> ReferenceIndex:
+    """Mark a registered or retired krepp build `removed` (`reference:delete`,
+    system_admin). 404 when the row is not a krepp build of this reference; 409 when
+    it is the active build or a ticket may still read it
+    (`repositories.reference_index.remove_krepp_build`). The master is deleted by the
+    operator afterwards; tickets fixed to the build keep it, and `/run` refuses them."""
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            owner = await conn.fetchval(
+                "SELECT reference_idx FROM qiita.reference_index WHERE reference_index_idx = $1",
+                reference_index_idx,
+            )
+            if owner != reference_idx:
+                raise KreppBuildNotFound(reference_index_idx)
+            await remove_krepp_build(conn, reference_index_idx)
+    except KreppBuildNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except KreppBuildTransitionRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    row = dict(
+        await pool.fetchrow(
+            "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
+            " shard_id, state FROM qiita.reference_index"
+            " WHERE reference_index_idx = $1",
+            reference_index_idx,
+        )
+    )
+    row["params"] = json.loads(row["params"])
+    return ReferenceIndex(**row)
+
+
 @router.get(PATH_REFERENCE_INDEX)
 async def get_reference_index(
     reference_idx: Annotated[int, Field(gt=0)],
@@ -221,11 +264,14 @@ async def get_reference_index(
     consumes (the runner injects it directly; this endpoint is for general
     visibility / admin). Scoped to reference:read — unlike the anonymous-OK
     reference metadata GETs — because fs_path exposes internal filesystem
-    layout; reference:read is held by every human role and service account."""
+    layout; reference:read is held by every human role and service account.
+
+    A krepp build's `fs_path` is relative to the orchestrator's PATH_DERIVED
+    (NODE_CACHED_INDEX_TYPES)."""
     await require_reference_exists(pool, reference_idx)
     rows = await pool.fetch(
         "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at,"
-        " shard_id"
+        " shard_id, state"
         " FROM qiita.reference_index WHERE reference_idx = $1"
         " ORDER BY created_at DESC, reference_index_idx DESC",
         reference_idx,

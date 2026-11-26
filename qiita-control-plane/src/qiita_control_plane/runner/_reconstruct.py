@@ -24,9 +24,11 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.data_plane_errors import (
     is_data_plane_transient,
 )
+from qiita_common.krepp import REFERENCE_INDEX_IDX_BINDING
 from qiita_common.models import (
     TERMINAL_STEP_PROGRESS_STATES,
     ComputeTarget,
+    ReferenceIndexState,
     ScopeTargetKind,
     StepHandleWire,
     StepProgressState,
@@ -630,6 +632,16 @@ async def _run_action_primitive(
         )
         return {entry.outputs[0]: subject_genome_map_path}
 
+    if entry.name == LibraryPrimitive.ACTIVATE_KREPP_BUILD:
+        if entry.inputs:
+            raise RuntimeError(f"{entry.name} takes no inputs; got {entry.inputs!r}")
+        await LIBRARY[LibraryPrimitive.ACTIVATE_KREPP_BUILD](
+            ctx.pool,
+            ctx.scope_target["reference_idx"],
+            int(bound[REFERENCE_INDEX_IDX_BINDING]),
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
         files = _register_files_payload(workspace, staging_dir)
@@ -722,6 +734,9 @@ async def _run_action_primitive(
             fs_path=meta["fs_path"],
             params=meta["params"],
             shard_id=meta.get("shard_id"),
+            # A krepp registration meta names its state (`registered`); every other
+            # builder's meta omits it and keeps the default.
+            state=ReferenceIndexState(meta.get("state", ReferenceIndexState.ACTIVE)),
         )
         return {}
 

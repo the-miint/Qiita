@@ -39,22 +39,23 @@ PATH_PERSISTENT/                            durable, backed up
   duckdb-spill/<host>-<pid>-<random>/       one data-plane connection's DuckDB spill
   references/staging/<name>/<version>/     operator-staged reference source files (docs/reference-data-staging.md)
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
-    references/<reference_idx>/<aligner>/   built reference data that doesn't need local-SSD random access
-  persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
-    references/<reference_idx>/<aligner>/   built reference data that needs local-SSD random access (e.g. aligner indices); rebuild-on-miss is the safety net
+    references/<reference_idx>/<index>/     built reference indexes (PATH_DERIVED/references; derived_store.py)
+    references/<reference_idx>/krepp/<build_label>/  master copy of a krepp build, placed by hand, sealed at registration
+  qiita-miint/                              recommended PATH_NODE_LOCAL (optional): the node cache, on each compute node's own disk
+    .locks/<sha256 of path>.lock            one per cached folder; jobs on a node take it in turn
+    references/<reference_idx>/krepp/<build_label>/  this node's copy of a sealed folder, made by the first job that needed it
 ```
 
-Two persistent tiers under `/scratch/`:
+Two tiers hold built reference data:
 
-- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Hosts built reference data whose access pattern doesn't justify the local-SSD copy (large databases, sequentially read inputs, anything streamed once per job).
-- `/scratch/persistent-local/` — **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
-
-Built reference data therefore lives under exactly one of `/scratch/persistent/references/<reference_idx>/<aligner>/` or `/scratch/persistent-local/references/<reference_idx>/<aligner>/`, picked per-reference at ingest time based on the database's access pattern. The path structure is the same; only the tier root differs.
+- `PATH_DERIVED` (`/scratch/persistent/`) — the shared-FS persistent tier. Visible to every node, durable. Every index Qiita builds lives here (`derived_store.py` owns the layout), and the master copy of a krepp build.
+- `PATH_NODE_LOCAL` (`/scratch/qiita-miint/`, optional) — the **node cache**: a directory on each compute node's own disk, writable by the job user, that `node_cache.py` alone writes. It holds copies of **sealed folders** (a folder under `PATH_DERIVED` whose `SHA256SUMS` hash is recorded in the database; the index types in `NODE_CACHED_INDEX_TYPES`), so a job reads them from local disk rather than the shared filesystem, where `place_krepp` with an index read by mmap stalled intermittently; reading from a node's own disk has not been measured. No workflow reads through it. A job asks `node_cache.materialize` for a folder: the first job on a node that needs it checks the free space, checks the master's file list, copies it while hashing every file against `SHA256SUMS`, and renames the folder into place, so a folder at that path was written whole; jobs on the same node wait on its lock, then check the copy (`SHA256SUMS` hash, file list, sizes) and use it. Nothing is copied at deploy or by hand. Unset, jobs read the master under `PATH_DERIVED`. The orchestrator forwards it into every job; the readiness probe's `node-cache` row fails the deploy when it is set but is not a writable directory on the node the probe ran on.
 
 Retention:
 
 - `PATH_PERSISTENT/` — never auto-deleted. Backed up by cluster policy.
-- `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
+- `/scratch/persistent/` — never auto-deleted by us; cluster purge exemption requested. Deleting a reference (`DELETE /reference/{idx}`) removes its `references/<reference_idx>/` subtree, and is refused while the reference has a krepp build not yet removed.
+- `PATH_NODE_LOCAL` — written only by `node_cache.py`. A job that calls `node_cache.materialize` with `evict_first` deletes those copies on its node first; no job passes it, so node copies of removed builds stay. There is no size cap: a copy that does not fit fails the job, naming the space it needed.
 - `PATH_SCRATCH/duckdb-spill/` — each directory is removed when the data-plane connection that owns it goes, which no stop reaches: the process has no shutdown path that drops its pool. A data plane at boot removes the directories its own host left whose process is gone (`sweep_abandoned_spill_directories` in `qiita-data-plane/src/pool.rs`); another host's are left to that host.
 - `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` — nothing reclaims them automatically: no sweep deletes a ticket's workspace or an upload's staging directory after the ticket ends, so both grow with every ticket. Registration moves a registered file out of its output dir; everything else (inputs, logs, `tmp/`, outputs no step registered) stays. `qiita-admin scratch reclaim --older-than DAYS [--execute]` deletes everything under `ticket/<idx>/<step>/attempt-<N>/` except `logs/` for finished tickets (see `--help` for eligibility; `--older-than` counts from the ticket's last update). It must run as the user that owns the job output dirs (the SLURM job user), since it restores owner write on 0550 container output dirs before deleting. It never touches `staging/`. A reclaimed ticket can no longer feed a backfill that reads its workspace, so the command skips the read-mask tickets the SynDNA read-count backfill would still write and the long-read-assembly tickets the gene-call recovery can still recover or is recovering; once a ticket is reclaimed, its backfill gap is permanent.
 

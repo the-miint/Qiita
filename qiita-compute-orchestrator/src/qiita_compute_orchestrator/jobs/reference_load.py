@@ -76,6 +76,7 @@ from ._feature_load import (
     write_feature_sequences,
 )
 from ._jplace import load_jplace
+from ._phylogeny import tree_difference
 
 _LOG = logging.getLogger(__name__)
 
@@ -716,43 +717,25 @@ def _write_placements(
 
 def _refuse_a_tree_other_than_the_jplaces(conn: duckdb.DuckDBPyConnection, phylogeny: str) -> None:
     """Raise unless the tree staged at `phylogeny` is the TEMP TABLE `jplace_tree`, as
-    far as a placement can tell: every node's edge number, its parent's edge number,
-    its branch length, and, at a tip, its name. Edge numbers count because a jplace's
-    edge_nums name edges of its own tree, so the same topology numbered another way
-    joins placements to the wrong edges. Branch lengths count because a
-    placement's `distal_length` is a position along its edge, and its likelihoods were
-    computed on those lengths. Internal labels and the order of a node's children are
-    not compared; a placement's meaning does not depend on them."""
+    far as a placement can tell (`_phylogeny.tree_difference`). Edge numbers count
+    because a jplace's edge_nums name edges of its own tree, so the same topology
+    numbered another way joins placements to the wrong edges. Branch lengths count
+    because a placement's `distal_length` is a position along its edge, and its
+    likelihoods were computed on those lengths."""
     conn.execute(
         "CREATE TEMP TABLE load_tree AS"
         " SELECT node_index, parent_index, edge_id, branch_length, is_tip, name"
         " FROM read_parquet(?)",
         [phylogeny],
     )
-    shape = (
-        "SELECT c.edge_id, p.edge_id AS parent_edge_id, c.branch_length,"
-        " CASE WHEN c.is_tip THEN c.name END AS tip"
-        " FROM {t} c LEFT JOIN {t} p ON c.parent_index = p.node_index"
-    )
-    jplace_nodes, load_nodes = conn.execute(
-        "SELECT (SELECT count(*) FROM jplace_tree), (SELECT count(*) FROM load_tree)"
-    ).fetchone()
-    n, first = _anomaly(
-        conn,
-        "SELECT 'edge ' || coalesce(CAST(edge_id AS VARCHAR), 'none')"
-        " || ' under edge ' || coalesce(CAST(parent_edge_id AS VARCHAR), 'none')"
-        " || ', length ' || coalesce(CAST(branch_length AS VARCHAR), 'none')"
-        " || coalesce(', tip ' || tip, '') FROM ("
-        f"{shape.format(t='jplace_tree')} EXCEPT ALL {shape.format(t='load_tree')}"
-        ") ORDER BY edge_id NULLS FIRST, parent_edge_id NULLS FIRST, tip NULLS FIRST",
-    )
+    diff = tree_difference(conn, "jplace_tree", "load_tree")
     conn.execute("DROP TABLE load_tree")
-    if n or jplace_nodes != load_nodes:
+    if not diff.same:
         raise ValueError(
-            f"the tree in this load is not the jplace's tree: it has {load_nodes} nodes to the "
-            f"jplace tree's {jplace_nodes}, and {n} of the jplace tree's nodes have no node in "
-            f"it with the same edge number, parent edge number, branch length and tip name "
-            f"(e.g. {first}). "
+            f"the tree in this load is not the jplace's tree: it has {diff.actual_nodes} nodes"
+            f" to the jplace tree's {diff.expected_nodes}, and {diff.missing} of the jplace"
+            " tree's nodes have no node in it with the same edge number, parent edge number,"
+            f" branch length and tip name (e.g. {diff.examples}). "
             "A jplace's edge_nums name edges of its own tree, so load that tree, `{N}` "
             "decorations included"
         )
