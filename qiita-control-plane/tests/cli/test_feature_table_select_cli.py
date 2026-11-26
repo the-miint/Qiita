@@ -372,8 +372,8 @@ def test_classified_only_without_a_reference_is_refused_before_anything_is_read(
 
 @pytest.mark.parametrize(
     "rows",
-    [[], [("QF1", "Bacteria"), ("QF1", "Archaea")]],
-    ids=["short", "repeated"],
+    [[], [("QF1", "Bacteria"), ("QF1", "Archaea")], [("QF9", "Bacteria")]],
+    ids=["short", "repeated", "another feature"],
 )
 def test_a_lineage_not_one_row_per_feature_is_refused(monkeypatch, tmp_path, capsys, rows):
     """A short lineage would read as unclassified features, and a repeated one as two

@@ -131,11 +131,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             else registered(con, "stored_taxonomy", taxonomy)
         ),
     ):
-        values_from, features_from, taxonomy_from = (
-            "stored_values",
-            "stored_features",
-            "stored_taxonomy",
-        )
+        values_from, features_from = "stored_values", "stored_features"
         if args.classified_only:
             # Narrowed here, so the table, its sequences and its lineage lose the same
             # features; the server never computes a filtered table.
@@ -143,9 +139,9 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
                 "CREATE TEMP TABLE classified AS SELECT feature FROM stored_taxonomy"
                 f" WHERE coalesce({rank_columns_sql()}) IS NOT NULL"
             )
-            values_from, features_from, taxonomy_from = (
+            values_from, features_from = (
                 f"{relation} SEMI JOIN classified USING (feature)"
-                for relation in (values_from, features_from, taxonomy_from)
+                for relation in (values_from, features_from)
             )
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
@@ -162,9 +158,11 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
                 f" - (SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION})"
             ).fetchall()
         if taxonomy is not None:
+            # The table's features only, so equal counts below mean equal sets.
             con.execute(
                 f"CREATE TEMP TABLE {ft.TAXONOMY_SIDECAR_RELATION} AS"
-                f" SELECT feature AS feature_id, * EXCLUDE (feature) FROM {taxonomy_from}"
+                " SELECT t.feature AS feature_id, t.* EXCLUDE (feature) FROM stored_taxonomy t"
+                f" SEMI JOIN {ft.LABELLED_RELATION} l ON l.feature_id = t.feature"
             )
             [(published, repeated, rows, feature_ids, unnamed)] = con.execute(
                 f"SELECT (SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION}),"
