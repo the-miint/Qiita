@@ -49,18 +49,20 @@ then each study's runs queue again behind anything already waiting.
    touches read data.
 
 That gate ends at submit. The background dispatch each submitted ticket starts runs
-past it under its own process-wide bound, the dispatch cap (`DISPATCH_MAX_INFLIGHT`,
-retunable with `qiita-admin dispatch-cap`; see [Dispatch
-concurrency](../architecture/processing.md), download workflows included), so a large import queues its downloads rather than
-pressuring the control plane's connection pool. A ticket past the cap dispatches as
+past it under its own process-wide bound, download workflows included: the dispatch
+cap (`DISPATCH_MAX_INFLIGHT`, retunable with `qiita-admin dispatch-cap`; see
+"Dispatch concurrency" under [Work Ticket
+Lifecycle](../architecture/processing.md#work-ticket-lifecycle)). So a large import
+queues its downloads rather than pressuring the control plane's connection pool. A ticket past the cap dispatches as
 soon as a slot frees — nothing fails while it waits — and logs `queued behind the
 dispatch cap` at INFO when it starts waiting, `dispatched after waiting` when it gets
 one. The queue is a single FIFO shared by every dispatch path: ENA downloads, user-
 submitted tickets, a redrive through `POST /work-ticket/{idx}/run`, and a restart's
-re-attach all wait on the same 8 slots, so eight hours-long downloads can hold a user
-ticket until one finishes. Raising the cap is a joint decision with the connection
-pool and `FANOUT_MAX_INFLIGHT` — the sizing note on the constant says what it is
-weighed against.
+re-attach all wait on the same slots, so as many hours-long downloads as the cap allows
+can hold a user ticket until one finishes. Raising the cap is a joint decision with the
+connection pool and `FANOUT_MAX_INFLIGHT`; the comment above `dispatch_cap_fits_pool`
+in `qiita-control-plane/src/qiita_control_plane/dispatch.py` says what it is weighed
+against.
 
 A download ticket fetches **4** runs at once by default. `ENA_DOWNLOAD_RUN_CONCURRENCY`
 (1-8, control-plane env, restart to change) sets it for every ticket an import batch

@@ -104,8 +104,8 @@ def test_every_allowed_cap_stays_well_below_the_pool_it_sizes(cap):
 
 
 def test_pool_sizes_for_the_allowed_caps():
-    """The pool sizes whose Postgres connection budget was added up when the set
-    was chosen; a change to the formula or the set changes them and fails here."""
+    """The pool size each allowed value builds; a change to the formula or the set
+    changes them and fails here."""
     assert {c: production_pool_max_size(c) for c in DISPATCH_MAX_INFLIGHT_CHOICES} == {
         8: 25,
         12: 25,

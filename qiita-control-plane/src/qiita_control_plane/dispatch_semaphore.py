@@ -4,8 +4,8 @@
 retunable on a running control plane (`PATCH /work-ticket/dispatch-cap`). This keeps
 the semaphore's contract — `async with`, FIFO wake order, `locked()` — and adds a
 limit that is the boot value (`DISPATCH_MAX_INFLIGHT`) unless an operator override
-replaces it. What the cap bounds and how its values are sized against the
-connection pool is on `dispatch.production_pool_max_size`.
+replaces it. What the cap bounds and how it is sized against the connection pool
+is in the comment above `dispatch.dispatch_cap_fits_pool`.
 
 Raising the limit starts waiters at once. Lowering it cancels nothing: tasks already
 holding a slot keep it, and waiters start only once `running` drops below the new
@@ -86,7 +86,7 @@ class DispatchSemaphore:
                 )
             if value < self._default:
                 _log.warning(
-                    "dispatch cap lowered to %d, BELOW the DISPATCH_MAX_INFLIGHT default of"
+                    "dispatch cap lowered to %d, below the DISPATCH_MAX_INFLIGHT default of"
                     " %d. The override is in-memory: a control-plane restart drops it and"
                     " dispatch resumes at %d. Re-apply after any restart (the unit is"
                     " Restart=on-failure, so a crash counts).",

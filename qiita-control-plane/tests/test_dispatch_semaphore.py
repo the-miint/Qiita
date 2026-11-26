@@ -202,7 +202,7 @@ async def test_lowering_below_the_default_warns_that_a_restart_reverts_it(caplog
     sem = DispatchSemaphore(12)
     with caplog.at_level(logging.WARNING, logger="qiita_control_plane.dispatch_semaphore"):
         sem.set_override(8, ceiling=12)
-    assert any("BELOW the DISPATCH_MAX_INFLIGHT default" in r.getMessage() for r in caplog.records)
+    assert any("below the DISPATCH_MAX_INFLIGHT default" in r.getMessage() for r in caplog.records)
 
 
 async def test_raising_above_the_default_does_not_warn(caplog):

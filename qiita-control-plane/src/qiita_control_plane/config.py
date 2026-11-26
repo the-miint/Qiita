@@ -164,7 +164,7 @@ def _parse_optional_positive_int_env(var: str) -> int | None:
 
 def _parse_dispatch_max_inflight() -> int:
     """DISPATCH_MAX_INFLIGHT, which must be one of `DISPATCH_MAX_INFLIGHT_CHOICES`
-    because it also sizes the connection pool (`dispatch.production_pool_max_size`)."""
+    (why the set is closed is on that constant)."""
     value = _parse_positive_int_env("DISPATCH_MAX_INFLIGHT", DEFAULT_DISPATCH_MAX_INFLIGHT)
     if value not in DISPATCH_MAX_INFLIGHT_CHOICES:
         raise RuntimeError(
@@ -234,7 +234,7 @@ class Settings:
     # Per-cohort cap on concurrently-dispatched fan-out child work_tickets.
     fanout_max_inflight: int = _DEFAULT_FANOUT_MAX_INFLIGHT
     # Process-wide cap on concurrently-running dispatches at boot; it also sizes the
-    # request pool. See `dispatch.dispatch_cap_fits_pool`.
+    # request pool. See the comment above `dispatch.dispatch_cap_fits_pool`.
     dispatch_max_inflight: int = DEFAULT_DISPATCH_MAX_INFLIGHT
     # Runs fetched at once per batch-submitted download ticket; None keeps the job's default.
     ena_download_run_concurrency: int | None = None

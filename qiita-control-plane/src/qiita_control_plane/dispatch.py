@@ -66,12 +66,12 @@ _log = logging.getLogger(__name__)
 # call's usual budget: the runner's `_stage_ena_run_roster`, parked on the
 # registration lock, holds its connection for the whole bounded wait,
 # `POOL_LOCK_WAIT_TIMEOUT_S`, rather than cycling it.) `production_pool_max_size`
-# sizes the pool from the boot cap so that holds; test_dispatch pins it for every
-# allowed value. The smallest allowed cap equals fanout's DEFAULT_FANOUT_MAX_INFLIGHT,
-# so a single cohort at its default cap stays reachable, and FANOUT_MAX_INFLIGHT tuned
-# above the dispatch cap buys a cohort nothing — its children queue for these same
-# shared slots. What a slot covers, and the workflow cap that follows from it, is
-# documented on `schedule_dispatch`.
+# sizes the pool from the boot cap so that holds for every value in
+# `DISPATCH_MAX_INFLIGHT_CHOICES`. The smallest allowed cap equals fanout's
+# DEFAULT_FANOUT_MAX_INFLIGHT, so a single cohort at its default cap stays reachable,
+# and FANOUT_MAX_INFLIGHT tuned above the dispatch cap buys a cohort nothing — its
+# children queue for these same shared slots. What a slot covers, and the workflow
+# cap that follows from it, is documented on `schedule_dispatch`.
 
 
 def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
@@ -85,12 +85,8 @@ def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
 def production_pool_max_size(dispatch_max_inflight: int) -> int:
     """The request pool's max_size for a boot-time DISPATCH_MAX_INFLIGHT: the smallest
     size at or above `PRODUCTION_POOL_FLOOR` that `dispatch_cap_fits_pool` accepts.
-
-    Every connection the pool opens is a backend on the Postgres server, which may be
-    shared with the DuckLake catalog. A value that takes the pool above the floor has
-    to fit that server's max_connections alongside the data plane's pools and every
-    other client before it is offered in `DISPATCH_MAX_INFLIGHT_CHOICES`.
-    """
+    Which values may reach it, and why the set is closed, is on
+    `DISPATCH_MAX_INFLIGHT_CHOICES`."""
     return max(
         PRODUCTION_POOL_FLOOR,
         dispatch_max_inflight * 2,

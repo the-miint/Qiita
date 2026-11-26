@@ -453,8 +453,7 @@ def test_settings_dispatch_max_inflight_from_env(monkeypatch, value):
 
 @pytest.mark.parametrize("bad_value", ["0", "-1", "10", "32", "x"])
 def test_settings_rejects_dispatch_max_inflight_outside_the_choices(monkeypatch, bad_value):
-    """A value outside the allowed set fails the boot: it would size the connection
-    pool to a number nobody has checked against Postgres max_connections."""
+    """A value outside `DISPATCH_MAX_INFLIGHT_CHOICES` fails the boot."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", bad_value)
 
