@@ -283,7 +283,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
     awk -F'\t' 'NR > 1 && $8 == "active" && $9 == "100" && $10 == "1.0.0"' "$W/affected.tsv" > "$W/rerun.tsv"
     wc -l "$W/rerun.tsv"
     ```
-  - **Submit a canary of 5, then batches of 8**, as a wet_lab_admin or system_admin with `prep_sample:write`. The control plane dispatches 8 tickets at a time across all users, so a batch of 8 leaves no one else's tickets queued behind more than one batch. Wait for a batch's tickets to finish (`qiita ticket status <idx>`) before starting the next. The loop records each ticket idx in `submitted.tsv`.
+  - **Submit a canary of 5, then batches of 8**, as a wet_lab_admin or system_admin with `prep_sample:write`. The control plane dispatches `DISPATCH_MAX_INFLIGHT` tickets at a time across all users (8 unless `control-plane.env` or `qiita-admin dispatch-cap` raised it), so at 8 a batch of 8 leaves no one else's tickets queued behind more than one batch. Wait for a batch's tickets to finish (`qiita ticket status <idx>`) before starting the next. The loop records each ticket idx in `submitted.tsv`.
     ```bash
     # [operator] canary; then `tail -n +6 "$W/rerun.tsv" | split -l 8 - "$W/batch-"`, and for each batch-* file
     # copy it to "$W/batch.tsv" and run the loop again

@@ -45,7 +45,7 @@ from .. import _common
 
 # At most this many tickets per batch, and so re-runs in flight. It is below the
 # control plane's process-wide dispatch cap at its smallest allowed value
-# (`DISPATCH_MAX_INFLIGHT_CHOICES`, see `dispatch.py`), leaving slots for other work.
+# (`qiita_common.models.DISPATCH_MAX_INFLIGHT_CHOICES`), leaving slots for other work.
 MAX_BATCH = 6
 
 # Above the route's own bound so a reply that is still coming is not cut off.

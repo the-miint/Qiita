@@ -49,11 +49,11 @@ then each study's runs queue again behind anything already waiting.
    touches read data.
 
 That gate ends at submit. The background dispatch each submitted ticket starts runs
-past it under its own process-wide bound, download workflows included: the dispatch
-cap (`DISPATCH_MAX_INFLIGHT`, retunable with `qiita-admin dispatch-cap`; see
-"Dispatch concurrency" under [Work Ticket
-Lifecycle](../architecture/processing.md#work-ticket-lifecycle)). So a large import
-queues its downloads rather than pressuring the control plane's connection pool. A ticket past the cap dispatches as
+past it under its own process-wide bound, the dispatch cap (`DISPATCH_MAX_INFLIGHT`,
+retunable with `qiita-admin dispatch-cap`; see "Dispatch concurrency" under [Work
+Ticket Lifecycle](../architecture/processing.md#work-ticket-lifecycle)), which covers
+download workflows too. So a large import queues its downloads rather than pressuring
+the control plane's connection pool. A ticket past the cap dispatches as
 soon as a slot frees — nothing fails while it waits — and logs `queued behind the
 dispatch cap` at INFO when it starts waiting, `dispatched after waiting` when it gets
 one. The queue is a single FIFO shared by every dispatch path: ENA downloads, user-
