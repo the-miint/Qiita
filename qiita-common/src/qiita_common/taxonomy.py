@@ -19,7 +19,7 @@ siblings to unclassified would relocate a whole genome on the strength of one
 curation decision.
 """
 
-# The data-plane relation both consumers stream, and it is the exclusion-aware VIEW
+# The data-plane relation every taxonomy reader streams, and it is the exclusion-aware VIEW
 # rather than the raw base table — a curated exclusion must not be bypassable by asking
 # for taxonomy directly. The accepted consequence is that a blocked feature has no row at
 # all, which is precisely why the representative below is the lowest CLASSIFIED member

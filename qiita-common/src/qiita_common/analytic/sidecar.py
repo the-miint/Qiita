@@ -89,7 +89,7 @@ def taxonomy_table_sql(source: str) -> str:
     `source` is the caller's stream relation. Projected to `feature_idx` plus the eight
     ranks: the stream also carries `reference_idx` and `ncbi_taxon_id` (always NULL
     today), and holding a whole reference's worth of columns nothing reads is the kind
-    of cost that only shows up at GG2 scale.
+    of cost that only shows up at the scale of the largest references.
     """
     return (
         f"CREATE TABLE {TAXONOMY_TABLE} AS SELECT feature_idx, {rank_columns_sql()} FROM {source}"
@@ -227,7 +227,7 @@ def phylogeny_table_sql(source: str) -> str:
 
     **A tip's own name is dropped on the way in.** Nothing downstream reads it — the
     shear renames every tip from the mint, and an unpublished one is left nameless — and
-    on a reference the size of GG2 the tip labels ARE the tree: half its ~660k nodes, and
+    on the largest references the tip labels ARE the tree: half its ~660k nodes, and
     the bulk of 407 MB of Newick, held for the length of the run for nothing. It also
     makes the promise that no reference-internal FASTA header can reach a published file
     structural rather than a property of one CASE expression downstream.
