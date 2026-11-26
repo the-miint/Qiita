@@ -87,9 +87,9 @@ def taxonomy_table_sql(source: str) -> str:
     """Materialize the streamed per-feature taxonomy into `TAXONOMY_TABLE`.
 
     `source` is the caller's stream relation. Projected to `feature_idx` plus the eight
-    ranks: the stream also carries `reference_idx` and `ncbi_taxon_id` (always NULL
-    today), and holding a whole reference's worth of columns nothing reads is the kind
-    of cost that grows with one row per feature of the reference.
+    ranks: the stream also carries `reference_idx` and `ncbi_taxon_id`, and holding a
+    whole reference's worth of columns nothing reads is the kind of cost that grows with
+    one row per feature of the reference.
     """
     return (
         f"CREATE TABLE {TAXONOMY_TABLE} AS SELECT feature_idx, {rank_columns_sql()} FROM {source}"
@@ -189,7 +189,7 @@ def check_taxonomy_diagnostics(
 
     Every fault here is silent in the file: a short sidecar reads as "those rows are
     unclassified", a duplicated one double-counts under any join, and a NULL name joins
-    to nothing. An unclassified row is NOT one of these — it is present with NULL ranks,
+    to nothing. An unclassified row is not one of these — it is present with NULL ranks,
     which is a different statement and a legitimate one.
     """
     # Checked on the streamed taxonomy rather than on the sidecar, because the genome
