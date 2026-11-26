@@ -108,7 +108,7 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         con.execute(
             f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
             " SELECT feature AS feature_id, sample AS sample_id, value"
-            " FROM stored_values ORDER BY sample_id, feature_id"
+            " FROM stored_values"
         )
     with registered(con, "stored_features", features):
         con.execute(
