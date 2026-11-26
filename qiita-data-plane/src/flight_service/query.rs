@@ -89,6 +89,12 @@ pub(super) const ALLOWED_TABLES: &[&str] = &[
     // the MINTED namespace, which is the join into the shared feature space this
     // table cannot make.
     "bin_quality",
+    // The amplicon feature-table surfaces. `amplicon_membership` is served only as
+    // its exclusion-aware view, like `alignment_visible`, so a blocked ASV cannot
+    // reach a feature table; `amplicon_sequence` is scoped by
+    // `build_amplicon_sequence_query`.
+    "amplicon_membership_visible",
+    "amplicon_sequence",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -454,12 +460,13 @@ fn is_alignment_doget_surface(table: &str) -> bool {
 ///
 /// The `reference_*` tables are broadly readable by design (an unfiltered SELECT
 /// there mirrors the anonymous REST `GET /reference/{idx}`), so the refusal is
-/// per-table rather than global. What is listed is the one table an empty filter
-/// would turn into the whole alignment sink. The assembly surfaces are not
-/// listed and do not need to be: like `read_masked`, their scope IS their query
-/// shape (`build_assembly_run_query`), which has no empty form to refuse.
+/// per-table rather than global. What is listed are the views an empty filter
+/// would turn into a whole sink: the alignment and the amplicon counts. The
+/// assembly and amplicon-sequence surfaces are not listed and do not need to be:
+/// like `read_masked`, their scope IS their query shape, which has no empty form
+/// to refuse.
 fn requires_scoped_filter(table: &str) -> bool {
-    is_alignment_doget_surface(table)
+    is_alignment_doget_surface(table) || table == "amplicon_membership_visible"
 }
 
 /// The DoGet surfaces whose scope is one assembly RUN.
@@ -480,6 +487,11 @@ fn is_assembly_run_surface(table: &str) -> bool {
 /// and needs none of the `assembly_membership` semi join those two require.
 fn is_bin_quality_surface(table: &str) -> bool {
     table == "bin_quality"
+}
+
+/// The amplicon ASV-sequence surface, scoped by `build_amplicon_sequence_query`.
+fn is_amplicon_sequence_surface(table: &str) -> bool {
+    table == "amplicon_sequence"
 }
 
 /// The query a verified DoGet ticket selects: what `do_get` streams and what
@@ -554,6 +566,10 @@ pub(super) fn build_query(
     // Scoped by a run it carries itself, and refused outright without one.
     if is_bin_quality_surface(table) {
         return build_bin_quality_query(filter);
+    }
+
+    if is_amplicon_sequence_surface(table) {
+        return build_amplicon_sequence_query(filter);
     }
 
     if filter.is_empty() {
@@ -754,6 +770,50 @@ fn build_assembly_run_query(
             "SELECT * FROM {full_table} WHERE feature_idx IN (\
              SELECT feature_idx FROM qiita_lake.assembly_membership \
              WHERE prep_sample_idx = {prep_sample_idx} AND processing_idx = {processing_idx})"
+        ),
+        full_table,
+    ))
+}
+
+/// Build the amplicon ASV-sequence DoGet: the cohort's sequences, selected by a
+/// semi join against `amplicon_membership_visible` rather than a roster the ticket
+/// carries.
+///
+/// `amplicon_sequence` has no cohort column — a sequence is stored once,
+/// content-deduped by `feature_idx` — so the cohort (its `processing_idx` runs over
+/// its `prep_sample_idx`s) is resolved through the membership VIEW, which also
+/// anti-joins the blocklist, so a blocked ASV's bytes are never streamed. The ticket
+/// names the cohort by those two list columns and nothing else; `feature_idx` is
+/// refused, so no ticket names sequences directly.
+///
+/// `IN (subquery)`, not a literal roster, for the SEMI-join dynamic-filter plan
+/// `build_assembly_run_query` documents — the cohort here pools many runs, so the
+/// resolved key set is larger still.
+fn build_amplicon_sequence_query(filter: &auth::TicketFilter) -> Result<(String, String), Status> {
+    let processing = i64_list_filter(filter, "processing_idx")?;
+    let preps = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "amplicon_sequence accepts only processing_idx and prep_sample_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let processing_csv = processing
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let preps_csv = preps
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let full_table = "qiita_lake.amplicon_sequence".to_string();
+    Ok((
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.amplicon_membership_visible \
+             WHERE processing_idx IN ({processing_csv}) AND prep_sample_idx IN ({preps_csv}))"
         ),
         full_table,
     ))

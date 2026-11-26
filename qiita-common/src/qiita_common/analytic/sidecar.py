@@ -1,7 +1,7 @@
-"""The two optional companions to a published table: the taxonomy sidecar and the
-sheared tree.
+"""The companions to a published table: the taxonomy sidecar, the sheared tree, and each
+feature's sequence.
 
-Both are named from the same `exported_feature` mint the table's rows are, so
+Each is named from the same `exported_feature` mint the table's rows are, so
 `feature_id` is the join key across the bundle — which is what makes them joinable to
 the table rather than merely shipped beside it.
 """
@@ -19,7 +19,10 @@ from ..taxonomy import (
 from .label import published_membership_sql
 from .relations import (
     BLOCKED_FEATURE_TABLE,
+    FEATURE_LABEL_TABLE,
+    FEATURE_SEQUENCE_TABLE,
     GENOME_LABEL_TABLE,
+    LABELLED_RELATION,
     PHYLOGENY_TABLE,
     SHEAR_INPUT_RELATION,
     SHEAR_KEEP_SET_RELATION,
@@ -84,9 +87,9 @@ def taxonomy_table_sql(source: str) -> str:
     """Materialize the streamed per-feature taxonomy into `TAXONOMY_TABLE`.
 
     `source` is the caller's stream relation. Projected to `feature_idx` plus the eight
-    ranks: the stream also carries `reference_idx` and `ncbi_taxon_id` (always NULL
-    today), and holding a whole reference's worth of columns nothing reads is the kind
-    of cost that only shows up at GG2 scale.
+    ranks: the stream also carries `reference_idx` and `ncbi_taxon_id`, and holding a
+    whole reference's worth of columns nothing reads is the kind of cost that grows with
+    one row per feature of the reference.
     """
     return (
         f"CREATE TABLE {TAXONOMY_TABLE} AS SELECT feature_idx, {rank_columns_sql()} FROM {source}"
@@ -112,6 +115,23 @@ def taxonomy_sidecar_sql() -> str:
     )
 
 
+def feature_taxonomy_sidecar_sql() -> str:
+    """The feature-axis twin of `taxonomy_sidecar_sql`: one row per labelled feature,
+    carrying its own ranks.
+
+    No genome-representative reduction: on this axis the feature is the taxonomic unit, so
+    the label joins straight to its own taxonomy row on `feature_idx`. LEFT, so a feature
+    the reference does not classify stays present with NULL ranks, keeping one row per
+    label.
+    """
+    return (
+        f"CREATE VIEW {TAXONOMY_SIDECAR_RELATION} AS "
+        f"SELECT l.feature_id, {prefixed_rank_columns_sql(alias='t')} "
+        f"FROM {FEATURE_LABEL_TABLE} l "
+        f"LEFT JOIN {TAXONOMY_TABLE} t ON t.feature_idx = l.feature_idx"
+    )
+
+
 @dataclass(frozen=True)
 class TaxonomyClearance:
     """Evidence that `check_taxonomy_diagnostics` ran and passed, plus the sidecar's row
@@ -130,13 +150,30 @@ def taxonomy_diagnostics_sql() -> str:
     must match."""
     return (
         f"SELECT (SELECT count(*) FROM {GENOME_LABEL_TABLE}) AS published_rows, "
-        f"(SELECT count(*) - count(DISTINCT feature_idx) FROM {TAXONOMY_TABLE}) "
-        f"    AS repeated_features, "
+        f"({repeated_features_sql()}) AS repeated_features, "
         f"count(*) AS taxonomy_rows, "
         f"count(DISTINCT feature_id) AS taxonomy_feature_ids, "
         f"count(*) FILTER (WHERE feature_id IS NULL) AS unnamed_rows "
         f"FROM {TAXONOMY_SIDECAR_RELATION}"
     )
+
+
+def repeated_features_sql() -> str:
+    """How many rows `TAXONOMY_TABLE` holds beyond one per feature, for
+    `refuse_repeated_features`."""
+    return f"SELECT count(*) - count(DISTINCT feature_idx) FROM {TAXONOMY_TABLE}"
+
+
+def refuse_repeated_features(repeated_features: int) -> None:
+    """Refuse a taxonomy that holds more than one row for some feature: a malformed
+    reference, on either axis."""
+    if repeated_features:
+        raise ValueError(
+            f"this reference's taxonomy holds more than one row for {repeated_features} "
+            f"feature(s), which ingest writes one-to-one, so the reference is malformed. "
+            f"Two rows for one feature can disagree, and choosing between them silently "
+            f"would publish an arbitrary lineage."
+        )
 
 
 def check_taxonomy_diagnostics(
@@ -152,20 +189,13 @@ def check_taxonomy_diagnostics(
 
     Every fault here is silent in the file: a short sidecar reads as "those rows are
     unclassified", a duplicated one double-counts under any join, and a NULL name joins
-    to nothing. An unclassified genome is NOT one of these — it is present with NULL
-    ranks, which is a different statement and a legitimate one.
+    to nothing. An unclassified row is not one of these — it is present with NULL ranks,
+    which is a different statement and a legitimate one.
     """
-    if repeated_features:
-        # Checked on the STREAMED taxonomy rather than on the sidecar, because the
-        # reduction resolves a repeat to one row and so cannot show it downstream — see
-        # `genome_representative_taxonomy_select_sql`. Two rows for one feature need not
-        # agree, and arbitrating between two lineages is not ours to do quietly.
-        raise ValueError(
-            f"this reference's taxonomy holds more than one row for {repeated_features} "
-            f"feature(s), which ingest writes one-to-one, so the reference is malformed. "
-            f"Two rows for one feature can disagree, and choosing between them silently "
-            f"would publish an arbitrary lineage."
-        )
+    # Checked on the streamed taxonomy rather than on the sidecar, because the genome
+    # axis's reduction resolves a repeat to one row and so cannot show it downstream; see
+    # `genome_representative_taxonomy_select_sql`.
+    refuse_repeated_features(repeated_features)
     if unnamed_rows:
         raise ValueError(
             f"{unnamed_rows} taxonomy rows carry no feature_id, so nothing could join "
@@ -176,7 +206,7 @@ def check_taxonomy_diagnostics(
         raise ValueError(
             f"the taxonomy sidecar describes {taxonomy_rows} rows but the table "
             f"publishes {published_rows}. A sidecar shorter than its table reads as "
-            f"though the missing rows were unclassified — an unclassified genome is "
+            f"though the missing rows were unclassified — an unclassified row is "
             f"present here with NULL ranks — and a longer one describes rows nobody "
             f"can find."
         )
@@ -184,9 +214,9 @@ def check_taxonomy_diagnostics(
         raise ValueError(
             f"{taxonomy_rows} taxonomy rows carry only {taxonomy_feature_ids} distinct "
             f"feature_ids, so joining the sidecar to the table would multiply the rows "
-            f"it duplicates. Each published row has exactly one representative member, "
-            f"so a repeat means the reference's taxonomy holds more than one row for "
-            f"one feature."
+            f"it duplicates. Each published row takes its lineage from one feature, so a "
+            f"repeat means the reference's taxonomy holds more than one row for one "
+            f"feature."
         )
     return TaxonomyClearance(rows=taxonomy_rows)
 
@@ -196,8 +226,9 @@ def phylogeny_table_sql(source: str) -> str:
 
     **A tip's own name is dropped on the way in.** Nothing downstream reads it — the
     shear renames every tip from the mint, and an unpublished one is left nameless — and
-    on a reference the size of GG2 the tip labels ARE the tree: half its ~660k nodes, and
-    the bulk of 407 MB of Newick, held for the length of the run for nothing. It also
+    on a large reference the tip labels are most of the tree: in a tree of about 660k
+    nodes they are half the nodes and the bulk of 407 MB of Newick, held for the length
+    of the run for nothing. It also
     makes the promise that no reference-internal FASTA header can reach a published file
     structural rather than a property of one CASE expression downstream.
     """
@@ -418,3 +449,45 @@ def check_tree_diagnostics(
             f"table publishes reads as though those rows were left out of the analysis."
         )
     return TreeClearance(tips=published_rows)
+
+
+@dataclass(frozen=True)
+class SequencesClearance:
+    """Evidence that `check_sequences_diagnostics` ran and passed, plus the number of
+    features the sequences sidecar covers. `sequences_copy_sql` takes one for the reason
+    `taxonomy_copy_sql` takes a `TaxonomyClearance`."""
+
+    rows: int
+
+
+def sequences_diagnostics_sql() -> str:
+    """One row for `check_sequences_diagnostics`, over the published table and
+    `FEATURE_SEQUENCE_TABLE`."""
+    return (
+        f"SELECT (SELECT count(DISTINCT feature_id) FROM {LABELLED_RELATION}) AS features, "
+        f"(SELECT count(DISTINCT feature_id) FROM {LABELLED_RELATION} l "
+        f"  ANTI JOIN {FEATURE_SEQUENCE_TABLE} s ON s.feature = l.feature_id) "
+        f"  AS unsequenced_features, "
+        f"(SELECT count(*) FROM (SELECT s.feature FROM {FEATURE_SEQUENCE_TABLE} s "
+        f"  SEMI JOIN {LABELLED_RELATION} l ON l.feature_id = s.feature "
+        f"  GROUP BY s.feature HAVING count(*) > 1)) AS repeated_features"
+    )
+
+
+def check_sequences_diagnostics(
+    *, features: int, unsequenced_features: int, repeated_features: int
+) -> SequencesClearance:
+    """Refuse a sequences sidecar that does not describe the table beside it: a feature
+    with no sequence row, or one with two, which a reader joining on the handle would
+    double. Return the clearance `sequences_copy_sql` requires."""
+    if unsequenced_features:
+        raise ValueError(
+            f"{unsequenced_features} of the table's {features} features have no sequence "
+            f"row, so the sequences sidecar would not cover the table."
+        )
+    if repeated_features:
+        raise ValueError(
+            f"{repeated_features} feature(s) carry more than one sequence row; the "
+            f"sequences are read one row per feature."
+        )
+    return SequencesClearance(rows=features)

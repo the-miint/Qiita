@@ -643,7 +643,7 @@ def _stage_exported_features(con, entries: list[dict[str, Any]]) -> None:
         entries,
         relation=_EXPORTED_FEATURE_SOURCE,
         columns=[("genome_idx", pa.int64()), ("export_feature_id", pa.string())],
-        table_sql=ft.genome_label_table_sql,
+        table_sql=ft.feature_label_table_sql,
     )
 
 
@@ -959,12 +959,12 @@ MANIFEST_NOTE = (
 
 
 class _Companion(NamedTuple):
-    """An optional bundle member: the flag that asks for one, the suffix it lands at, and
-    the COPY that writes it.
+    """A bundle member beside the table: its name, the suffix it lands at, and the COPY
+    that writes it.
 
-    One record read by both halves — `_bundle_targets` needs the suffixes from the flags
-    alone, since it runs before anything has been computed, and `_write_bundle` needs the
-    writers — so a member cannot be reserved a path and then not written, and adding one
+    One record read by both halves — `_bundle_targets` needs the suffixes of the members
+    asked for, since it runs before anything has been computed, and `_write_bundle` needs
+    the writers — so a member cannot be reserved a path and then not written, and adding one
     is a line here rather than a third positional index at each site.
     """
 
@@ -979,6 +979,7 @@ class _Companion(NamedTuple):
 _COMPANIONS = (
     _Companion("taxonomy", ".taxonomy.parquet", ft.taxonomy_copy_sql),
     _Companion("tree", ".tree.parquet", ft.tree_copy_sql),
+    _Companion("sequences", ".sequences.parquet", ft.sequences_copy_sql),
 )
 
 
@@ -1201,12 +1202,22 @@ def _manifest_payload(
     }
 
 
+def _companions(*names: str) -> tuple[_Companion, ...]:
+    """The companions named, in write order. An unknown name is refused: silently writing
+    nothing is the one outcome a bundle must not have, since the member would be absent
+    from a bundle whose whole promise is all-of-its-files."""
+    unknown = set(names) - {c.name for c in _COMPANIONS}
+    if unknown:
+        raise ValueError(f"no bundle companion is named {sorted(unknown)}")
+    return tuple(c for c in _COMPANIONS if c.name in names)
+
+
 def _requested_companions(*, taxonomy: bool, tree: bool) -> tuple[_Companion, ...]:
-    """The companions these flags ask for, in write order. Spelled out per member rather
-    than read off the namespace, so a renamed flag is a signature change here instead of a
-    silently absent file."""
+    """The companions these flags ask for. Spelled out per member rather than read off
+    the namespace, so a renamed flag is a signature change here instead of a silently
+    absent file."""
     asked = {"taxonomy": taxonomy, "tree": tree}
-    return tuple(companion for companion in _COMPANIONS if asked[companion.name])
+    return _companions(*(name for name, on in asked.items() if on))
 
 
 # Written INTO the map as well as printed, because a warning that lives only in a
@@ -1288,10 +1299,11 @@ def _write_bundle(
     identifiers: list[dict[str, Any]],
     manifest: Callable[[list[Path]], dict[str, Any]],
     clearances: dict[str, Any],
+    map_note: str = IDENTIFIER_MAP_NOTE,
 ) -> list[Path]:
     """Write the bundle — the relabelled table at `table_path`, the exported-identifier map
-    and the manifest beside it, and one file per companion in `clearances` — and return the
-    files written.
+    (led by `map_note`) and the manifest beside it, and one file per companion in
+    `clearances` — and return the files written.
 
     `clearances` is keyed by companion name, and holding the clearance is what makes a
     member writable: each companion's COPY takes one, so a file cannot be written without
@@ -1309,12 +1321,7 @@ def _write_bundle(
     reproduced; the rest because an artifact naming rows the table does not contain is
     worse than no artifact. Half a bundle is not a partial result but a useless one.
     """
-    unknown = set(clearances) - {c.name for c in _COMPANIONS}
-    if unknown:
-        # Silently writing nothing is the one outcome a bundle must not have: the member
-        # would be absent from a bundle whose whole promise is all-of-its-files.
-        raise ValueError(f"no bundle companion is named {sorted(unknown)}")
-    companions = tuple(c for c in _COMPANIONS if c.name in clearances)
+    companions = _companions(*clearances)
     targets = _bundle_targets(table_path, fmt, companions=companions)
     pairs = [(p.with_name(p.name + ".partial"), p) for p in targets]
     for partial, _ in pairs:
@@ -1337,7 +1344,7 @@ def _write_bundle(
         else:
             con.execute(ft.biom_copy_sql(table_partial))
         payload = {
-            "note": IDENTIFIER_MAP_NOTE,
+            "note": map_note,
             "count": len(identifiers),
             "identifiers": identifiers,
         }

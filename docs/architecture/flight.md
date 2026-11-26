@@ -419,3 +419,22 @@ genome map for a different reference than the alignment used — and those `para
 verified against the digest the server reported for them (`_alignment_summary`) before
 anything is read off them, because the manifest cites that digest as the processing's
 reproducibility key.
+
+### The stored-value feature table
+
+`POST /feature-table` (and `qiita feature-table select`, which writes what it answers)
+serves the other kind of feature table: one whose values a run already stored, one per
+(processed sample, feature), so the table is a selection rather than a computation. The
+methods that store values this way are `SOURCES` in `stored_feature_table.py`; amplicon
+is one. The request names a method, its parameters and a cohort, never a run; the
+control plane chooses the method's matching runs. Because nothing has to be computed
+over the cohort, it reads the values over Flight, relabels them in its own DuckDB
+through the same `qiita_common.analytic` relabel the client-side table uses
+(`ft.FEATURE_AXIS` here, `ft.GENOME_AXIS` there), and answers one zip of the columns
+(JSON) and the values and features (Arrow IPC), with each feature's lineage when the
+request names a reference. Authorization and the identifier mints are the ones described
+above, and the values ticket is scoped to the cohort; the lineage ticket is scoped to the
+reference and the table's features. The CLI writes the bundle with `feature-table
+build`'s writer. Narrowing the table by that lineage (`--classified-only`) happens on the
+caller's machine, from the table it downloaded, so the server never computes a filtered
+table.

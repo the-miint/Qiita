@@ -32,6 +32,22 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+# The statuses whose data is servable over Flight: `active` (loaded) or `indexing`
+# (mid-reindex, still serving the prior index). Any other status may hold partial or
+# stale rows.
+SERVABLE_REFERENCE_STATUSES = (ReferenceStatus.ACTIVE, ReferenceStatus.INDEXING)
+
+
+class ReferenceHandle(BaseModel):
+    """A reference by its public `(name, version)` handle, as `GET /reference` lists it
+    and as someone reproducing a result would cite it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)]
+    version: Annotated[str, Field(min_length=1, max_length=MAX_VERSION_LENGTH)]
+
+
 class ReadMaskReason(StrEnum):
     """Why a read is kept or dropped by a read mask.
 

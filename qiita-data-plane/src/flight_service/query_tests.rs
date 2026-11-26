@@ -1070,6 +1070,202 @@ fn build_query_assembly_membership_reaches_no_output_column() {
     );
 }
 
+/// A well-formed amplicon ticket: the cohort's runs over its prep_samples, and
+/// nothing else. Unlike an assembly run, BOTH columns are lists (a feature table
+/// pools many runs × prep_samples).
+fn amplicon_cohort_scope(processing: &[i64], preps: &[i64]) -> auth::TicketFilter {
+    filter_of(&[
+        (
+            "processing_idx",
+            processing.iter().map(|v| serde_json::json!(v)).collect(),
+        ),
+        (
+            "prep_sample_idx",
+            preps.iter().map(|v| serde_json::json!(v)).collect(),
+        ),
+    ])
+}
+
+#[test]
+fn build_query_amplicon_sequence_resolves_the_cohort_through_the_visible_view() {
+    // The sequence table has no cohort column, so the cohort is resolved through
+    // `amplicon_membership_visible` — and reading the VISIBLE view (not the raw
+    // membership) is what keeps a blocked ASV's bytes out of the stream.
+    let (sql, full) = build_query(
+        "amplicon_sequence",
+        &amplicon_cohort_scope(&[7, 8], &[42, 43]),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.amplicon_sequence");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.amplicon_sequence WHERE feature_idx IN (\
+         SELECT feature_idx FROM qiita_lake.amplicon_membership_visible \
+         WHERE processing_idx IN (7,8) AND prep_sample_idx IN (42,43))",
+        "got: {sql}"
+    );
+}
+
+#[test]
+fn build_query_amplicon_sequence_rejects_a_direct_feature_or_extra_column() {
+    let empty = auth::TicketFilter::new();
+    let cases = [
+        ("empty", empty.clone()),
+        (
+            "processing alone",
+            filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
+        ),
+        (
+            "prep_sample alone",
+            filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]),
+        ),
+        (
+            "the cohort plus a named feature",
+            filter_of(&[
+                ("processing_idx", vec![serde_json::json!(7)]),
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("feature_idx", vec![serde_json::json!(11)]),
+            ]),
+        ),
+        ("a feature roster alone", feature_scope(&[11, 22, 33])),
+    ];
+    for (label, filter) in &cases {
+        assert!(
+            build_query("amplicon_sequence", filter, &[], &[]).is_err(),
+            "amplicon_sequence must reject {label}"
+        );
+    }
+}
+
+#[test]
+fn build_query_amplicon_membership_visible_uses_the_generic_cohort_filter() {
+    // The counts view carries both cohort columns, so it goes through the generic
+    // WHERE path: an `IN` per column, multi-valued (HashMap order is unspecified,
+    // so assert per clause, not on the whole string).
+    let (sql, full) = build_query(
+        "amplicon_membership_visible",
+        &amplicon_cohort_scope(&[7, 8], &[42, 43]),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.amplicon_membership_visible");
+    assert!(sql.contains("processing_idx IN (7,8)"), "got: {sql}");
+    assert!(sql.contains("prep_sample_idx IN (42,43)"), "got: {sql}");
+    assert!(
+        build_query(
+            "amplicon_membership_visible",
+            &auth::TicketFilter::new(),
+            &[],
+            &[]
+        )
+        .is_err(),
+        "empty filter on amplicon_membership_visible must be rejected"
+    );
+}
+
+#[test]
+fn amplicon_surfaces_are_doget_allowed_and_the_raw_membership_is_not() {
+    for readable in ["amplicon_membership_visible", "amplicon_sequence"] {
+        assert!(
+            ALLOWED_TABLES.contains(&readable),
+            "{readable:?} must be DoGet-readable"
+        );
+    }
+    // The raw counts table stays unreachable — exclusion is enforced only on the
+    // view, so a ticket naming the base table would bypass the blocklist.
+    assert!(
+        !ALLOWED_TABLES.contains(&"amplicon_membership"),
+        "raw amplicon_membership must not be Flight-reachable (exclusion bypass)"
+    );
+}
+
+/// The distinct `feature_idx` a DoGet for `table` streams under `filter`, run
+/// through the real `build_query` SQL against the catalog — what a signed ticket
+/// would yield, the round trip the monkeypatched route tests cannot exercise.
+#[cfg(feature = "integration")]
+fn doget_feature_idxs(conn: &Connection, table: &str, filter: &auth::TicketFilter) -> Vec<i64> {
+    let (sql, _) = build_query(table, filter, &[], &[]).expect("build_query failed");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT DISTINCT feature_idx FROM ({sql}) ORDER BY feature_idx"
+        ))
+        .expect("prepare the DoGet SQL");
+    stmt.query_map([], |r| r.get(0))
+        .expect("run the DoGet SQL")
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+/// The amplicon surfaces are served end to end: a cohort's counts stream from
+/// `amplicon_membership_visible`, its sequences resolve through that same view, and a
+/// blocklisted ASV is absent from BOTH even though its base rows remain. Unique ids so the
+/// shared serial catalog never collides.
+#[test]
+#[serial_test::serial]
+#[cfg(feature = "integration")]
+fn amplicon_doget_serves_the_cohort_and_the_blocklist_excludes_an_asv() {
+    let connstr = crate::test_catalog::connstr();
+    let data_path = crate::test_catalog::data_path();
+    let conn = Connection::open_in_memory().unwrap();
+    ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+    // The exclusion views reference reference_taxonomy / alignment /
+    // amplicon_membership, so every base table must exist before the views build.
+    ducklake::ensure_reference_tables(&conn).unwrap();
+    ducklake::ensure_alignment_tables(&conn).unwrap();
+    ducklake::ensure_amplicon_tables(&conn).unwrap();
+    ducklake::ensure_exclusion_tables(&conn).unwrap();
+
+    let proc: i64 = 942_000;
+    let prep_a: i64 = 942_001;
+    let prep_b: i64 = 942_002;
+    let feat_a: i64 = 942_010;
+    let feat_b: i64 = 942_011;
+    let feat_blocked: i64 = 942_012;
+
+    let cleanup = format!(
+        "DELETE FROM qiita_lake.amplicon_membership WHERE processing_idx = {proc};
+         DELETE FROM qiita_lake.amplicon_sequence \
+             WHERE feature_idx IN ({feat_a}, {feat_b}, {feat_blocked});
+         DELETE FROM qiita_lake.reference_exclusion WHERE feature_idx = {feat_blocked};"
+    );
+    conn.execute_batch(&format!(
+        "{cleanup}
+         INSERT INTO qiita_lake.amplicon_membership \
+             (prep_sample_idx, processing_idx, feature_idx, count) VALUES \
+             ({prep_a}, {proc}, {feat_a}, 5), \
+             ({prep_a}, {proc}, {feat_blocked}, 7), \
+             ({prep_b}, {proc}, {feat_b}, 3);
+         INSERT INTO qiita_lake.amplicon_sequence \
+             (feature_idx, sequence_hash, sequence_length_bp, sequence) VALUES \
+             ({feat_a}, '00000000-0000-0000-0000-000000000001'::UUID, 4, 'ACGT'), \
+             ({feat_b}, '00000000-0000-0000-0000-000000000002'::UUID, 4, 'TGCA'), \
+             ({feat_blocked}, '00000000-0000-0000-0000-000000000003'::UUID, 4, 'GGGG');
+         INSERT INTO qiita_lake.reference_exclusion (feature_idx) VALUES ({feat_blocked});"
+    ))
+    .unwrap();
+
+    let cohort = amplicon_cohort_scope(&[proc], &[prep_a, prep_b]);
+
+    // Counts: served from the view, blocked ASV anti-joined out.
+    assert_eq!(
+        doget_feature_idxs(&conn, "amplicon_membership_visible", &cohort),
+        vec![feat_a, feat_b],
+        "the counts surface serves the cohort and drops the blocked ASV"
+    );
+    // Sequences: resolved THROUGH the view, so the blocked ASV's bytes are absent
+    // even though `amplicon_sequence` still holds its row.
+    assert_eq!(
+        doget_feature_idxs(&conn, "amplicon_sequence", &cohort),
+        vec![feat_a, feat_b],
+        "the sequence surface serves the cohort and drops the blocked ASV"
+    );
+
+    conn.execute_batch(&cleanup).unwrap();
+}
+
 /// A well-formed `bin_quality` ticket filter: one run, over a cohort.
 fn bin_quality_scope(prep_sample_idx: &[i64], processing_idx: i64) -> auth::TicketFilter {
     filter_of(&[

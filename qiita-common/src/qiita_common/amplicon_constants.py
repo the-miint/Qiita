@@ -7,12 +7,20 @@ reader of the same lake tables share one spelling without seeing each other's
 code.
 """
 
-# One row per (prep_sample_idx, processing_idx, feature_idx) with its count.
+# One row per (prep_sample_idx, processing_idx, feature_idx) with its count. The
+# WRITE target (register-files); reads use the exclusion-aware view below.
 AMPLICON_MEMBERSHIP_TABLE = "amplicon_membership"
+# The read surface: `amplicon_membership` with blocked features excluded (data plane
+# `ensure_exclusion_tables`), mirroring `alignment_visible`.
+AMPLICON_MEMBERSHIP_VISIBLE_TABLE = "amplicon_membership_visible"
 # One row per ASV feature_idx: its sequence hash, length, and the sequence itself.
 # An ASV is short (a single 64 KB chunk at most), so its bytes are stored inline here
 # rather than in a separate chunk table — unlike a reference genome, which is chunked.
 AMPLICON_SEQUENCE_TABLE = "amplicon_sequence"
+
+# action_context keys of two amplicon knobs, which the processing params hash.
+TRIM_BINDING = "trim"
+ORIENT_PRIMER_BINDING = "orient_primer"
 
 # register-files names a staged table after its file stem.
 AMPLICON_MEMBERSHIP_BASENAME = f"{AMPLICON_MEMBERSHIP_TABLE}.parquet"

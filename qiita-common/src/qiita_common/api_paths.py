@@ -1223,3 +1223,11 @@ URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIE
 URL_PREP_SAMPLE_GLOBAL_FIELD_LIST = (
     f"{URL_PREP_SAMPLE_GLOBAL_FIELD_PREFIX}{PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT}"
 )
+
+# =============================================================================
+# /feature-table — a feature table of stored values over a cohort
+# =============================================================================
+PATH_FEATURE_TABLE_PREFIX = "/feature-table"
+PATH_FEATURE_TABLE_ROOT = ""  # POST against the prefix itself
+URL_FEATURE_TABLE_PREFIX = f"{API_PREFIX}{PATH_FEATURE_TABLE_PREFIX}"
+URL_FEATURE_TABLE = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_ROOT}"
