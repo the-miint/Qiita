@@ -1,17 +1,13 @@
-"""`SlurmBackend.result_step` must not hold the orchestrator's event loop while it
-checks a step's output tree.
-
-The orchestrator is one uvicorn process on one event loop. On the deploy host the
-output tree is on Lustre, where checking a gene_call output of ~940 files took
-1–1.7 s; while that ran, every other request (`/health`, `/step/status`,
-`/step/submit`) waited. `verify_container_output` is replaced here by a wrapper
-that sleeps `_STALL_SECONDS` before running the real check, standing in for a slow
-file system.
+"""`SlurmBackend.result_step` checks a step's output tree off the event loop (see
+its docstring for why). `verify_container_output` is replaced here by a wrapper that
+records its thread and sleeps `_STALL_SECONDS` before running the real check,
+standing in for a slow file system.
 """
 
 import asyncio
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -44,7 +40,7 @@ def _no_slurmrestd(request: httpx.Request) -> httpx.Response:
 
 
 @pytest.fixture
-def backend(tmp_path) -> SlurmBackend:
+async def backend(tmp_path):
     jwt_path = tmp_path / "jwt"
     jwt_path.write_text(_jwt("qiita-orch"))
     client = SlurmrestdClient(
@@ -56,7 +52,9 @@ def backend(tmp_path) -> SlurmBackend:
             transport=httpx.MockTransport(_no_slurmrestd),
         ),
     )
-    return SlurmBackend(client=client, partition="qiita", account="qiita-prod")
+    backend = SlurmBackend(client=client, partition="qiita", account="qiita-prod")
+    yield backend
+    await backend.aclose()
 
 
 @pytest.fixture
@@ -77,29 +75,21 @@ def workspace(tmp_path) -> Path:
 
 
 @pytest.fixture
-def slow_verify(monkeypatch):
+def slow_verify(monkeypatch) -> list[int]:
+    """Thread idents `verify_container_output` ran on, one per call."""
     real = slurm_backend_module.verify_container_output
+    threads: list[int] = []
 
     def slow(*args, **kwargs):
+        threads.append(threading.get_ident())
         time.sleep(_STALL_SECONDS)
         return real(*args, **kwargs)
 
     monkeypatch.setattr(slurm_backend_module, "verify_container_output", slow)
+    return threads
 
 
-async def _max_tick_gap(stop: asyncio.Event) -> float:
-    """Longest wait between 10 ms ticks of the event loop until `stop` is set."""
-    worst = 0.0
-    last = time.perf_counter()
-    while not stop.is_set():
-        await asyncio.sleep(0.01)
-        now = time.perf_counter()
-        worst = max(worst, now - last)
-        last = now
-    return worst
-
-
-async def test_result_step_keeps_event_loop_responsive(backend, workspace, slow_verify):
+async def test_result_step_verifies_off_the_event_loop_thread(backend, workspace, slow_verify):
     handle = SlurmStepHandle(
         step_name="gene_call",
         slurm_job_id=1,
@@ -107,27 +97,20 @@ async def test_result_step_keeps_event_loop_responsive(backend, workspace, slow_
         output_path=workspace / "output",
         logs_path=workspace / "logs",
     )
-    stop = asyncio.Event()
-    ticker = asyncio.create_task(_max_tick_gap(stop))
-    await asyncio.sleep(0.03)
-
     outputs = await backend.result_step(handle, StepStatusInfo(status=StepStatus.COMPLETED))
-    stop.set()
-    worst_gap = await ticker
 
     assert outputs == {"manifest": (workspace / "output" / "result.parquet").resolve()}
-    assert worst_gap < _FREE_LOOP_BOUND_SECONDS, (
-        f"event loop stalled {worst_gap:.3f}s while result_step verified the output"
-    )
+    assert len(slow_verify) == 1
+    assert slow_verify[0] != threading.get_ident()
 
 
 async def test_health_answers_while_step_result_verifies(
-    backend, workspace, slow_verify, cp_to_co_token
+    backend, workspace, slow_verify, cp_to_co_token, monkeypatch
 ):
-    """The production symptom: the CP's 1 s `/health` probe of the CO times out
-    while the CO is answering a `step/result`."""
-    app.state.backend = backend
-    app.state.cp_to_co_token = cp_to_co_token
+    """The production symptom: the CP's 1 s `/health` probe of the CO timed out
+    while the CO was answering a `step/result`."""
+    monkeypatch.setattr(app.state, "backend", backend, raising=False)
+    monkeypatch.setattr(app.state, "cp_to_co_token", cp_to_co_token, raising=False)
     body = {
         "handle": {
             "compute_target": "slurm",

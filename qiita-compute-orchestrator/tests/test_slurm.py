@@ -715,18 +715,27 @@ def test_verify_declared_symlink_out_of_output_dir_escapes(tmp_path):
 
 def test_verify_files_under_a_symlinked_dir_are_not_walked(tmp_path):
     """A symlink to a directory is listed, not descended: a file reached only
-    through it is neither counted as undeclared nor accepted as declared."""
+    through it is not reported as undeclared, and declaring it is an escape."""
     outside = tmp_path / "elsewhere"
     outside.mkdir()
     (outside / "stray").write_bytes(b"x")
     (outside / "stray").chmod(0o440)
     out = _make_output(
         tmp_path,
-        {"output.parquet": b"abc"},
-        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+        {"output.parquet": b"abc", "extra": b"y"},
+        manifest={
+            "files": [
+                {"path": "output.parquet", "size_bytes": 3},
+                {"path": "linked/stray", "size_bytes": 1},
+            ]
+        },
     )
     (out / "linked").symlink_to(outside)
-    assert verify_container_output(out) == []
+    failures = {(f.reason, f.detail) for f in verify_container_output(out)}
+    assert failures == {
+        ("output file not listed in manifest", "extra"),
+        ("manifest entry 1 path escapes $QIITA_OUTPUT_PATH", "linked/stray"),
+    }
 
 
 def test_verify_resolves_paths_independent_of_file_count(tmp_path, monkeypatch):
@@ -759,7 +768,9 @@ def test_verify_resolves_paths_independent_of_file_count(tmp_path, monkeypatch):
         assert verify_container_output(out) == []
         return calls
 
-    assert realpath_calls(3) == realpath_calls(60)
+    few = realpath_calls(3)
+    assert few > 0  # the patch sees Path.resolve's calls
+    assert realpath_calls(60) == few
 
 
 # ============================================================================

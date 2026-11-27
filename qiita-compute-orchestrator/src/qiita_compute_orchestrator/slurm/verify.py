@@ -209,15 +209,22 @@ def verify_container_output(
 
     tree = _walk_output_tree(output_path)
 
-    def canonical(relative: str) -> Path:
-        """`(output_path / relative).resolve()`, read from `tree` when it already
-        shows the path is a non-symlink entry under the resolved output dir."""
+    def plain_entry(relative: str) -> tuple[tuple[str, ...], _WalkedEntry] | None:
+        """The walked entry `relative` names when the walk reached it as a
+        non-symlink, with its parts; None when the path needs a real `resolve()`."""
         parts = _plain_relative_parts(relative)
-        if parts is not None:
-            walked = tree.get(parts)
-            if walked is not None and not walked.is_symlink:
-                return output_path_resolved.joinpath(*parts)
-        return (output_path / relative).resolve()
+        walked = tree.get(parts) if parts is not None else None
+        if walked is None or walked.is_symlink:
+            return None
+        return parts, walked
+
+    def canonical(relative: str) -> Path:
+        """`(output_path / relative).resolve()`, without the syscalls when the
+        walk already shows the path is a non-symlink entry under the output dir."""
+        plain = plain_entry(relative)
+        if plain is None:
+            return (output_path / relative).resolve()
+        return output_path_resolved.joinpath(*plain[0])
 
     # Gate 2: every listed file exists with declared size.
     for i, entry in enumerate(files):
@@ -260,10 +267,9 @@ def verify_container_output(
                 )
             )
             continue
-        parts = _plain_relative_parts(relative)
-        walked = tree.get(parts) if parts is not None else None
-        if walked is not None and not walked.is_symlink and walked.file_stat is not None:
-            actual_size = walked.file_stat.st_size
+        plain = plain_entry(relative)
+        if plain is not None and plain[1].file_stat is not None:
+            actual_size = plain[1].file_stat.st_size
         else:
             if not full.exists():
                 failures.append(
@@ -296,11 +302,7 @@ def verify_container_output(
         if walked.file_stat is None:
             continue
         relative = "/".join(parts)
-        if walked.is_symlink:
-            resolved = (output_path / relative).resolve()
-        else:
-            resolved = output_path_resolved.joinpath(*parts)
-        if resolved not in declared_paths:
+        if canonical(relative) not in declared_paths:
             failures.append(
                 VerificationFailure(
                     reason="output file not listed in manifest",
@@ -333,10 +335,8 @@ def _walk_output_tree(output_path: Path) -> dict[tuple[str, ...], _WalkedEntry]:
     Lists the entries `output_path.rglob("*")` yields, minus the real directories:
     dotfiles included, symlinks listed but symlinked directories not descended, and
     a directory that cannot be listed skipped. One `scandir` per directory and one
-    `stat` per regular file. A path is resolved only where a symlink is involved:
-    with every file resolved three times, `realpath` was 44% of the profile samples
-    taken while verifying a 1,154-file gene_call output on the deploy host's Lustre
-    scratch.
+    `stat` per regular file, so a caller can resolve a path only where a symlink is
+    involved.
     """
     entries: dict[tuple[str, ...], _WalkedEntry] = {}
     pending: list[tuple[Path, tuple[str, ...]]] = [(output_path, ())]
