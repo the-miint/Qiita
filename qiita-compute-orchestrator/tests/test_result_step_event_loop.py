@@ -107,8 +107,7 @@ async def test_result_step_verifies_off_the_event_loop_thread(backend, workspace
 async def test_health_answers_while_step_result_verifies(
     backend, workspace, slow_verify, cp_to_co_token, monkeypatch
 ):
-    """The production symptom: the CP's 1 s `/health` probe of the CO timed out
-    while the CO was answering a `step/result`."""
+    """The `/health` symptom described in `SlurmBackend.result_step`'s docstring."""
     monkeypatch.setattr(app.state, "backend", backend, raising=False)
     monkeypatch.setattr(app.state, "cp_to_co_token", cp_to_co_token, raising=False)
     body = {
