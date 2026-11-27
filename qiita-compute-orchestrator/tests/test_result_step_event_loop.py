@@ -35,14 +35,17 @@ def _jwt(sun: str) -> str:
     return f"{b64url({'alg': 'none'})}.{b64url({'sun': sun, 'exp': 4102444800})}.sig"
 
 
-def _submit_only(request: httpx.Request) -> httpx.Response:
-    if request.method == "POST" and request.url.path.endswith("/job/submit"):
-        return httpx.Response(200, json={"job_id": 1})
+def _no_slurmrestd(request: httpx.Request) -> httpx.Response:
     raise AssertionError(f"unexpected slurmrestd call: {request.method} {request.url}")
 
 
-@pytest.fixture
-async def backend(tmp_path):
+def _submit_only(request: httpx.Request) -> httpx.Response:
+    if request.method == "POST" and request.url.path.endswith("/job/submit"):
+        return httpx.Response(200, json={"job_id": 1})
+    return _no_slurmrestd(request)
+
+
+def _backend(tmp_path: Path, handler) -> SlurmBackend:
     jwt_path = tmp_path / "jwt"
     jwt_path.write_text(_jwt("qiita-orch"))
     client = SlurmrestdClient(
@@ -51,10 +54,23 @@ async def backend(tmp_path):
         user_name="qiita-orch",
         http_client=httpx.AsyncClient(
             base_url="http://slurm-test:6820",
-            transport=httpx.MockTransport(_submit_only),
+            transport=httpx.MockTransport(handler),
         ),
     )
-    backend = SlurmBackend(client=client, partition="qiita", account="qiita-prod")
+    return SlurmBackend(client=client, partition="qiita", account="qiita-prod")
+
+
+@pytest.fixture
+async def backend(tmp_path):
+    """A backend whose result_step must make no slurmrestd call."""
+    backend = _backend(tmp_path, _no_slurmrestd)
+    yield backend
+    await backend.aclose()
+
+
+@pytest.fixture
+async def submitting_backend(tmp_path):
+    backend = _backend(tmp_path, _submit_only)
     yield backend
     await backend.aclose()
 
@@ -152,21 +168,33 @@ async def test_health_answers_while_step_result_verifies(
     )
 
 
-async def test_submit_step_lays_out_the_workspace_off_the_event_loop_thread(
-    backend, tmp_path, monkeypatch
+async def test_submit_step_does_its_file_system_work_off_the_event_loop_thread(
+    submitting_backend, tmp_path, monkeypatch
 ):
-    real = slurm_backend_module._lay_out_workspace
-    threads: list[int] = []
+    threads: dict[str, int] = {}
 
-    def recording(*args, **kwargs):
-        threads.append(threading.get_ident())
-        return real(*args, **kwargs)
+    def recording(name, real):
+        def wrapper(*args, **kwargs):
+            threads[name] = threading.get_ident()
+            return real(*args, **kwargs)
 
-    monkeypatch.setattr(slurm_backend_module, "_lay_out_workspace", recording)
+        return wrapper
+
+    monkeypatch.setattr(
+        slurm_backend_module,
+        "_lay_out_workspace",
+        recording("workspace", slurm_backend_module._lay_out_workspace),
+    )
+    monkeypatch.setattr(
+        submitting_backend,
+        "_container_binds",
+        recording("binds", submitting_backend._container_binds),
+    )
+    (tmp_path / "in").mkdir()
     workspace = tmp_path / "submit-ws"
-    handle = await backend.submit_step(
+    handle = await submitting_backend.submit_step(
         "gene_call",
-        {},
+        {"genomes": tmp_path / "in"},
         workspace,
         scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
@@ -177,5 +205,5 @@ async def test_submit_step_lays_out_the_workspace_off_the_event_loop_thread(
 
     assert handle.slurm_job_id == 1
     assert (workspace / "input" / "params.json").is_file()
-    assert len(threads) == 1
-    assert threads[0] != threading.get_ident()
+    assert set(threads) == {"workspace", "binds"}
+    assert threading.get_ident() not in threads.values()

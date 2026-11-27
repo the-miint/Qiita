@@ -738,6 +738,7 @@ def test_verify_files_under_a_symlinked_dir_are_not_walked(tmp_path):
     }
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
 def test_verify_unreadable_directory_fails(tmp_path):
     out = _make_output(
         tmp_path,
@@ -754,6 +755,7 @@ def test_verify_unreadable_directory_fails(tmp_path):
     ]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
 def test_verify_symlink_to_an_unreadable_target_fails(tmp_path):
     shut = tmp_path / "shut"
     shut.mkdir()
@@ -771,6 +773,28 @@ def test_verify_symlink_to_an_unreadable_target_fails(tmp_path):
         shut.chmod(0o755)
     assert [(f.reason, f.detail.split(":")[0]) for f in failures] == [
         ("output entry cannot be read", "link")
+    ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_verify_declared_path_that_cannot_be_read_is_not_reported_missing(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"locked/hidden": b"x"},
+        manifest={
+            "files": [{"path": "locked/hidden", "size_bytes": 1}],
+            "outputs": {"hidden": "locked/hidden"},
+        },
+    )
+    (out / "locked").chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        (out / "locked").chmod(0o755)
+    assert sorted((f.reason, f.detail.split(":")[0]) for f in failures) == [
+        ("declared output file cannot be read", "locked/hidden"),
+        ("manifest.json `outputs.hidden` cannot be read", "locked/hidden"),
+        ("output entry cannot be read", "locked"),
     ]
 
 

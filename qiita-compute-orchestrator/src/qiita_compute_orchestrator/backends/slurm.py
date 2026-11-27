@@ -359,6 +359,25 @@ class SlurmBackend(ComputeBackend):
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
 
+    def _container_binds(
+        self, inputs: dict[str, Path], derived_inputs: dict[str, str], step_name: str
+    ) -> tuple[list[Path], list[Path] | None, dict[str, str] | None]:
+        """A container step's read-write binds, read-only binds, and forwarded env."""
+        extra_bind_dirs = self._resolve_input_binds(inputs, step_name=step_name)
+        # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
+        # reference DB, too large to bake into the SIF). Bind each one
+        # read-only and forward its absolute path under the declared env var
+        # — apptainer runs `--containall`, so an unforwarded host env var is
+        # invisible inside the container.
+        derived = self._resolve_derived_inputs(derived_inputs, step_name=step_name)
+        if not derived:
+            return extra_bind_dirs, None, None
+        # Same directory-granularity rule as _resolve_input_binds: bind a
+        # directory itself, but a FILE's parent (apptainer's --bind is
+        # directory-granular). The env var still names the file.
+        ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
+        return extra_bind_dirs, ro_bind_dirs, {k: str(v) for k, v in derived.items()}
+
     def _resolve_derived_inputs(
         self, derived_inputs: dict[str, str], *, step_name: str
     ) -> dict[str, Path]:
@@ -584,19 +603,10 @@ class SlurmBackend(ComputeBackend):
         ro_bind_dirs: list[Path] | None = None
         container_env: dict[str, str] | None = None
         if container is not None:
-            extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
-            # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
-            # reference DB, too large to bake into the SIF). Bind each one
-            # read-only and forward its absolute path under the declared env var
-            # — apptainer runs `--containall`, so an unforwarded host env var is
-            # invisible inside the container.
-            derived = self._resolve_derived_inputs(derived_inputs or {}, step_name=name)
-            if derived:
-                # Same directory-granularity rule as _resolve_input_binds: bind a
-                # directory itself, but a FILE's parent (apptainer's --bind is
-                # directory-granular). The env var still names the file.
-                ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
-                container_env = {k: str(v) for k, v in derived.items()}
+            # Off the loop: each input is stat'ed to tell a directory from a file.
+            extra_bind_dirs, ro_bind_dirs, container_env = await asyncio.to_thread(
+                self._container_binds, inputs, derived_inputs or {}, name
+            )
 
         payload = build_job_submit_payload(
             step_name=name,

@@ -14,8 +14,9 @@
 - **A step output with a directory or entry the orchestrator cannot read fails
   verification (#TBD).** It was skipped, so files in or behind it were never checked
   against the manifest or for mode `0440`. The failure is `output entry cannot be
-  read`, naming the path. All 40,872 step output directories on the deploy host's
-  scratch could be read in full by `qiita-orch`.
-- **`POST /api/v1/step/submit` creates the step's workspace off the event loop
-  (#TBD).** The workspace directories and `params.json` are written in a worker
-  thread.
+  read`, naming the path; a declared file or `outputs` path that cannot be read is
+  reported as `cannot be read`, no longer as missing. All 40,872 step output
+  directories on the deploy host's scratch could be read in full by `qiita-orch`.
+- **`POST /api/v1/step/submit` does its file-system work off the event loop
+  (#TBD).** Creating the workspace directories, writing `params.json`, and checking
+  each container input to pick its bind directory run in a worker thread.

@@ -196,11 +196,19 @@ def verify_container_output(
                 )
             )
             continue
-        if not full.exists():
+        looked = _stat_or_error(full)
+        if looked is None:
             failures.append(
                 VerificationFailure(
                     reason=f"manifest.json `outputs.{name}` points at missing path",
                     detail=value,
+                )
+            )
+        elif isinstance(looked, OSError):
+            failures.append(
+                VerificationFailure(
+                    reason=f"manifest.json `outputs.{name}` cannot be read",
+                    detail=f"{value}: [Errno {looked.errno}] {looked.strerror}",
                 )
             )
 
@@ -280,7 +288,8 @@ def verify_container_output(
         if plain is not None and plain[1].file_stat is not None:
             actual_size = plain[1].file_stat.st_size
         else:
-            if not full.exists():
+            looked = _stat_or_error(full)
+            if looked is None:
                 failures.append(
                     VerificationFailure(
                         reason="declared output file missing",
@@ -288,7 +297,15 @@ def verify_container_output(
                     )
                 )
                 continue
-            actual_size = full.stat().st_size
+            if isinstance(looked, OSError):
+                failures.append(
+                    VerificationFailure(
+                        reason="declared output file cannot be read",
+                        detail=f"{relative}: [Errno {looked.errno}] {looked.strerror}",
+                    )
+                )
+                continue
+            actual_size = looked.st_size
         if actual_size != declared_size:
             failures.append(
                 VerificationFailure(
@@ -373,6 +390,17 @@ def _walk_output_tree(
             except OSError as exc:
                 unreadable.append(("/".join(parts), exc))
     return entries, unreadable
+
+
+def _stat_or_error(path: Path) -> os.stat_result | OSError | None:
+    """`path`'s followed stat; None when it does not exist; the error when it
+    exists or may exist but cannot be read (a permission error, say)."""
+    try:
+        return path.stat()
+    except FileNotFoundError, NotADirectoryError:
+        return None
+    except OSError as exc:
+        return exc
 
 
 def _plain_relative_parts(relative: str) -> tuple[str, ...] | None:
