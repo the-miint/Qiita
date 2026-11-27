@@ -30,4 +30,4 @@ sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
 make verify-health
 ```
 
-Container input bind mounts are computed by `SlurmBackend._resolve_input_binds` (file → parent dir, directory → itself, deduped by resolved path). This means a step's YAML-declared `inputs:` paths must be absolute when they originate from `action_context` and must be visible from the compute node — bind mounts only expose host paths, they do not copy.
+Container input bind mounts are computed by `SlurmBackend._resolve_input_binds` (file → parent dir, directory → itself, deduped as written, without resolving symlinks). This means a step's YAML-declared `inputs:` paths must be absolute when they originate from `action_context` and must be visible from the compute node — bind mounts only expose host paths, they do not copy.

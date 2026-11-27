@@ -324,8 +324,8 @@ class SlurmBackend(ComputeBackend):
           * If it's a file, bind its parent directory (apptainer's
             ``--bind`` is directory-granular).
 
-        Paths are resolved to absolute form (``Path.resolve()``) and
-        deduplicated, so two inputs that share a parent emit one bind.
+        Paths are deduplicated as written (symlinks are not resolved), so two
+        inputs that share a parent emit one bind.
         Relative paths are rejected at submit time as
         CONTRACT_VIOLATION — the runner has already resolved every input
         to an absolute host path via ``bound``, so a relative path here
