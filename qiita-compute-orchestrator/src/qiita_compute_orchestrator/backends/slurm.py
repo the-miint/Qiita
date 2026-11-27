@@ -20,6 +20,7 @@ SUBMISSION vs STEP_RUN classification — is only meaningful here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -162,6 +163,12 @@ def _read_stderr_tail(logs_path: Path) -> str:
         max_bytes=_FAILURE_REASON_TAIL_BYTES,
     )
     return text
+
+
+def _lay_out_workspace(dirs: tuple[Path, ...], params_path: Path, params_json: str) -> None:
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    params_path.write_text(params_json)
 
 
 def _is_absent(path: Path) -> bool:
@@ -317,8 +324,8 @@ class SlurmBackend(ComputeBackend):
           * If it's a file, bind its parent directory (apptainer's
             ``--bind`` is directory-granular).
 
-        Paths are resolved to absolute form (``Path.resolve()``) and
-        deduplicated, so two inputs that share a parent emit one bind.
+        Paths are deduplicated as written (symlinks are not resolved), so two
+        inputs that share a parent emit one bind.
         Relative paths are rejected at submit time as
         CONTRACT_VIOLATION — the runner has already resolved every input
         to an absolute host path via ``bound``, so a relative path here
@@ -347,10 +354,32 @@ class SlurmBackend(ComputeBackend):
             # bind the path as the workflow author wrote it. is_dir() is
             # safe on non-existent paths (returns False), which lets the
             # CONTRACT_VIOLATION check above stay as the only existence-
-            # related guard.
+            # related guard. It also returns False on a path this account
+            # (qiita-orch) cannot stat; the job runs as qiita-job, whose groups
+            # can read more of the filesystem, so the parent bind is kept
+            # rather than refusing the submit.
             bind_dirs.add(path if path.is_dir() else path.parent)
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
+
+    def _container_binds(
+        self, inputs: dict[str, Path], derived_inputs: dict[str, str], step_name: str
+    ) -> tuple[list[Path], list[Path] | None, dict[str, str] | None]:
+        """A container step's read-write binds, read-only binds, and forwarded env."""
+        extra_bind_dirs = self._resolve_input_binds(inputs, step_name=step_name)
+        # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
+        # reference DB, too large to bake into the SIF). Bind each one
+        # read-only and forward its absolute path under the declared env var
+        # — apptainer runs `--containall`, so an unforwarded host env var is
+        # invisible inside the container.
+        derived = self._resolve_derived_inputs(derived_inputs, step_name=step_name)
+        if not derived:
+            return extra_bind_dirs, None, None
+        # Same directory-granularity rule as _resolve_input_binds: bind a
+        # directory itself, but a FILE's parent (apptainer's --bind is
+        # directory-granular). The env var still names the file.
+        ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
+        return extra_bind_dirs, ro_bind_dirs, {k: str(v) for k, v in derived.items()}
 
     def _resolve_derived_inputs(
         self, derived_inputs: dict[str, str], *, step_name: str
@@ -496,8 +525,6 @@ class SlurmBackend(ComputeBackend):
         # container, where /tmp is ordinary node-local disk — deliberately left
         # alone (DuckDB's spill dir resolves against it).
         tmp_path = workspace / "tmp"
-        for d in (input_path, output_path, logs_path, tmp_path):
-            d.mkdir(parents=True, exist_ok=True)
         # params.json is the channel for workflow-specific data — never the
         # slurmrestd submit body, which is visible in `scontrol show job`
         # and SLURM accounting (no place for signed Flight tickets or
@@ -514,7 +541,7 @@ class SlurmBackend(ComputeBackend):
         # Pretty-print so a human debugging a job's input dir can read it;
         # the consumer (jobs/__main__.py) parses with model_validate_json,
         # which is whitespace-insensitive.
-        params_path.write_text(
+        params_json = (
             JobParams(
                 step_name=name,
                 scope_target=scope_target,
@@ -523,6 +550,14 @@ class SlurmBackend(ComputeBackend):
                 output_path=str(output_path),
             ).model_dump_json(indent=2)
             + "\n"
+        )
+        # The workspace is on the shared filesystem; see `result_step` for why its
+        # I/O stays off the event loop.
+        await asyncio.to_thread(
+            _lay_out_workspace,
+            (input_path, output_path, logs_path, tmp_path),
+            params_path,
+            params_json,
         )
 
         baseline = BaselineResources(
@@ -571,19 +606,10 @@ class SlurmBackend(ComputeBackend):
         ro_bind_dirs: list[Path] | None = None
         container_env: dict[str, str] | None = None
         if container is not None:
-            extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
-            # Operator-provisioned artifacts under PATH_DERIVED (e.g. CheckM's
-            # reference DB, too large to bake into the SIF). Bind each one
-            # read-only and forward its absolute path under the declared env var
-            # — apptainer runs `--containall`, so an unforwarded host env var is
-            # invisible inside the container.
-            derived = self._resolve_derived_inputs(derived_inputs or {}, step_name=name)
-            if derived:
-                # Same directory-granularity rule as _resolve_input_binds: bind a
-                # directory itself, but a FILE's parent (apptainer's --bind is
-                # directory-granular). The env var still names the file.
-                ro_bind_dirs = sorted({p if p.is_dir() else p.parent for p in derived.values()})
-                container_env = {k: str(v) for k, v in derived.items()}
+            # Off the loop: each input is stat'ed to tell a directory from a file.
+            extra_bind_dirs, ro_bind_dirs, container_env = await asyncio.to_thread(
+                self._container_binds, inputs, derived_inputs or {}, name
+            )
 
         payload = build_job_submit_payload(
             step_name=name,
@@ -641,8 +667,17 @@ class SlurmBackend(ComputeBackend):
         """Finalize a terminal SLURM step: verify + parse outputs on
         success, or raise the classified BackendFailure on failure. The
         single home for the post-poll terminal logic, called by the runner
-        once `status_step` reports the job terminal."""
+        once `status_step` reports the job terminal.
+
+        Runs in a worker thread: every part of it reads the step's workspace (the
+        output tree, the manifest, the stderr log), on the deploy host a Lustre
+        mount where checking one gene_call output took up to 2.85 s. On the event
+        loop that time stopped every other request to this single-process service,
+        and the control plane's 1 s `/health` probe of it timed out."""
         self._require_slurm_handle(handle)
+        return await asyncio.to_thread(self._result_step_blocking, handle, status)
+
+    def _result_step_blocking(self, handle: StepHandle, status: StepStatusInfo) -> dict[str, Path]:
         if status.status == StepStatus.COMPLETED and status.raw_state == PURGED_RAW_STATE:
             try:
                 manifest_absent = _is_absent(handle.output_path / MANIFEST_FILENAME)

@@ -693,6 +693,156 @@ def test_verify_outputs_dot_means_output_dir(tmp_path):
     assert verify_container_output(out) == []
 
 
+def test_verify_dotfiles_must_be_declared(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc", ".hidden": b"x", ".cache/part": b"y"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    undeclared = {
+        f.detail for f in verify_container_output(out) if "not listed in manifest" in f.reason
+    }
+    assert undeclared == {".hidden", ".cache/part"}
+
+
+def test_verify_declared_symlink_out_of_output_dir_escapes(tmp_path):
+    (tmp_path / "secret").write_bytes(b"x")
+    out = _make_output(tmp_path, {}, manifest={"files": [{"path": "link", "size_bytes": 1}]})
+    (out / "link").symlink_to(tmp_path / "secret")
+    failures = verify_container_output(out)
+    assert any("escapes" in f.reason and f.detail == "link" for f in failures)
+
+
+def test_verify_files_under_a_symlinked_dir_are_not_walked(tmp_path):
+    """A symlink to a directory is listed, not descended: a file reached only
+    through it is not reported as undeclared, and declaring it is an escape."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "stray").write_bytes(b"x")
+    (outside / "stray").chmod(0o440)
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc", "extra": b"y"},
+        manifest={
+            "files": [
+                {"path": "output.parquet", "size_bytes": 3},
+                {"path": "linked/stray", "size_bytes": 1},
+            ]
+        },
+    )
+    (out / "linked").symlink_to(outside)
+    failures = {(f.reason, f.detail) for f in verify_container_output(out)}
+    assert failures == {
+        ("output file not listed in manifest", "extra"),
+        ("manifest entry 1 path escapes $QIITA_OUTPUT_PATH", "linked/stray"),
+    }
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_verify_unreadable_directory_fails(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc", "locked/hidden": b"x"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "locked").chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        (out / "locked").chmod(0o755)
+    assert [(f.reason, f.detail.split(":")[0]) for f in failures] == [
+        ("output entry cannot be read", "locked")
+    ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_verify_symlink_to_an_unreadable_target_fails(tmp_path):
+    shut = tmp_path / "shut"
+    shut.mkdir()
+    (shut / "target").write_bytes(b"x")
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "link").symlink_to(shut / "target")
+    shut.chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        shut.chmod(0o755)
+    assert [(f.reason, f.detail.split(":")[0]) for f in failures] == [
+        ("output entry cannot be read", "link")
+    ]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+def test_verify_declared_path_that_cannot_be_read_is_not_reported_missing(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"locked/hidden": b"x"},
+        manifest={
+            "files": [{"path": "locked/hidden", "size_bytes": 1}],
+            "outputs": {"hidden": "locked/hidden"},
+        },
+    )
+    (out / "locked").chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        (out / "locked").chmod(0o755)
+    assert sorted((f.reason, f.detail.split(":")[0]) for f in failures) == [
+        ("declared output file cannot be read", "locked/hidden"),
+        ("manifest.json `outputs.hidden` cannot be read", "locked/hidden"),
+        ("output entry cannot be read", "locked"),
+    ]
+
+
+def test_verify_undeclared_dangling_symlink_passes(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "dangling").symlink_to(tmp_path / "nowhere")
+    assert verify_container_output(out) == []
+
+
+def test_verify_resolves_paths_independent_of_file_count(tmp_path, monkeypatch):
+    """Plain files are checked from one directory walk; `realpath` runs a fixed
+    number of times, not once or more per file."""
+    calls = 0
+    real = os.path.realpath
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counting)
+
+    def realpath_calls(n_files: int) -> int:
+        nonlocal calls
+        names = {f"d{i % 3}/f{i}.parquet": b"abc" for i in range(n_files)}
+        root = tmp_path / str(n_files)
+        root.mkdir()
+        out = _make_output(
+            root,
+            names,
+            manifest={
+                "files": [{"path": p, "size_bytes": 3} for p in names],
+                "outputs": {"first": "d0/f0.parquet"},
+            },
+        )
+        calls = 0
+        assert verify_container_output(out) == []
+        return calls
+
+    few = realpath_calls(3)
+    assert few > 0  # the patch sees Path.resolve's calls
+    assert realpath_calls(60) == few
+
+
 # ============================================================================
 # parse_outputs_map
 # ============================================================================

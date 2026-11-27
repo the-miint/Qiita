@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import shlex
 from pathlib import Path
 
@@ -2020,3 +2021,34 @@ async def test_cancel_prefix_does_not_match_a_numerically_larger_ticket(jwt_path
     deletes = [c for c in seen if c.startswith("DELETE")]
     assert any(c.endswith("/job/5") for c in deletes)
     assert not any(c.endswith("/job/50") for c in deletes)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root traverses a mode-000 directory")
+async def test_submit_binds_the_parent_of_an_input_it_cannot_stat(jwt_path, baseline, tmp_path):
+    """The job runs as a different account from the orchestrator (see
+    `_resolve_input_binds`), so an input the orchestrator cannot stat may still be
+    readable by the job: it binds the input's parent instead of refusing."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode())
+        return httpx.Response(200, json={"job_id": 1})
+
+    shut = tmp_path / "shut"
+    (shut / "run_folder").mkdir(parents=True)
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    shut.chmod(0o000)
+    try:
+        await backend.submit_step(
+            "bcl",
+            {"run": shut / "run_folder"},
+            tmp_path / "ws",
+            scope_target={"kind": "reference", "reference_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/hash:1.0.0",
+            entrypoint="/usr/local/bin/hash",
+            baseline_resources=baseline,
+        )
+    finally:
+        shut.chmod(0o755)
+    assert f"--bind {shut}:{shut}" in captured["payload"]["script"]
