@@ -20,6 +20,7 @@ SUBMISSION vs STEP_RUN classification — is only meaningful here.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -641,8 +642,17 @@ class SlurmBackend(ComputeBackend):
         """Finalize a terminal SLURM step: verify + parse outputs on
         success, or raise the classified BackendFailure on failure. The
         single home for the post-poll terminal logic, called by the runner
-        once `status_step` reports the job terminal."""
+        once `status_step` reports the job terminal.
+
+        Runs in a worker thread: every part of it reads the step's workspace (the
+        output tree, the manifest, the stderr log), on the deploy host a Lustre
+        mount where checking one gene_call output took up to 2.85 s. On the event
+        loop that time stopped every other request to this single-process service,
+        and the control plane's 1 s `/health` probe of it timed out."""
         self._require_slurm_handle(handle)
+        return await asyncio.to_thread(self._result_step_blocking, handle, status)
+
+    def _result_step_blocking(self, handle: StepHandle, status: StepStatusInfo) -> dict[str, Path]:
         if status.status == StepStatus.COMPLETED and status.raw_state == PURGED_RAW_STATE:
             try:
                 manifest_absent = _is_absent(handle.output_path / MANIFEST_FILENAME)

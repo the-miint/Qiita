@@ -33,9 +33,10 @@ truncation via its trailing PAR1 magic, but non-parquet outputs
 from __future__ import annotations
 
 import json
+import os
 import stat
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
 
@@ -206,6 +207,18 @@ def verify_container_output(
     if recovered:
         return failures
 
+    tree = _walk_output_tree(output_path)
+
+    def canonical(relative: str) -> Path:
+        """`(output_path / relative).resolve()`, read from `tree` when it already
+        shows the path is a non-symlink entry under the resolved output dir."""
+        parts = _plain_relative_parts(relative)
+        if parts is not None:
+            walked = tree.get(parts)
+            if walked is not None and not walked.is_symlink:
+                return output_path_resolved.joinpath(*parts)
+        return (output_path / relative).resolve()
+
     # Gate 2: every listed file exists with declared size.
     for i, entry in enumerate(files):
         if not isinstance(entry, dict):
@@ -236,7 +249,7 @@ def verify_container_output(
             continue
         # Resolve relative to output_path; reject path traversal that
         # would let the container declare a file outside its scope.
-        full = (output_path / relative).resolve()
+        full = canonical(relative)
         try:
             full.relative_to(output_path_resolved)
         except ValueError:
@@ -247,15 +260,20 @@ def verify_container_output(
                 )
             )
             continue
-        if not full.exists():
-            failures.append(
-                VerificationFailure(
-                    reason="declared output file missing",
-                    detail=relative,
+        parts = _plain_relative_parts(relative)
+        walked = tree.get(parts) if parts is not None else None
+        if walked is not None and not walked.is_symlink and walked.file_stat is not None:
+            actual_size = walked.file_stat.st_size
+        else:
+            if not full.exists():
+                failures.append(
+                    VerificationFailure(
+                        reason="declared output file missing",
+                        detail=relative,
+                    )
                 )
-            )
-            continue
-        actual_size = full.stat().st_size
+                continue
+            actual_size = full.stat().st_size
         if actual_size != declared_size:
             failures.append(
                 VerificationFailure(
@@ -269,33 +287,89 @@ def verify_container_output(
     # writes extra files (debug logs, partial outputs) is also a
     # contract violation; the manifest must list everything.
     declared_paths = {
-        (output_path / entry["path"]).resolve()
+        canonical(entry["path"])
         for entry in files
         if isinstance(entry, dict) and isinstance(entry.get("path"), str)
     }
-    declared_paths.add(manifest_path.resolve())
-    for child in output_path.rglob("*"):
-        if not child.is_file():
+    declared_paths.add(canonical(MANIFEST_FILENAME))
+    for parts, walked in sorted(tree.items()):
+        if walked.file_stat is None:
             continue
-        resolved = child.resolve()
+        relative = "/".join(parts)
+        if walked.is_symlink:
+            resolved = (output_path / relative).resolve()
+        else:
+            resolved = output_path_resolved.joinpath(*parts)
         if resolved not in declared_paths:
             failures.append(
                 VerificationFailure(
                     reason="output file not listed in manifest",
-                    detail=str(child.relative_to(output_path)),
+                    detail=relative,
                 )
             )
             continue
-        mode = stat.S_IMODE(child.stat().st_mode)
+        mode = stat.S_IMODE(walked.file_stat.st_mode)
         if mode != EXPECTED_FILE_MODE:
             failures.append(
                 VerificationFailure(
                     reason="output file has wrong mode",
-                    detail=f"{child.relative_to(output_path)}: expected 0o440, got {mode:#o}",
+                    detail=f"{relative}: expected 0o440, got {mode:#o}",
                 )
             )
 
     return failures
+
+
+@dataclass(frozen=True, slots=True)
+class _WalkedEntry:
+    is_symlink: bool
+    # The followed stat when the entry is (or links to) a regular file, else None.
+    file_stat: os.stat_result | None
+
+
+def _walk_output_tree(output_path: Path) -> dict[tuple[str, ...], _WalkedEntry]:
+    """Every non-directory entry under `output_path`, keyed by its relative parts.
+
+    Lists the entries `output_path.rglob("*")` yields, minus the real directories:
+    dotfiles included, symlinks listed but symlinked directories not descended, and
+    a directory that cannot be listed skipped. One `scandir` per directory and one
+    `stat` per regular file. A path is resolved only where a symlink is involved:
+    with every file resolved three times, `realpath` was 44% of the profile samples
+    taken while verifying a 1,154-file gene_call output on the deploy host's Lustre
+    scratch.
+    """
+    entries: dict[tuple[str, ...], _WalkedEntry] = {}
+    pending: list[tuple[Path, tuple[str, ...]]] = [(output_path, ())]
+    while pending:
+        directory, prefix = pending.pop()
+        try:
+            scan = os.scandir(directory)
+        except OSError:
+            continue
+        with scan:
+            for dir_entry in scan:
+                parts = (*prefix, dir_entry.name)
+                if dir_entry.is_dir(follow_symlinks=False):
+                    pending.append((Path(dir_entry.path), parts))
+                    continue
+                try:
+                    is_file = dir_entry.is_file()
+                except OSError:
+                    is_file = False
+                entries[parts] = _WalkedEntry(
+                    is_symlink=dir_entry.is_symlink(),
+                    file_stat=dir_entry.stat() if is_file else None,
+                )
+    return entries
+
+
+def _plain_relative_parts(relative: str) -> tuple[str, ...] | None:
+    """`relative`'s parts when it names a path inside the directory without `..`
+    or an absolute root, else None (that path needs a real `resolve()`)."""
+    parts = PurePosixPath(relative).parts
+    if not parts or parts[0] == "/" or ".." in parts:
+        return None
+    return parts
 
 
 def parse_outputs_map(output_path: Path) -> dict[str, Path]:

@@ -693,6 +693,75 @@ def test_verify_outputs_dot_means_output_dir(tmp_path):
     assert verify_container_output(out) == []
 
 
+def test_verify_dotfiles_must_be_declared(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc", ".hidden": b"x", ".cache/part": b"y"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    undeclared = {
+        f.detail for f in verify_container_output(out) if "not listed in manifest" in f.reason
+    }
+    assert undeclared == {".hidden", ".cache/part"}
+
+
+def test_verify_declared_symlink_out_of_output_dir_escapes(tmp_path):
+    (tmp_path / "secret").write_bytes(b"x")
+    out = _make_output(tmp_path, {}, manifest={"files": [{"path": "link", "size_bytes": 1}]})
+    (out / "link").symlink_to(tmp_path / "secret")
+    failures = verify_container_output(out)
+    assert any("escapes" in f.reason and f.detail == "link" for f in failures)
+
+
+def test_verify_files_under_a_symlinked_dir_are_not_walked(tmp_path):
+    """A symlink to a directory is listed, not descended: a file reached only
+    through it is neither counted as undeclared nor accepted as declared."""
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "stray").write_bytes(b"x")
+    (outside / "stray").chmod(0o440)
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "linked").symlink_to(outside)
+    assert verify_container_output(out) == []
+
+
+def test_verify_resolves_paths_independent_of_file_count(tmp_path, monkeypatch):
+    """Plain files are checked from one directory walk; `realpath` runs a fixed
+    number of times, not once or more per file."""
+    calls = 0
+    real = os.path.realpath
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counting)
+
+    def realpath_calls(n_files: int) -> int:
+        nonlocal calls
+        names = {f"d{i % 3}/f{i}.parquet": b"abc" for i in range(n_files)}
+        root = tmp_path / str(n_files)
+        root.mkdir()
+        out = _make_output(
+            root,
+            names,
+            manifest={
+                "files": [{"path": p, "size_bytes": 3} for p in names],
+                "outputs": {"first": "d0/f0.parquet"},
+            },
+        )
+        calls = 0
+        assert verify_container_output(out) == []
+        return calls
+
+    assert realpath_calls(3) == realpath_calls(60)
+
+
 # ============================================================================
 # parse_outputs_map
 # ============================================================================
