@@ -393,8 +393,9 @@ def _walk_output_tree(
 
 
 def _stat_or_error(path: Path) -> os.stat_result | OSError | None:
-    """`path`'s followed stat; None when it does not exist; the error when it
-    exists or may exist but cannot be read (a permission error, say)."""
+    """`path.stat()`, following symlinks. None when the path or one of its parents
+    does not exist; the `OSError` for any other failure, such as a parent directory
+    that cannot be traversed."""
     try:
         return path.stat()
     except FileNotFoundError, NotADirectoryError:
