@@ -207,7 +207,16 @@ def verify_container_output(
     if recovered:
         return failures
 
-    tree = _walk_output_tree(output_path)
+    tree, unreadable = _walk_output_tree(output_path)
+    # A directory or entry the walk cannot read hides whatever files are in or
+    # behind it from gate 3, so it fails the output rather than being skipped.
+    for relative, exc in unreadable:
+        failures.append(
+            VerificationFailure(
+                reason="output entry cannot be read",
+                detail=f"{relative}: [Errno {exc.errno}] {exc.strerror}",
+            )
+        )
 
     def plain_entry(relative: str) -> tuple[tuple[str, ...], _WalkedEntry] | None:
         """The walked entry `relative` names when the walk reached it as a
@@ -329,38 +338,41 @@ class _WalkedEntry:
     file_stat: os.stat_result | None
 
 
-def _walk_output_tree(output_path: Path) -> dict[tuple[str, ...], _WalkedEntry]:
-    """Every non-directory entry under `output_path`, keyed by its relative parts.
+def _walk_output_tree(
+    output_path: Path,
+) -> tuple[dict[tuple[str, ...], _WalkedEntry], list[tuple[str, OSError]]]:
+    """Every non-directory entry under `output_path`, keyed by its relative parts,
+    and each relative path (`.` for `output_path`) the walk could not read.
 
-    Lists the entries `output_path.rglob("*")` yields, minus the real directories:
-    dotfiles included, symlinks listed but symlinked directories not descended, and
-    a directory that cannot be listed skipped. One `scandir` per directory and one
-    `stat` per regular file, so a caller can resolve a path only where a symlink is
-    involved.
+    Lists dotfiles, and lists a symlink without descending into it when it points
+    at a directory. One `scandir` per directory and one `stat` per regular file, so
+    a caller can resolve a path only where a symlink is involved. A dangling
+    symlink is an entry with no file stat, not an unreadable one.
     """
     entries: dict[tuple[str, ...], _WalkedEntry] = {}
+    unreadable: list[tuple[str, OSError]] = []
     pending: list[tuple[Path, tuple[str, ...]]] = [(output_path, ())]
     while pending:
         directory, prefix = pending.pop()
         try:
-            scan = os.scandir(directory)
-        except OSError:
+            with os.scandir(directory) as scan:
+                listed = list(scan)
+        except OSError as exc:
+            unreadable.append(("/".join(prefix) or ".", exc))
             continue
-        with scan:
-            for dir_entry in scan:
-                parts = (*prefix, dir_entry.name)
+        for dir_entry in listed:
+            parts = (*prefix, dir_entry.name)
+            try:
                 if dir_entry.is_dir(follow_symlinks=False):
                     pending.append((Path(dir_entry.path), parts))
                     continue
-                try:
-                    is_file = dir_entry.is_file()
-                except OSError:
-                    is_file = False
                 entries[parts] = _WalkedEntry(
                     is_symlink=dir_entry.is_symlink(),
-                    file_stat=dir_entry.stat() if is_file else None,
+                    file_stat=dir_entry.stat() if dir_entry.is_file() else None,
                 )
-    return entries
+            except OSError as exc:
+                unreadable.append(("/".join(parts), exc))
+    return entries, unreadable
 
 
 def _plain_relative_parts(relative: str) -> tuple[str, ...] | None:

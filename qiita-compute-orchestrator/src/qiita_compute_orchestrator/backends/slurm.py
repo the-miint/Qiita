@@ -165,6 +165,12 @@ def _read_stderr_tail(logs_path: Path) -> str:
     return text
 
 
+def _lay_out_workspace(dirs: tuple[Path, ...], params_path: Path, params_json: str) -> None:
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    params_path.write_text(params_json)
+
+
 def _is_absent(path: Path) -> bool:
     """True only when `path` does not exist; any other stat error propagates."""
     try:
@@ -497,8 +503,6 @@ class SlurmBackend(ComputeBackend):
         # container, where /tmp is ordinary node-local disk — deliberately left
         # alone (DuckDB's spill dir resolves against it).
         tmp_path = workspace / "tmp"
-        for d in (input_path, output_path, logs_path, tmp_path):
-            d.mkdir(parents=True, exist_ok=True)
         # params.json is the channel for workflow-specific data — never the
         # slurmrestd submit body, which is visible in `scontrol show job`
         # and SLURM accounting (no place for signed Flight tickets or
@@ -515,7 +519,7 @@ class SlurmBackend(ComputeBackend):
         # Pretty-print so a human debugging a job's input dir can read it;
         # the consumer (jobs/__main__.py) parses with model_validate_json,
         # which is whitespace-insensitive.
-        params_path.write_text(
+        params_json = (
             JobParams(
                 step_name=name,
                 scope_target=scope_target,
@@ -524,6 +528,14 @@ class SlurmBackend(ComputeBackend):
                 output_path=str(output_path),
             ).model_dump_json(indent=2)
             + "\n"
+        )
+        # The workspace is on the shared filesystem; see `result_step` for why its
+        # I/O stays off the event loop.
+        await asyncio.to_thread(
+            _lay_out_workspace,
+            (input_path, output_path, logs_path, tmp_path),
+            params_path,
+            params_json,
         )
 
         baseline = BaselineResources(

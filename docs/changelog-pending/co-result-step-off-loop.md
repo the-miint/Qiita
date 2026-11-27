@@ -10,4 +10,12 @@
 - **Checking a step's outputs resolves each path only when a symlink is involved
   (#TBD).** The check resolved every output file's path three times; it now lists the
   output directory once and resolves only symlinks and paths containing `..` or an
-  absolute root. Which outputs pass or fail is unchanged.
+  absolute root. Apart from the next entry, which outputs pass or fail is unchanged.
+- **A step output with a directory or entry the orchestrator cannot read fails
+  verification (#TBD).** It was skipped, so files in or behind it were never checked
+  against the manifest or for mode `0440`. The failure is `output entry cannot be
+  read`, naming the path. All 40,872 step output directories on the deploy host's
+  scratch could be read in full by `qiita-orch`.
+- **`POST /api/v1/step/submit` creates the step's workspace off the event loop
+  (#TBD).** The workspace directories and `params.json` are written in a worker
+  thread.

@@ -738,6 +738,52 @@ def test_verify_files_under_a_symlinked_dir_are_not_walked(tmp_path):
     }
 
 
+def test_verify_unreadable_directory_fails(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc", "locked/hidden": b"x"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "locked").chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        (out / "locked").chmod(0o755)
+    assert [(f.reason, f.detail.split(":")[0]) for f in failures] == [
+        ("output entry cannot be read", "locked")
+    ]
+
+
+def test_verify_symlink_to_an_unreadable_target_fails(tmp_path):
+    shut = tmp_path / "shut"
+    shut.mkdir()
+    (shut / "target").write_bytes(b"x")
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "link").symlink_to(shut / "target")
+    shut.chmod(0o000)
+    try:
+        failures = verify_container_output(out)
+    finally:
+        shut.chmod(0o755)
+    assert [(f.reason, f.detail.split(":")[0]) for f in failures] == [
+        ("output entry cannot be read", "link")
+    ]
+
+
+def test_verify_undeclared_dangling_symlink_passes(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"output.parquet": b"abc"},
+        manifest={"files": [{"path": "output.parquet", "size_bytes": 3}]},
+    )
+    (out / "dangling").symlink_to(tmp_path / "nowhere")
+    assert verify_container_output(out) == []
+
+
 def test_verify_resolves_paths_independent_of_file_count(tmp_path, monkeypatch):
     """Plain files are checked from one directory walk; `realpath` runs a fixed
     number of times, not once or more per file."""

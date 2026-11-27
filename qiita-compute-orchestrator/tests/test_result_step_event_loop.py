@@ -1,7 +1,7 @@
-"""`SlurmBackend.result_step` checks a step's output tree off the event loop (see
-its docstring for why). `verify_container_output` is replaced here by a wrapper that
-records its thread and sleeps `_STALL_SECONDS` before running the real check,
-standing in for a slow file system.
+"""`SlurmBackend.result_step` and `submit_step` do their workspace I/O off the event
+loop (see `result_step`'s docstring for why). `verify_container_output` is replaced
+here by a wrapper that records its thread and sleeps `_STALL_SECONDS` before running
+the real check, standing in for a slow file system.
 """
 
 import asyncio
@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 from qiita_common.api_paths import URL_STEP_RESULT
-from qiita_common.models import StepStatus
+from qiita_common.models import StepBaselineResources, StepStatus
 
 from qiita_compute_orchestrator.backend import SlurmStepHandle, StepStatusInfo
 from qiita_compute_orchestrator.backends import slurm as slurm_backend_module
@@ -35,8 +35,10 @@ def _jwt(sun: str) -> str:
     return f"{b64url({'alg': 'none'})}.{b64url({'sun': sun, 'exp': 4102444800})}.sig"
 
 
-def _no_slurmrestd(request: httpx.Request) -> httpx.Response:
-    raise AssertionError(f"result_step made a slurmrestd call: {request.method} {request.url}")
+def _submit_only(request: httpx.Request) -> httpx.Response:
+    if request.method == "POST" and request.url.path.endswith("/job/submit"):
+        return httpx.Response(200, json={"job_id": 1})
+    raise AssertionError(f"unexpected slurmrestd call: {request.method} {request.url}")
 
 
 @pytest.fixture
@@ -49,7 +51,7 @@ async def backend(tmp_path):
         user_name="qiita-orch",
         http_client=httpx.AsyncClient(
             base_url="http://slurm-test:6820",
-            transport=httpx.MockTransport(_no_slurmrestd),
+            transport=httpx.MockTransport(_submit_only),
         ),
     )
     backend = SlurmBackend(client=client, partition="qiita", account="qiita-prod")
@@ -148,3 +150,32 @@ async def test_health_answers_while_step_result_verifies(
     assert health_seconds < _FREE_LOOP_BOUND_SECONDS, (
         f"/health took {health_seconds:.3f}s while step/result verified the output"
     )
+
+
+async def test_submit_step_lays_out_the_workspace_off_the_event_loop_thread(
+    backend, tmp_path, monkeypatch
+):
+    real = slurm_backend_module._lay_out_workspace
+    threads: list[int] = []
+
+    def recording(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(slurm_backend_module, "_lay_out_workspace", recording)
+    workspace = tmp_path / "submit-ws"
+    handle = await backend.submit_step(
+        "gene_call",
+        {},
+        workspace,
+        scope_target={"kind": "reference", "reference_idx": 1},
+        work_ticket_idx=1,
+        container="docker://qiita/hash:1.0.0",
+        entrypoint="/usr/local/bin/hash",
+        baseline_resources=StepBaselineResources(cpu=1, mem_gb=1, walltime_seconds=60),
+    )
+
+    assert handle.slurm_job_id == 1
+    assert (workspace / "input" / "params.json").is_file()
+    assert len(threads) == 1
+    assert threads[0] != threading.get_ident()
