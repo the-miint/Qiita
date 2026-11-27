@@ -32,7 +32,7 @@ import pytest_asyncio
 # (QIITA_TEST_POSTGRES_URL) must include it too.
 POSTGRES_URL_DEFAULT = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmode=disable"
 
-# Deliberately far below db.PRODUCTION_POOL_MAX_SIZE: a test bug that saturates
+# Deliberately far below db.PRODUCTION_POOL_FLOOR: a test bug that saturates
 # the pool must surface as a fast, obvious connection-exhaustion failure, not a
 # slow accidental pass because the fixture happened to have production's headroom.
 POSTGRES_POOL_MAX_SIZE = 5

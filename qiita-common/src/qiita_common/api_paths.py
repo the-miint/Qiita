@@ -343,6 +343,9 @@ PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
 PATH_WORK_TICKET_FANOUT = "/fanout"
 PATH_WORK_TICKET_FANOUT_COHORT = "/fanout/{kind}/{key}"
 PATH_WORK_TICKET_FANOUT_COHORT_PUMP = "/fanout/{kind}/{key}/pump"
+# The process-wide dispatch cap (system_admin, work_ticket:cancel). GET reads it;
+# PATCH sets or clears its runtime override. One resource, no key.
+PATH_WORK_TICKET_DISPATCH_CAP = "/dispatch-cap"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 # GET-list URL — same path as the POST root, named distinctly so clients
@@ -357,6 +360,7 @@ URL_WORK_TICKET_FANOUT_COHORT = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANO
 URL_WORK_TICKET_FANOUT_COHORT_PUMP = (
     f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_FANOUT_COHORT_PUMP}"
 )
+URL_WORK_TICKET_DISPATCH_CAP = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_DISPATCH_CAP}"
 
 
 # =============================================================================

@@ -3169,6 +3169,79 @@ def test_fanout_set_rejects_an_unknown_kind():
     assert exc.value.code == 2
 
 
+def _dispatch_cap_status(**overrides) -> dict:
+    base = {
+        "default": 8,
+        "override": None,
+        "max_inflight": 8,
+        "running": 8,
+        "waiting": 990,
+        "max_settable": 12,
+        "choices": [8, 12, 16, 24],
+    }
+    base.update(overrides)
+    return base
+
+
+def _capture_dispatch_cap_request(monkeypatch, body: dict) -> dict:
+    from qiita_control_plane.cli import _common
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured.update(method=method, url=url, json=json)
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    return captured
+
+
+def test_dispatch_cap_without_flags_reads_it(monkeypatch, capsys):
+    from qiita_common.api_paths import URL_WORK_TICKET_DISPATCH_CAP
+
+    from qiita_control_plane.cli import admin as cli
+
+    captured = _capture_dispatch_cap_request(monkeypatch, _dispatch_cap_status())
+    assert cli.main(["dispatch-cap"]) == 0
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(URL_WORK_TICKET_DISPATCH_CAP)
+    err = capsys.readouterr().err
+    assert "cap 8 (DISPATCH_MAX_INFLIGHT)" in err
+    assert "990 waiting" in err
+
+
+def test_dispatch_cap_set_patches_the_override(monkeypatch, capsys):
+    from qiita_control_plane.cli import admin as cli
+
+    captured = _capture_dispatch_cap_request(
+        monkeypatch, _dispatch_cap_status(override=12, max_inflight=12, running=12)
+    )
+    assert cli.main(["dispatch-cap", "--set", "12"]) == 0
+    assert captured["method"] == "PATCH"
+    assert captured["json"] == {"max_inflight": 12}
+    assert "after a restart" in capsys.readouterr().err
+
+
+def test_dispatch_cap_reset_sends_an_explicit_null(monkeypatch):
+    from qiita_control_plane.cli import admin as cli
+
+    captured = _capture_dispatch_cap_request(monkeypatch, _dispatch_cap_status())
+    assert cli.main(["dispatch-cap", "--reset"]) == 0
+    assert captured["method"] == "PATCH"
+    # Explicit null, not an omitted key: the route requires the field.
+    assert captured["json"] == {"max_inflight": None}
+
+
+@pytest.mark.parametrize("argv", [["--set", "10"], ["--set", "12", "--reset"]])
+def test_dispatch_cap_rejects_a_value_outside_the_choices_or_both_flags(argv):
+    from qiita_control_plane.cli import admin as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["dispatch-cap", *argv])
+    assert exc.value.code == 2
+
+
 def test_fanout_pump_posts_and_reports_fail_stop(monkeypatch, capsys):
     """A pump that releases nothing because the cohort is frozen must say so —
     a bare `released 0` is what made the original incident hard to read."""

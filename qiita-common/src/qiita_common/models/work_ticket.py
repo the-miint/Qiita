@@ -19,6 +19,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -855,3 +856,52 @@ class FanoutListResponse(BaseModel):
     `override` — the shape that says "set, with nothing to apply it to"."""
 
     cohorts: list[FanoutCohortStatus]
+
+
+# The values the control plane's process-wide dispatch cap may take, at boot
+# (DISPATCH_MAX_INFLIGHT) and as a runtime override. A closed set rather than a range
+# because each value fixes the size of the control plane's connection pool
+# (`dispatch.production_pool_max_size` in qiita-control-plane), and each pool size has
+# to be added up against the Postgres server's max_connections before it is offered.
+# Adding a value means doing that sum.
+DISPATCH_MAX_INFLIGHT_CHOICES: tuple[int, ...] = (8, 12, 16, 24)
+DEFAULT_DISPATCH_MAX_INFLIGHT = 8
+
+
+class DispatchCapStatus(BaseModel):
+    """The dispatch cap's state, returned by GET and PATCH
+    /api/v1/work-ticket/dispatch-cap.
+
+    `max_inflight` is the cap in force: `override` when an operator set one, else
+    `default`, the boot-time DISPATCH_MAX_INFLIGHT a restart reverts to. `running` can
+    exceed `max_inflight` after a lowering, until the excess finishes. `max_settable`
+    is the largest override this process's connection pool can carry; above it,
+    DISPATCH_MAX_INFLIGHT has to be raised and the control plane restarted.
+    """
+
+    default: int
+    override: int | None
+    max_inflight: int
+    running: int
+    waiting: int
+    max_settable: int
+    choices: list[int]
+
+
+class DispatchCapOverrideRequest(BaseModel):
+    """Body for PATCH /api/v1/work-ticket/dispatch-cap.
+
+    `max_inflight` null clears the override, reverting to DISPATCH_MAX_INFLIGHT. The
+    field is required, so clearing is an explicit null rather than an omitted key.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_inflight: int | None
+
+    @field_validator("max_inflight")
+    @classmethod
+    def _one_of_the_choices(cls, value: int | None) -> int | None:
+        if value is not None and value not in DISPATCH_MAX_INFLIGHT_CHOICES:
+            raise ValueError(f"must be one of {list(DISPATCH_MAX_INFLIGHT_CHOICES)}")
+        return value

@@ -76,6 +76,7 @@ from .backfill_wol_genome_repair import add_wol_genome_repair_parser
 from .check_stored_preflights import add_check_stored_preflights_parser
 from .compute_readiness import _DEFAULT_ORCHESTRATOR_VENV, _handle_compute_readiness
 from .definition import add_definition_parser
+from .dispatch_cap import add_dispatch_cap_parser
 from .fanout import add_fanout_parser
 from .force_fail import (
     _FAILURE_STAGE_CHOICES,
@@ -255,6 +256,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cancel.set_defaults(handler=_handle_ticket_cancel)
 
     add_fanout_parser(sub)
+    add_dispatch_cap_parser(sub)
     add_alignment_parser(sub)
     add_output_equivalence_parser(sub)
     add_definition_parser(sub)
