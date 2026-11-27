@@ -354,7 +354,10 @@ class SlurmBackend(ComputeBackend):
             # bind the path as the workflow author wrote it. is_dir() is
             # safe on non-existent paths (returns False), which lets the
             # CONTRACT_VIOLATION check above stay as the only existence-
-            # related guard.
+            # related guard. It also returns False on a path this account
+            # (qiita-orch) cannot stat; the job runs as qiita-job, whose groups
+            # can read more of the filesystem, so the parent bind is kept
+            # rather than refusing the submit.
             bind_dirs.add(path if path.is_dir() else path.parent)
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
