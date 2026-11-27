@@ -9,7 +9,7 @@ or CTEs — hence every staging statement in this package creates a regular non-
 TABLE. **Some relations are exceptions, read only on the caller's own connection and
 VIEWs for the same reason** — materializing would duplicate a large relation
 in RAM for one reader: `COVERAGE_ALIGNMENTS_VIEW` (read by the coverage
-macros), its de novo twin, and `LABELLED_RELATION` (read by one COPY).
+macros), its de novo twin, and `LABELLED_RELATION` (read by the companions' checks and the COPYs).
 
 The releases at the bottom are the other half of the same subject: which relations
 are dead at which point, and what a caller runs to let go of them. On a client
@@ -80,19 +80,22 @@ OGU_INPUT_TABLE = "ogu_input"
 # server-side job COPYs `woltka_ogu_select_sql()` straight out to Parquet and
 # relabels nothing, because its output stays inside the system.
 OGU_OUTPUT_TABLE = "ogu_output"
+# The feature-axis counterpart: one stored value per (processed sample, feature), staged
+# by the control plane from the data plane's read.
+FEATURE_OUTPUT_TABLE = "feature_output"
 
-# The two label relations, each `internal key -> public handle`.
-#
-# **The row axis is a genome only because this table flavour is OGU.** A feature is not
-# always a genome — an amplicon sequence variant, a full-length 16S observed in a sample,
-# an assembled contig are all features with no genome to roll up to — so a row-keyed
-# flavour is a genuine second shape, not a variant spelling of this one. The identifier
-# layer is already ready for it: the mint behind `export_feature_id` publishes a genome
-# OR a `(reference, feature)` pair. What is genome-only is the roll-up, which counts what
-# `woltka_ogu` counts. This name says `genome` to be honest about that, rather than
-# implying generality the computation does not have.
+# The label relations, each `internal key -> public handle`; which ones a relabel reads is
+# its `RelabelAxis`. The genome-keyed one is named `genome` because only the OGU roll-up
+# produces genome rows; a feature-keyed table labels its rows through `FEATURE_LABEL_TABLE`.
 GENOME_LABEL_TABLE = "genome_label"
 SAMPLE_LABEL_TABLE = "sample_label"
+
+# `feature_idx -> feature_id`, the feature-keyed counterpart of `GENOME_LABEL_TABLE`.
+FEATURE_LABEL_TABLE = "feature_label"
+# Each feature's sequence, keyed by its published handle: at least `(feature, sequence,
+# length, md5)`, the columns the sequences sidecar writes. The md5 is what
+# sequence-keyed tools (QIIME 2) match on.
+FEATURE_SEQUENCE_TABLE = "feature_sequence"
 
 # The published shape — a VIEW, not a table, and the second exception to the
 # non-temp-TABLE rule above (`COVERAGE_ALIGNMENTS_VIEW` is the first, for the same

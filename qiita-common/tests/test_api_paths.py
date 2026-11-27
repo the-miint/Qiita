@@ -497,6 +497,8 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX",
         "PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT",
     ),
+    # /feature-table
+    ("URL_FEATURE_TABLE", "PATH_FEATURE_TABLE_PREFIX", "PATH_FEATURE_TABLE_ROOT"),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)

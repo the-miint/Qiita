@@ -150,6 +150,11 @@ from .sequencing import (
     _handle_sequencing_run_create,
     _handle_sequencing_run_lookup,
 )
+from .stored_feature_table import (
+    SELECT_KEY_CHOICES,
+    SELECT_METHOD_CHOICES,
+    _handle_feature_table_select,
+)
 from .study import (
     _handle_study_access_grant,
     _handle_study_access_list,
@@ -1761,6 +1766,70 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
+
+    # `feature-table select` — a table of stored values over a cohort, read from
+    # `/feature-table` and written straight from its sparse rows.
+    p_ft_select = p_feature_table_sub.add_parser(
+        "select",
+        help=(
+            "Write a feature table of the values a method's runs stored, over a study's"
+            " prep_samples or the prep_samples of named biosamples, with the map needed to"
+            " read it"
+        ),
+    )
+    p_ft_select.add_argument(
+        "--method",
+        required=True,
+        choices=SELECT_METHOD_CHOICES,
+        help="The method whose stored values make the table.",
+    )
+    p_ft_select.add_argument(
+        "--parameter",
+        action="append",
+        metavar="KEY=VALUE",
+        help=(
+            "Draw only on runs with this setting (repeatable). The method's runs over the"
+            " cohort must agree on the settings that make features comparable; when they"
+            " do not, the refusal lists the ones found to choose from."
+        ),
+    )
+    select_cohort = p_ft_select.add_mutually_exclusive_group(required=True)
+    select_cohort.add_argument(
+        "--study",
+        metavar="VALUE",
+        help="Every prep_sample of this study a matching run processed, the study named by --key.",
+    )
+    select_cohort.add_argument(
+        "--biosample",
+        metavar="VALUE",
+        nargs="+",
+        help=(
+            "Every prep_sample of these biosamples a matching run processed, each named by"
+            " --key; a biosample with no prep_sample a matching run processed is refused."
+        ),
+    )
+    p_ft_select.add_argument(
+        _KEY_FLAG,
+        choices=SELECT_KEY_CHOICES,
+        help=f"The kind of identifier --study or --biosample names (default {EXPORT_ENTITY_ID}).",
+    )
+    p_ft_select.add_argument(
+        "--format",
+        choices=TABLE_FORMATS,
+        default=DEFAULT_TABLE_FORMAT,
+        help=f"Table format (default {DEFAULT_TABLE_FORMAT}).",
+    )
+    p_ft_select.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=(
+            "Where to write the table. The rest of the bundle is named after it:"
+            " <stem>.exported-identifier.json, <stem>.manifest.json and"
+            " <stem>.sequences.parquet."
+        ),
+    )
+    p_ft_select.set_defaults(handler=_handle_feature_table_select)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)

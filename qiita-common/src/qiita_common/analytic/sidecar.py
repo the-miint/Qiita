@@ -1,7 +1,7 @@
-"""The two optional companions to a published table: the taxonomy sidecar and the
-sheared tree.
+"""The companions to a published table: the taxonomy sidecar, the sheared tree, and each
+feature's sequence.
 
-Both are named from the same `exported_feature` mint the table's rows are, so
+Each is named from the same `exported_feature` mint the table's rows are, so
 `feature_id` is the join key across the bundle — which is what makes them joinable to
 the table rather than merely shipped beside it.
 """
@@ -19,7 +19,9 @@ from ..taxonomy import (
 from .label import published_membership_sql
 from .relations import (
     BLOCKED_FEATURE_TABLE,
+    FEATURE_SEQUENCE_TABLE,
     GENOME_LABEL_TABLE,
+    LABELLED_RELATION,
     PHYLOGENY_TABLE,
     SHEAR_INPUT_RELATION,
     SHEAR_KEEP_SET_RELATION,
@@ -418,3 +420,45 @@ def check_tree_diagnostics(
             f"table publishes reads as though those rows were left out of the analysis."
         )
     return TreeClearance(tips=published_rows)
+
+
+@dataclass(frozen=True)
+class SequencesClearance:
+    """Evidence that `check_sequences_diagnostics` ran and passed, plus the number of
+    features the sequences sidecar covers. `sequences_copy_sql` takes one for the reason
+    `taxonomy_copy_sql` takes a `TaxonomyClearance`."""
+
+    rows: int
+
+
+def sequences_diagnostics_sql() -> str:
+    """One row for `check_sequences_diagnostics`, over the published table and
+    `FEATURE_SEQUENCE_TABLE`."""
+    return (
+        f"SELECT (SELECT count(DISTINCT feature_id) FROM {LABELLED_RELATION}) AS features, "
+        f"(SELECT count(DISTINCT feature_id) FROM {LABELLED_RELATION} l "
+        f"  ANTI JOIN {FEATURE_SEQUENCE_TABLE} s ON s.feature = l.feature_id) "
+        f"  AS unsequenced_features, "
+        f"(SELECT count(*) FROM (SELECT s.feature FROM {FEATURE_SEQUENCE_TABLE} s "
+        f"  SEMI JOIN {LABELLED_RELATION} l ON l.feature_id = s.feature "
+        f"  GROUP BY s.feature HAVING count(*) > 1)) AS repeated_features"
+    )
+
+
+def check_sequences_diagnostics(
+    *, features: int, unsequenced_features: int, repeated_features: int
+) -> SequencesClearance:
+    """Refuse a sequences sidecar that does not describe the table beside it: a feature
+    with no sequence row, or one with two, which a reader joining on the handle would
+    double. Return the clearance `sequences_copy_sql` requires."""
+    if unsequenced_features:
+        raise ValueError(
+            f"{unsequenced_features} of the table's {features} features have no sequence "
+            f"row, so the sequences sidecar would not cover the table."
+        )
+    if repeated_features:
+        raise ValueError(
+            f"{repeated_features} feature(s) carry more than one sequence row; the "
+            f"sequences are read one row per feature."
+        )
+    return SequencesClearance(rows=features)

@@ -23,6 +23,7 @@ from qiita_common.actions import (
     PROCESSING_IDX_BINDING,
     action_threads_processing_idx,
 )
+from qiita_common.amplicon_constants import ORIENT_PRIMER_BINDING, TRIM_BINDING
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.hashing import canonical_params_hash
 
@@ -113,11 +114,11 @@ def _build_processing_params(
     # here, and primer is hashed ONLY when orienting — otherwise it's a no-op knob
     # (`_set_session_vars` ignores it) and an omitted-vs-explicit primer must not
     # split the identity.
-    if bound.get("trim") is not None:
-        orient = bool(bound.get("orient_primer"))
-        candidates["trim"] = bound.get("trim")
+    if bound.get(TRIM_BINDING) is not None:
+        orient = bool(bound.get(ORIENT_PRIMER_BINDING))
+        candidates[TRIM_BINDING] = bound.get(TRIM_BINDING)
         candidates["sortmerna_reference_idx"] = bound.get("sortmerna_reference_idx")
-        candidates["orient_primer"] = orient
+        candidates[ORIENT_PRIMER_BINDING] = orient
         if orient:
             candidates["primer"] = bound.get("primer")
     params: dict[str, Any] = {"workflow": action_id, "version": action_version}

@@ -98,6 +98,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   repair needs both. (#926)
 - `[operator]` (#929) `make migrate` applies `20261120000000_ena_imported_studies_public.sql`, which sets `default_tier = 'public'` on every study that an ENA import created. It refuses to apply, naming the studies, while one holds data that did not come from ENA; the bucket-2 check finds them first. If it does refuse, stop and follow its HINT.
 - `[operator]` (#854) Run `make migrate` — adds `qiita.amplicon_sample` (the amplicon per-sample completion gate) and `qiita.exported_identifier.processing_idx` (the second processing kind, for amplicon public identifiers). No out-of-band setup; applies with the standard migrate step.
+- `[operator]` (#857) Run `make migrate` — adds the `observed_feature` kind on `qiita.exported_feature` (a feature Qiita observed itself, such as a de-novo ASV, named by a `QF` handle). No out-of-band setup; applies with the standard migrate step.
 
 ### 4. Deploy
 

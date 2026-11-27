@@ -13,7 +13,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import asyncpg
-from qiita_common.models import BiosampleLookupKey, FieldDataType, Tier
+from qiita_common.models import (
+    IDX_KEY,
+    BiosampleIdentifierKey,
+    BiosampleLookupKey,
+    FieldDataType,
+    Tier,
+)
 
 from . import RowLock, require_transaction, row_lock_clause, update_row
 from ._sample_helpers import (
@@ -355,6 +361,23 @@ async def fetch_biosample_idxs_by_natural_key(
     )
     resolved = {r["lookup_value"]: r["idx"] for r in rows}
     return resolved
+
+
+async def fetch_biosample_idxs_by_identifier(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    key: BiosampleIdentifierKey,
+    values: list[str],
+    include_retired: bool = False,
+) -> dict[str, int]:
+    """`fetch_biosample_idxs_by_natural_key`, also taking a biosample's idx as the key.
+    Under `idx`, each value maps to itself as a number, whether or not a biosample has
+    it."""
+    if key == IDX_KEY:
+        return {value: int(value) for value in values}
+    return await fetch_biosample_idxs_by_natural_key(
+        pool_or_conn, key=key, values=values, include_retired=include_retired
+    )
 
 
 async def fetch_active_study_idxs_by_biosample_idx(

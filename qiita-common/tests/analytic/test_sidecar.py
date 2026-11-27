@@ -263,3 +263,73 @@ def test_a_cleared_keep_set_of_no_tips_builds_the_tree_without_the_shear():
     assert sql.endswith("WHERE false")
     for name, sql_type in ft.TREE_SCHEMA.items():
         assert f"CAST(NULL AS {sql_type}) AS {name}" in sql
+
+
+# --- The sequences sidecar -------------------------------------------------------------
+
+
+def _sequences_setup(con, *, published, sequenced):
+    con.execute(
+        f"CREATE TABLE {ft.LABELLED_RELATION} AS SELECT * FROM (VALUES "
+        + ", ".join(f"('{f}', 'QM1', 1.0)" for f in published)
+        + ") AS t(feature_id, sample_id, value)"
+    )
+    con.execute(
+        f"CREATE TABLE {ft.FEATURE_SEQUENCE_TABLE} AS SELECT * FROM (VALUES "
+        + ", ".join(f"('{f}', '{s}', {len(s)}, md5('{s}'))" for f, s in sequenced)
+        + ") AS t(feature, sequence, length, md5)"
+    )
+
+
+def _sequences_check(con) -> ft.SequencesClearance:
+    cur = con.execute(ft.sequences_diagnostics_sql())
+    row = dict(zip((c[0] for c in cur.description), cur.fetchone(), strict=True))
+    return ft.check_sequences_diagnostics(**row)
+
+
+def test_the_sequences_sidecar_covers_exactly_the_published_features(tmp_path):
+    import duckdb
+
+    with duckdb.connect() as con:
+        _sequences_setup(
+            con,
+            published=["QF1", "QF2"],
+            sequenced=[("QF1", "ACGT"), ("QF2", "TTTT"), ("QF3", "GG")],
+        )
+        clearance = _sequences_check(con)
+        assert clearance.rows == 2
+        out = tmp_path / "t.sequences.parquet"
+        con.execute(ft.sequences_copy_sql(out, clearance=clearance))
+        rows = con.execute(
+            f"SELECT feature_id, sequence, md5 FROM read_parquet('{out}') ORDER BY 1"
+        ).fetchall()
+    assert [r[:2] for r in rows] == [("QF1", "ACGT"), ("QF2", "TTTT")]
+
+
+def test_check_refuses_a_published_feature_with_no_sequence():
+    import duckdb
+
+    with duckdb.connect() as con:
+        _sequences_setup(con, published=["QF1", "QF2"], sequenced=[("QF1", "ACGT")])
+        with pytest.raises(ValueError, match="1 of the table's 2 features have no sequence"):
+            _sequences_check(con)
+
+
+def test_check_counts_the_features_with_repeated_sequences_not_the_extra_rows():
+    import duckdb
+
+    with duckdb.connect() as con:
+        sequenced = [("QF1", "ACGT"), ("QF1", "ACGA"), ("QF1", "ACGC"), ("QF2", "TT")]
+        _sequences_setup(con, published=["QF1", "QF2"], sequenced=sequenced)
+        with pytest.raises(ValueError, match="1 feature\\(s\\) carry more than one sequence"):
+            _sequences_check(con)
+
+
+def test_a_repeated_sequence_of_an_unpublished_feature_is_not_the_tables_concern():
+    """The copy writes only published features, so a repeat outside them is not one."""
+    import duckdb
+
+    with duckdb.connect() as con:
+        sequenced = [("QF1", "ACGT"), ("QF9", "GG"), ("QF9", "CC")]
+        _sequences_setup(con, published=["QF1"], sequenced=sequenced)
+        assert _sequences_check(con).rows == 1

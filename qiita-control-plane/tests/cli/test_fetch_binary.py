@@ -261,3 +261,18 @@ def test_an_error_body_is_read_before_the_status_is_raised():
         )
     assert exc.value.response.status_code == 404
     assert "Reference not found" in exc.value.response.text
+
+
+def test_a_json_body_is_posted(monkeypatch):
+    """A read whose request is a body (a cohort too long for query params) POSTs it;
+    without one the read stays a GET."""
+    sent = []
+
+    def stream(method, url, **kwargs):
+        sent.append((method, kwargs.get("json")))
+        return _FakeStream([(0.0, b"P")])
+
+    monkeypatch.setattr(_common.httpx, "stream", stream)
+    _common.fetch_binary("http://cp", "tok", "/x", accept=PARQUET_MEDIA_TYPE, json={"a": 1})
+    _common.fetch_binary("http://cp", "tok", "/x", accept=PARQUET_MEDIA_TYPE)
+    assert sent == [("POST", {"a": 1}), ("GET", None)]

@@ -1,11 +1,9 @@
 """The analytic export surface, as SQL text.
 
-Two consumers run this same analytic and must not disagree about it: the
-compute-orchestrator native job `estimate_feature_table` (server-side, reached
-through a work ticket) and the client-side feature-table recipe (a user's machine,
-composing the analytic-export routes). They differ in everything *around* the
-analytic — where the inputs come from, how the result is written — so the SQL lives
-here and the streaming and I/O stay with each caller.
+Every caller that builds or publishes a feature table runs this one analytic, so they
+cannot disagree about it. Callers differ in everything *around* the analytic, such as
+where the inputs come from and how the result is written, so the SQL lives here and
+the streaming and I/O stay with each caller.
 
 They disagree about the analytic in exactly one place: `denovo_map_statements` gates
 the de novo arm on CheckM scores, and a client-built combined table calls
@@ -36,9 +34,9 @@ The modules, in the order a recipe reaches them:
 | `reconcile` | the de novo arm's own relations, and precedence between the two arms |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
 | `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
-| `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
+| `ogu` | `woltka_ogu`'s input and output, for the table computed from alignments |
 | `label` | the relabel to public handles |
-| `sidecar` | the taxonomy sidecar and the sheared tree |
+| `sidecar` | the companions: the taxonomy sidecar, the sheared tree, the sequences |
 | `write` | the Parquet / BIOM / tree writers |
 """
 
@@ -81,11 +79,14 @@ from .gate import (
     streamed_alignment_table_sql,
 )
 from .label import (
+    FEATURE_AXIS,
+    GENOME_AXIS,
     LABELLED_COLUMNS,
     LABELLED_SCHEMA,
     LabelClearance,
+    RelabelAxis,
     check_relabel_diagnostics,
-    genome_label_table_sql,
+    feature_label_table_sql,
     labelled_relation_sql,
     published_membership_sql,
     relabel_diagnostics_sql,
@@ -124,7 +125,10 @@ from .relations import (
     DENOVO_COVERAGE_ALIGNMENTS_VIEW,
     DENOVO_GENOME_QUALITY_TABLE,
     DENOVO_MAP_TABLE,
+    FEATURE_LABEL_TABLE,
     FEATURE_LENGTHS_TABLE,
+    FEATURE_OUTPUT_TABLE,
+    FEATURE_SEQUENCE_TABLE,
     FEATURE_TOPOLOGY_VIEW,
     GENOME_LABEL_TABLE,
     GENOME_LENGTHS_TABLE,
@@ -151,12 +155,15 @@ from .sidecar import (
     TAXONOMY_SIDECAR_COLUMNS,
     TREE_COLUMNS,
     TREE_SCHEMA,
+    SequencesClearance,
     TaxonomyClearance,
     TreeClearance,
     blocked_feature_table_sql,
+    check_sequences_diagnostics,
     check_taxonomy_diagnostics,
     check_tree_diagnostics,
     phylogeny_table_sql,
+    sequences_diagnostics_sql,
     shear_input_statements,
     sheared_tree_table_sql,
     taxonomy_diagnostics_sql,
@@ -175,6 +182,7 @@ from .write import (
     BIOM_GENERATED_BY,
     biom_copy_sql,
     parquet_copy_sql,
+    sequences_copy_sql,
     taxonomy_copy_sql,
     tree_copy_sql,
 )
@@ -198,8 +206,13 @@ __all__ = [
     "denovo_map_join",
     "DENOVO_MAP_TABLE",
     "CoverageScope",
+    "FEATURE_AXIS",
+    "FEATURE_LABEL_TABLE",
+    "FEATURE_OUTPUT_TABLE",
+    "FEATURE_SEQUENCE_TABLE",
     "FEATURE_LENGTHS_TABLE",
     "FEATURE_TOPOLOGY_VIEW",
+    "GENOME_AXIS",
     "GENOME_LABEL_TABLE",
     "GENOME_LENGTHS_TABLE",
     "GateClearance",
@@ -219,6 +232,7 @@ __all__ = [
     "UNSCORABLE_ROW",
     "PHYLOGENY_COLUMNS",
     "PHYLOGENY_TABLE",
+    "RelabelAxis",
     "RollupCoverage",
     "SAMPLE_LABEL_TABLE",
     "SHEAR_INPUT_RELATION",
@@ -230,6 +244,7 @@ __all__ = [
     "TREE_COLUMNS",
     "TREE_SCHEMA",
     "TREE_TABLE",
+    "SequencesClearance",
     "TaxonomyClearance",
     "TreeClearance",
     "alignment_table_sql",
@@ -237,6 +252,7 @@ __all__ = [
     "blocked_feature_table_sql",
     "check_gate_diagnostics",
     "check_relabel_diagnostics",
+    "check_sequences_diagnostics",
     "check_taxonomy_diagnostics",
     "check_tree_diagnostics",
     "circular_alignments_view_sql",
@@ -261,6 +277,7 @@ __all__ = [
     "drop_phylogeny_statements",
     "drop_streamed_alignment_table_sql",
     "empty_ogu_select_sql",
+    "feature_label_table_sql",
     "feature_lengths_table_sql",
     "feature_topology_view_sql",
     "gate_alignment_columns",
@@ -268,7 +285,6 @@ __all__ = [
     "gated_alignment_parameters",
     "gate_parameters",
     "gated_alignment_table_sql",
-    "genome_label_table_sql",
     "genome_lengths_table_sql",
     "labelled_relation_sql",
     "map_table_sql",
@@ -289,7 +305,9 @@ __all__ = [
     "survivor_parameters",
     "survivor_table_name",
     "survivor_table_sql",
+    "sequences_copy_sql",
     "taxonomy_copy_sql",
+    "sequences_diagnostics_sql",
     "taxonomy_diagnostics_sql",
     "taxonomy_sidecar_sql",
     "taxonomy_table_sql",
