@@ -161,8 +161,9 @@ async def test_patch_null_clears_the_override(ctx):
     assert (resp.json()["override"], resp.json()["max_inflight"]) == (None, 8)
 
 
-async def test_patch_above_what_the_boot_pool_carries_is_422(ctx):
-    """Booted at 8, the pool is 25, so 16 is refused and the cap is unchanged."""
+async def test_patch_above_the_ceiling_is_422(ctx):
+    """Booted at 8 with no DISPATCH_MAX_INFLIGHT_CEILING, the ceiling is what the pool
+    of 25 carries (12), so 16 is refused and the cap is unchanged."""
     async with _client() as c:
         resp = await c.patch(
             URL_WORK_TICKET_DISPATCH_CAP,

@@ -84,16 +84,15 @@ def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
     return max_inflight * 2 <= pool_max_size and max_inflight + _STUDY_CONCURRENCY <= pool_max_size
 
 
-def production_pool_max_size(dispatch_max_inflight: int) -> int:
-    """The request pool's max_size for a dispatch cap of up to `dispatch_max_inflight`
-    (at boot, `dispatch_max_inflight_ceiling`): the smallest size at or above
-    `PRODUCTION_POOL_FLOOR` that `dispatch_cap_fits_pool` accepts.
-    Which values may reach it, and why the set is closed, is on
-    `DISPATCH_MAX_INFLIGHT_CHOICES`."""
+def production_pool_max_size(max_cap: int) -> int:
+    """The request pool's max_size for `max_cap`, the largest dispatch cap the pool must
+    carry: the smallest size at or above `PRODUCTION_POOL_FLOOR` that
+    `dispatch_cap_fits_pool` accepts. Which values may reach it, and why the set is
+    closed, is on `DISPATCH_MAX_INFLIGHT_CHOICES`."""
     return max(
         PRODUCTION_POOL_FLOOR,
-        dispatch_max_inflight * 2,
-        dispatch_max_inflight + _STUDY_CONCURRENCY,
+        max_cap * 2,
+        max_cap + _STUDY_CONCURRENCY,
     )
 
 

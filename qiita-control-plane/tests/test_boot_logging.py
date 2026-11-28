@@ -133,7 +133,9 @@ async def test_boot_sizes_the_pool_from_the_dispatch_ceiling(monkeypatch, caplog
 
     assert sizes == [48]
     boot = [r.getMessage() for r in caplog.records if "control-plane up" in r.getMessage()]
-    assert "dispatch_max_inflight=12 dispatch_max_inflight_ceiling=24 pool_max_size=48" in boot[0]
+    assert (
+        "dispatch_max_inflight=12 dispatch_max_inflight_ceiling=24 max_settable=24 pool_max_size=48"
+    ) in boot[0]
 
 
 async def test_shutdown_cancels_the_reconcile_resume_task_before_the_drain(monkeypatch, tmp_path):
