@@ -875,8 +875,10 @@ class DispatchCapStatus(BaseModel):
     `max_inflight` is the cap in force: `override` when an operator set one, else
     `default`, the boot-time DISPATCH_MAX_INFLIGHT a restart reverts to. `running` can
     exceed `max_inflight` after a lowering, until the excess finishes. `max_settable`
-    is the largest override this process's connection pool can carry; above it,
-    DISPATCH_MAX_INFLIGHT has to be raised and the control plane restarted.
+    is the largest override this process accepts: DISPATCH_MAX_INFLIGHT_CEILING, or when
+    that is unset the most a connection pool sized from DISPATCH_MAX_INFLIGHT carries.
+    Above it, DISPATCH_MAX_INFLIGHT_CEILING has to be raised and the control plane
+    restarted.
     """
 
     default: int

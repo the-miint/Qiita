@@ -103,7 +103,6 @@ from ..auth.principal import Anonymous, Principal, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import (
     dispatch_semaphore,
-    max_settable_dispatch_max_inflight,
     schedule_dispatch,
 )
 from ..ena_import.registration import download_ticket_has_live_job, fetch_pool_download_ticket
@@ -576,7 +575,7 @@ def _dispatch_cap_status(request: Request) -> DispatchCapStatus:
         max_inflight=semaphore.limit,
         running=semaphore.running,
         waiting=semaphore.waiting,
-        max_settable=max_settable_dispatch_max_inflight(semaphore.default),
+        max_settable=semaphore.ceiling,
         choices=list(DISPATCH_MAX_INFLIGHT_CHOICES),
     )
 
@@ -602,14 +601,11 @@ async def set_dispatch_cap(
     Raising it starts queued dispatches at once. Lowering it cancels nothing: running
     dispatches keep their slots and queued ones start as the excess finishes. The
     override is in-memory, so a restart reverts to DISPATCH_MAX_INFLIGHT. 422 for a
-    value above `max_settable`, the most the connection pool built at boot can carry.
+    value above `max_settable`, the ceiling fixed at boot.
     """
     semaphore = dispatch_semaphore(request.app)
     try:
-        semaphore.set_override(
-            body.max_inflight,
-            ceiling=max_settable_dispatch_max_inflight(semaphore.default),
-        )
+        semaphore.set_override(body.max_inflight)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)

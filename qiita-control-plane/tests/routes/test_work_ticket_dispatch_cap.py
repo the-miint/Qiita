@@ -92,6 +92,27 @@ async def test_get_reports_the_default_cap(ctx):
     }
 
 
+async def test_a_ceiling_above_the_default_is_settable_and_reported(ctx, monkeypatch):
+    """Booted at 12 with DISPATCH_MAX_INFLIGHT_CEILING=24: GET reports 24 as
+    `max_settable`, and PATCH to 24 is accepted rather than refused as above the
+    boot value."""
+    from qiita_control_plane.dispatch import build_dispatch_semaphore
+    from qiita_control_plane.main import app
+
+    monkeypatch.setattr(app.state, "dispatch_semaphore", build_dispatch_semaphore(12, 24))
+    async with _client() as c:
+        got = await c.get(URL_WORK_TICKET_DISPATCH_CAP, headers=_auth(ctx["admin_tok"]))
+        patched = await c.patch(
+            URL_WORK_TICKET_DISPATCH_CAP,
+            headers=_auth(ctx["admin_tok"]),
+            json={"max_inflight": 24},
+        )
+    assert got.status_code == 200
+    assert (got.json()["default"], got.json()["max_settable"]) == (12, 24)
+    assert patched.status_code == 200
+    assert (patched.json()["default"], patched.json()["max_inflight"]) == (12, 24)
+
+
 async def test_get_counts_running_and_waiting(ctx):
     sem = ctx["semaphore"]
     for _ in range(8):
@@ -129,7 +150,7 @@ async def test_patch_raises_the_cap_and_starts_waiters(ctx):
 
 
 async def test_patch_null_clears_the_override(ctx):
-    ctx["semaphore"].set_override(12, ceiling=12)
+    ctx["semaphore"].set_override(12)
     async with _client() as c:
         resp = await c.patch(
             URL_WORK_TICKET_DISPATCH_CAP,
@@ -140,8 +161,9 @@ async def test_patch_null_clears_the_override(ctx):
     assert (resp.json()["override"], resp.json()["max_inflight"]) == (None, 8)
 
 
-async def test_patch_above_what_the_boot_pool_carries_is_422(ctx):
-    """Booted at 8, the pool is 25, so 16 is refused and the cap is unchanged."""
+async def test_patch_above_the_ceiling_is_422(ctx):
+    """Booted at 8 with no DISPATCH_MAX_INFLIGHT_CEILING, the ceiling is what the pool
+    of 25 carries (12), so 16 is refused and the cap is unchanged."""
     async with _client() as c:
         resp = await c.patch(
             URL_WORK_TICKET_DISPATCH_CAP,
@@ -149,7 +171,7 @@ async def test_patch_above_what_the_boot_pool_carries_is_422(ctx):
             json={"max_inflight": 16},
         )
     assert resp.status_code == 422
-    assert "DISPATCH_MAX_INFLIGHT" in resp.json()["detail"]
+    assert "DISPATCH_MAX_INFLIGHT_CEILING" in resp.json()["detail"]
     assert ctx["semaphore"].override is None
 
 

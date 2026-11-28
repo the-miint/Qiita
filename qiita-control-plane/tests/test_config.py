@@ -463,6 +463,47 @@ def test_settings_rejects_dispatch_max_inflight_outside_the_choices(monkeypatch,
         Settings.from_env()
 
 
+def test_settings_dispatch_max_inflight_ceiling_unset_is_none(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.delenv("DISPATCH_MAX_INFLIGHT_CEILING", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().dispatch_max_inflight_ceiling is None
+
+
+def test_settings_dispatch_max_inflight_ceiling_above_the_default(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", "12")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT_CEILING", "24")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert (settings.dispatch_max_inflight, settings.dispatch_max_inflight_ceiling) == (12, 24)
+
+
+@pytest.mark.parametrize(
+    ("default", "ceiling", "match"),
+    [
+        ("12", "8", "is below DISPATCH_MAX_INFLIGHT=12"),
+        ("8", "10", "must be one of"),
+        ("8", "32", "must be one of"),
+        ("8", "x", "DISPATCH_MAX_INFLIGHT_CEILING"),
+    ],
+)
+def test_settings_rejects_a_bad_dispatch_max_inflight_ceiling(monkeypatch, default, ceiling, match):
+    """A ceiling outside the choices or below DISPATCH_MAX_INFLIGHT fails the boot."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", default)
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT_CEILING", ceiling)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match=match):
+        Settings.from_env()
+
+
 def test_settings_ena_download_run_concurrency_unset_is_none(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     monkeypatch.delenv("ENA_DOWNLOAD_RUN_CONCURRENCY", raising=False)

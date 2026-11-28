@@ -2,7 +2,7 @@
 
 Thin client over `GET`/`PATCH /work-ticket/dispatch-cap`, same shape as `fanout`: it
 checks the value against the allowed set so a typo costs no round trip, and lets
-the server own the rest (the ceiling the pool allows, the counts). Gated server-side
+the server own the rest (the ceiling (`max_settable`) and the counts). Gated server-side
 on the `work_ticket:cancel` scope (system_admin).
 
 Renders the full JSON to stdout and a one-line summary to stderr.
