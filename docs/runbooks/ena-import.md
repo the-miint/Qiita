@@ -173,6 +173,24 @@ anything is written. Deleting a batch (which cascades its items) discards the re
 that the import created the study, so a later re-import of that accession is refused
 as well.
 
+An item that creates its study registers it in the same transaction, so when its
+registration fails, or every run fails or none maps to a pool, nothing is committed: the
+study, its owner grant and its pools are gone, and the item is `failed` with no
+`study_idx`. Re-importing creates the study afresh, under a new idx and `QS` handle. The
+rolled-back ones leave gaps in both numberings. Concurrent imports of one accession take
+turns: the second waits for the first to commit or roll back, and gives up after 90 s,
+failing its item with `another import holds <accession>; gave up waiting 90s for it`. An
+import-created study with no `biosample` or `prep_sample` links stays until a re-import
+succeeds into it. List them with:
+
+```sql
+SELECT s.idx, s.bioproject_accession, i.idx AS item_idx
+FROM qiita.study s
+JOIN qiita.ena_import_batch_item i ON i.study_idx = s.idx AND i.study_created
+WHERE NOT EXISTS (SELECT 1 FROM qiita.biosample_to_study WHERE study_idx = s.idx)
+  AND NOT EXISTS (SELECT 1 FROM qiita.prep_sample_to_study WHERE study_idx = s.idx);
+```
+
 A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
 is reused, and is still subject to the import-created guard above. If the pair
 identifies two different studies, or contradicts the accession the one study it
@@ -206,7 +224,9 @@ the item still ends up `excluded`, `unsupported` and/or `failed` — none reache
 `registered`/`skipped_already_present` — the item fails with "every run failed to
 register", grouping those runs by reason (see *Metadata
 harmonization* below); if no platform ever mapped, no pool
-exists and the item instead fails with "no run mapped to a downloadable pool".
+exists and the item instead fails with "no run mapped to a downloadable pool". When the
+import created the study, either reason ends with "the import-created study was rolled
+back"; into an existing study it is prefixed "study registered but" instead.
 
 Resolution only sees public records (see `qiita_common.models.ena`), so these checks
 rarely fire in practice; they enforce the rule rather than assume it.

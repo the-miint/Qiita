@@ -164,7 +164,7 @@ async def update_ena_import_batch_item_run_outcomes(
     conn: asyncpg.Connection,
     *,
     item_idx: int,
-    study_idx: int,
+    study_idx: int | None,
     ena_run_outcomes: list[dict[str, Any]],
 ) -> None:
     """Record per-run outcomes on an item without changing its state, so a
