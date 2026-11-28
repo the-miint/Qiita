@@ -107,14 +107,40 @@ async def test_boot_line_carries_the_configured_logger_name(monkeypatch, caplog,
     assert boot and boot[0].name == "qiita_control_plane.main"
 
 
-async def test_boot_sizes_the_pool_from_the_dispatch_ceiling(monkeypatch, caplog, tmp_path):
-    """DISPATCH_MAX_INFLIGHT=12 with DISPATCH_MAX_INFLIGHT_CEILING=24 builds the pool a
-    cap of 24 needs (48), and the boot line names both values."""
+@pytest.mark.parametrize(
+    ("cap", "ceiling", "pool", "logged"),
+    [
+        (
+            "12",
+            "24",
+            48,
+            "dispatch_max_inflight=12 dispatch_max_inflight_ceiling=24 max_settable=24"
+            " pool_max_size=48",
+        ),
+        (
+            "8",
+            None,
+            25,
+            "dispatch_max_inflight=8 dispatch_max_inflight_ceiling=unset max_settable=12"
+            " pool_max_size=25",
+        ),
+    ],
+)
+async def test_boot_sizes_the_pool_from_the_dispatch_ceiling(
+    monkeypatch, caplog, tmp_path, cap, ceiling, pool, logged
+):
+    """A DISPATCH_MAX_INFLIGHT_CEILING of 24 over a cap of 12 builds the pool a cap of 24
+    needs (48). With no ceiling the pool is sized from the cap as before, and the boot
+    line says the ceiling is unset rather than printing the effective 12 under the
+    variable's name."""
     from qiita_control_plane import main as cp_main
 
     _minimal_boot_env(monkeypatch, tmp_path)
-    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", "12")
-    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT_CEILING", "24")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", cap)
+    if ceiling is None:
+        monkeypatch.delenv("DISPATCH_MAX_INFLIGHT_CEILING", raising=False)
+    else:
+        monkeypatch.setenv("DISPATCH_MAX_INFLIGHT_CEILING", ceiling)
     monkeypatch.setattr(cp_main, "configure_logging", lambda *a, **k: "INFO")
     monkeypatch.setattr(cp_main, "install_authorization_scrub", lambda *a, **k: None)
     sizes: list[int] = []
@@ -131,11 +157,9 @@ async def test_boot_sizes_the_pool_from_the_dispatch_ceiling(monkeypatch, caplog
             async with cp_main.lifespan(app):
                 pass
 
-    assert sizes == [48]
+    assert sizes == [pool]
     boot = [r.getMessage() for r in caplog.records if "control-plane up" in r.getMessage()]
-    assert (
-        "dispatch_max_inflight=12 dispatch_max_inflight_ceiling=24 max_settable=24 pool_max_size=48"
-    ) in boot[0]
+    assert logged in boot[0]
 
 
 async def test_shutdown_cancels_the_reconcile_resume_task_before_the_drain(monkeypatch, tmp_path):

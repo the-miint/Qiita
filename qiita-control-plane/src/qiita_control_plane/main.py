@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     # this fixed. The fan-out and dispatch defaults are here because they are the
     # numbers an operator reconciles a `fanout list` / `dispatch-cap` reading against,
     # and overrides revert to them on restart.
-    # The pool is sized from the same ceiling the semaphore below enforces.
+    # The pool is sized from the same ceiling that the semaphore below enforces.
     dispatch_ceiling = dispatch_max_inflight_ceiling(
         settings.dispatch_max_inflight, settings.dispatch_max_inflight_ceiling
     )
