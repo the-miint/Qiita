@@ -107,6 +107,35 @@ async def test_boot_line_carries_the_configured_logger_name(monkeypatch, caplog,
     assert boot and boot[0].name == "qiita_control_plane.main"
 
 
+async def test_boot_sizes_the_pool_from_the_dispatch_ceiling(monkeypatch, caplog, tmp_path):
+    """DISPATCH_MAX_INFLIGHT=12 with DISPATCH_MAX_INFLIGHT_CEILING=24 builds the pool a
+    cap of 24 needs (48), and the boot line names both values."""
+    from qiita_control_plane import main as cp_main
+
+    _minimal_boot_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT", "12")
+    monkeypatch.setenv("DISPATCH_MAX_INFLIGHT_CEILING", "24")
+    monkeypatch.setattr(cp_main, "configure_logging", lambda *a, **k: "INFO")
+    monkeypatch.setattr(cp_main, "install_authorization_scrub", lambda *a, **k: None)
+    sizes: list[int] = []
+
+    async def _no_pool(*a, max_size, **k):
+        sizes.append(max_size)
+        raise _StopAfterBoot
+
+    monkeypatch.setattr(cp_main, "get_pool", _no_pool)
+
+    app = FastAPI()
+    with caplog.at_level(logging.INFO, logger="qiita_control_plane.main"):
+        with pytest.raises(_StopAfterBoot):
+            async with cp_main.lifespan(app):
+                pass
+
+    assert sizes == [48]
+    boot = [r.getMessage() for r in caplog.records if "control-plane up" in r.getMessage()]
+    assert "dispatch_max_inflight=12 dispatch_max_inflight_ceiling=24 pool_max_size=48" in boot[0]
+
+
 async def test_shutdown_cancels_the_reconcile_resume_task_before_the_drain(monkeypatch, tmp_path):
     """Cancelled first, the waiting resume cannot register dispatches behind the drain."""
     from qiita_control_plane import main as cp_main

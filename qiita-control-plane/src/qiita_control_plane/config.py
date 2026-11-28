@@ -174,6 +174,26 @@ def _parse_dispatch_max_inflight() -> int:
     return value
 
 
+def _parse_dispatch_max_inflight_ceiling(dispatch_max_inflight: int) -> int | None:
+    """DISPATCH_MAX_INFLIGHT_CEILING, the largest runtime override of the dispatch cap,
+    or None when unset. One of `DISPATCH_MAX_INFLIGHT_CHOICES` and at least
+    DISPATCH_MAX_INFLIGHT, or the boot fails."""
+    value = _parse_optional_positive_int_env("DISPATCH_MAX_INFLIGHT_CEILING")
+    if value is None:
+        return None
+    if value not in DISPATCH_MAX_INFLIGHT_CHOICES:
+        raise RuntimeError(
+            f"DISPATCH_MAX_INFLIGHT_CEILING must be one of"
+            f" {list(DISPATCH_MAX_INFLIGHT_CHOICES)}, got {value}"
+        )
+    if value < dispatch_max_inflight:
+        raise RuntimeError(
+            f"DISPATCH_MAX_INFLIGHT_CEILING={value} is below"
+            f" DISPATCH_MAX_INFLIGHT={dispatch_max_inflight}"
+        )
+    return value
+
+
 def _parse_ena_download_run_concurrency() -> int | None:
     value = _parse_optional_positive_int_env("ENA_DOWNLOAD_RUN_CONCURRENCY")
     if value is not None and value > MAX_ENA_DOWNLOAD_RUN_CONCURRENCY:
@@ -236,6 +256,10 @@ class Settings:
     # Process-wide cap on concurrently-running dispatches at boot; it also sizes the
     # request pool. See the comment above `dispatch.dispatch_cap_fits_pool`.
     dispatch_max_inflight: int = DEFAULT_DISPATCH_MAX_INFLIGHT
+    # The largest runtime override of that cap; when set, it sizes the request pool
+    # instead. None leaves the pool sized from `dispatch_max_inflight`
+    # (`dispatch.dispatch_max_inflight_ceiling`).
+    dispatch_max_inflight_ceiling: int | None = None
     # Runs fetched at once per batch-submitted download ticket; None keeps the job's default.
     ena_download_run_concurrency: int | None = None
     # Per-ticket workspace root the workflow runner mints under
@@ -408,6 +432,8 @@ class Settings:
                 f"DATA_PLANE_URL must be a grpc://host:port address, got {data_plane_url!r}"
             )
 
+        dispatch_max_inflight = _parse_dispatch_max_inflight()
+
         return cls(
             database_url=require_env("DATABASE_URL"),
             flight_signing_key=signing_seed,
@@ -455,7 +481,10 @@ class Settings:
                 "FANOUT_MAX_INFLIGHT",
                 _DEFAULT_FANOUT_MAX_INFLIGHT,
             ),
-            dispatch_max_inflight=_parse_dispatch_max_inflight(),
+            dispatch_max_inflight=dispatch_max_inflight,
+            dispatch_max_inflight_ceiling=_parse_dispatch_max_inflight_ceiling(
+                dispatch_max_inflight
+            ),
             ena_download_run_concurrency=_parse_ena_download_run_concurrency(),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,

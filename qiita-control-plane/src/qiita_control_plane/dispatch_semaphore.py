@@ -3,9 +3,9 @@
 `asyncio.Semaphore` fixes its size at construction, and the dispatch cap has to be
 retunable on a running control plane (`PATCH /work-ticket/dispatch-cap`). This keeps
 the semaphore's contract — `async with`, FIFO wake order, `locked()` — and adds a
-limit that is the boot value (`DISPATCH_MAX_INFLIGHT`) unless an operator override
-replaces it. What the cap bounds and how it is sized against the connection pool
-is in the comment above `dispatch.dispatch_cap_fits_pool`.
+limit that is the boot value (`DISPATCH_MAX_INFLIGHT`) unless an operator override,
+at most the boot `ceiling`, replaces it. What the cap bounds and how it is sized
+against the connection pool is in the comment above `dispatch.dispatch_cap_fits_pool`.
 
 Raising the limit starts waiters at once. Lowering it cancels nothing: tasks already
 holding a slot keep it, and waiters start only once `running` drops below the new
@@ -27,15 +27,20 @@ _log = logging.getLogger(__name__)
 
 
 class DispatchSemaphore:
-    """FIFO counting semaphore with a boot `default` limit and an optional override.
+    """FIFO counting semaphore with a boot `default` limit and an optional override of
+    at most `ceiling`.
 
     A slot is handed to the head waiter at the moment one frees (`running` is
     incremented on its behalf), so a task arriving later cannot take it first.
     """
 
-    def __init__(self, default: int) -> None:
+    def __init__(self, default: int, *, ceiling: int) -> None:
         _check_choice(default, what="default")
+        _check_choice(ceiling, what="ceiling")
+        if ceiling < default:
+            raise ValueError(f"dispatch cap ceiling {ceiling} is below the default {default}")
         self._default = default
+        self._ceiling = ceiling
         self._override: int | None = None
         self._running = 0
         self._waiters: deque[asyncio.Future[None]] = deque()
@@ -44,6 +49,12 @@ class DispatchSemaphore:
     def default(self) -> int:
         """The limit read from DISPATCH_MAX_INFLIGHT at boot; a restart reverts to it."""
         return self._default
+
+    @property
+    def ceiling(self) -> int:
+        """The largest override this process accepts, fixed at boot
+        (`dispatch.dispatch_max_inflight_ceiling`)."""
+        return self._ceiling
 
     @property
     def override(self) -> int | None:
@@ -69,20 +80,21 @@ class DispatchSemaphore:
         """True when an `acquire` now would wait: no free slot, or others queued first."""
         return self._running >= self.limit or self.waiting > 0
 
-    def set_override(self, value: int | None, *, ceiling: int) -> None:
+    def set_override(self, value: int | None) -> None:
         """Set the runtime limit, or clear it with None, and start any waiters it frees.
 
         Raises ValueError when `value` is not one of `DISPATCH_MAX_INFLIGHT_CHOICES`
-        or is above `ceiling`, the largest value the connection pool built at boot
-        can carry (`dispatch.max_settable_dispatch_max_inflight`).
+        or is above `ceiling`.
         """
         if value is not None:
             _check_choice(value, what="override")
-            if value > ceiling:
+            if value > self._ceiling:
                 raise ValueError(
-                    f"override {value} is above {ceiling}, the most this control plane's"
-                    f" connection pool (sized at boot from DISPATCH_MAX_INFLIGHT="
-                    f"{self._default}) can carry; raise DISPATCH_MAX_INFLIGHT and restart"
+                    f"override {value} is above {self._ceiling}, the most this control"
+                    f" plane accepts without a restart (DISPATCH_MAX_INFLIGHT_CEILING, or"
+                    f" when that is unset the most the connection pool sized from"
+                    f" DISPATCH_MAX_INFLIGHT={self._default} carries); raise"
+                    f" DISPATCH_MAX_INFLIGHT_CEILING and restart"
                 )
             if value < self._default:
                 _log.warning(

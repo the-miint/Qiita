@@ -66,12 +66,14 @@ _log = logging.getLogger(__name__)
 # call's usual budget: the runner's `_stage_ena_run_roster`, parked on the
 # registration lock, holds its connection for the whole bounded wait,
 # `POOL_LOCK_WAIT_TIMEOUT_S`, rather than cycling it.) `production_pool_max_size`
-# sizes the pool from the boot cap so that holds for every value in
-# `DISPATCH_MAX_INFLIGHT_CHOICES`. The smallest allowed cap equals fanout's
-# DEFAULT_FANOUT_MAX_INFLIGHT, so a single cohort at its default cap stays reachable,
-# and FANOUT_MAX_INFLIGHT tuned above the dispatch cap buys a cohort nothing — its
-# children queue for these same shared slots. What a slot covers, and the workflow
-# cap that follows from it, is documented on `schedule_dispatch`.
+# sizes the pool from the largest cap this process accepts
+# (`dispatch_max_inflight_ceiling`), so that holds for every value in
+# `DISPATCH_MAX_INFLIGHT_CHOICES` and for every override up to that ceiling. The
+# smallest allowed cap equals fanout's DEFAULT_FANOUT_MAX_INFLIGHT, so a single cohort
+# at its default cap stays reachable, and FANOUT_MAX_INFLIGHT tuned above the dispatch
+# cap buys a cohort nothing — its children queue for these same shared slots. What a
+# slot covers, and the workflow cap that follows from it, is documented on
+# `schedule_dispatch`.
 
 
 def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
@@ -83,8 +85,9 @@ def dispatch_cap_fits_pool(max_inflight: int, pool_max_size: int) -> bool:
 
 
 def production_pool_max_size(dispatch_max_inflight: int) -> int:
-    """The request pool's max_size for a boot-time DISPATCH_MAX_INFLIGHT: the smallest
-    size at or above `PRODUCTION_POOL_FLOOR` that `dispatch_cap_fits_pool` accepts.
+    """The request pool's max_size for a dispatch cap of up to `dispatch_max_inflight`
+    (at boot, `dispatch_max_inflight_ceiling`): the smallest size at or above
+    `PRODUCTION_POOL_FLOOR` that `dispatch_cap_fits_pool` accepts.
     Which values may reach it, and why the set is closed, is on
     `DISPATCH_MAX_INFLIGHT_CHOICES`."""
     return max(
@@ -94,10 +97,14 @@ def production_pool_max_size(dispatch_max_inflight: int) -> int:
     )
 
 
-def max_settable_dispatch_max_inflight(dispatch_max_inflight: int) -> int:
-    """The largest runtime override the pool built for a boot-time
-    DISPATCH_MAX_INFLIGHT can carry. The pool's size is fixed at boot, so going
-    higher takes a larger DISPATCH_MAX_INFLIGHT and a restart."""
+def dispatch_max_inflight_ceiling(dispatch_max_inflight: int, configured: int | None) -> int:
+    """The largest runtime override this process accepts, which also sizes its request
+    pool (`production_pool_max_size`). `configured` is DISPATCH_MAX_INFLIGHT_CEILING
+    (config validates it against `dispatch_max_inflight`); when it is None, the most a
+    pool sized from DISPATCH_MAX_INFLIGHT alone carries. The pool's size is fixed at
+    boot, so a higher override takes a larger ceiling and a restart."""
+    if configured is not None:
+        return configured
     pool_max_size = production_pool_max_size(dispatch_max_inflight)
     return max(c for c in DISPATCH_MAX_INFLIGHT_CHOICES if dispatch_cap_fits_pool(c, pool_max_size))
 
@@ -107,10 +114,15 @@ _RESUME_RETRY_BASE_SECONDS = 1.0
 
 def build_dispatch_semaphore(
     dispatch_max_inflight: int = DEFAULT_DISPATCH_MAX_INFLIGHT,
+    ceiling: int | None = None,
 ) -> DispatchSemaphore:
     """The process-wide cap `schedule_dispatch` binds every dispatch task to, at the
-    boot-time DISPATCH_MAX_INFLIGHT."""
-    return DispatchSemaphore(dispatch_max_inflight)
+    boot-time DISPATCH_MAX_INFLIGHT, accepting overrides up to
+    `dispatch_max_inflight_ceiling(dispatch_max_inflight, ceiling)`."""
+    return DispatchSemaphore(
+        dispatch_max_inflight,
+        ceiling=dispatch_max_inflight_ceiling(dispatch_max_inflight, ceiling),
+    )
 
 
 def dispatch_semaphore(app: FastAPI) -> DispatchSemaphore:

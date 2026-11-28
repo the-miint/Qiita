@@ -22,8 +22,8 @@ from qiita_control_plane.dispatch import (
     build_compute_backend_client,
     build_dispatch_semaphore,
     dispatch_cap_fits_pool,
+    dispatch_max_inflight_ceiling,
     drain_running_dispatches,
-    max_settable_dispatch_max_inflight,
     production_pool_max_size,
     reconcile_inflight_tickets,
     schedule_dispatch,
@@ -124,10 +124,36 @@ def test_dispatch_cap_fits_pool_rejects_a_cap_over_half_the_pool():
     ("boot", "settable"),
     [(8, 12), (12, 12), (16, 16), (24, 24)],
 )
-def test_max_settable_override_is_what_the_boot_pool_carries(boot, settable):
-    """The pool is sized once at boot, so a runtime override can go only as high as
-    that pool allows: booted at 8 or 12 (pool 25) the most is 12."""
-    assert max_settable_dispatch_max_inflight(boot) == settable
+def test_unset_ceiling_is_what_the_boot_pool_carries(boot, settable):
+    """With DISPATCH_MAX_INFLIGHT_CEILING unset, the pool is sized from the boot cap
+    and an override can go only as high as that pool allows: booted at 8 or 12
+    (pool 25) the most is 12."""
+    assert dispatch_max_inflight_ceiling(boot, None) == settable
+    assert production_pool_max_size(dispatch_max_inflight_ceiling(boot, None)) == (
+        production_pool_max_size(boot)
+    )
+
+
+@pytest.mark.parametrize(("boot", "ceiling"), [(8, 8), (8, 24), (12, 16), (12, 24)])
+def test_a_set_ceiling_is_the_most_an_override_reaches(boot, ceiling):
+    """A set ceiling is the limit, below what the pool would carry included (8 with a
+    pool of 25), and the semaphore refuses one step above it."""
+    assert dispatch_max_inflight_ceiling(boot, ceiling) == ceiling
+    sem = build_dispatch_semaphore(boot, ceiling)
+    assert (sem.default, sem.ceiling) == (boot, ceiling)
+    sem.set_override(ceiling)
+    above = [c for c in DISPATCH_MAX_INFLIGHT_CHOICES if c > ceiling]
+    if above:
+        with pytest.raises(ValueError, match="DISPATCH_MAX_INFLIGHT_CEILING"):
+            sem.set_override(above[0])
+
+
+def test_pool_is_sized_from_the_ceiling_not_the_boot_cap():
+    """Booted at 12 with a ceiling of 24, the pool is the one a cap of 24 needs."""
+    assert production_pool_max_size(dispatch_max_inflight_ceiling(12, 24)) == 48
+    assert dispatch_cap_fits_pool(
+        24, production_pool_max_size(dispatch_max_inflight_ceiling(12, 24))
+    )
 
 
 def test_default_dispatch_cap_is_an_allowed_value():

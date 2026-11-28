@@ -28,6 +28,7 @@ from .deps import get_db_pool
 from .dispatch import (
     build_compute_backend_client,
     build_dispatch_semaphore,
+    dispatch_max_inflight_ceiling,
     dispatch_semaphore,
     drain_running_dispatches,
     production_pool_max_size,
@@ -66,13 +67,17 @@ async def lifespan(app: FastAPI):
     # this fixed. The fan-out and dispatch defaults are here because they are the
     # numbers an operator reconciles a `fanout list` / `dispatch-cap` reading against,
     # and overrides revert to them on restart.
-    pool_max_size = production_pool_max_size(settings.dispatch_max_inflight)
+    dispatch_ceiling = dispatch_max_inflight_ceiling(
+        settings.dispatch_max_inflight, settings.dispatch_max_inflight_ceiling
+    )
+    pool_max_size = production_pool_max_size(dispatch_ceiling)
     _log.info(
         "control-plane up: log_level=%s fanout_max_inflight=%d dispatch_max_inflight=%d"
-        " pool_max_size=%d",
+        " dispatch_max_inflight_ceiling=%d pool_max_size=%d",
         log_level,
         settings.fanout_max_inflight,
         settings.dispatch_max_inflight,
+        dispatch_ceiling,
         pool_max_size,
     )
     app.state.pool = await get_pool(settings.database_url, max_size=pool_max_size)
@@ -95,7 +100,9 @@ async def lifespan(app: FastAPI):
         token_path=settings.cp_to_co_token_path,
     )
     app.state.running_dispatches = set()
-    app.state.dispatch_semaphore = build_dispatch_semaphore(settings.dispatch_max_inflight)
+    app.state.dispatch_semaphore = build_dispatch_semaphore(
+        settings.dispatch_max_inflight, settings.dispatch_max_inflight_ceiling
+    )
     # Boot-time read: if the assignment above was removed or reordered, fail
     # here — before reconcile dispatches anything — rather than post-commit at
     # the first route, or in the fan-out pump where a raise strands a released
